@@ -46,9 +46,22 @@ waist. The 12 vertices are the degree-5 points: gnomonic scale swells
 smoothly to ~58% there and five cell grids meet without 1:1 alignment —
 a texel-density and adjacency hotspot, not a singularity. Four land on
 land (Sulawesi, Amazon, Sahara, central Siberia); Washington is ~2,700 km
-from the nearest vertex, New Zealand ~700 km. Revisit (Fuller-style
-all-ocean rotation) only before any tile data ships, and only if global
-cartographic polish at those four spots ever matters.
+from the nearest vertex, New Zealand ~700 km. The poles are not vertices:
+each sits on an edge midpoint (north on the D0/D5 seam, south on D3/D8).
+
+This orientation was measured against the pole-vertex alternative
+(2026-10-03, Natural Earth land-weighted): gnomonic area distortion mean
+1.217/p99 1.771/max 1.948 vs 1.205/1.775/1.930 for the best pole-vertex
+rotation — a tie. Land within 500 km of a vertex: 2.0% vs 1.6–3.1%
+depending on rotation. Washington occupies a single diamond (D6) either
+way; New Zealand straddles faces 3 and 8, which are paired as diamond D3,
+so both islands also sit in one diamond — the face seam is an interior
+crease, not an addressing boundary. Note the pairing itself is a free
+choice among perfect matchings: a future region on an ugly seam can be
+fixed by re-pairing, which is cheaper than re-orienting but still re-tiles.
+Revisit orientation (Fuller-style all-ocean rotation) only before any tile
+data ships, and only if cartographic polish at the four land vertices ever
+matters.
 
 ## Cells and anchoring
 
