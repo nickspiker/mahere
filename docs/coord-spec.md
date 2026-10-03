@@ -36,6 +36,20 @@ deliberately: all source data (OSM, GPX, NAIP, 3DEP) is geodetic WGS84.
 Elevation never enters the codec. (3DEP heights are NAVD88 orthometric, GPS
 heights ellipsoidal, ~20 m apart in WA — a display-side concern.)
 
+## Orientation (locked — changing it re-tiles the world)
+
+The vertex table is the golden-ratio icosahedron shared with the reference
+`icosahedron` codec and `vsf::WorldCoord` — one orientation, bit-congruent
+across all three. The 10 diamonds form two interlocking fans of five around
+the antipodal vertices 0 (0°, 121.7°E) and 3 (0°, 58.3°W), meshing at the
+waist. The 12 vertices are the degree-5 points: gnomonic scale swells
+smoothly to ~58% there and five cell grids meet without 1:1 alignment —
+a texel-density and adjacency hotspot, not a singularity. Four land on
+land (Sulawesi, Amazon, Sahara, central Siberia); Washington is ~2,700 km
+from the nearest vertex, New Zealand ~700 km. Revisit (Fuller-style
+all-ocean rotation) only before any tile data ships, and only if global
+cartographic polish at those four spots ever matters.
+
 ## Cells and anchoring
 
 - A cell at depth d (0–30) is the top `4 + 2d` bits; depth 0 is a whole
