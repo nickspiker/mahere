@@ -1,0 +1,9 @@
+[package]
+name = "mahere-coord"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "mahere's canonical coordinate system: icosahedral diamond-Morton u64 positions and quadtree cells"
+
+[dependencies]

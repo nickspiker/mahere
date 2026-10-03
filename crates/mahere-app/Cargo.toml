@@ -1,0 +1,11 @@
+[package]
+name = "mahere-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "mahere desktop app: offline trail map on the fluor compositor"
+
+[dependencies]
+mahere-coord = { path = "../mahere-coord" }
+fluor = { version = "0.0.4", features = ["host-winit"] }
