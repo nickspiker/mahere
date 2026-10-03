@@ -1,0 +1,11 @@
+[package]
+name = "mahere-osm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "mahere's OSM ingest boundary: .osm.pbf dies here, mahere coordinates come out"
+
+[dependencies]
+mahere-coord = { path = "../mahere-coord" }
+osmpbf = "0.3"

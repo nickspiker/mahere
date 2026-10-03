@@ -41,8 +41,10 @@ Early. Working today:
 
 - `mahere-coord` — the coordinate system, tested (round-trips < 2 cm
   globally, prefix/containment algebra, all diamonds reachable).
-- `mahere-app` — a fluor window rendering the diamond/quadtree world view as
-  a visual test of the codec.
+- `mahere-osm` — the ingest boundary: `.osm.pbf` in, codec-quantized
+  coordinates out (a Washington-state extract loads in ~7 s).
+- `mahere-app` — a fluor window drawing real roads and trails from an
+  extract: anti-aliased CPU strokes, class styling, drag-pan, wheel-zoom.
 
 Next, in order: the VSF tile spec (`mahere-tiles`), the OSM → tile build
 pipeline (`mahere-tiler`), DEM-derived hillshade and contours, imagery.
@@ -50,8 +52,12 @@ pipeline (`mahere-tiler`), DEM-derived hillshade and contours, imagery.
 ## Building
 
 ```sh
-cargo run -p mahere-app   # Linux; opens the world view
-cargo test                # coordinate-system tests
+# Grab an extract (any Geofabrik region works):
+curl -L -o data/washington-latest.osm.pbf \
+  https://download.geofabrik.de/north-america/us/washington-latest.osm.pbf
+
+cargo run --release -p mahere-app   # Linux; opens centered on Seattle
+cargo test                          # coordinate-system tests
 ```
 
 ## License
