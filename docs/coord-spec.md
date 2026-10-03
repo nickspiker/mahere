@@ -36,32 +36,37 @@ deliberately: all source data (OSM, GPX, NAIP, 3DEP) is geodetic WGS84.
 Elevation never enters the codec. (3DEP heights are NAVD88 orthometric, GPS
 heights ellipsoidal, ~20 m apart in WA — a display-side concern.)
 
-## Orientation (locked — changing it re-tiles the world)
+## Orientation (locked 2026-10-03 — changing it re-tiles the world)
 
-The vertex table is the golden-ratio icosahedron shared with the reference
-`icosahedron` codec and `vsf::WorldCoord` — one orientation, bit-congruent
-across all three. The 10 diamonds form two interlocking fans of five around
-the antipodal vertices 0 (0°, 121.7°E) and 3 (0°, 58.3°W), meshing at the
-waist. The 12 vertices are the degree-5 points: gnomonic scale swells
-smoothly to ~58% there and five cell grids meet without 1:1 alignment —
-a texel-density and adjacency hotspot, not a singularity. Four land on
-land (Sulawesi, Amazon, Sahara, central Siberia); Washington is ~2,700 km
-from the nearest vertex, New Zealand ~700 km. The poles are not vertices:
-each sits on an edge midpoint (north on the D0/D5 seam, south on D3/D8).
+**Pole-vertex, Greenwich-aligned**: vertex 0 is the north pole, vertices
+1–5 form the upper ring at lat atan(1/2) ≈ 26.565° (lons 0°, 72°, 144°,
+216°, 288°), vertices 6–10 the lower ring at −26.565° (lons 36°, 108°, …),
+vertex 11 the south pole. Shared verbatim with `vsf::WorldCoord`. The five
+northern diamonds hang from the north pole to the lower ring, the five
+southern rise to the upper ring, interlocking at the waist; cap-face edges
+are meridian arcs, so the whole construction is 72°-periodic in longitude.
 
-This orientation was measured against the pole-vertex alternative
-(2026-10-03, Natural Earth land-weighted): gnomonic area distortion mean
-1.217/p99 1.771/max 1.948 vs 1.205/1.775/1.930 for the best pole-vertex
-rotation — a tie. Land within 500 km of a vertex: 2.0% vs 1.6–3.1%
-depending on rotation. Washington occupies a single diamond (D6) either
-way; New Zealand straddles faces 3 and 8, which are paired as diamond D3,
-so both islands also sit in one diamond — the face seam is an interior
-crease, not an addressing boundary. Note the pairing itself is a free
-choice among perfect matchings: a future region on an ugly seam can be
-fixed by re-pairing, which is cheaper than re-orienting but still re-tiles.
-Revisit orientation (Fuller-style all-ocean rotation) only before any tile
-data ships, and only if cartographic polish at the four land vertices ever
-matters.
+Chosen on mathematical grounds, Nick's call: the three canonical choices
+put the poles on a 5-fold (vertex), 3-fold (face center) or 2-fold (edge
+midpoint) symmetry axis. Vertex wins twice over — lat/lon's rotational
+symmetry shares its largest cyclic subgroup with the solid (C5 > C3 > C2),
+and the coordinate system's polar degeneracy lands exactly on the grid's
+two degree-5 points, spending both singular structures on the same two
+spots (Arctic Ocean, Antarctic plateau) instead of four. Land-weighted
+distortion is orientation-insensitive (~1% spread, measured vs the prior
+accidental golden/z-up orientation), so the symmetry argument decided.
+Conversion cost is unaffected either way: encode/decode are
+transcendental-dominated, and face-finding (the only orientation-sensitive
+step) is already a cheap 20-way max-dot — the 72° periodicity permits a
+fold-to-fundamental-sector fast path if ever wanted.
+
+Consequences: the ten ring vertices (distortion maxima, ~2.0× area vs face
+center; five-grid meeting points) sit at ±26.565°; nearest land vertices
+are ~Algeria, ~Rajasthan, ~southern Mozambique; 1.65% of land is within
+500 km of any vertex. Washington is a single diamond (D3), all of New
+Zealand a single diamond (D6). The face pairing remains a free perfect
+matching: a future region on an ugly seam can be re-buried by re-pairing
+(cheaper than re-orienting, still a re-tile).
 
 ## Cells and anchoring
 

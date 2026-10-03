@@ -22,24 +22,27 @@
 //! (face-finding via closest centroid, gnomonic projection, barycentric UV),
 //! re-laid-out from face × BASE² packing to diamond-Morton prefix coding.
 
-/// Golden-ratio icosahedron vertex components (unnormalized; all vertices
-/// share the same length, which the gnomonic math never needs normalized).
-const IA: f64 = 0.618033988749894848; // 1/φ
-const IB: f64 = 1.0;
-
+/// Pole-vertex icosahedron, unit vertices (locked orientation): vertex 0 is
+/// the north pole, 1–5 the upper ring at lat atan(1/2) ≈ 26.565° (lons 0°,
+/// 72°, …), 6–10 the lower ring at −atan(1/2) (lons 36°, 108°, …), 11 the
+/// south pole. Chosen 2026-10-03 on symmetry grounds: the polar axis is a
+/// 5-fold axis, so lat/lon's rotational symmetry shares its largest cyclic
+/// subgroup with the solid, and the coordinate system's polar degeneracy
+/// coincides with the grid's two degree-5 points. Ring components are
+/// cos/sin of 72° multiples scaled by 2/√5, z = ±1/√5.
 const VERTICES: [[f64; 3]; 12] = [
-    [-IA, IB, 0.],
-    [IA, IB, 0.],
-    [-IA, -IB, 0.],
-    [IA, -IB, 0.],
-    [0., -IA, IB],
-    [0., IA, IB],
-    [0., -IA, -IB],
-    [0., IA, -IB],
-    [IB, 0., -IA],
-    [IB, 0., IA],
-    [-IB, 0., -IA],
-    [-IB, 0., IA],
+    [0., 0., 1.0],
+    [0.8944271909999159, 0., 0.4472135954999579],
+    [0.27639320225002106, 0.8506508083520399, 0.4472135954999579],
+    [-0.7236067977499788, 0.5257311121191337, 0.4472135954999579],
+    [-0.723606797749979, -0.5257311121191335, 0.4472135954999579],
+    [0.27639320225002084, -0.85065080835204, 0.4472135954999579],
+    [0.7236067977499789, 0.5257311121191336, -0.4472135954999579],
+    [-0.27639320225002095, 0.85065080835204, -0.4472135954999579],
+    [-0.8944271909999159, 0., -0.4472135954999579],
+    [-0.2763932022500211, -0.8506508083520399, -0.4472135954999579],
+    [0.7236067977499788, -0.5257311121191338, -0.4472135954999579],
+    [0., 0., -1.0],
 ];
 
 /// The 10 diamonds as vertex indices `[a0, q, r, b0]`: lower triangle
@@ -47,16 +50,16 @@ const VERTICES: [[f64; 3]; 12] = [
 /// diagonal). UV basis: origin a0, u along a0→q, v along a0→r; b0 sits at
 /// (1, 1). Pairing covers all 20 icosahedron faces exactly once.
 const DIAMONDS: [[usize; 4]; 10] = [
-    [0, 11, 5, 4],
-    [0, 5, 1, 9],
-    [0, 1, 7, 8],
-    [0, 7, 10, 6],
-    [0, 10, 11, 2],
-    [3, 9, 4, 5],
-    [3, 4, 2, 11],
-    [3, 2, 6, 10],
-    [3, 6, 8, 7],
-    [3, 8, 9, 1],
+    [0, 1, 2, 6],
+    [0, 2, 3, 7],
+    [0, 3, 4, 8],
+    [0, 4, 5, 9],
+    [0, 1, 5, 10],
+    [11, 6, 7, 2],
+    [11, 7, 8, 3],
+    [11, 8, 9, 4],
+    [11, 9, 10, 5],
+    [11, 6, 10, 1],
 ];
 
 /// Each diamond's two triangles as `(vertex indices, diamond, is_upper)` —
