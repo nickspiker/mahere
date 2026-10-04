@@ -10,8 +10,11 @@ mod terrain;
 
 use fluor::coord::Coord as Px;
 use fluor::event::{CursorIcon, ElementState, Event as FEvent, MouseButton, MouseScrollDelta};
+use fluor::geom::Viewport;
 use fluor::host::app::{Context, EventResponse, FluorApp, run_app};
-use fluor::paint::pack_argb;
+use fluor::host::chrome::{self, HIT_NONE, ResizeEdge};
+use fluor::host::chrome_widget::DefaultChrome;
+use fluor::paint::{Clip, HitId, pack_argb};
 use mahere_osm::{CLASS_COUNT, Road, RoadClass};
 use std::time::Instant;
 
@@ -83,6 +86,7 @@ struct MahereApp {
     dirty: bool,
     dragging: bool,
     last_cursor: (f64, f64),
+    chrome: DefaultChrome,
 }
 
 impl MahereApp {
@@ -109,7 +113,19 @@ impl MahereApp {
                 PreparedRoad { class: r.class, pts, bbox }
             })
             .collect();
+        // fluor draws its own window chrome (the OS surface is borderless);
+        // DefaultChrome provides the title strip, close/min/max buttons and
+        // resize edges. Placeholder viewport; on_resize feeds the real one.
+        let mut hit_counter: HitId = HIT_NONE;
+        let chrome = DefaultChrome::new(
+            Viewport::new(1280, 800),
+            "mahere",
+            None,
+            Some("drag pan · wheel zoom · A/D W/S sun · R home".to_string()),
+            &mut hit_counter,
+        );
         MahereApp {
+            chrome,
             roads: prepared,
             origin,
             cam: Camera { lat: 47.6062, lon: -122.3321, ppd: PPD_REF },
@@ -124,6 +140,30 @@ impl MahereApp {
             dragging: false,
             last_cursor: (0., 0.),
         }
+    }
+
+    fn clamp_camera(&mut self) {
+        // Past the pole cos(lat) flips sign and horizontal panning inverts;
+        // clamp well inside, and keep longitude wrapped.
+        self.cam.lat = self.cam.lat.clamp(-85.0, 85.0);
+        if self.cam.lon > 180.0 {
+            self.cam.lon -= 360.0;
+        } else if self.cam.lon < -180.0 {
+            self.cam.lon += 360.0;
+        }
+    }
+
+    fn zoom_about_cursor(&mut self, factor: f64, ctx: &mut Context) {
+        let (w, h) = (ctx.viewport.width_px as f64, ctx.viewport.height_px as f64);
+        let (mx, my) = (self.last_cursor.0 - w * 0.5, self.last_cursor.1 - h * 0.5);
+        let coslat = self.cam.coslat();
+        let old_ppd = self.cam.ppd;
+        self.cam.ppd = (self.cam.ppd * factor).clamp(40., 4_000_000.);
+        let f = self.cam.ppd / old_ppd;
+        self.cam.lat -= my * (1. - 1. / f) / self.cam.ppd;
+        self.cam.lon += mx * (1. - 1. / f) / (self.cam.ppd * coslat);
+        self.clamp_camera();
+        self.camera_moved(ctx);
     }
 
     fn camera_moved(&mut self, ctx: &mut Context) {
@@ -241,47 +281,99 @@ impl FluorApp for MahereApp {
         "mahere"
     }
 
-    fn init(&mut self, _ctx: &mut Context) {}
+    fn init(&mut self, ctx: &mut Context) {
+        self.chrome.resize(ctx.viewport);
+    }
+    // NOTE: owns_zoom_gesture/on_zoom (route macOS pinch into map zoom
+    // instead of fluor's UI scale) exist in fluor's dev tree but not in
+    // published 0.0.4 — claim the gesture when the next fluor ships.
 
-    fn on_resize(&mut self, width: u32, height: u32, _ctx: &mut Context) {
+    fn on_resize(&mut self, width: u32, height: u32, ctx: &mut Context) {
+        self.chrome.resize(ctx.viewport);
+        self.chrome.set_full_edge(ctx.is_maximized);
         self.terrain
             .note_camera(width as usize, height as usize, &self.cam);
         self.dirty = true;
     }
 
+    fn hit_test_map(&self) -> Option<(&[HitId], usize, usize)> {
+        let (w, h) = self.chrome.dims();
+        Some((self.chrome.hit_test_map(), w, h))
+    }
+
     fn on_event(&mut self, event: &FEvent, ctx: &mut Context) -> EventResponse {
         match event {
-            FEvent::MouseInput { state, button: MouseButton::Left } => {
-                self.dragging = *state == ElementState::Pressed;
-                self.last_cursor = (ctx.cursor_x as f64, ctx.cursor_y as f64);
+            FEvent::MouseInput { state: ElementState::Pressed, button: MouseButton::Left } => {
+                // last_cursor is maintained from the CursorMoved stream only:
+                // mixing in host-tracked ctx.cursor_* diffs two coordinate
+                // spaces on scaled displays (Retina) and teleports the view.
+                let (cx, cy) = (self.last_cursor.0 as Px, self.last_cursor.1 as Px);
+                let hit = self.chrome.hit_at(cx, cy);
+                if hit != HIT_NONE {
+                    // Chrome button ids were allocated in new(); dispatch
+                    // directly — no other widgets exist yet.
+                    return if hit == self.chrome.close_btn.id() {
+                        EventResponse::Close
+                    } else if hit == self.chrome.min_btn.id() {
+                        EventResponse::Minimize
+                    } else if hit == self.chrome.max_btn.id() {
+                        EventResponse::ToggleMaximized
+                    } else {
+                        EventResponse::Handled
+                    };
+                }
+                let edge = chrome::get_resize_edge(ctx.viewport, cx, cy);
+                if edge != ResizeEdge::None {
+                    return EventResponse::StartResize(edge);
+                }
+                if cy < chrome::strip_height(ctx.viewport) {
+                    return EventResponse::StartWindowDrag;
+                }
+                self.dragging = true;
+                EventResponse::Handled
+            }
+            FEvent::MouseInput { state: ElementState::Released, button: MouseButton::Left } => {
+                self.dragging = false;
                 EventResponse::Handled
             }
             FEvent::CursorMoved { x, y } => {
+                if self.chrome.set_hover(self.chrome.hit_at(*x, *y)) {
+                    ctx.window.request_redraw();
+                }
+                let (x, y) = (*x as f64, *y as f64);
                 if self.dragging {
-                    let (dx, dy) =
-                        (*x as f64 - self.last_cursor.0, *y as f64 - self.last_cursor.1);
-                    self.last_cursor = (*x as f64, *y as f64);
+                    let (dx, dy) = (x - self.last_cursor.0, y - self.last_cursor.1);
                     self.cam.lat += dy / self.cam.ppd;
                     self.cam.lon -= dx / (self.cam.ppd * self.cam.coslat());
+                    self.clamp_camera();
                     self.camera_moved(ctx);
+                }
+                self.last_cursor = (x, y);
+                EventResponse::Handled
+            }
+            FEvent::CursorLeft => {
+                self.dragging = false;
+                if self.chrome.set_hover(HIT_NONE) {
+                    ctx.window.request_redraw();
                 }
                 EventResponse::Handled
             }
+            FEvent::Focused(focused) => {
+                if self.chrome.set_focused(*focused) {
+                    ctx.window.request_redraw();
+                }
+                EventResponse::Pass
+            }
             FEvent::MouseWheel { delta } => {
-                let notches = match delta {
+                // Trackpads deliver Pixels with momentum: hundreds of px
+                // across many events. Scale gently and clamp per event, or a
+                // flick compounds into a x100 zoom teleport.
+                let notches = (match delta {
                     MouseScrollDelta::Lines(_, y) => *y,
-                    MouseScrollDelta::Pixels(_, y) => *y / 60.,
-                } as f64;
-                let factor = 1.18_f64.powf(notches);
-                let (w, h) = (ctx.viewport.width_px as f64, ctx.viewport.height_px as f64);
-                let (mx, my) = (ctx.cursor_x as f64 - w * 0.5, ctx.cursor_y as f64 - h * 0.5);
-                let coslat = self.cam.coslat();
-                let old_ppd = self.cam.ppd;
-                self.cam.ppd = (self.cam.ppd * factor).clamp(40., 4_000_000.);
-                let f = self.cam.ppd / old_ppd;
-                self.cam.lat -= my * (1. - 1. / f) / self.cam.ppd;
-                self.cam.lon += mx * (1. - 1. / f) / (self.cam.ppd * coslat);
-                self.camera_moved(ctx);
+                    MouseScrollDelta::Pixels(_, y) => *y / 120.,
+                } as f64)
+                    .clamp(-3.0, 3.0);
+                self.zoom_about_cursor(1.18_f64.powf(notches), ctx);
                 EventResponse::Handled
             }
             FEvent::KeyboardInput { event } => {
@@ -306,9 +398,23 @@ impl FluorApp for MahereApp {
                         self.sun_alt = (self.sun_alt - 5.0).max(5.0);
                         true
                     }
+                    Some("r") => {
+                        // Home: recover the viewport from anywhere.
+                        self.cam = Camera { lat: 47.6062, lon: -122.3321, ppd: PPD_REF };
+                        self.terrain.note_camera(
+                            ctx.viewport.width_px as usize,
+                            ctx.viewport.height_px as usize,
+                            &self.cam,
+                        );
+                        true
+                    }
                     _ => false,
                 };
                 if handled {
+                    self.chrome.set_status_text(Some(format!(
+                        "sun {:.0}° az / {:.0}° alt · R home",
+                        self.sun_az, self.sun_alt
+                    )));
                     self.dirty = true;
                     ctx.window.request_redraw();
                     EventResponse::Handled
@@ -343,14 +449,36 @@ impl FluorApp for MahereApp {
             self.dirty = false;
             self.terrain_gen_seen = tgen;
         }
-        let n = (w * h).min(target.len()).min(self.canvas.len());
-        for (out, &rgb) in target[..n].iter_mut().zip(&self.canvas[..n]) {
-            *out = pack_argb((rgb >> 16) as u8, (rgb >> 8) as u8, rgb as u8, 255);
-        }
+        // fluor composites front-to-back (under-blend): the map is the
+        // BACKGROUND layer of the chrome group, never painted straight over
+        // `target`, or it would occlude the title strip and buttons.
+        self.chrome.invalidate_bg();
+        let map = &self.canvas;
+        self.chrome.rasterize_bg(ctx.damage, |c| {
+            let n = c.pixels.len().min(map.len());
+            for (out, &rgb) in c.pixels[..n].iter_mut().zip(&map[..n]) {
+                *out = pack_argb((rgb >> 16) as u8, (rgb >> 8) as u8, rgb as u8, 255);
+            }
+        });
+        self.chrome.rasterize_perimeter(target, w, h, ctx.clip_mask);
+        self.chrome.rasterize_chrome(ctx.damage, ctx.text, ctx.clip_mask);
+        let clip = ctx.damage_clip;
+        self.chrome
+            .flatten_into(target, w, h, Some(Clip::new(clip.x0, clip.y0, clip.x1, clip.y1)));
     }
 
-    fn cursor_for(&self, _x: Px, _y: Px, _ctx: &Context) -> CursorIcon {
-        CursorIcon::Default
+    fn cursor_for(&self, x: Px, y: Px, ctx: &Context) -> CursorIcon {
+        let hit = self.chrome.hit_at(x, y);
+        if self.chrome.owns_hit(hit) && hit != self.chrome.app_icon_btn.id() {
+            return CursorIcon::Pointer;
+        }
+        match chrome::get_resize_edge(ctx.viewport, x, y) {
+            ResizeEdge::Top | ResizeEdge::Bottom => CursorIcon::NsResize,
+            ResizeEdge::Left | ResizeEdge::Right => CursorIcon::EwResize,
+            ResizeEdge::TopLeft | ResizeEdge::BottomRight => CursorIcon::NwseResize,
+            ResizeEdge::TopRight | ResizeEdge::BottomLeft => CursorIcon::NeswResize,
+            ResizeEdge::None => CursorIcon::Default,
+        }
     }
 }
 
