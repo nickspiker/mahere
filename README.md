@@ -43,8 +43,14 @@ Early. Working today:
   globally, prefix/containment algebra, all diamonds reachable).
 - `mahere-osm` — the ingest boundary: `.osm.pbf` in, codec-quantized
   coordinates out (a Washington-state extract loads in ~7 s).
-- `mahere-app` — a fluor window drawing real roads and trails from an
-  extract: anti-aliased CPU strokes, class styling, drag-pan, wheel-zoom.
+- `mahere-dem` — the raster elevation boundary: USGS 3DEP GeoTIFFs in,
+  bilinear elevation + gradient queries out.
+- `mahere-app` — a fluor window with the organic-pixel-grid terrain engine:
+  a reservoir of exact (elevation, gradient) point samples converges under
+  the view by stratified refinement, hillshaded *at splat time* — A/D move
+  the sun's azimuth and W/S its altitude, relighting the cached reservoir
+  with zero re-evaluation. Roads and trails draw on top (anti-aliased CPU
+  strokes, class styling); drag to pan, wheel to zoom.
 
 Next, in order: the VSF tile spec (`mahere-tiles`), the OSM → tile build
 pipeline (`mahere-tiler`), DEM-derived hillshade and contours, imagery.
@@ -55,6 +61,12 @@ pipeline (`mahere-tiler`), DEM-derived hillshade and contours, imagery.
 # Grab an extract (any Geofabrik region works):
 curl -L -o data/washington-latest.osm.pbf \
   https://download.geofabrik.de/north-america/us/washington-latest.osm.pbf
+
+# And DEM tiles for the view (USGS 3DEP, 1 arc-second):
+for t in n47w122 n47w123 n48w122 n48w123; do
+  curl -L -o data/USGS_1_$t.tif \
+    "https://prd-tnm.s3.amazonaws.com/StagedProducts/Elevation/1/TIFF/current/$t/USGS_1_$t.tif"
+done
 
 cargo run --release -p mahere-app   # Linux; opens centered on Seattle
 cargo test                          # coordinate-system tests

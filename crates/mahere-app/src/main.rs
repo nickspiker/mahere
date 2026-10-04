@@ -1,61 +1,83 @@
 //! mahere desktop app — fluor host, CPU rendering.
 //!
-//! v0.2: real Washington roads. Loads highways from a Geofabrik extract
-//! through the mahere-osm boundary (every point codec-quantized), rasterizes
-//! them with anti-aliased distance-field strokes, class-styled, with
-//! drag-pan and wheel-zoom.
+//! v0.3: terrain. The DEM sampling engine (see terrain.rs) converges a
+//! reservoir of exact elevation+gradient samples under the view, hillshaded
+//! at splat time — move the sun with A/D (azimuth) and W/S (altitude) and
+//! the cached reservoir relights without re-evaluating anything. Roads and
+//! trails draw on top via the v0 stroke rasterizer.
+
+mod terrain;
 
 use fluor::coord::Coord as Px;
 use fluor::event::{CursorIcon, ElementState, Event as FEvent, MouseButton, MouseScrollDelta};
 use fluor::host::app::{Context, EventResponse, FluorApp, run_app};
 use fluor::paint::pack_argb;
 use mahere_osm::{CLASS_COUNT, Road, RoadClass};
+use std::time::Instant;
 
-/// Visible RGB per class, tuned for the dark background. Trails green — this
-/// is a trail app.
+/// Visible RGB per class, tuned for terrain underneath. Trails green.
 const CLASS_RGB: [[u8; 3]; CLASS_COUNT] = [
-    [235, 145, 60],  // Motorway
-    [228, 170, 62],  // Trunk
-    [230, 202, 82],  // Primary
-    [202, 202, 160], // Secondary
-    [172, 182, 172], // Tertiary
-    [122, 127, 138], // Residential
-    [96, 101, 112],  // Service
-    [142, 112, 82],  // Track
-    [92, 200, 122],  // Path
+    [245, 150, 60],  // Motorway
+    [238, 175, 62],  // Trunk
+    [240, 208, 84],  // Primary
+    [212, 212, 168], // Secondary
+    [182, 192, 182], // Tertiary
+    [142, 147, 158], // Residential
+    [112, 117, 128], // Service
+    [152, 120, 88],  // Track
+    [80, 230, 120],  // Path
 ];
 
-/// Stroke half-width in pixels at the reference zoom (PPD_REF), per class.
-const CLASS_HALF_W: [f32; CLASS_COUNT] = [1.6, 1.4, 1.2, 1.0, 0.85, 0.6, 0.45, 0.45, 0.5];
-
-/// Minimum pixels-per-degree(lat) at which each class appears. Majors always;
-/// trails only once zoomed near city scale.
+const CLASS_HALF_W: [f32; CLASS_COUNT] = [1.6, 1.4, 1.2, 1.0, 0.85, 0.6, 0.45, 0.45, 0.55];
 const CLASS_MIN_PPD: [f64; CLASS_COUNT] =
     [0., 0., 0., 700., 700., 2500., 2500., 2500., 2500.];
-
-/// Reference zoom for stroke widths: ~18.5 m/px.
 const PPD_REF: f64 = 6000.;
 
-const BG_RGB: u32 = 0x12141A;
+/// View state in absolute WGS84 degrees; ppd = pixels per degree latitude.
+#[derive(Clone, Copy)]
+pub struct Camera {
+    pub lat: f64,
+    pub lon: f64,
+    pub ppd: f64,
+}
 
-/// A road prepared for drawing: points relative to a fixed local origin, in
-/// degrees, plus a bbox for culling. f32 degrees lose ~0.4 m absolute, so
-/// points are stored as offsets from the dataset's bbox center instead —
-/// sub-centimeter at state scale.
+impl Camera {
+    fn coslat(&self) -> f64 {
+        self.lat.to_radians().cos()
+    }
+
+    pub fn geo_to_screen(&self, lat: f64, lon: f64, w: usize, h: usize) -> (f64, f64) {
+        let ppd_lon = self.ppd * self.coslat();
+        (
+            w as f64 * 0.5 + (lon - self.lon) * ppd_lon,
+            h as f64 * 0.5 - (lat - self.lat) * self.ppd,
+        )
+    }
+
+    pub fn screen_to_geo(&self, px: f64, py: f64, w: usize, h: usize) -> (f64, f64) {
+        let ppd_lon = self.ppd * self.coslat();
+        (
+            self.lat + (h as f64 * 0.5 - py) / self.ppd,
+            self.lon + (px - w as f64 * 0.5) / ppd_lon,
+        )
+    }
+}
+
 struct PreparedRoad {
     class: RoadClass,
-    pts: Vec<(f32, f32)>, // (dlat, dlon) from origin
-    bbox: (f32, f32, f32, f32), // min dlat, min dlon, max dlat, max dlon
+    pts: Vec<(f32, f32)>,            // (dlat, dlon) from origin
+    bbox: (f32, f32, f32, f32),
 }
 
 struct MahereApp {
     roads: Vec<PreparedRoad>,
-    origin: (f64, f64), // (lat, lon) all road points are relative to
-    /// View center as offsets from origin, degrees.
-    center: (f64, f64),
-    /// Zoom: pixels per degree of latitude.
-    ppd: f64,
-    canvas: Vec<u32>, // visible 0xRRGGBB working buffer
+    origin: (f64, f64),
+    cam: Camera,
+    terrain: terrain::Terrain,
+    terrain_gen_seen: u64,
+    sun_az: f32,
+    sun_alt: f32,
+    canvas: Vec<u32>,
     canvas_w: usize,
     canvas_h: usize,
     dirty: bool,
@@ -64,8 +86,7 @@ struct MahereApp {
 }
 
 impl MahereApp {
-    fn new(roads: Vec<Road>, origin: (f64, f64), start: (f64, f64)) -> Self {
-        // Sort minor-first so majors draw on top, then prepare.
+    fn new(roads: Vec<Road>, origin: (f64, f64), terrain: terrain::Terrain) -> Self {
         let mut roads: Vec<&Road> = roads.iter().collect();
         roads.sort_by(|a, b| b.class.cmp(&a.class));
         let prepared = roads
@@ -91,8 +112,11 @@ impl MahereApp {
         MahereApp {
             roads: prepared,
             origin,
-            center: (start.0 - origin.0, start.1 - origin.1),
-            ppd: PPD_REF,
+            cam: Camera { lat: 47.6062, lon: -122.3321, ppd: PPD_REF },
+            terrain,
+            terrain_gen_seen: 0,
+            sun_az: 315.0,
+            sun_alt: 40.0,
             canvas: Vec::new(),
             canvas_w: 0,
             canvas_h: 0,
@@ -102,27 +126,33 @@ impl MahereApp {
         }
     }
 
-    /// Longitude compression at the view center.
-    fn coslat(&self) -> f64 {
-        (self.origin.0 + self.center.0).to_radians().cos()
+    fn camera_moved(&mut self, ctx: &mut Context) {
+        let (w, h) = (ctx.viewport.width_px as usize, ctx.viewport.height_px as usize);
+        self.terrain.note_camera(w, h, &self.cam);
+        self.dirty = true;
+        ctx.window.request_redraw();
     }
 
     fn redraw(&mut self, w: usize, h: usize) {
         self.canvas.clear();
-        self.canvas.resize(w * h, BG_RGB);
+        self.canvas.resize(w * h, 0x12141A);
         self.canvas_w = w;
         self.canvas_h = h;
         if w == 0 || h == 0 {
             return;
         }
-        let ppd = self.ppd;
-        let ppd_lon = ppd * self.coslat();
+        self.terrain
+            .splat(&mut self.canvas, w, h, &self.cam, self.sun_az, self.sun_alt);
+
+        // Roads over terrain (v0 stroke rasterizer, 1D splats come later).
+        let ppd = self.cam.ppd;
+        let ppd_lon = ppd * self.cam.coslat();
         let (cx, cy) = (w as f64 * 0.5, h as f64 * 0.5);
-        // Viewport in origin-relative degrees, padded a stroke's worth.
-        let vlat0 = (self.center.0 - cy / ppd) as f32;
-        let vlat1 = (self.center.0 + cy / ppd) as f32;
-        let vlon0 = (self.center.1 - cx / ppd_lon) as f32;
-        let vlon1 = (self.center.1 + cx / ppd_lon) as f32;
+        let (clat, clon) = (self.cam.lat - self.origin.0, self.cam.lon - self.origin.1);
+        let vlat0 = (clat - cy / ppd) as f32;
+        let vlat1 = (clat + cy / ppd) as f32;
+        let vlon0 = (clon - cx / ppd_lon) as f32;
+        let vlon1 = (clon + cx / ppd_lon) as f32;
         let wscale = (ppd / PPD_REF).clamp(0.35, 3.0) as f32;
 
         for road in &self.roads {
@@ -141,8 +171,8 @@ impl MahereApp {
             let half_w = (CLASS_HALF_W[ci] * wscale).max(0.45);
             let mut prev: Option<(f32, f32)> = None;
             for &(dlat, dlon) in &road.pts {
-                let x = (cx + (dlon as f64 - self.center.1) * ppd_lon) as f32;
-                let y = (cy - (dlat as f64 - self.center.0) * ppd) as f32;
+                let x = (cx + (dlon as f64 - clon) * ppd_lon) as f32;
+                let y = (cy - (dlat as f64 - clat) * ppd) as f32;
                 if let Some((px, py)) = prev {
                     draw_segment(&mut self.canvas, w, h, px, py, x, y, half_w, rgb);
                 }
@@ -152,8 +182,7 @@ impl MahereApp {
     }
 }
 
-/// Anti-aliased stroke: distance-to-segment coverage over the segment's
-/// padded bbox, lerped onto the canvas in visible RGB.
+/// Anti-aliased stroke: distance-to-segment coverage over the padded bbox.
 #[allow(clippy::too_many_arguments)]
 fn draw_segment(
     canvas: &mut [u32],
@@ -184,7 +213,6 @@ fn draw_segment(
         let row = &mut canvas[py * w..py * w + w];
         for (px, pixel) in row[bx0..bx1].iter_mut().enumerate() {
             let fx = (bx0 + px) as f32 + 0.5;
-            // Project onto the segment, clamped to its endpoints.
             let t = if len2 > 0. {
                 (((fx - x0) * dx + (fy - y0) * dy) / len2).clamp(0., 1.)
             } else {
@@ -196,9 +224,8 @@ fn draw_segment(
             let cov = (half_w + 0.5 - d).clamp(0., 1.);
             if cov > 0. {
                 let bg = *pixel;
-                let lerp = |b: u32, f: u8| -> u32 {
-                    (b as f32 + (f as f32 - b as f32) * cov) as u32
-                };
+                let lerp =
+                    |b: u32, f: u8| -> u32 { (b as f32 + (f as f32 - b as f32) * cov) as u32 };
                 *pixel = (lerp((bg >> 16) & 255, rgb[0]) << 16)
                     | (lerp((bg >> 8) & 255, rgb[1]) << 8)
                     | lerp(bg & 255, rgb[2]);
@@ -216,7 +243,9 @@ impl FluorApp for MahereApp {
 
     fn init(&mut self, _ctx: &mut Context) {}
 
-    fn on_resize(&mut self, _width: u32, _height: u32, _ctx: &mut Context) {
+    fn on_resize(&mut self, width: u32, height: u32, _ctx: &mut Context) {
+        self.terrain
+            .note_camera(width as usize, height as usize, &self.cam);
         self.dirty = true;
     }
 
@@ -229,12 +258,12 @@ impl FluorApp for MahereApp {
             }
             FEvent::CursorMoved { x, y } => {
                 if self.dragging {
-                    let (dx, dy) = (*x as f64 - self.last_cursor.0, *y as f64 - self.last_cursor.1);
+                    let (dx, dy) =
+                        (*x as f64 - self.last_cursor.0, *y as f64 - self.last_cursor.1);
                     self.last_cursor = (*x as f64, *y as f64);
-                    self.center.0 += dy / self.ppd;
-                    self.center.1 -= dx / (self.ppd * self.coslat());
-                    self.dirty = true;
-                    ctx.window.request_redraw();
+                    self.cam.lat += dy / self.cam.ppd;
+                    self.cam.lon -= dx / (self.cam.ppd * self.cam.coslat());
+                    self.camera_moved(ctx);
                 }
                 EventResponse::Handled
             }
@@ -244,29 +273,75 @@ impl FluorApp for MahereApp {
                     MouseScrollDelta::Pixels(_, y) => *y / 60.,
                 } as f64;
                 let factor = 1.18_f64.powf(notches);
-                // Zoom about the cursor: keep the geo point under it fixed.
                 let (w, h) = (ctx.viewport.width_px as f64, ctx.viewport.height_px as f64);
                 let (mx, my) = (ctx.cursor_x as f64 - w * 0.5, ctx.cursor_y as f64 - h * 0.5);
-                let coslat = self.coslat();
-                let old_ppd = self.ppd;
-                self.ppd = (self.ppd * factor).clamp(40., 4_000_000.);
-                let f = self.ppd / old_ppd;
-                self.center.0 -= my * (1. - 1. / f) / self.ppd;
-                self.center.1 += mx * (1. - 1. / f) / (self.ppd * coslat);
-                self.dirty = true;
-                ctx.window.request_redraw();
+                let coslat = self.cam.coslat();
+                let old_ppd = self.cam.ppd;
+                self.cam.ppd = (self.cam.ppd * factor).clamp(40., 4_000_000.);
+                let f = self.cam.ppd / old_ppd;
+                self.cam.lat -= my * (1. - 1. / f) / self.cam.ppd;
+                self.cam.lon += mx * (1. - 1. / f) / (self.cam.ppd * coslat);
+                self.camera_moved(ctx);
                 EventResponse::Handled
+            }
+            FEvent::KeyboardInput { event } => {
+                if event.state != ElementState::Pressed {
+                    return EventResponse::Pass;
+                }
+                // Splat-time relighting: the reservoir never re-evaluates.
+                let handled = match event.text.as_deref() {
+                    Some("a") => {
+                        self.sun_az = (self.sun_az - 15.0).rem_euclid(360.0);
+                        true
+                    }
+                    Some("d") => {
+                        self.sun_az = (self.sun_az + 15.0).rem_euclid(360.0);
+                        true
+                    }
+                    Some("w") => {
+                        self.sun_alt = (self.sun_alt + 5.0).min(85.0);
+                        true
+                    }
+                    Some("s") => {
+                        self.sun_alt = (self.sun_alt - 5.0).max(5.0);
+                        true
+                    }
+                    _ => false,
+                };
+                if handled {
+                    self.dirty = true;
+                    ctx.window.request_redraw();
+                    EventResponse::Handled
+                } else {
+                    EventResponse::Pass
+                }
             }
             _ => EventResponse::Pass,
         }
     }
 
+    fn wake_at(&self) -> Option<Instant> {
+        if self.terrain.converged() {
+            None
+        } else {
+            Some(Instant::now()) // host floors this to one frame out
+        }
+    }
+
+    fn tick(&mut self, ctx: &mut Context) -> bool {
+        let (w, h) = (ctx.viewport.width_px as usize, ctx.viewport.height_px as usize);
+        self.terrain.tick(w, h, &self.cam)
+    }
+
     fn render(&mut self, target: &mut [u32], ctx: &mut Context) {
         let w = ctx.viewport.width_px as usize;
         let h = ctx.viewport.height_px as usize;
-        if self.dirty || (w, h) != (self.canvas_w, self.canvas_h) {
+        let tgen = self.terrain.generation();
+        if self.dirty || (w, h) != (self.canvas_w, self.canvas_h) || tgen != self.terrain_gen_seen
+        {
             self.redraw(w, h);
             self.dirty = false;
+            self.terrain_gen_seen = tgen;
         }
         let n = (w * h).min(target.len()).min(self.canvas.len());
         for (out, &rgb) in target[..n].iter_mut().zip(&self.canvas[..n]) {
@@ -280,20 +355,23 @@ impl FluorApp for MahereApp {
 }
 
 fn main() {
-    let path = std::env::args()
+    let pbf = std::env::args()
         .nth(1)
         .unwrap_or_else(|| "data/washington-latest.osm.pbf".into());
-    eprintln!("loading {path} ...");
-    let t = std::time::Instant::now();
-    let roads = mahere_osm::load_roads(&path).expect("failed to read extract");
+    eprintln!("loading {pbf} ...");
+    let t = Instant::now();
+    let roads = mahere_osm::load_roads(&pbf).expect("failed to read extract");
     let pts: usize = roads.iter().map(|r| r.pts.len()).sum();
-    eprintln!(
-        "{} roads, {} points, {:.1}s",
-        roads.len(),
-        pts,
-        t.elapsed().as_secs_f32()
-    );
-    // Origin: dataset bbox center, so f32 offsets stay tiny.
+    eprintln!("{} roads, {} points, {:.1}s", roads.len(), pts, t.elapsed().as_secs_f32());
+
+    let t = Instant::now();
+    let dem_paths: Vec<String> = ["n47w122", "n47w123", "n48w122", "n48w123"]
+        .iter()
+        .map(|t| format!("data/USGS_1_{t}.tif"))
+        .collect();
+    let dem = mahere_dem::DemStore::load(&dem_paths).expect("failed to load DEM tiles");
+    eprintln!("{} DEM tiles, {:.1}s", dem.tile_count(), t.elapsed().as_secs_f32());
+
     let mut bbox = (f64::MAX, f64::MAX, f64::MIN, f64::MIN);
     for r in &roads {
         for &(lat, lon) in &r.pts {
@@ -304,6 +382,6 @@ fn main() {
         }
     }
     let origin = ((bbox.0 + bbox.2) * 0.5, (bbox.1 + bbox.3) * 0.5);
-    let seattle = (47.6062, -122.3321);
-    run_app(MahereApp::new(roads, origin, seattle)).expect("fluor event loop failed");
+    let terrain = terrain::Terrain::new(dem);
+    run_app(MahereApp::new(roads, origin, terrain)).expect("fluor event loop failed");
 }

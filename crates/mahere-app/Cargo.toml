@@ -8,5 +8,10 @@ description = "mahere desktop app: offline trail map on the fluor compositor"
 
 [dependencies]
 mahere-coord = { path = "../mahere-coord" }
+mahere-dem = { path = "../mahere-dem" }
 mahere-osm = { path = "../mahere-osm" }
+rayon = "1"
 fluor = { version = "0.0.4", features = ["host-winit"] }
+
+[dev-dependencies]
+png = "0.17"

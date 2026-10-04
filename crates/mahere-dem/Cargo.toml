@@ -1,0 +1,10 @@
+[package]
+name = "mahere-dem"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "mahere's raster elevation boundary: USGS 3DEP GeoTIFFs in, elevation and gradient samples out"
+
+[dependencies]
+tiff = "0.9"
