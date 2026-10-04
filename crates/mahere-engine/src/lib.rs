@@ -172,11 +172,13 @@ impl MapCore {
     /// Pan by a screen-pixel delta (bearing-aware: dragging always moves
     /// the map with the finger, whatever direction north points).
     pub fn pan(&mut self, dx: f64, dy: f64, w: usize, h: usize) {
+        // Camera ENU delta for a drag (dx, dy) in y-down screen px:
+        // (-dx cosB + dy sinB, dx sinB + dy cosB) — content follows finger.
         let (sb, cb) = self.cam.bearing.sin_cos();
-        let e = dx * cb - dy * sb; // screen delta in ENU (y-down input)
-        let n = -dx * sb - dy * cb;
-        self.cam.lat += n / self.cam.ppd;
-        self.cam.lon -= e / (self.cam.ppd * self.cam.coslat());
+        let de = -dx * cb + dy * sb;
+        let dn = dx * sb + dy * cb;
+        self.cam.lat += dn / self.cam.ppd;
+        self.cam.lon += de / (self.cam.ppd * self.cam.coslat());
         self.clamp_camera();
         self.camera_moved(w, h);
     }
