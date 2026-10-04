@@ -31,6 +31,9 @@ struct TwoFinger {
     geo_b: (f64, f64),
     d0: f64,
     ppd0: f64,
+    /// Screen angle of the finger vector at capture, and bearing then.
+    alpha0: f64,
+    bearing0: f64,
 }
 
 pub struct AndroidApp {
@@ -51,14 +54,28 @@ impl AndroidApp {
         let geo_a = self.map.cam.screen_to_geo(x0, y0, self.w, self.h);
         let geo_b = self.map.cam.screen_to_geo(x1, y1, self.w, self.h);
         let d0 = ((x1 - x0).powi(2) + (y1 - y0).powi(2)).sqrt().max(1.0);
-        self.two = Some(TwoFinger { geo_a, geo_b, d0, ppd0: self.map.cam.ppd });
+        self.two = Some(TwoFinger {
+            geo_a,
+            geo_b,
+            d0,
+            ppd0: self.map.cam.ppd,
+            alpha0: (y1 - y0).atan2(x1 - x0),
+            bearing0: self.map.cam.bearing,
+        });
         self.dragging = false;
     }
 
+    /// Full 4-DOF similarity solve: two finger correspondences exactly
+    /// determine pan+rotate+zoom. Scale from the distance ratio, bearing
+    /// from the finger-vector angle (screen angle of a fixed geo segment is
+    /// -(B + its ENU angle), so B = B0 + (alpha0 - alpha)), then the
+    /// geographic midpoint pinned under the screen midpoint.
     fn two_update(&mut self, x0: f64, y0: f64, x1: f64, y1: f64) {
         let Some(t) = &self.two else { return };
         let d = ((x1 - x0).powi(2) + (y1 - y0).powi(2)).sqrt().max(1.0);
+        let alpha = (y1 - y0).atan2(x1 - x0);
         self.map.set_ppd(t.ppd0 * d / t.d0);
+        self.map.set_bearing(t.bearing0 + (t.alpha0 - alpha));
         let mid_lat = (t.geo_a.0 + t.geo_b.0) * 0.5;
         let mid_lon = (t.geo_a.1 + t.geo_b.1) * 0.5;
         let (mx, my) = ((x0 + x1) * 0.5, (y0 + y1) * 0.5);
@@ -198,7 +215,7 @@ pub extern "system" fn Java_nz_mahere_app_MahereActivity_nativeInit(
             Vec::new(),
             mahere_engine::terrain::Terrain::new(dem),
             // Mt Adams until the first GPS fix recenters us.
-            Camera { lat: 46.2024, lon: -121.4909, ppd: 12_000.0 },
+            Camera { lat: 46.2024, lon: -121.4909, ppd: 12_000.0, bearing: 0.0 },
         ),
         w: width as usize,
         h: height as usize,

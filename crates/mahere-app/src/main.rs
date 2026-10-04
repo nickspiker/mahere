@@ -26,7 +26,7 @@ impl MahereApp {
             Viewport::new(1280, 800),
             "mahere",
             None,
-            Some("drag pan · wheel zoom · A/D W/S sun · R home".to_string()),
+            Some("drag pan · wheel zoom · A/D W/S sun · Q/E rotate · R home".to_string()),
             &mut hit_counter,
         );
         MahereApp { map, chrome, dragging: false, last_cursor: (0., 0.) }
@@ -192,6 +192,16 @@ impl FluorApp for MahereApp {
                         self.map.adjust_sun(0.0, -5.0);
                         true
                     }
+                    Some("q") => {
+                        self.map.set_bearing(self.map.cam.bearing + 15f64.to_radians());
+                        self.map.camera_moved(w, h);
+                        true
+                    }
+                    Some("e") => {
+                        self.map.set_bearing(self.map.cam.bearing - 15f64.to_radians());
+                        self.map.camera_moved(w, h);
+                        true
+                    }
                     Some("r") => {
                         self.map.go_home(w, h);
                         true
@@ -280,7 +290,7 @@ fn main() {
     let map = MapCore::new(
         roads,
         mahere_engine::terrain::Terrain::new(dem),
-        Camera { lat: 47.6062, lon: -122.3321, ppd: PPD_REF },
+        Camera { lat: 47.6062, lon: -122.3321, ppd: PPD_REF, bearing: 0.0 },
     );
     run_app(MahereApp::new(map)).expect("fluor event loop failed");
 }

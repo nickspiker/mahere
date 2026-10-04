@@ -25,12 +25,15 @@ const CLASS_MIN_PPD: [f64; CLASS_COUNT] = [0., 0., 0., 700., 700., 2500., 2500.,
 pub const PPD_REF: f64 = 6000.;
 pub const BG_RGB: u32 = 0x12141A;
 
-/// View state in absolute WGS84 degrees; ppd = pixels per degree latitude.
+/// View state in absolute WGS84 degrees; ppd = pixels per degree latitude;
+/// bearing = radians the view is rotated (0 = north-up; positive turns the
+/// map so that bearing B of compass points screen-up).
 #[derive(Clone, Copy)]
 pub struct Camera {
     pub lat: f64,
     pub lon: f64,
     pub ppd: f64,
+    pub bearing: f64,
 }
 
 impl Camera {
@@ -38,19 +41,27 @@ impl Camera {
         self.lat.to_radians().cos()
     }
 
+    /// Screen basis in local east/north: up = (sin B, cos B), right =
+    /// (cos B, −sin B). B = 0 is north-up.
     pub fn geo_to_screen(&self, lat: f64, lon: f64, w: usize, h: usize) -> (f64, f64) {
-        let ppd_lon = self.ppd * self.coslat();
+        let e = (lon - self.lon) * self.ppd * self.coslat();
+        let n = (lat - self.lat) * self.ppd;
+        let (sb, cb) = self.bearing.sin_cos();
         (
-            w as f64 * 0.5 + (lon - self.lon) * ppd_lon,
-            h as f64 * 0.5 - (lat - self.lat) * self.ppd,
+            w as f64 * 0.5 + e * cb - n * sb,
+            h as f64 * 0.5 - (e * sb + n * cb),
         )
     }
 
     pub fn screen_to_geo(&self, px: f64, py: f64, w: usize, h: usize) -> (f64, f64) {
-        let ppd_lon = self.ppd * self.coslat();
+        let sx = px - w as f64 * 0.5;
+        let sy = h as f64 * 0.5 - py; // screen-up positive
+        let (sb, cb) = self.bearing.sin_cos();
+        let e = sx * cb + sy * sb;
+        let n = -sx * sb + sy * cb;
         (
-            self.lat + (h as f64 * 0.5 - py) / self.ppd,
-            self.lon + (px - w as f64 * 0.5) / ppd_lon,
+            self.lat + n / self.ppd,
+            self.lon + e / (self.ppd * self.coslat()),
         )
     }
 }
@@ -158,10 +169,14 @@ impl MapCore {
         }
     }
 
-    /// Pan by a screen-pixel delta.
+    /// Pan by a screen-pixel delta (bearing-aware: dragging always moves
+    /// the map with the finger, whatever direction north points).
     pub fn pan(&mut self, dx: f64, dy: f64, w: usize, h: usize) {
-        self.cam.lat += dy / self.cam.ppd;
-        self.cam.lon -= dx / (self.cam.ppd * self.cam.coslat());
+        let (sb, cb) = self.cam.bearing.sin_cos();
+        let e = dx * cb - dy * sb; // screen delta in ENU (y-down input)
+        let n = -dx * sb - dy * cb;
+        self.cam.lat += n / self.cam.ppd;
+        self.cam.lon -= e / (self.cam.ppd * self.cam.coslat());
         self.clamp_camera();
         self.camera_moved(w, h);
     }
@@ -173,13 +188,23 @@ impl MapCore {
         self.place_anchor(alat, alon, ax, ay, w, h);
     }
 
-    /// Re-solve the camera so (alat, alon) sits at screen (ax, ay).
+    /// Re-solve the camera so (alat, alon) sits at screen (ax, ay), under
+    /// the current ppd and bearing.
     pub fn place_anchor(&mut self, alat: f64, alon: f64, ax: f64, ay: f64, w: usize, h: usize) {
-        self.cam.lat = alat - (h as f64 * 0.5 - ay) / self.cam.ppd;
-        let coslat = self.cam.coslat();
-        self.cam.lon = alon - (ax - w as f64 * 0.5) / (self.cam.ppd * coslat);
+        let sx = ax - w as f64 * 0.5;
+        let sy = h as f64 * 0.5 - ay;
+        let (sb, cb) = self.cam.bearing.sin_cos();
+        let e = sx * cb + sy * sb;
+        let n = -sx * sb + sy * cb;
+        self.cam.lat = alat - n / self.cam.ppd;
+        // coslat varies negligibly across a screen; anchor latitude is fine.
+        self.cam.lon = alon - e / (self.cam.ppd * alat.to_radians().cos());
         self.clamp_camera();
         self.camera_moved(w, h);
+    }
+
+    pub fn set_bearing(&mut self, bearing: f64) {
+        self.cam.bearing = bearing.rem_euclid(core::f64::consts::TAU);
     }
 
     /// Set zoom directly (two-finger solve), without anchoring.
@@ -259,10 +284,14 @@ impl MapCore {
         let ppd_lon = ppd * self.cam.coslat();
         let (cx, cy) = (w as f64 * 0.5, h as f64 * 0.5);
         let (clat, clon) = (self.cam.lat - self.origin.0, self.cam.lon - self.origin.1);
-        let vlat0 = (clat - cy / ppd) as f32;
-        let vlat1 = (clat + cy / ppd) as f32;
-        let vlon0 = (clon - cx / ppd_lon) as f32;
-        let vlon1 = (clon + cx / ppd_lon) as f32;
+        // Conservative cull box: half-diagonal in both axes so rotation
+        // never culls a visible road.
+        let diag = (cx * cx + cy * cy).sqrt();
+        let vlat0 = (clat - diag / ppd) as f32;
+        let vlat1 = (clat + diag / ppd) as f32;
+        let vlon0 = (clon - diag / ppd_lon) as f32;
+        let vlon1 = (clon + diag / ppd_lon) as f32;
+        let (sb, cb) = self.cam.bearing.sin_cos();
         let wscale = (ppd / PPD_REF).clamp(0.35, 3.0) as f32;
 
         for road in &self.roads {
@@ -281,8 +310,10 @@ impl MapCore {
             let half_w = (CLASS_HALF_W[ci] * wscale).max(0.45);
             let mut prev: Option<(f32, f32)> = None;
             for &(dlat, dlon) in &road.pts {
-                let x = (cx + (dlon as f64 - clon) * ppd_lon) as f32;
-                let y = (cy - (dlat as f64 - clat) * ppd) as f32;
+                let e = (dlon as f64 - clon) * ppd_lon;
+                let n = (dlat as f64 - clat) * ppd;
+                let x = (cx + e * cb - n * sb) as f32;
+                let y = (cy - (e * sb + n * cb)) as f32;
                 if let Some((px, py)) = prev {
                     draw_segment(&mut self.canvas, w, h, px, py, x, y, half_w, rgb);
                 }
