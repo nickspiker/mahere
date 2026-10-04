@@ -648,8 +648,7 @@ dependencies = [
 [[package]]
 name = "fluor"
 version = "0.0.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "aa2915a44fc53aec7de33bb47a7a9a2d81282f5d57b7ac79423339e4daa74780"
+source = "git+https://github.com/nickspiker/fluor?rev=d538a0a#d538a0a2c8215046bafbae8422d8a6c6ea90e403"
 dependencies = [
  "block2 0.6.2",
  "cosmic-text",
@@ -665,7 +664,6 @@ dependencies = [
  "rav1d",
  "rayon",
  "softbuffer",
- "spirix",
  "swash",
  "unicode-script",
  "vsf",
@@ -1231,15 +1229,6 @@ name = "num-complex"
 version = "0.4.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "73f88a1307638156682bada9d7604135552957b7818057dcef22705b4d509495"
-dependencies = [
- "num-traits",
-]
-
-[[package]]
-name = "num-integer"
-version = "0.1.47"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7ce2d95d4b3734dc35aa2f45e1aa22cd416814592a4f9d9205e11affd5b8e10b"
 dependencies = [
  "num-traits",
 ]
@@ -2348,18 +2337,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3763264f6b73151db08c50ff20d7d8a0b8796e021cdea7ceedad07b80155fa0e"
 
 [[package]]
-name = "spirix"
-version = "0.1.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7089346dff43c10fd42537510b444d1ea8dd30d709e3b71521cff264d470df4f"
-dependencies = [
- "i256",
- "num-complex",
- "num-integer",
- "num-traits",
-]
-
-[[package]]
 name = "static_assertions"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2691,8 +2668,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 [[package]]
 name = "vsf"
 version = "0.9.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ff82003f696a0edc51d6eec656ec08a55ff850b9b6586d1c4848ae214d463315"
+source = "git+https://github.com/nickspiker/vsf?rev=5f2bb06c8d96ee417a2571944882ef36d6c9ca8f#5f2bb06c8d96ee417a2571944882ef36d6c9ca8f"
 dependencies = [
  "bitvec",
  "blake3",

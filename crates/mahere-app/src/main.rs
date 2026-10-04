@@ -153,13 +153,12 @@ impl MahereApp {
         }
     }
 
-    fn zoom_about_cursor(&mut self, factor: f64, ctx: &mut Context) {
-        // Exact geo anchoring: record the geography under the cursor, apply
+    fn zoom_about(&mut self, factor: f64, ax: f64, ay: f64, ctx: &mut Context) {
+        // Exact geo anchoring: record the geography under the anchor, apply
         // the zoom, then re-solve the camera so that geography is under the
-        // cursor again. (The earlier incremental form divided by the wrong
+        // anchor again. (The earlier incremental form divided by the wrong
         // ppd — a center-ward drift proportional to zoom step.)
         let (w, h) = (ctx.viewport.width_px as usize, ctx.viewport.height_px as usize);
-        let (ax, ay) = (ctx.cursor_x as f64, ctx.cursor_y as f64);
         let (alat, alon) = self.cam.screen_to_geo(ax, ay, w, h);
         self.cam.ppd = (self.cam.ppd * factor).clamp(40., 4_000_000.);
         self.cam.lat = alat - (h as f64 * 0.5 - ay) / self.cam.ppd;
@@ -287,9 +286,20 @@ impl FluorApp for MahereApp {
     fn init(&mut self, ctx: &mut Context) {
         self.chrome.resize(ctx.viewport);
     }
-    // NOTE: owns_zoom_gesture/on_zoom (route macOS pinch into map zoom
-    // instead of fluor's UI scale) exist in fluor's dev tree but not in
-    // published 0.0.4 — claim the gesture when the next fluor ships.
+
+    /// Pinch zooms the MAP, not fluor's UI scale.
+    fn owns_zoom_gesture(&self) -> bool {
+        true
+    }
+
+    fn on_zoom(&mut self, factor: f32, anchor_x: Px, anchor_y: Px, ctx: &mut Context) {
+        self.zoom_about(
+            (factor as f64).clamp(0.5, 2.0),
+            anchor_x as f64,
+            anchor_y as f64,
+            ctx,
+        );
+    }
 
     fn on_resize(&mut self, width: u32, height: u32, ctx: &mut Context) {
         self.chrome.resize(ctx.viewport);
@@ -398,7 +408,12 @@ impl FluorApp for MahereApp {
                     MouseScrollDelta::Pixels(_, y) => *y / 120.,
                 } as f64)
                     .clamp(-3.0, 3.0);
-                self.zoom_about_cursor(1.18_f64.powf(notches), ctx);
+                self.zoom_about(
+                    1.18_f64.powf(notches),
+                    ctx.cursor_x as f64,
+                    ctx.cursor_y as f64,
+                    ctx,
+                );
                 EventResponse::Handled
             }
             FEvent::KeyboardInput { event } => {

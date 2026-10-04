@@ -7,3 +7,8 @@ version = "0.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/nickspiker/mahere"
+
+# fluor's dev tree declares vsf as a sibling path dep (../vsf), which a git
+# checkout of fluor doesn't contain — point it at the pushed vsf repo.
+[patch."https://github.com/nickspiker/fluor"]
+vsf = { git = "https://github.com/nickspiker/vsf", rev = "5f2bb06c8d96ee417a2571944882ef36d6c9ca8f" }
