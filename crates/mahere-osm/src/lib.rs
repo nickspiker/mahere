@@ -235,15 +235,43 @@ pub fn read_featpack(path: &str) -> Result<Vec<Road>, String> {
     let section = header
         .primary_section(&data, header_end)
         .map_err(|e| format!("{path}: {e}"))?;
+    // Width-agnostic reads, per VSF doctrine: the encoder emits the
+    // narrowest tensor spelling, so never match exact variants.
+    fn tensor_u32(v: VsfType) -> Option<Vec<u32>> {
+        Some(match v {
+            VsfType::t_u0(t) => t.data.into_iter().map(|b| b as u32).collect(),
+            VsfType::t_u3(t) => t.data.into_iter().map(|x| x as u32).collect(),
+            VsfType::t_u4(t) => t.data.into_iter().map(|x| x as u32).collect(),
+            VsfType::t_u5(t) => t.data,
+            VsfType::t_u6(t) => t.data.into_iter().map(|x| x as u32).collect(),
+            VsfType::v_u3(v) => v.data.into_iter().map(|x| x as u32).collect(),
+            VsfType::v_u4(v) => v.data.into_iter().map(|x| x as u32).collect(),
+            VsfType::v_u5(v) => v.data,
+            VsfType::v_u6(v) => v.data.into_iter().map(|x| x as u32).collect(),
+            _ => return None,
+        })
+    }
+    fn tensor_f64(v: VsfType) -> Option<Vec<f64>> {
+        Some(match v {
+            VsfType::t_f5(t) => t.data.into_iter().map(|x| x as f64).collect(),
+            VsfType::t_f6(t) => t.data,
+            VsfType::v_f5(v) => v.data.into_iter().map(|x| x as f64).collect(),
+            VsfType::v_f6(v) => v.data,
+            _ => return None,
+        })
+    }
     let mut classes: Option<Vec<u8>> = None;
     let mut counts: Option<Vec<u32>> = None;
     let mut points: Option<Vec<f64>> = None;
     if section.name == "features" {
         for f in section.fields {
-            match (f.name.as_str(), f.values.into_iter().next()) {
-                ("classes", Some(VsfType::t_u3(t))) => classes = Some(t.data),
-                ("counts", Some(VsfType::t_u5(t))) => counts = Some(t.data),
-                ("points", Some(VsfType::t_f6(t))) => points = Some(t.data),
+            let v = f.values.into_iter().next();
+            match (f.name.as_str(), v) {
+                ("classes", Some(v)) => {
+                    classes = tensor_u32(v).map(|u| u.into_iter().map(|x| x as u8).collect())
+                }
+                ("counts", Some(v)) => counts = tensor_u32(v),
+                ("points", Some(v)) => points = tensor_f64(v),
                 _ => {}
             }
         }
