@@ -197,7 +197,7 @@ pub extern "system" fn Java_nz_mahere_app_MahereActivity_nativeInit(
         Ok(s) => s.into(),
         Err(_) => return 0,
     };
-    let mut tifs: Vec<String> = match std::fs::read_dir(&dir) {
+    let mut tifs: Vec<String> = match std::fs::read_dir(format!("{dir}/dem")) {
         Ok(rd) => rd
             .filter_map(|e| e.ok())
             .map(|e| e.path().to_string_lossy().into_owned())
@@ -205,14 +205,16 @@ pub extern "system" fn Java_nz_mahere_app_MahereActivity_nativeInit(
             .collect(),
         Err(_) => return 0,
     };
-    tifs.sort();
+    tifs.sort(); // "USGS_13_*" (10 m) sorts before "USGS_1_*" (30 m): finer wins
     let dem = match mahere_dem::DemStore::load(&tifs) {
         Ok(d) => d,
         Err(_) => return 0,
     };
+    // Trails, roads, streams, rail, powerlines: the bundled featpack.
+    let feats = mahere_osm::read_featpack(&format!("{dir}/features.vsf")).unwrap_or_default();
     let app = AndroidApp {
         map: MapCore::new(
-            Vec::new(),
+            feats,
             mahere_engine::terrain::Terrain::new(dem),
             // Mt Adams until the first GPS fix recenters us.
             Camera { lat: 46.2024, lon: -121.4909, ppd: 12_000.0, bearing: 0.0 },

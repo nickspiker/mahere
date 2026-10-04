@@ -1094,6 +1094,7 @@ dependencies = [
  "jni 0.21.1",
  "mahere-dem",
  "mahere-engine",
+ "mahere-osm",
  "ndk",
 ]
 
@@ -1134,6 +1135,7 @@ version = "0.1.0"
 dependencies = [
  "mahere-coord",
  "osmpbf",
+ "vsf",
 ]
 
 [[package]]

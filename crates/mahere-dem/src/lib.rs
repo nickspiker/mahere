@@ -31,7 +31,9 @@ pub struct DemStore {
 impl DemTile {
     pub fn load(path: &str) -> Result<DemTile, String> {
         let file = File::open(path).map_err(|e| format!("{path}: {e}"))?;
-        let mut dec = Decoder::new(BufReader::new(file)).map_err(|e| format!("{path}: {e}"))?;
+        let mut dec = Decoder::new(BufReader::new(file))
+            .map_err(|e| format!("{path}: {e}"))?
+            .with_limits(tiff::decoder::Limits::unlimited());
         let (w, h) = dec.dimensions().map_err(|e| format!("{path}: {e}"))?;
         let scale = dec
             .get_tag_f64_vec(Tag::ModelPixelScaleTag)

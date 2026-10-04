@@ -1,6 +1,15 @@
 [workspace]
 resolver = "3"
 members = ["crates/*"]
+# mahere-android only compiles for Android targets (cargo ndk -p mahere-android);
+# host-side `cargo build/test` skips it.
+default-members = [
+    "crates/mahere-app",
+    "crates/mahere-coord",
+    "crates/mahere-dem",
+    "crates/mahere-engine",
+    "crates/mahere-osm",
+]
 
 [workspace.package]
 version = "0.1.0"

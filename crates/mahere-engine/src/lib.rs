@@ -18,10 +18,15 @@ const CLASS_RGB: [[u8; 3]; CLASS_COUNT] = [
     [112, 117, 128], // Service
     [152, 120, 88],  // Track
     [80, 230, 120],  // Path
+    [125, 122, 128], // Rail
+    [148, 136, 160], // Power
+    [84, 150, 210],  // Waterway
 ];
 
-const CLASS_HALF_W: [f32; CLASS_COUNT] = [1.6, 1.4, 1.2, 1.0, 0.85, 0.6, 0.45, 0.45, 0.55];
-const CLASS_MIN_PPD: [f64; CLASS_COUNT] = [0., 0., 0., 700., 700., 2500., 2500., 2500., 2500.];
+const CLASS_HALF_W: [f32; CLASS_COUNT] =
+    [1.6, 1.4, 1.2, 1.0, 0.85, 0.6, 0.45, 0.45, 0.55, 0.7, 0.5, 0.8];
+const CLASS_MIN_PPD: [f64; CLASS_COUNT] =
+    [0., 0., 0., 700., 700., 2500., 2500., 2500., 2500., 700., 1500., 1200.];
 pub const PPD_REF: f64 = 6000.;
 pub const BG_RGB: u32 = 0x12141A;
 

@@ -71,6 +71,14 @@ class MahereActivity : Activity(), SurfaceHolder.Callback, Choreographer.FrameCa
                     }
                 }
             }
+            for (name in assets.list("").orEmpty().filter { it.endsWith(".vsf") }) {
+                val out = java.io.File(filesDir, name)
+                if (!out.exists() || out.length() == 0L) {
+                    assets.open(name).use { input ->
+                        out.outputStream().use { input.copyTo(it) }
+                    }
+                }
+            }
             runOnUiThread {
                 assetsStaged = true
                 maybeInit()
@@ -105,7 +113,7 @@ class MahereActivity : Activity(), SurfaceHolder.Callback, Choreographer.FrameCa
         val (w, h) = pendingSize ?: return
         if (!assetsStaged || !surfaceReady) return
         if (nativePtr == 0L) {
-            nativePtr = nativeInit(w, h, java.io.File(filesDir, "dem").absolutePath)
+            nativePtr = nativeInit(w, h, filesDir.absolutePath)
             Choreographer.getInstance().postFrameCallback(this)
         } else {
             nativeResize(nativePtr, w, h)

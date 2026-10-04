@@ -280,10 +280,14 @@ fn main() {
     eprintln!("{} roads, {} points, {:.1}s", roads.len(), pts, t.elapsed().as_secs_f32());
 
     let t = Instant::now();
-    let dem_paths: Vec<String> = ["n47w122", "n47w123", "n48w122", "n48w123"]
+    let mut dem_paths: Vec<String> = ["n47w122", "n47w123", "n48w122", "n48w123"]
         .iter()
         .map(|t| format!("data/USGS_1_{t}.tif"))
         .collect();
+    // Finer tiles first: DemStore answers from the first tile that covers.
+    if std::path::Path::new("data/USGS_13_n47w122.tif").exists() {
+        dem_paths.insert(0, "data/USGS_13_n47w122.tif".into());
+    }
     let dem = mahere_dem::DemStore::load(&dem_paths).expect("failed to load DEM tiles");
     eprintln!("{} DEM tiles, {:.1}s", dem.tile_count(), t.elapsed().as_secs_f32());
 

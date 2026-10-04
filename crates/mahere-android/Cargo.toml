@@ -13,6 +13,7 @@ crate-type = ["cdylib"]
 [dependencies]
 mahere-dem = { path = "../mahere-dem" }
 mahere-engine = { path = "../mahere-engine" }
+mahere-osm = { path = "../mahere-osm" }
 fluor = { git = "https://github.com/nickspiker/fluor", rev = "d538a0a", features = ["host-android"] }
 jni = "0.21"
 ndk = { version = "0.9", features = ["api-level-26"] }
