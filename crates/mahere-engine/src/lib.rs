@@ -88,6 +88,7 @@ pub struct MapCore {
     pub cam: Camera,
     terrain: terrain::Terrain,
     terrain_gen_seen: u64,
+    /// SCREEN-space sun azimuth in degrees (315 = top-left).
     pub sun_az: f32,
     pub sun_alt: f32,
     pub gps: Option<GpsFix>,
@@ -275,8 +276,14 @@ impl MapCore {
         if w == 0 || h == 0 {
             return;
         }
-        let (sun_az, sun_alt) = (self.sun_az, self.sun_alt);
-        self.terrain.splat(&mut self.canvas, w, h, &self.cam, sun_az, sun_alt);
+        // sun_az is SCREEN azimuth (315 = top-left, the cartographic relief
+        // convention): convert to world by the camera bearing at splat time,
+        // so terrain stays lit from the display's top-left at any rotation.
+        // World-fixed light would perceptually invert relief once the map
+        // turns ~180 (lit-from-below illusion).
+        let az_world = self.sun_az + self.cam.bearing.to_degrees() as f32;
+        let sun_alt = self.sun_alt;
+        self.terrain.splat(&mut self.canvas, w, h, &self.cam, az_world, sun_alt);
         self.draw_roads(w, h);
         self.draw_gps(w, h);
     }
