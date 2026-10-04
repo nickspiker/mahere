@@ -68,6 +68,10 @@ impl Terrain {
         self.generation
     }
 
+    pub fn dem(&self) -> &DemStore {
+        &self.dem
+    }
+
     pub fn converged(&self) -> bool {
         self.converged
     }

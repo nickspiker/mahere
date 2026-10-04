@@ -1,0 +1,18 @@
+[package]
+name = "mahere-android"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "mahere Android shell: fluor AndroidShell host + raw two-finger gesture solve + GPS JNI"
+
+[lib]
+name = "mahere_android"
+crate-type = ["cdylib"]
+
+[dependencies]
+mahere-dem = { path = "../mahere-dem" }
+mahere-engine = { path = "../mahere-engine" }
+fluor = { git = "https://github.com/nickspiker/fluor", rev = "d538a0a", features = ["host-android"] }
+jni = "0.21"
+ndk = { version = "0.9", features = ["api-level-26"] }

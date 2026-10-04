@@ -1,2 +1,8 @@
 /target
 /data
+/android/app/src/main/assets
+/android/app/src/main/jniLibs
+/android/.gradle
+/android/app/build
+/android/build
+/android/local.properties

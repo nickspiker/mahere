@@ -1,0 +1,42 @@
+apply plugin: 'com.android.application'
+apply plugin: 'org.jetbrains.kotlin.android'
+
+android {
+    namespace 'nz.mahere.app'
+    compileSdk 35
+
+    defaultConfig {
+        applicationId "nz.mahere.app"
+        minSdk 26
+        targetSdk 35
+        versionCode 1
+        versionName "0.1.0"
+        ndk { abiFilters 'arm64-v8a' }
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+            signingConfig signingConfigs.debug // field-test builds; real signing later
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+    kotlinOptions { jvmTarget = '17' }
+}
+
+// Build the Rust cdylib and drop it into jniLibs before every build.
+task cargoBuild(type: Exec) {
+    workingDir rootProject.projectDir.parentFile
+    commandLine 'cargo', 'ndk', '-t', 'arm64-v8a',
+            '-o', new File(projectDir, 'src/main/jniLibs').absolutePath,
+            'build', '--release', '-p', 'mahere-android'
+}
+preBuild.dependsOn cargoBuild
+
+dependencies {
+    implementation "org.jetbrains.kotlin:kotlin-stdlib:$kotlin_version"
+}

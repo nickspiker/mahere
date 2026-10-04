@@ -1,0 +1,12 @@
+[package]
+name = "mahere-engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "mahere's host-independent map core: camera, terrain reservoir engine, road rasterizer, GPS pin"
+
+[dependencies]
+mahere-dem = { path = "../mahere-dem" }
+mahere-osm = { path = "../mahere-osm" }
+rayon = "1"
