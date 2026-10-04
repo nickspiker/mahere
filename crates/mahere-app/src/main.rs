@@ -154,14 +154,17 @@ impl MahereApp {
     }
 
     fn zoom_about_cursor(&mut self, factor: f64, ctx: &mut Context) {
-        let (w, h) = (ctx.viewport.width_px as f64, ctx.viewport.height_px as f64);
-        let (mx, my) = (self.last_cursor.0 - w * 0.5, self.last_cursor.1 - h * 0.5);
-        let coslat = self.cam.coslat();
-        let old_ppd = self.cam.ppd;
+        // Exact geo anchoring: record the geography under the cursor, apply
+        // the zoom, then re-solve the camera so that geography is under the
+        // cursor again. (The earlier incremental form divided by the wrong
+        // ppd — a center-ward drift proportional to zoom step.)
+        let (w, h) = (ctx.viewport.width_px as usize, ctx.viewport.height_px as usize);
+        let (ax, ay) = (ctx.cursor_x as f64, ctx.cursor_y as f64);
+        let (alat, alon) = self.cam.screen_to_geo(ax, ay, w, h);
         self.cam.ppd = (self.cam.ppd * factor).clamp(40., 4_000_000.);
-        let f = self.cam.ppd / old_ppd;
-        self.cam.lat -= my * (1. - 1. / f) / self.cam.ppd;
-        self.cam.lon += mx * (1. - 1. / f) / (self.cam.ppd * coslat);
+        self.cam.lat = alat - (h as f64 * 0.5 - ay) / self.cam.ppd;
+        let coslat = self.cam.coslat();
+        self.cam.lon = alon - (ax - w as f64 * 0.5) / (self.cam.ppd * coslat);
         self.clamp_camera();
         self.camera_moved(ctx);
     }
@@ -301,13 +304,34 @@ impl FluorApp for MahereApp {
         Some((self.chrome.hit_test_map(), w, h))
     }
 
+    /// Hover tints are applied by the host's overlay pass from this table —
+    /// without it, set_hover tracks state but nothing ever shows.
+    fn overlay_deltas(&mut self) -> Vec<u32> {
+        // Chrome allocated ids 1..=4; index 0 is HIT_NONE.
+        let mut t = vec![0u32; 5];
+        for id in [
+            self.chrome.min_btn.id(),
+            self.chrome.max_btn.id(),
+            self.chrome.close_btn.id(),
+        ] {
+            if self.chrome.hit_at(self.last_cursor.0 as Px, self.last_cursor.1 as Px) == id {
+                if let Some(d) = self.chrome.hover_colour_for(id) {
+                    t[id as usize] = d;
+                }
+            }
+        }
+        t
+    }
+
     fn on_event(&mut self, event: &FEvent, ctx: &mut Context) -> EventResponse {
         match event {
             FEvent::MouseInput { state: ElementState::Pressed, button: MouseButton::Left } => {
-                // last_cursor is maintained from the CursorMoved stream only:
-                // mixing in host-tracked ctx.cursor_* diffs two coordinate
-                // spaces on scaled displays (Retina) and teleports the view.
-                let (cx, cy) = (self.last_cursor.0 as Px, self.last_cursor.1 as Px);
+                // ALL cursor positions come from host-tracked ctx.cursor_*,
+                // never from raw event coordinates: on macOS the events
+                // arrive in logical points while the viewport, hit maps and
+                // host cursor are physical pixels. One source, one space.
+                let (cx, cy) = (ctx.cursor_x, ctx.cursor_y);
+                self.last_cursor = (cx as f64, cy as f64);
                 let hit = self.chrome.hit_at(cx, cy);
                 if hit != HIT_NONE {
                     // Chrome button ids were allocated in new(); dispatch
@@ -336,11 +360,12 @@ impl FluorApp for MahereApp {
                 self.dragging = false;
                 EventResponse::Handled
             }
-            FEvent::CursorMoved { x, y } => {
-                if self.chrome.set_hover(self.chrome.hit_at(*x, *y)) {
+            FEvent::CursorMoved { .. } => {
+                let (hx, hy) = (ctx.cursor_x, ctx.cursor_y);
+                if self.chrome.set_hover(self.chrome.hit_at(hx, hy)) {
                     ctx.window.request_redraw();
                 }
-                let (x, y) = (*x as f64, *y as f64);
+                let (x, y) = (hx as f64, hy as f64);
                 if self.dragging {
                     let (dx, dy) = (x - self.last_cursor.0, y - self.last_cursor.1);
                     self.cam.lat += dy / self.cam.ppd;
