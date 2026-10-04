@@ -53,7 +53,6 @@ pub struct Terrain {
     // Reused per-pixel occupancy buffers for reservoir maintenance.
     keep_fine: Vec<u8>,
     keep_coarse: Vec<u8>,
-    keep_band: Vec<u8>,
     idx_scratch: Vec<i64>,
 }
 
@@ -72,7 +71,6 @@ impl Terrain {
             acc_n: Vec::new(),
             keep_fine: Vec::new(),
             keep_coarse: Vec::new(),
-            keep_band: Vec::new(),
             idx_scratch: Vec::new(),
         }
     }
@@ -100,30 +98,21 @@ impl Terrain {
         self.jitter_gen = self.jitter_gen.wrapping_add(1);
     }
 
-    /// Uniform-reservoir maintenance (Nick's rule), amortized: runs from
-    /// tick() only when the reservoir crosses its high-water mark. Keeps at
-    /// most PER_PIXEL_KEEP fine samples per visible pixel (fine samples get
-    /// the budget; coarse placeholders survive only where no fine sample
-    /// covers), keeps a half-screen margin band at quarter density so
-    /// reorientation lands on cache, and drops everything farther out.
-    /// Single projection pass: screen indices are scratch-cached, then one
-    /// ordered retain applies the budgets.
+    /// Uniform-reservoir maintenance (Nick's rule, strict edition): if a
+    /// sample is off the screen it is GONE — no margin band, no grace.
+    /// On-screen, at most PER_PIXEL_KEEP fine samples survive per pixel
+    /// (fine first; a coarse placeholder only where nothing fine covers).
+    /// Amortized from tick(); one projection pass caches pixel indices,
+    /// then one ordered retain applies the budget.
     fn maintain(&mut self, w: usize, h: usize, cam: &Camera) {
-        let (mw, mh) = (w as f64 * 0.5, h as f64 * 0.5);
-        let (bw, bh) = (w.div_ceil(2), h.div_ceil(2)); // 4px band cells over 2w x 2h
         self.idx_scratch.clear();
         self.idx_scratch.reserve(self.samples.len());
         for s in &self.samples {
             let (x, y) = cam.geo_to_screen(s.lat, s.lon, w, h);
-            let code = if x < -mw || x >= w as f64 + mw || y < -mh || y >= h as f64 + mh {
-                i64::MIN // outside margin: drop
-            } else if x >= 0.0 && y >= 0.0 && (x as usize) < w && (y as usize) < h {
-                (y as usize * w + x as usize) as i64 // visible pixel index
+            let code = if x >= 0.0 && y >= 0.0 && (x as usize) < w && (y as usize) < h {
+                (y as usize * w + x as usize) as i64
             } else {
-                // margin band cell (4px), offset into its own grid
-                let bx = ((x + mw) * 0.25) as usize;
-                let by = ((y + mh) * 0.25) as usize;
-                -2 - (by.min(bh * 2 - 1) * bw * 2 + bx.min(bw * 2 - 1)) as i64
+                i64::MIN
             };
             self.idx_scratch.push(code);
         }
@@ -131,34 +120,23 @@ impl Terrain {
         self.keep_fine.resize(w * h, 0);
         self.keep_coarse.clear();
         self.keep_coarse.resize(w * h, 0);
-        self.keep_band.clear();
-        self.keep_band.resize(bw * bh * 4, 0);
-        // Prepass: where does any fine sample land? (so coarse placeholders
-        // under fine coverage die regardless of vector order)
+        // Prepass: fine-presence per pixel, so coarse under fine always dies
+        // regardless of vector order.
         for (s, &code) in self.samples.iter().zip(&self.idx_scratch) {
             if s.level == 0 && code >= 0 {
                 let c = &mut self.keep_coarse[code as usize];
-                *c = c.saturating_add(1); // reused as fine-presence count
+                *c = c.saturating_add(1);
             }
         }
         let keep_fine = &mut self.keep_fine;
         let fine_present = &mut self.keep_coarse;
-        let keep_band = &mut self.keep_band;
-        let mut i = 0usize;
         let idx = &self.idx_scratch;
+        let mut i = 0usize;
         self.samples.retain(|s| {
             let code = idx[i];
             i += 1;
-            if code == i64::MIN {
-                return false;
-            }
             if code < 0 {
-                let b = &mut keep_band[(-2 - code) as usize];
-                if *b >= PER_PIXEL_KEEP {
-                    return false;
-                }
-                *b += 1;
-                return true;
+                return false;
             }
             let px = code as usize;
             if s.level == 0 {
@@ -169,9 +147,8 @@ impl Terrain {
                     false
                 }
             } else {
-                // Coarse: only where no fine sample covers, one per pixel.
                 if fine_present[px] == 0 && keep_fine[px] == 0 {
-                    keep_fine[px] = 1; // claims the slot; fine would have won in prepass
+                    keep_fine[px] = 1;
                     true
                 } else {
                     false
@@ -197,7 +174,7 @@ impl Terrain {
         // Amortized reservoir maintenance: high-water = what a converged
         // view plus the margin band legitimately holds, with slack.
         let high_water =
-            ((w * h) * (PER_PIXEL_KEEP as usize + 2)).min(MAX_SAMPLES);
+            ((w * h) * (PER_PIXEL_KEEP as usize + 1)).min(MAX_SAMPLES);
         if self.samples.len() > high_water {
             self.maintain(w, h, cam);
         }
