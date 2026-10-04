@@ -21,8 +21,12 @@ const COARSEST: u8 = 5;
 const AA_PASSES: u8 = 2;
 /// Evaluation budget per tick, keeps frames interactive while converging.
 const MAX_EVAL_PER_TICK: usize = 120_000;
-/// Reservoir cap; eviction keeps the on-screen neighborhood.
-const MAX_SAMPLES: usize = 5_000_000;
+/// Per-pixel sample budget (Nick's uniform-reservoir rule): 1 + AA_PASSES
+/// is the converged density, so keeping this many per pixel preserves a
+/// fully-converged view exactly while thinning zoom-out bunching.
+const PER_PIXEL_KEEP: u8 = 3;
+/// Absolute backstop so a huge viewport can't balloon memory.
+const MAX_SAMPLES: usize = 9_000_000;
 
 pub struct Sample {
     lat: f64,
@@ -46,6 +50,11 @@ pub struct Terrain {
     // Reused splat buffers for the fine-level accumulation.
     acc_rgb: Vec<[u32; 3]>,
     acc_n: Vec<u16>,
+    // Reused per-pixel occupancy buffers for reservoir maintenance.
+    keep_fine: Vec<u8>,
+    keep_coarse: Vec<u8>,
+    keep_band: Vec<u8>,
+    idx_scratch: Vec<i64>,
 }
 
 impl Terrain {
@@ -61,6 +70,10 @@ impl Terrain {
             jitter_gen: 0,
             acc_rgb: Vec::new(),
             acc_n: Vec::new(),
+            keep_fine: Vec::new(),
+            keep_coarse: Vec::new(),
+            keep_band: Vec::new(),
+            idx_scratch: Vec::new(),
         }
     }
 
@@ -77,22 +90,101 @@ impl Terrain {
     }
 
     /// Camera moved: restart refinement against the new view. Existing
-    /// samples stay valid (they're exact); only coverage must be re-derived.
-    pub fn note_camera(&mut self, w: usize, h: usize, cam: &Camera) {
+    /// samples stay valid (they're exact); coverage re-derives in tick().
+    /// Deliberately cheap — it runs on every drag event.
+    pub fn note_camera(&mut self, _w: usize, _h: usize, _cam: &Camera) {
         self.level = COARSEST;
         self.aa_pass = 0;
         self.aa_cursor = 0;
         self.converged = false;
         self.jitter_gen = self.jitter_gen.wrapping_add(1);
+    }
+
+    /// Uniform-reservoir maintenance (Nick's rule), amortized: runs from
+    /// tick() only when the reservoir crosses its high-water mark. Keeps at
+    /// most PER_PIXEL_KEEP fine samples per visible pixel (fine samples get
+    /// the budget; coarse placeholders survive only where no fine sample
+    /// covers), keeps a half-screen margin band at quarter density so
+    /// reorientation lands on cache, and drops everything farther out.
+    /// Single projection pass: screen indices are scratch-cached, then one
+    /// ordered retain applies the budgets.
+    fn maintain(&mut self, w: usize, h: usize, cam: &Camera) {
+        let (mw, mh) = (w as f64 * 0.5, h as f64 * 0.5);
+        let (bw, bh) = (w.div_ceil(2), h.div_ceil(2)); // 4px band cells over 2w x 2h
+        self.idx_scratch.clear();
+        self.idx_scratch.reserve(self.samples.len());
+        for s in &self.samples {
+            let (x, y) = cam.geo_to_screen(s.lat, s.lon, w, h);
+            let code = if x < -mw || x >= w as f64 + mw || y < -mh || y >= h as f64 + mh {
+                i64::MIN // outside margin: drop
+            } else if x >= 0.0 && y >= 0.0 && (x as usize) < w && (y as usize) < h {
+                (y as usize * w + x as usize) as i64 // visible pixel index
+            } else {
+                // margin band cell (4px), offset into its own grid
+                let bx = ((x + mw) * 0.25) as usize;
+                let by = ((y + mh) * 0.25) as usize;
+                -2 - (by.min(bh * 2 - 1) * bw * 2 + bx.min(bw * 2 - 1)) as i64
+            };
+            self.idx_scratch.push(code);
+        }
+        self.keep_fine.clear();
+        self.keep_fine.resize(w * h, 0);
+        self.keep_coarse.clear();
+        self.keep_coarse.resize(w * h, 0);
+        self.keep_band.clear();
+        self.keep_band.resize(bw * bh * 4, 0);
+        // Prepass: where does any fine sample land? (so coarse placeholders
+        // under fine coverage die regardless of vector order)
+        for (s, &code) in self.samples.iter().zip(&self.idx_scratch) {
+            if s.level == 0 && code >= 0 {
+                let c = &mut self.keep_coarse[code as usize];
+                *c = c.saturating_add(1); // reused as fine-presence count
+            }
+        }
+        let keep_fine = &mut self.keep_fine;
+        let fine_present = &mut self.keep_coarse;
+        let keep_band = &mut self.keep_band;
+        let mut i = 0usize;
+        let idx = &self.idx_scratch;
+        self.samples.retain(|s| {
+            let code = idx[i];
+            i += 1;
+            if code == i64::MIN {
+                return false;
+            }
+            if code < 0 {
+                let b = &mut keep_band[(-2 - code) as usize];
+                if *b >= PER_PIXEL_KEEP {
+                    return false;
+                }
+                *b += 1;
+                return true;
+            }
+            let px = code as usize;
+            if s.level == 0 {
+                if keep_fine[px] < PER_PIXEL_KEEP {
+                    keep_fine[px] += 1;
+                    true
+                } else {
+                    false
+                }
+            } else {
+                // Coarse: only where no fine sample covers, one per pixel.
+                if fine_present[px] == 0 && keep_fine[px] == 0 {
+                    keep_fine[px] = 1; // claims the slot; fine would have won in prepass
+                    true
+                } else {
+                    false
+                }
+            }
+        });
         if self.samples.len() > MAX_SAMPLES {
-            // Keep what the camera can see (with margin); exact samples
-            // off-screen are cheap to regenerate relative to their memory.
-            let (mw, mh) = (w as f64 * 0.3, h as f64 * 0.3);
-            self.samples.retain(|s| {
-                let (x, y) = cam.geo_to_screen(s.lat, s.lon, w, h);
-                x > -mw && x < w as f64 + mw && y > -mh && y < h as f64 + mh
+            let step = (self.samples.len() / (self.samples.len() - MAX_SAMPLES).max(1)).max(2);
+            let mut k = 0usize;
+            self.samples.retain(|_| {
+                k += 1;
+                !k.is_multiple_of(step)
             });
-            self.samples.truncate(MAX_SAMPLES);
         }
     }
 
@@ -101,6 +193,13 @@ impl Terrain {
     pub fn tick(&mut self, w: usize, h: usize, cam: &Camera) -> bool {
         if self.converged || w == 0 || h == 0 {
             return false;
+        }
+        // Amortized reservoir maintenance: high-water = what a converged
+        // view plus the margin band legitimately holds, with slack.
+        let high_water =
+            ((w * h) * (PER_PIXEL_KEEP as usize + 2)).min(MAX_SAMPLES);
+        if self.samples.len() > high_water {
+            self.maintain(w, h, cam);
         }
         // Collect this batch's evaluation points (screen px centers+jitter).
         let mut points: Vec<(f64, f64, u8)> = Vec::new(); // (px, py, level)
