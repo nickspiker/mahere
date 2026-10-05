@@ -85,6 +85,9 @@ pub struct MapCore {
     /// Measured cost of the last `render` call in milliseconds.
     pub last_frame_ms: f32,
     pub last_straddle_blocks: usize,
+    /// Something changed since the last render (camera, sun, GPS). Reported
+    /// by `tick` so shells that only draw on demand get a frame.
+    dirty: bool,
 }
 
 impl MapCore {
@@ -105,6 +108,7 @@ impl MapCore {
             home,
             last_frame_ms: 0.0,
             last_straddle_blocks: 0,
+            dirty: true,
         }
     }
 
@@ -152,10 +156,12 @@ impl MapCore {
 
     pub fn set_bearing(&mut self, bearing: f64) {
         self.cam.bearing = bearing.rem_euclid(core::f64::consts::TAU);
+        self.dirty = true;
     }
 
     pub fn set_ppd(&mut self, ppd: f64) {
         self.cam.ppd = ppd.clamp(40., 4_000_000.);
+        self.dirty = true;
     }
 
     pub fn go_home(&mut self, w: usize, h: usize) {
@@ -166,10 +172,12 @@ impl MapCore {
     pub fn adjust_sun(&mut self, daz: f32, dalt: f32) {
         self.sun_az = (self.sun_az + daz).rem_euclid(360.0);
         self.sun_alt = (self.sun_alt + dalt).clamp(5.0, 85.0);
+        self.dirty = true;
     }
 
     pub fn set_gps(&mut self, fix: GpsFix) {
         self.gps = Some(fix);
+        self.dirty = true;
     }
 
     /// DEM elevation at the GPS fix from resident cells (deepest first).
@@ -197,15 +205,20 @@ impl MapCore {
         None
     }
 
-    pub fn camera_moved(&mut self, _w: usize, _h: usize) {}
+    pub fn camera_moved(&mut self, _w: usize, _h: usize) {
+        self.dirty = true;
+    }
 
-    pub fn mark_dirty(&mut self) {}
+    pub fn mark_dirty(&mut self) {
+        self.dirty = true;
+    }
 
     // ==================== PROGRESS ====================
 
-    /// Integrate async-loaded cells. True if anything arrived (redraw).
+    /// Integrate async-loaded cells. True if a redraw is due: cells arrived
+    /// or the camera/sun/GPS changed since the last render.
     pub fn tick(&mut self, _w: usize, _h: usize) -> bool {
-        self.res.drain() > 0
+        self.res.drain() > 0 || self.dirty
     }
 
     pub fn converged(&self) -> bool {
@@ -222,6 +235,7 @@ impl MapCore {
     /// construction (fetch + composite), so it runs every host frame.
     pub fn render(&mut self, w: usize, h: usize) {
         let t0 = Instant::now();
+        self.dirty = false;
         self.res.frame += 1;
         self.res.drain();
         self.canvas.resize(w * h, BG_RGB);
@@ -390,5 +404,39 @@ pub fn draw_seven_seg(
             }
         }
         cx += sw + size * 0.28;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct Empty;
+    impl CellStore for Empty {
+        fn get(&self, _rel: &str) -> Option<Vec<u8>> {
+            None
+        }
+    }
+
+    /// Shells that draw on demand rely on `tick` to report camera changes
+    /// (the Android two-finger path has no redraw request of its own).
+    #[test]
+    fn tick_reports_camera_changes() {
+        let cam = Camera { lat: 46.2, lon: -121.5, ppd: 2800.0, bearing: 0.0 };
+        let mut map = MapCore::new(Arc::new(Empty), cam);
+        for _ in 0..500 {
+            map.render(64, 64);
+            if map.converged() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        map.tick(64, 64);
+        map.render(64, 64);
+        assert!(!map.tick(64, 64), "nothing changed, nothing to draw");
+        map.set_bearing(1.0);
+        assert!(map.tick(64, 64), "bearing changed: a frame is due");
+        map.render(64, 64);
+        assert!(!map.tick(64, 64));
     }
 }

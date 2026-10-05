@@ -10,6 +10,7 @@ use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, channel};
 
 use mahere_tiles::{CellKey, TEX, decode_cell_fields, tensor_f32, tensor_u8};
+use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 /// Where cell bytes come from. DirStore today; vault / R2 fetcher later.
@@ -169,10 +170,19 @@ impl Residency {
         n
     }
 
-    /// Declare the frame's desired set; request whatever isn't resident or
-    /// in flight, nearest-first.
+    /// Declare the frame's desired set — the cells this view needs at its
+    /// depth plus the parents it falls back through. Everything else is
+    /// dropped now (out of view or zoom mismatch: gone, re-fetched if it
+    /// comes back), in-flight requests outside it are forgotten, and only
+    /// what's missing is requested, nearest-first.
     pub fn want(&mut self, mut list: Vec<(Layer, CellKey)>, center: (u64, u64)) {
         self.desired = list.iter().map(|&(l, k)| (l, k.depth, k.prefix)).collect();
+        let desired = &self.desired;
+        self.dem.map.retain(|&(d, p), _| desired.contains(&(Layer::Dem, d, p)));
+        self.dem.stamp.retain(|&(d, p), _| desired.contains(&(Layer::Dem, d, p)));
+        self.line.map.retain(|&(d, p), _| desired.contains(&(Layer::Line, d, p)));
+        self.line.stamp.retain(|&(d, p), _| desired.contains(&(Layer::Line, d, p)));
+        self.pending.retain(|id| desired.contains(id));
         list.retain(|&(l, k)| {
             let id = (l, k.depth, k.prefix);
             !self.pending.contains(&id)
@@ -204,10 +214,15 @@ impl Residency {
     }
 }
 
+/// The newest want-list is the only one that matters: an older list's
+/// leftovers are cells the view no longer needs (the main side forgets
+/// them as pending too, so they're re-requested if they come back).
+/// Cells decode in parallel a small chunk at a time so the nearest-first
+/// order still holds and a newer list preempts within a few cells.
 fn loader_thread(store: Arc<dyn CellStore>, want_rx: Receiver<WantList>, done_tx: Sender<Loaded>) {
+    let chunk = rayon::current_num_threads().clamp(2, 8);
     let mut current: Option<WantList> = None;
     loop {
-        // Collapse the queue to the newest want-list.
         if current.is_none() {
             match want_rx.recv() {
                 Ok(w) => current = Some(w),
@@ -215,24 +230,22 @@ fn loader_thread(store: Arc<dyn CellStore>, want_rx: Receiver<WantList>, done_tx
             }
         }
         while let Ok(w) = want_rx.try_recv() {
-            // Newer list supersedes, but keep servicing union: items in the
-            // old list are also pending on the main side, so finish them —
-            // simplest correct policy: append new items, dedupe.
-            if let Some(cur) = &mut current {
-                cur.list.extend(w.list);
-            }
+            current = Some(w);
         }
-        let Some(mut w) = current.take() else { continue };
-        let mut seen = FxHashSet::default();
-        w.list.retain(|&(l, k)| seen.insert((l, k.depth, k.prefix)));
-        for (layer, key) in w.list {
-            let loaded = load_cell(&*store, layer, key);
-            if done_tx.send(loaded).is_err() {
-                return;
+        let Some(w) = current.take() else { continue };
+        let mut list = w.list;
+        while !list.is_empty() {
+            let n = list.len().min(chunk);
+            let batch: Vec<(Layer, CellKey)> = list.drain(..n).collect();
+            let loaded: Vec<Loaded> = batch.par_iter().map(|&(l, k)| load_cell(&*store, l, k)).collect();
+            for l in loaded {
+                if done_tx.send(l).is_err() {
+                    return;
+                }
             }
-            // Preempt politely between cells if a newer list arrived.
             if let Ok(newer) = want_rx.try_recv() {
                 current = Some(newer);
+                break;
             }
         }
     }
@@ -284,4 +297,49 @@ fn load_cell(store: &dyn CellStore, layer: Layer, key: CellKey) -> Loaded {
         }
     };
     Loaded { layer, key, planes }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A store with nothing in it: every request resolves to Absent, which
+    /// is enough to exercise the residency policy end to end.
+    struct Empty;
+    impl CellStore for Empty {
+        fn get(&self, _rel: &str) -> Option<Vec<u8>> {
+            None
+        }
+    }
+
+    fn settle(r: &mut Residency) {
+        for _ in 0..500 {
+            r.drain();
+            if r.converged() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        panic!("loader never converged");
+    }
+
+    #[test]
+    fn view_only_residency() {
+        let mut r = Residency::new(Arc::new(Empty));
+        let a = CellKey { depth: 8, prefix: 0x3_0000 };
+        let b = CellKey { depth: 8, prefix: 0x3_0001 };
+        r.want(vec![(Layer::Dem, a)], (0, 0));
+        settle(&mut r);
+        assert!(r.dem.map.contains_key(&(8, a.prefix)));
+        // A new view that no longer needs `a`: it's dropped at once, `b` is
+        // requested, and nothing stays pending for the old view.
+        r.want(vec![(Layer::Dem, b)], (0, 0));
+        assert!(!r.dem.map.contains_key(&(8, a.prefix)));
+        assert!(r.pending.contains(&(Layer::Dem, 8, b.prefix)));
+        settle(&mut r);
+        assert!(r.dem.map.contains_key(&(8, b.prefix)));
+        // Re-wanting a resident cell requests nothing.
+        r.want(vec![(Layer::Dem, b)], (0, 0));
+        assert!(r.converged());
+    }
 }
