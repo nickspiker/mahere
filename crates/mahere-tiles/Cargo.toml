@@ -1,0 +1,17 @@
+[package]
+name = "mahere-tiles"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "mahere's cell pipeline: bake DEM + linework into dymaxion-cell VSF rasters (the #pagetable renderer's food)"
+
+[dependencies]
+mahere-coord = { path = "../mahere-coord" }
+mahere-dem = { path = "../mahere-dem" }
+mahere-osm = { path = "../mahere-osm" }
+rayon = "1"
+vsf = { git = "https://github.com/nickspiker/vsf", rev = "5f2bb06c8d96ee417a2571944882ef36d6c9ca8f" }
+
+[dev-dependencies]
+png = "0.17"

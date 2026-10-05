@@ -1400,6 +1400,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "mahere-tiles"
+version = "0.1.0"
+dependencies = [
+ "mahere-coord",
+ "mahere-dem",
+ "mahere-osm",
+ "png",
+ "rayon",
+ "vsf",
+]
+
+[[package]]
 name = "malloc_buf"
 version = "0.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"

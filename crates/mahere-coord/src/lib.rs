@@ -240,6 +240,30 @@ impl Cell {
     }
 }
 
+/// Geographic position of a continuous diamond-UV point (texel centers in
+/// the cell pipeline). Inverse of the encode path's projection, exposed for
+/// bakers that walk cell grids.
+pub fn uv_to_lat_lon(diamond: u8, u: f64, v: f64) -> (f64, f64) {
+    let [a0, q, r, b0] = DIAMONDS[diamond as usize];
+    let fp = if u + v <= 1. {
+        lerp3(VERTICES[a0], VERTICES[q], VERTICES[r], 1. - u - v, u, v)
+    } else {
+        lerp3(VERTICES[b0], VERTICES[q], VERTICES[r], u + v - 1., 1. - v, 1. - u)
+    };
+    let [x, y, z] = normalize(fp);
+    (z.asin().to_degrees(), y.atan2(x).to_degrees())
+}
+
+/// Public Morton helpers for cell-grid math (30-bit axes, u in the higher
+/// bit of each pair — the same layout as [`Coord`]).
+pub fn morton_spread(x: u64) -> u64 {
+    spread(x)
+}
+
+pub fn morton_compact(x: u64) -> u64 {
+    compact(x)
+}
+
 /// Bits kept by a cell at `depth`: the diamond ID plus `2·depth` Morton bits.
 fn prefix_mask(depth: u8) -> u64 {
     // depth 30 keeps everything; !0 << 0 would also work but be explicit.
