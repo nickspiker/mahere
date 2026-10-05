@@ -63,6 +63,13 @@ class MahereActivity : Activity(), SurfaceHolder.Callback, Choreographer.FrameCa
         // Stage bundled DEM tiles into filesDir once (the tiff reader wants
         // real file paths; assets are zip entries).
         thread {
+            // A changed bake stamp means every staged cell is stale: wipe
+            // and restage (per-file existence checks can't see new content).
+            val stamp = runCatching { assets.open("cells/bake-stamp").bufferedReader().readText() }.getOrNull()
+            val staged = java.io.File(filesDir, "cells/bake-stamp")
+            if (stamp != null && (!staged.exists() || staged.readText() != stamp)) {
+                java.io.File(filesDir, "cells").deleteRecursively()
+            }
             stageAssetDir("cells")
             runOnUiThread {
                 assetsStaged = true
