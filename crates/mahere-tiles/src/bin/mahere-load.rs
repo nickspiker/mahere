@@ -55,15 +55,22 @@ fn main() {
     let t = std::time::Instant::now();
     let dem = mahere_dem::DemStore::load(&tifs).expect("dem");
     eprintln!("dem source loaded {:.1}s", t.elapsed().as_secs_f32());
-    for &dem_depth in &dem_depths {
-        let t = std::time::Instant::now();
-        let keys = mahere_tiles::cells_covering(lat0, lon0, lat1, lon1, dem_depth);
-        let baked = mahere_tiles::bake_dem(&dem, &keys);
-        for (key, cell) in &baked {
-            mahere_tiles::write_dem_cell(out, *key, cell).expect("write dem cell");
-        }
-        eprintln!("depth {dem_depth}: {} dem cells, {:.1}s", keys.len(), t.elapsed().as_secs_f32());
+    // Base depth sampled from the source; every coarser depth down to the
+    // minimum is the box-filtered pyramid of it (so ancestors always exist).
+    let dem_base = *dem_depths.iter().max().unwrap();
+    let dem_min = *dem_depths.iter().min().unwrap();
+    let t = std::time::Instant::now();
+    let keys = mahere_tiles::cells_covering(lat0, lon0, lat1, lon1, dem_base);
+    let base = mahere_tiles::bake_dem(&dem, &keys);
+    eprintln!("depth {dem_base}: {} dem cells sampled, {:.1}s", base.len(), t.elapsed().as_secs_f32());
+    let t = std::time::Instant::now();
+    let pyramid = mahere_tiles::dem_pyramid(&base, dem_min);
+    eprintln!("dem pyramid {}..{dem_min}: {} cells, {:.1}s", dem_base - 1, pyramid.len(), t.elapsed().as_secs_f32());
+    let t = std::time::Instant::now();
+    for (key, cell) in base.iter().chain(pyramid.iter()) {
+        mahere_tiles::write_dem_cell(out, *key, cell).expect("write dem cell");
     }
+    eprintln!("dem cells written, {:.1}s", t.elapsed().as_secs_f32());
 
     // Size census.
     let du = std::process::Command::new("du").args(["-sh", out.to_str().unwrap()]).output();

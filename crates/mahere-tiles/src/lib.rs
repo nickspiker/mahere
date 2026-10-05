@@ -46,6 +46,11 @@ impl CellKey {
         CellKey { depth: self.depth - 1, prefix: self.prefix >> 2 }
     }
 
+    /// Ancestor at a shallower `depth` (`depth <= self.depth`).
+    pub fn ancestor(self, depth: u8) -> CellKey {
+        CellKey { depth, prefix: self.prefix >> (2 * (self.depth - depth) as u32) }
+    }
+
     /// Child 0-3 (Morton bit pair: u high, v low).
     pub fn child(self, q: u64) -> CellKey {
         CellKey { depth: self.depth + 1, prefix: (self.prefix << 2) | q }
@@ -249,12 +254,80 @@ pub fn bake_dem(dem: &DemStore, keys: &[CellKey]) -> Vec<(CellKey, DemCell)> {
         .collect()
 }
 
-/// All cells at `depth` that intersect a lat/lon bbox (scanned at half-cell
-/// resolution — fine for the convex boxes bakers use).
+/// Every depth from `base.depth - 1` down to `min_depth`, each cell the
+/// box-filter of its four children (mean of the children's elevations and
+/// gradients, no-data ignored). Building the pyramid from the base set is
+/// what guarantees every ancestor of a baked cell exists.
+pub fn dem_pyramid(base: &[(CellKey, DemCell)], min_depth: u8) -> Vec<(CellKey, DemCell)> {
+    let mut out: Vec<(CellKey, DemCell)> = Vec::new();
+    // Start index of the most recent level inside `out` (None = base).
+    let mut last: Option<usize> = None;
+    loop {
+        let cur: &[(CellKey, DemCell)] = match last {
+            None => base,
+            Some(i) => &out[i..],
+        };
+        let Some(&(k0, _)) = cur.first() else { break };
+        if k0.depth <= min_depth {
+            break;
+        }
+        let mut parents: Vec<CellKey> = cur.iter().map(|(k, _)| k.parent()).collect();
+        parents.sort_by_key(|k| k.prefix);
+        parents.dedup();
+        let by_key: std::collections::HashMap<(u8, u64), &DemCell> =
+            cur.iter().map(|(k, c)| ((k.depth, k.prefix), c)).collect();
+        let next: Vec<(CellKey, DemCell)> = parents
+            .par_iter()
+            .map(|&p| {
+                let mut cell = DemCell {
+                    elev: vec![f32::NAN; TEX * TEX],
+                    ge: vec![0.0; TEX * TEX],
+                    gn: vec![0.0; TEX * TEX],
+                };
+                for q in 0..4u64 {
+                    let ck = p.child(q);
+                    let Some(child) = by_key.get(&(ck.depth, ck.prefix)) else { continue };
+                    let (ox, oy) = (((q >> 1) as usize) * (TEX / 2), ((q & 1) as usize) * (TEX / 2));
+                    for ty in 0..TEX / 2 {
+                        for tx in 0..TEX / 2 {
+                            let (mut e, mut ge, mut gn, mut n) = (0.0f32, 0.0f32, 0.0f32, 0u32);
+                            for (dy, dx) in [(0, 0), (0, 1), (1, 0), (1, 1)] {
+                                let i = (2 * ty + dy) * TEX + 2 * tx + dx;
+                                if !child.elev[i].is_nan() {
+                                    e += child.elev[i];
+                                    ge += child.ge[i];
+                                    gn += child.gn[i];
+                                    n += 1;
+                                }
+                            }
+                            if n > 0 {
+                                let i = (oy + ty) * TEX + ox + tx;
+                                cell.elev[i] = e / n as f32;
+                                cell.ge[i] = ge / n as f32;
+                                cell.gn[i] = gn / n as f32;
+                            }
+                        }
+                    }
+                }
+                (p, cell)
+            })
+            .collect();
+        last = Some(out.len());
+        out.extend(next);
+    }
+    out
+}
+
+/// All cells at `depth` that intersect a lat/lon bbox. Scanned at half-cell
+/// resolution, never coarser than an eighth of the box — a slanted rhombus
+/// cell can cut through a box without containing any corner of it.
 pub fn cells_covering(lat0: f64, lon0: f64, lat1: f64, lon1: f64, depth: u8) -> Vec<CellKey> {
     let mut keys = std::collections::HashSet::new();
     // Half a cell edge in degrees of latitude, as the scan step.
-    let step = (7054_000.0 / (1u64 << depth) as f64) / 111_320.0 / 2.0;
+    let step = ((7054_000.0 / (1u64 << depth) as f64) / 111_320.0 / 2.0)
+        .min((lat1 - lat0) / 8.0)
+        .min((lon1 - lon0) / 8.0)
+        .max(1e-4);
     let mut lat = lat0;
     while lat <= lat1 + step {
         let mut lon = lon0;

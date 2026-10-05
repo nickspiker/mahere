@@ -352,6 +352,17 @@ fn render_block_interp(
             n_line += 1;
         }
     }
+    // Finest ref first: a parent-fallback ref covers its resident fine
+    // siblings' footprints too, so first-match must try the fine cell before
+    // the parent or the block paints coarse where sharp data is resident.
+    dem_refs[..n_dem].sort_by_key(|(_, r)| match r {
+        DemRef::Cell { prefix_shift, .. } => *prefix_shift,
+        DemRef::None => u32::MAX,
+    });
+    line_refs[..n_line].sort_by_key(|(_, r)| match r {
+        LineRef::Cell { prefix_shift, .. } => *prefix_shift,
+        LineRef::None => u32::MAX,
+    });
     let one_cell = n_dem == 1 && n_line == 1;
 
     // Fixed-point steps across the block (divide by BLOCK).
