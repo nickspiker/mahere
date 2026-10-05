@@ -239,7 +239,11 @@ pub extern "system" fn Java_nz_mahere_app_MahereActivity_nativeResize(
     height: jint,
 ) {
     if ptr != 0 {
-        shell(ptr).resize(width as u32, height as u32);
+        let s = shell(ptr);
+        s.resize(width as u32, height as u32);
+        // A restored surface arrives with undefined buffers; same-size
+        // resizes must still repaint everything.
+        s.app().map.mark_dirty();
     }
 }
 

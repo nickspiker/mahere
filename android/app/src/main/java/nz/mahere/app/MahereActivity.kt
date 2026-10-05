@@ -42,9 +42,10 @@ class MahereActivity : Activity(), SurfaceHolder.Callback, Choreographer.FrameCa
     private external fun nativeOnLocation(ptr: Long, lat: Double, lon: Double, accuracy: Float)
 
     private lateinit var surfaceView: SurfaceView
-    private var nativePtr = 0L
+    @Volatile private var nativePtr = 0L
     private var surfaceReady = false
     private var assetsStaged = false
+    private var initInFlight = false
     private var pendingSize: Pair<Int, Int>? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -109,14 +110,39 @@ class MahereActivity : Activity(), SurfaceHolder.Callback, Choreographer.FrameCa
             )
     }
 
+    /// Idempotent frame-loop (re)start — the resume/surfaceChanged ordering
+    /// varies by path (screen-off vs app-switch), so every reentry point
+    /// calls this instead of guessing which event comes last.
+    private fun startFrames() {
+        Choreographer.getInstance().removeFrameCallback(this)
+        if (nativePtr != 0L && surfaceReady) {
+            Choreographer.getInstance().postFrameCallback(this)
+        }
+    }
+
     private fun maybeInit() {
         val (w, h) = pendingSize ?: return
         if (!assetsStaged || !surfaceReady) return
         if (nativePtr == 0L) {
-            nativePtr = nativeInit(w, h, filesDir.absolutePath)
-            Choreographer.getInstance().postFrameCallback(this)
+            if (initInFlight) return
+            initInFlight = true
+            // The first init decodes ~500 MB of GeoTIFF — off the UI thread,
+            // or the app black-screens (and ANRs on touch) for ~30 s.
+            thread {
+                val ptr = nativeInit(w, h, filesDir.absolutePath)
+                runOnUiThread {
+                    nativePtr = ptr
+                    initInFlight = false
+                    // The surface may have changed size during the long init.
+                    pendingSize?.let { (pw, ph) ->
+                        if (pw != w || ph != h) nativeResize(ptr, pw, ph)
+                    }
+                    startFrames()
+                }
+            }
         } else {
             nativeResize(nativePtr, w, h)
+            startFrames()
         }
     }
 
@@ -147,9 +173,7 @@ class MahereActivity : Activity(), SurfaceHolder.Callback, Choreographer.FrameCa
     override fun onResume() {
         super.onResume()
         hideSystemBars()
-        if (nativePtr != 0L && surfaceReady) {
-            Choreographer.getInstance().postFrameCallback(this)
-        }
+        startFrames()
     }
 
     override fun onPause() {
