@@ -1,6 +1,6 @@
-// Diagnostic: the Adams view with dymaxion cell outlines drawn over it —
-// depth-10 dem cell edges in yellow, depth-8 in cyan — so the actual tile
-// footprints (diamond-UV rhombi, not lat/lon rectangles) are visible.
+// Diagnostic: the Adams view with the dymaxion triangle grid drawn over it —
+// depth-10 triangles (cell rhombi split along u+v) in yellow, depth-8 in
+// cyan — so the actual tile footprints are visible.
 use mahere_coord::Coord;
 use mahere_engine::{Camera, MapCore, residency::DirStore};
 
@@ -32,9 +32,14 @@ fn main() {
     }
     map.render(w, h);
     let mut canvas = map.canvas.clone();
+    // Triangle at `depth`: the Morton prefix plus which half of the square.
     let key = |px: usize, py: usize, depth: u8| -> u64 {
         let (lat, lon) = cam.screen_to_geo(px as f64, py as f64, w, h);
-        Coord::from_lat_lon(lat, lon).raw() >> (60 - 2 * depth as u32)
+        let c = Coord::from_lat_lon(lat, lon);
+        let (iu, iv) = c.uv();
+        let m = (1u64 << (30 - depth as u32)) - 1;
+        let half = ((iu & m) + (iv & m)) >> (30 - depth as u32);
+        ((c.raw() >> (60 - 2 * depth as u32)) << 1) | half
     };
     for py in 0..h - 1 {
         for px in 0..w - 1 {

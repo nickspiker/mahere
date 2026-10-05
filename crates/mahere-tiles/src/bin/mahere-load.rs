@@ -25,7 +25,7 @@ fn main() {
     let dem_depths: Vec<u8> = arg(&args, "--dem-depths")
         .or_else(|| arg(&args, "--dem-depth"))
         .map(|v| v.split(',').map(|x| x.parse().unwrap()).collect())
-        .unwrap_or_else(|| vec![12, 10, 8, 6]);
+        .unwrap_or_else(|| vec![11, 6]);
     let tifs: Vec<String> = {
         let i = args.iter().position(|a| a == "--dem").expect("--dem") + 1;
         args[i..].iter().take_while(|a| !a.starts_with("--")).cloned().collect()

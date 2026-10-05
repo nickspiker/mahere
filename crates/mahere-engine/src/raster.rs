@@ -14,7 +14,7 @@ use crate::residency::{DemPacked, ELEV_NODATA, Entry, Layer, LinePlanes, Pool};
 
 pub const BLOCK: usize = 32;
 pub const LINE_BASE_DEPTH: u8 = 13;
-pub const DEM_BASE_DEPTH: u8 = 12;
+pub const DEM_BASE_DEPTH: u8 = 11;
 pub const MIN_DEPTH: u8 = 6;
 
 /// texel/pixel ratio constant: diamond edge 7054 km, 111320 m/deg, 256
@@ -271,6 +271,18 @@ fn raw_of(diamond: u8, uq: i64, vq: i64) -> u64 {
         | mahere_coord::morton_spread((vq >> 16) as u64)
 }
 
+/// Triangle texel index for Q30.16 UV against an entry whose texel grid is
+/// `shift` bits below the UV: the UV square, then which side of `u+v = k`
+/// — the carry of the two fractional parts.
+#[inline(always)]
+pub fn tri_index(uq: i64, vq: i64, shift: u32) -> usize {
+    let tx = ((uq >> shift) & 255) as usize;
+    let ty = ((vq >> shift) & 255) as usize;
+    let m = (1i64 << shift) - 1;
+    let half = ((((uq & m) + (vq & m)) >> shift) & 1) as usize;
+    (((ty << 8) | tx) << 1) | half
+}
+
 #[inline(always)]
 fn compose(
     dem: &DemRef,
@@ -281,9 +293,7 @@ fn compose(
 ) -> u32 {
     let (mut r, mut g, mut b) = (18u32, 20u32, 26u32); // background
     if let DemRef::Cell { planes, shift, .. } = dem {
-        let tx = ((uq >> shift) & 255) as usize;
-        let ty = ((vq >> shift) & 255) as usize;
-        let t = planes.texel[(ty << 8) | tx];
+        let t = planes.texel[tri_index(uq, vq, *shift)];
         let eq = (t & 0xFFFF) as u16;
         if eq != ELEV_NODATA {
             let nx = (t >> 16) as u16 as i16 as f32;
@@ -302,9 +312,7 @@ fn compose(
         }
     }
     if let LineRef::Cell { planes, shift, .. } = line {
-        let tx = ((uq >> shift) & 255) as usize;
-        let ty = ((vq >> shift) & 255) as usize;
-        let i = (ty << 8) | tx;
+        let i = tri_index(uq, vq, *shift);
         let cov = planes.cov[i] as u32;
         if cov != 0 {
             let c = CLASS_LUT[(planes.class[i] as usize).min(12)];
@@ -493,7 +501,7 @@ mod tests {
         // Flat terrain at 1000 m: eq = (1000+500)*4 = 6000, normal = +z.
         let eq = 6000u64;
         let nz = 32767u64;
-        let texel = vec![eq | (nz << 48); mahere_tiles::TEX * mahere_tiles::TEX];
+        let texel = vec![eq | (nz << 48); mahere_tiles::TRI];
         let cam = crate::Camera { lat: 46.2, lon: -121.5, ppd: 6000.0, bearing: 0.0 };
         let c = mahere_coord::Coord::from_lat_lon(cam.lat, cam.lon);
         let prefix = c.raw() >> (60 - 2 * 6);

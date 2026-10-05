@@ -4,12 +4,11 @@
 //! decompresses / decodes / repacks off-thread, and the main thread drains
 //! a channel of finished planes at frame start.
 
-use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, channel};
 
-use mahere_tiles::{CellKey, TEX, decode_cell_fields, tensor_f32, tensor_u8};
+use mahere_tiles::{CellKey, TRI, decode_cell_fields, plane_f32_mem, plane_u8_mem};
 use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
 
@@ -41,7 +40,8 @@ impl Layer {
     }
 }
 
-/// Decoded dem cell, packed one u64 per texel for the hot loop:
+/// Decoded dem cell, packed one u64 per triangle texel for the hot loop
+/// (memory order `((ty << 8 | tx) << 1) | half`):
 /// `[elev_q u16 | nx i16 | ny i16 | nz i16]`, elev_q = (elev + 500) * 4
 /// clamped (0.25 m steps), 0xFFFF = no data. snorm16 normals (i16, not u8:
 /// u8 bands on gentle slopes, exactly where hillshade banding shows).
@@ -260,7 +260,7 @@ fn load_cell(store: &dyn CellStore, layer: Layer, key: CellKey) -> Loaded {
     };
     let planes = match layer {
         Layer::Line => {
-            match (fields.get("class").and_then(tensor_u8), fields.get("cov").and_then(tensor_u8)) {
+            match (fields.get("class").and_then(plane_u8_mem), fields.get("cov").and_then(plane_u8_mem)) {
                 (Some(class), Some(cov)) => Planes::Line(LinePlanes {
                     class: class.into_boxed_slice(),
                     cov: cov.into_boxed_slice(),
@@ -270,14 +270,14 @@ fn load_cell(store: &dyn CellStore, layer: Layer, key: CellKey) -> Loaded {
         }
         Layer::Dem => {
             let (Some(elev), Some(ge), Some(gn)) = (
-                fields.get("elev").and_then(tensor_f32),
-                fields.get("ge").and_then(tensor_f32),
-                fields.get("gn").and_then(tensor_f32),
+                fields.get("elev").and_then(plane_f32_mem),
+                fields.get("ge").and_then(plane_f32_mem),
+                fields.get("gn").and_then(plane_f32_mem),
             ) else {
                 return Loaded { layer, key, planes: Planes::Absent };
             };
-            let mut texel = vec![0u64; TEX * TEX].into_boxed_slice();
-            for i in 0..TEX * TEX {
+            let mut texel = vec![0u64; TRI].into_boxed_slice();
+            for i in 0..TRI {
                 let e = elev[i];
                 let eq: u16 = if e.is_nan() {
                     ELEV_NODATA

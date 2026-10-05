@@ -46,15 +46,20 @@ Early. Working today:
 - `mahere-dem` — the raster elevation boundary: USGS 3DEP GeoTIFFs in,
   bilinear elevation + gradient queries out.
 - `mahere-tiles` + `mahere-load` — the bake: sources in, dymaxion **cells**
-  out. A cell is 256×256 texels of one diamond-Morton prefix, a VSF file
-  (whole-file zstd) at `{layer}/{depth}/{prefix}.vsf.zst` — a layout that is
-  also the future object-store bucket. The `dem` layer is elevation +
-  gradient sampled from the GeoTIFF at the base depth, then a box-filtered
-  pyramid of it down to depth 6; the `line` layer is every road, trail and
-  stream stamped one texel wide at depth 13 as (class, coverage) texels, with
-  each parent texel the average of its four children — coverage up the
-  pyramid is exact box filtering, so minor ways fade and towns glow with no
-  styling tricks and no aliasing.
+  out. A cell is one diamond-Morton rhombus whose texels are **triangles**:
+  the icosahedron's own subdivision, 256×256 UV squares each split into a
+  lower and an upper equilateral triangle (131072 texels), stored as a VSF
+  file (whole-file zstd) at `{layer}/{depth}/{prefix}.vsf.zst` — a layout
+  that is also the future object-store bucket. Triangles matter: the tiling
+  has 6-fold symmetry and a line always crosses it edge-to-edge, so linework
+  is isotropic (a rhombus grid draws +45° and −45° roads differently). The
+  `dem` layer is elevation + gradient sampled at each triangle's centroid at
+  the base depth, then a pyramid down to depth 6 where every texel is the
+  mean of its four children — three corners and the inverted center; the
+  `line` layer is every road, trail and stream stamped into the triangles it
+  crosses at depth 13 as (class, coverage) texels, averaged up the same way —
+  coverage up the pyramid is exact box filtering, so minor ways fade and
+  towns glow with no styling tricks and no aliasing.
 - `mahere-engine` — the `#pagetable` renderer. Pure raster: a frame is
   fetches. A 32 px block grid gets exact screen→diamond-UV corners; inside
   a block UV steps in Q30.16 fixed point; each block resolves its cell(s)
@@ -89,11 +94,11 @@ curl -L -o data/USGS_13_n47w122.tif \
   "https://prd-tnm.s3.amazonaws.com/StagedProducts/Elevation/13/TIFF/current/n47w122/USGS_13_n47w122.tif"
 
 # Bake cells for a lat/lon box (Mount Adams here): line pyramid 13..6,
-# dem sampled at depth 12 with its pyramid down to 6.
+# dem sampled at depth 11 (10 m source) with its pyramid down to 6.
 cargo run --release -p mahere-tiles --bin mahere-load -- \
   --pbf data/washington-latest.osm.pbf --out data/cells \
   --bbox 46.0,-121.75,46.35,-121.30 --line-base 13 --line-min 6 \
-  --dem-depths 12,6 --dem data/USGS_13_n47w122.tif
+  --dem-depths 11,6 --dem data/USGS_13_n47w122.tif
 
 cargo run --release -p mahere-app   # Linux/macOS; reads data/cells
 cargo test                          # coordinates, tiles, engine, store

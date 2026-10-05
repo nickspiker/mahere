@@ -5,16 +5,33 @@
 //!   source DEM at bake time (so cell-edge gradients are exact — the baker
 //!   holds the whole source; no aprons needed).
 //! - **line**: the linework pyramid. Every line feature stamped 1 texel wide
-//!   at the base depth, then parents built by averaging 4 children per
-//!   texel up the Morton tree — coverage IS box filtering, so opacity at
-//!   every zoom is computed, not styled. No vectors exist at render time.
+//!   at the base depth, then parents built by averaging the 4 children of
+//!   each texel up the triangle tree — coverage IS box filtering, so opacity
+//!   at every zoom is computed, not styled. No vectors exist at render time.
+//!
+//! **Texels are triangles.** A cell is one rhombus of the diamond-Morton
+//! grid (`depth`), and its texels are the triangular subdivision of that
+//! rhombus's two faces: 256×256 UV squares, each split along `u+v = k` into
+//! a lower and an upper equilateral triangle. The triangular tiling has
+//! 6-fold symmetry and a line always crosses it edge-to-edge, so linework
+//! is isotropic; a square/rhombus texel grid is not (a line along one
+//! diagonal touches rhombi tip-to-tip, along the other obtuse-to-obtuse).
+//! Each triangle subdivides into four — three corners and the inverted
+//! center — and that is the pyramid's box filter.
+//!
+//! In memory a cell's planes are indexed `((ty << 8 | tx) << 1) | half`
+//! (the renderer's stepping order). On disk they are in triangle-path
+//! order, `[face half][2 bits per level]` — the triangle code — so a
+//! parent texel's four children are contiguous. [`disk_to_mem`] /
+//! [`mem_to_disk`] convert.
 //!
 //! Texels are (class, coverage) so styling stays a draw-time LUT. Cells are
-//! 256x256, written as VSF at `{layer}/{depth:02}/{prefix:016x}.vsf` —
+//! written as zstd'd VSF at `{layer}/{depth:02}/{prefix:016x}.vsf.zst` —
 //! a directory layout that is byte-for-byte the future R2 bucket layout.
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::OnceLock;
 
 use mahere_coord::{Coord, morton_compact, morton_spread, uv_to_lat_lon};
 use mahere_dem::DemStore;
@@ -23,9 +40,11 @@ use rayon::prelude::*;
 use vsf::types::Tensor;
 use vsf::{VsfBuilder, VsfType};
 
-/// Cells are TEX x TEX texels; TEX_BITS of Morton depth below the cell.
+/// Cells are TEX x TEX UV squares; TEX_BITS of Morton depth below the cell.
 pub const TEX: usize = 256;
 pub const TEX_BITS: u8 = 8;
+/// Texels per cell: two triangles per UV square.
+pub const TRI: usize = 2 * TEX * TEX;
 
 /// A cell address: dymaxion Morton prefix (diamond in the top 4 bits of the
 /// full-resolution coordinate, right-aligned here) at `depth`.
@@ -83,6 +102,90 @@ impl CellKey {
     }
 }
 
+// ==================== TRIANGLE TEXELS ====================
+
+/// Memory index of triangle texel (tx, ty, half) in a cell.
+#[inline(always)]
+pub fn tri_idx(tx: usize, ty: usize, half: usize) -> usize {
+    (((ty << TEX_BITS) | tx) << 1) | half
+}
+
+/// Triangle texel containing a point given in texel units within the cell
+/// (or any grid): the UV square plus which side of `u+v = k` it lies on.
+#[inline(always)]
+pub fn tri_at(gx: f64, gy: f64) -> (usize, usize, usize) {
+    let (tx, ty) = (gx.floor(), gy.floor());
+    let half = ((gx - tx) + (gy - ty) >= 1.0) as usize;
+    (tx as usize, ty as usize, half)
+}
+
+/// UV position of a triangle texel's centroid, in texel units.
+#[inline(always)]
+pub fn tri_centroid(tx: usize, ty: usize, half: usize) -> (f64, f64) {
+    let off = if half == 0 { 1.0 / 3.0 } else { 2.0 / 3.0 };
+    (tx as f64 + off, ty as f64 + off)
+}
+
+/// The four children of triangle (tx, ty, half) on the next-finer grid, in
+/// code-digit order: 0 apex, 1 toward r (+v), 2 toward q (+u), 3 the
+/// inverted center — which lives in the apex's UV square with the opposite
+/// orientation. A lower triangle's apex is its square's (0,0) corner, an
+/// upper's is (1,1).
+#[inline]
+pub fn tri_children(tx: usize, ty: usize, half: usize) -> [(usize, usize, usize); 4] {
+    let (x, y) = (2 * tx, 2 * ty);
+    if half == 0 {
+        [(x, y, 0), (x, y + 1, 0), (x + 1, y, 0), (x, y, 1)]
+    } else {
+        [(x + 1, y + 1, 1), (x, y + 1, 1), (x + 1, y, 1), (x + 1, y + 1, 0)]
+    }
+}
+
+/// Parent-cell texel -> its four children as (child cell Morton digit,
+/// memory index in that child cell).
+#[inline]
+fn child_cell_texels(tx: usize, ty: usize, half: usize) -> [(u64, usize); 4] {
+    tri_children(tx, ty, half).map(|(cx, cy, ch)| {
+        let q = (((cx >> TEX_BITS) as u64) << 1) | (cy >> TEX_BITS) as u64;
+        (q, tri_idx(cx & (TEX - 1), cy & (TEX - 1), ch))
+    })
+}
+
+/// Disk order (triangle path) -> memory index, both halves.
+fn tri_order() -> &'static [u32] {
+    static ORDER: OnceLock<Box<[u32]>> = OnceLock::new();
+    ORDER.get_or_init(|| {
+        let mut to_mem = vec![0u32; TRI].into_boxed_slice();
+        fn descend(level: u8, tx: usize, ty: usize, half: usize, path: usize, out: &mut [u32]) {
+            if level == TEX_BITS {
+                out[path] = tri_idx(tx, ty, half) as u32;
+                return;
+            }
+            for (d, (cx, cy, ch)) in tri_children(tx, ty, half).into_iter().enumerate() {
+                descend(level + 1, cx, cy, ch, (path << 2) | d, out);
+            }
+        }
+        for face in 0..2 {
+            descend(0, 0, 0, face, face, &mut to_mem);
+        }
+        to_mem
+    })
+}
+
+pub fn mem_to_disk<T: Copy>(mem: &[T]) -> Vec<T> {
+    debug_assert_eq!(mem.len(), TRI);
+    tri_order().iter().map(|&m| mem[m as usize]).collect()
+}
+
+pub fn disk_to_mem<T: Copy + Default>(disk: &[T]) -> Vec<T> {
+    debug_assert_eq!(disk.len(), TRI);
+    let mut mem = vec![T::default(); TRI];
+    for (d, &m) in tri_order().iter().enumerate() {
+        mem[m as usize] = disk[d];
+    }
+    mem
+}
+
 /// Global texel coordinates of a Coord at a given base depth: the texel grid
 /// is the cell grid times TEX.
 fn texel_of(c: Coord, depth: u8) -> (u8, u64, f64, f64) {
@@ -101,7 +204,7 @@ pub struct LineCell {
 
 impl LineCell {
     fn new() -> LineCell {
-        LineCell { class: vec![0; TEX * TEX], cov: vec![0; TEX * TEX] }
+        LineCell { class: vec![0; TRI], cov: vec![0; TRI] }
     }
 }
 
@@ -134,52 +237,50 @@ pub fn bake_lines(
     if cross_diamond > 0 {
         eprintln!("  (skipped {cross_diamond} cross-diamond segments)");
     }
-    // Pyramid: average coverage, keep the most major class present.
+    // Pyramid: each parent texel the mean coverage of its four triangle
+    // children (missing children are empty), keeping the most major class.
     let mut depth = base_depth;
     while depth > min_depth {
-        let child_keys: Vec<CellKey> =
-            cells.keys().filter(|k| k.depth == depth).copied().collect();
-        for key in child_keys {
-            let parent = key.parent();
-            let q = key.prefix & 3;
-            let (ox, oy) = (((q >> 1) & 1) as usize * (TEX / 2), (q & 1) as usize * (TEX / 2));
-            // Read child quad sums first (borrow discipline), then write.
-            let mut patch = vec![(0u8, 0u16); (TEX / 2) * (TEX / 2)];
-            {
-                let child = &cells[&key];
-                for ty in 0..TEX / 2 {
-                    for tx in 0..TEX / 2 {
-                        let mut covsum = 0u16;
-                        let mut best = 0u8;
-                        for (sx, sy) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
-                            let i = (ty * 2 + sy) * TEX + tx * 2 + sx;
-                            covsum += child.cov[i] as u16;
-                            let cl = child.class[i];
-                            if cl != 0 && (best == 0 || cl < best) {
-                                best = cl;
+        let mut parents: Vec<CellKey> =
+            cells.keys().filter(|k| k.depth == depth).map(|k| k.parent()).collect();
+        parents.sort_by_key(|k| k.prefix);
+        parents.dedup();
+        let built: Vec<(CellKey, LineCell)> = parents
+            .par_iter()
+            .map(|&p| {
+                let kids: [Option<&LineCell>; 4] = std::array::from_fn(|q| cells.get(&p.child(q as u64)));
+                let mut cell = LineCell::new();
+                for ty in 0..TEX {
+                    for tx in 0..TEX {
+                        for half in 0..2 {
+                            let mut covsum = 0u16;
+                            let mut best = 0u8;
+                            for (q, i) in child_cell_texels(tx, ty, half) {
+                                let Some(child) = kids[q as usize] else { continue };
+                                covsum += child.cov[i] as u16;
+                                let cl = child.class[i];
+                                if cl != 0 && (best == 0 || cl < best) {
+                                    best = cl;
+                                }
                             }
+                            let i = tri_idx(tx, ty, half);
+                            cell.cov[i] = (covsum / 4) as u8;
+                            cell.class[i] = best;
                         }
-                        patch[ty * (TEX / 2) + tx] = (best, covsum / 4);
                     }
                 }
-            }
-            let p = cells.entry(parent).or_insert_with(LineCell::new);
-            for ty in 0..TEX / 2 {
-                for tx in 0..TEX / 2 {
-                    let (best, cov) = patch[ty * (TEX / 2) + tx];
-                    let i = (oy + ty) * TEX + ox + tx;
-                    p.cov[i] = cov as u8;
-                    if best != 0 && (p.class[i] == 0 || best < p.class[i]) {
-                        p.class[i] = best;
-                    }
-                }
-            }
-        }
+                (p, cell)
+            })
+            .collect();
+        cells.extend(built);
         depth -= 1;
     }
     cells
 }
 
+/// Walk the triangles a segment crosses — every crossing of a `u = k`,
+/// `v = k` or `u + v = k` lattice line enters a new triangle — and stamp
+/// each one. Edge-to-edge in every direction: no corner-touching diagonals.
 #[allow(clippy::too_many_arguments)]
 fn stamp_segment(
     cells: &mut HashMap<CellKey, LineCell>,
@@ -191,24 +292,40 @@ fn stamp_segment(
     y1: f64,
     class: u8,
 ) {
-    let steps = ((x1 - x0).abs().max((y1 - y0).abs()) * 2.0).ceil().max(1.0) as usize;
-    let grid = 1u64 << depth;
-    for i in 0..=steps {
-        let t = i as f64 / steps as f64;
-        let gx = x0 + (x1 - x0) * t;
-        let gy = y0 + (y1 - y0) * t;
-        let (cu, tu) = ((gx as u64) / TEX as u64, (gx as u64) % TEX as u64);
-        let (cv, tv) = ((gy as u64) / TEX as u64, (gy as u64) % TEX as u64);
-        if cu >= grid || cv >= grid {
+    let extent = ((1u64 << depth) * TEX as u64) as f64;
+    let mut ts = vec![0.0f64, 1.0];
+    for (a0, a1) in [(x0, x1), (y0, y1), (x0 + y0, x1 + y1)] {
+        if a0 == a1 {
             continue;
         }
+        let (lo, hi) = (a0.min(a1), a0.max(a1));
+        for k in (lo.floor() as i64 + 1)..=(hi.ceil() as i64 - 1) {
+            let t = (k as f64 - a0) / (a1 - a0);
+            if t > 0.0 && t < 1.0 {
+                ts.push(t);
+            }
+        }
+    }
+    ts.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    for w in ts.windows(2) {
+        if w[1] - w[0] < 1e-12 {
+            continue;
+        }
+        let t = (w[0] + w[1]) * 0.5;
+        let gx = x0 + (x1 - x0) * t;
+        let gy = y0 + (y1 - y0) * t;
+        if gx < 0.0 || gy < 0.0 || gx >= extent || gy >= extent {
+            continue;
+        }
+        let (tx, ty, half) = tri_at(gx, gy);
+        let (cu, cv) = ((tx / TEX) as u64, (ty / TEX) as u64);
         let m = (morton_spread(cu << (30 - depth as u32)) << 1)
             | morton_spread(cv << (30 - depth as u32));
         let prefix = ((diamond as u64) << (2 * depth)) | (m >> (60 - 2 * depth as u32));
         let cell = cells
             .entry(CellKey { depth, prefix })
             .or_insert_with(LineCell::new);
-        let i = tv as usize * TEX + tu as usize;
+        let i = tri_idx(tx % TEX, ty % TEX, half);
         cell.cov[i] = 255;
         if cell.class[i] == 0 || class < cell.class[i] {
             cell.class[i] = class;
@@ -218,34 +335,39 @@ fn stamp_segment(
 
 // ==================== DEM LAYER ====================
 
+#[derive(Clone)]
 pub struct DemCell {
     pub elev: Vec<f32>,
     pub ge: Vec<f32>,
     pub gn: Vec<f32>,
 }
 
-/// Bake dem cells covering `keys` from the source store.
+impl DemCell {
+    fn new() -> DemCell {
+        DemCell { elev: vec![f32::NAN; TRI], ge: vec![0.0; TRI], gn: vec![0.0; TRI] }
+    }
+}
+
+/// Bake dem cells covering `keys` from the source store: each triangle
+/// texel sampled at its centroid.
 pub fn bake_dem(dem: &DemStore, keys: &[CellKey]) -> Vec<(CellKey, DemCell)> {
     keys.par_iter()
         .map(|&key| {
             let (u0, v0, size) = key.uv_rect();
             let d = key.diamond();
             let step = size / TEX as f64;
-            let mut cell = DemCell {
-                elev: vec![f32::NAN; TEX * TEX],
-                ge: vec![0.0; TEX * TEX],
-                gn: vec![0.0; TEX * TEX],
-            };
+            let mut cell = DemCell::new();
             for ty in 0..TEX {
                 for tx in 0..TEX {
-                    let u = u0 + (tx as f64 + 0.5) * step;
-                    let v = v0 + (ty as f64 + 0.5) * step;
-                    let (lat, lon) = uv_to_lat_lon(d, u, v);
-                    if let Some((e, (ge, gn))) = dem.elev_and_gradient(lat, lon) {
-                        let i = ty * TEX + tx;
-                        cell.elev[i] = e;
-                        cell.ge[i] = ge;
-                        cell.gn[i] = gn;
+                    for half in 0..2 {
+                        let (cx, cy) = tri_centroid(tx, ty, half);
+                        let (lat, lon) = uv_to_lat_lon(d, u0 + cx * step, v0 + cy * step);
+                        if let Some((e, (ge, gn))) = dem.elev_and_gradient(lat, lon) {
+                            let i = tri_idx(tx, ty, half);
+                            cell.elev[i] = e;
+                            cell.ge[i] = ge;
+                            cell.gn[i] = gn;
+                        }
                     }
                 }
             }
@@ -254,10 +376,10 @@ pub fn bake_dem(dem: &DemStore, keys: &[CellKey]) -> Vec<(CellKey, DemCell)> {
         .collect()
 }
 
-/// Every depth from `base.depth - 1` down to `min_depth`, each cell the
-/// box-filter of its four children (mean of the children's elevations and
-/// gradients, no-data ignored). Building the pyramid from the base set is
-/// what guarantees every ancestor of a baked cell exists.
+/// Every depth from `base.depth - 1` down to `min_depth`, each texel the
+/// mean of its four triangle children (no-data ignored). Building the
+/// pyramid from the base set is what guarantees every ancestor of a baked
+/// cell exists.
 pub fn dem_pyramid(base: &[(CellKey, DemCell)], min_depth: u8) -> Vec<(CellKey, DemCell)> {
     let mut out: Vec<(CellKey, DemCell)> = Vec::new();
     // Start index of the most recent level inside `out` (None = base).
@@ -274,25 +396,20 @@ pub fn dem_pyramid(base: &[(CellKey, DemCell)], min_depth: u8) -> Vec<(CellKey, 
         let mut parents: Vec<CellKey> = cur.iter().map(|(k, _)| k.parent()).collect();
         parents.sort_by_key(|k| k.prefix);
         parents.dedup();
-        let by_key: std::collections::HashMap<(u8, u64), &DemCell> =
+        let by_key: HashMap<(u8, u64), &DemCell> =
             cur.iter().map(|(k, c)| ((k.depth, k.prefix), c)).collect();
         let next: Vec<(CellKey, DemCell)> = parents
             .par_iter()
             .map(|&p| {
-                let mut cell = DemCell {
-                    elev: vec![f32::NAN; TEX * TEX],
-                    ge: vec![0.0; TEX * TEX],
-                    gn: vec![0.0; TEX * TEX],
-                };
-                for q in 0..4u64 {
-                    let ck = p.child(q);
-                    let Some(child) = by_key.get(&(ck.depth, ck.prefix)) else { continue };
-                    let (ox, oy) = (((q >> 1) as usize) * (TEX / 2), ((q & 1) as usize) * (TEX / 2));
-                    for ty in 0..TEX / 2 {
-                        for tx in 0..TEX / 2 {
+                let kids: [Option<&&DemCell>; 4] =
+                    std::array::from_fn(|q| by_key.get(&(p.depth + 1, p.child(q as u64).prefix)));
+                let mut cell = DemCell::new();
+                for ty in 0..TEX {
+                    for tx in 0..TEX {
+                        for half in 0..2 {
                             let (mut e, mut ge, mut gn, mut n) = (0.0f32, 0.0f32, 0.0f32, 0u32);
-                            for (dy, dx) in [(0, 0), (0, 1), (1, 0), (1, 1)] {
-                                let i = (2 * ty + dy) * TEX + 2 * tx + dx;
+                            for (q, i) in child_cell_texels(tx, ty, half) {
+                                let Some(child) = kids[q as usize] else { continue };
                                 if !child.elev[i].is_nan() {
                                     e += child.elev[i];
                                     ge += child.ge[i];
@@ -301,7 +418,7 @@ pub fn dem_pyramid(base: &[(CellKey, DemCell)], min_depth: u8) -> Vec<(CellKey, 
                                 }
                             }
                             if n > 0 {
-                                let i = (oy + ty) * TEX + ox + tx;
+                                let i = tri_idx(tx, ty, half);
                                 cell.elev[i] = e / n as f32;
                                 cell.ge[i] = ge / n as f32;
                                 cell.gn[i] = gn / n as f32;
@@ -347,6 +464,14 @@ pub fn cells_covering(lat0: f64, lon0: f64, lat1: f64, lon1: f64, depth: u8) -> 
 
 // ==================== VSF I/O ====================
 
+fn plane_u8(mem: &[u8]) -> VsfType {
+    VsfType::t_u3(Tensor::new(vec![2, TEX * TEX], mem_to_disk(mem)))
+}
+
+fn plane_f32(mem: &[f32]) -> VsfType {
+    VsfType::t_f5(Tensor::new(vec![2, TEX * TEX], mem_to_disk(mem)))
+}
+
 pub fn write_line_cell(out: &Path, key: CellKey, cell: &LineCell) -> Result<(), String> {
     let bytes = VsfBuilder::new()
         .add_section(
@@ -354,8 +479,8 @@ pub fn write_line_cell(out: &Path, key: CellKey, cell: &LineCell) -> Result<(), 
             vec![
                 ("depth".to_string(), VsfType::u(key.depth as usize, false)),
                 ("prefix".to_string(), VsfType::u(key.prefix as usize, false)),
-                ("class".to_string(), VsfType::t_u3(Tensor::new(vec![TEX, TEX], cell.class.clone()))),
-                ("cov".to_string(), VsfType::t_u3(Tensor::new(vec![TEX, TEX], cell.cov.clone()))),
+                ("class".to_string(), plane_u8(&cell.class)),
+                ("cov".to_string(), plane_u8(&cell.cov)),
             ],
         )
         .build()
@@ -370,9 +495,9 @@ pub fn write_dem_cell(out: &Path, key: CellKey, cell: &DemCell) -> Result<(), St
             vec![
                 ("depth".to_string(), VsfType::u(key.depth as usize, false)),
                 ("prefix".to_string(), VsfType::u(key.prefix as usize, false)),
-                ("elev".to_string(), VsfType::t_f5(Tensor::new(vec![TEX, TEX], cell.elev.clone()))),
-                ("ge".to_string(), VsfType::t_f5(Tensor::new(vec![TEX, TEX], cell.ge.clone()))),
-                ("gn".to_string(), VsfType::t_f5(Tensor::new(vec![TEX, TEX], cell.gn.clone()))),
+                ("elev".to_string(), plane_f32(&cell.elev)),
+                ("ge".to_string(), plane_f32(&cell.ge)),
+                ("gn".to_string(), plane_f32(&cell.gn)),
             ],
         )
         .build()
@@ -416,21 +541,25 @@ pub fn decode_cell_fields(data: &[u8]) -> Result<HashMap<String, VsfType>, Strin
         .collect())
 }
 
-pub fn tensor_u8(v: &VsfType) -> Option<Vec<u8>> {
-    match v {
-        VsfType::t_u3(t) => Some(t.data.clone()),
-        VsfType::v_u3(t) => Some(t.data.clone()),
-        _ => None,
-    }
+/// A u8 plane in memory order, or None if missing/malformed.
+pub fn plane_u8_mem(v: &VsfType) -> Option<Vec<u8>> {
+    let disk = match v {
+        VsfType::t_u3(t) => &t.data,
+        VsfType::v_u3(t) => &t.data,
+        _ => return None,
+    };
+    (disk.len() == TRI).then(|| disk_to_mem(disk))
 }
 
-pub fn tensor_f32(v: &VsfType) -> Option<Vec<f32>> {
-    match v {
-        VsfType::t_f5(t) => Some(t.data.clone()),
-        VsfType::v_f5(t) => Some(t.data.clone()),
-        VsfType::t_f6(t) => Some(t.data.iter().map(|&x| x as f32).collect()),
-        _ => None,
-    }
+/// An f32 plane in memory order, or None if missing/malformed.
+pub fn plane_f32_mem(v: &VsfType) -> Option<Vec<f32>> {
+    let disk: Vec<f32> = match v {
+        VsfType::t_f5(t) => t.data.clone(),
+        VsfType::v_f5(t) => t.data.clone(),
+        VsfType::t_f6(t) => t.data.iter().map(|&x| x as f32).collect(),
+        _ => return None,
+    };
+    (disk.len() == TRI).then(|| disk_to_mem(&disk))
 }
 
 #[cfg(test)]
@@ -450,6 +579,52 @@ mod tests {
             assert!(v >= v0 && v < v0 + size);
             assert_eq!(key.parent().child((key.prefix & 3) as u64), key);
         }
+    }
+
+    /// Children partition the parent: every triangle at the fine grid is
+    /// the child of exactly one triangle at the coarse grid.
+    #[test]
+    fn triangle_children_partition() {
+        let n = 8usize;
+        let mut seen = vec![0u8; 2 * (2 * n) * (2 * n)];
+        for ty in 0..n {
+            for tx in 0..n {
+                for half in 0..2 {
+                    for (cx, cy, ch) in tri_children(tx, ty, half) {
+                        assert!(cx < 2 * n && cy < 2 * n);
+                        seen[((cy * 2 * n) + cx) * 2 + ch] += 1;
+                    }
+                }
+            }
+        }
+        assert!(seen.iter().all(|&s| s == 1), "children overlap or leave gaps");
+        // The center child really is the apex square with flipped orientation,
+        // and its centroid is the parent's centroid.
+        let (px, py) = tri_centroid(3, 5, 0);
+        let (cx, cy, ch) = tri_children(3, 5, 0)[3];
+        let (qx, qy) = tri_centroid(cx, cy, ch);
+        assert!(((qx / 2.0) - px).abs() < 1e-12 && ((qy / 2.0) - py).abs() < 1e-12);
+    }
+
+    #[test]
+    fn disk_order_is_a_bijection() {
+        let order = tri_order();
+        let mut hit = vec![false; TRI];
+        for &m in order.iter() {
+            assert!(!hit[m as usize]);
+            hit[m as usize] = true;
+        }
+        assert!(hit.iter().all(|&h| h));
+        // A parent texel's four children are contiguous in disk order.
+        let mem: Vec<u32> = (0..TRI as u32).collect();
+        let disk = mem_to_disk(&mem);
+        assert_eq!(disk_to_mem(&disk), mem);
+        // Disk index 0..4 of face 0 are the four children of the level-7
+        // apex chain: they share the (0,0) square or its neighbors.
+        let first: Vec<usize> = disk[..4].iter().map(|&m| m as usize).collect();
+        let (tx, ty, h) = (0, 0, 0);
+        let kids: Vec<usize> = tri_children(tx, ty, h).iter().map(|&(x, y, c)| tri_idx(x, y, c)).collect();
+        assert_eq!(first, kids);
     }
 
     #[test]
@@ -484,5 +659,24 @@ mod tests {
             (0.7..=1.5).contains(&(ratio / 16.0)),
             "coverage not conserved through 2 levels: base {base_cov} top {top_cov}"
         );
+    }
+
+    /// Lines in the two diagonal directions stamp the same number of
+    /// triangles per unit length — the isotropy the rhombus grid lacked.
+    #[test]
+    fn diagonal_lines_are_isotropic() {
+        let mut cells = HashMap::new();
+        let len = 100.0;
+        stamp_segment(&mut cells, 12, 3, 10.0, 10.0, 10.0 + len, 10.0 + len, 1);
+        let plus: usize = cells.values().map(|c| c.cov.iter().filter(|&&x| x > 0).count()).sum();
+        let mut cells = HashMap::new();
+        stamp_segment(&mut cells, 12, 3, 10.0, 110.0, 10.0 + len, 110.0 - len, 1);
+        let minus: usize = cells.values().map(|c| c.cov.iter().filter(|&&x| x > 0).count()).sum();
+        assert!(plus > 0 && minus > 0);
+        // In UV units (1,1) is the rhombus's long diagonal, sqrt(3) times
+        // the ground length of (1,-1): per unit of ground the two stamp the
+        // same number of triangles within the lattice's inherent 2/sqrt(3).
+        let r = plus as f64 / 3f64.sqrt() / minus as f64;
+        assert!((0.8..=1.25).contains(&r), "+45 stamped {plus} triangles, -45 stamped {minus}");
     }
 }

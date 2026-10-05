@@ -13,7 +13,7 @@ use std::time::Instant;
 use mahere_coord::Coord;
 use mahere_tiles::TEX;
 use raster::{DEM_BASE_DEPTH, FrameLuts, LINE_BASE_DEPTH, build_hypso_lut, select_depth};
-use residency::{CellStore, Entry, Layer, Residency};
+use residency::{CellStore, Entry, Residency};
 
 pub const PPD_REF: f64 = 6000.;
 pub const BG_RGB: u32 = 0x12141A;
@@ -193,10 +193,9 @@ impl MapCore {
         for depth in (raster::MIN_DEPTH..=DEM_BASE_DEPTH).rev() {
             let prefix = raw >> (60 - 2 * depth as u32);
             if let Some(Entry::Dem(p)) = self.res.dem.map.get(&(depth, prefix)) {
-                let shift = 22 - depth as u32;
-                let tx = ((iu >> shift) & 255) as usize;
-                let ty = ((iv >> shift) & 255) as usize;
-                let eq = (p.texel[(ty << 8) | tx] & 0xFFFF) as u16;
+                let shift = 16 + (22 - depth as u32);
+                let i = raster::tri_index((iu as i64) << 16, (iv as i64) << 16, shift);
+                let eq = (p.texel[i] & 0xFFFF) as u16;
                 if eq != residency::ELEV_NODATA {
                     return Some(eq as f32 / 4.0 - 500.0);
                 }

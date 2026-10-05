@@ -287,6 +287,61 @@ pub fn morton_compact(x: u64) -> u64 {
     compact(x)
 }
 
+/// Levels of triangle subdivision carried by [`Coord::tri_code`].
+pub const TRI_LEVELS: u32 = 29;
+
+impl Coord {
+    /// The triangle code of this position — the icosahedron's own
+    /// hierarchy: `[4 bits diamond][1 bit face: upper][2 bits × 29 levels]`,
+    /// each digit naming the sub-triangle (0 apex, 1 toward r, 2 toward q,
+    /// 3 the inverted center), so truncating the code gives the containing
+    /// triangle at that depth. Every depth-k triangle is one half of a
+    /// depth-k Morton rhombus — which half is whether the fractional parts
+    /// of u and v sum past 1, i.e. the carry of `u + v` at that bit. So the
+    /// code is a bit-parallel function of the Morton form and the two are
+    /// the same hierarchy: no base-20 arithmetic anywhere.
+    pub fn tri_code(self) -> u64 {
+        let (iu, iv) = self.uv();
+        let m30 = (1u64 << 30) - 1;
+        // Bit p of `carries` = carry into bit p of u + v.
+        let carries = (iu + iv) ^ iu ^ iv;
+        let face = (carries >> 30) & 1;
+        // Level j's half flips relative to level j-1 exactly where the
+        // point descended into a center child.
+        let flip = (carries ^ (carries >> 1)) & m30;
+        let eq = !(iu ^ iv) & m30;
+        let morton = (spread(iu) << 1) | spread(iv);
+        let sel = spread(eq) * 3;
+        let digits = (morton & !sel) | (spread(eq & flip) * 3);
+        ((self.diamond() as u64) << 59) | (face << 58) | (digits >> 2)
+    }
+
+    /// Inverse of [`tri_code`](Self::tri_code): a Coord inside the coded
+    /// depth-29 triangle (its apex-most Morton position at depth 30).
+    pub fn from_tri_code(code: u64) -> Coord {
+        let diamond = (code >> 59) as u64;
+        let mut half = (code >> 58) & 1;
+        let (mut iu, mut iv) = (0u64, 0u64);
+        for level in 0..TRI_LEVELS {
+            let d = (code >> (56 - 2 * level)) & 3;
+            let (ub, vb) = match d {
+                1 => (0, 1),
+                2 => (1, 0),
+                _ => (half, half),
+            };
+            if d == 3 {
+                half ^= 1;
+            }
+            iu = (iu << 1) | ub;
+            iv = (iv << 1) | vb;
+        }
+        // Depth-30 bits: (1,1) lands in the upper half, (0,0) in the lower.
+        iu = (iu << 1) | half;
+        iv = (iv << 1) | half;
+        Coord((diamond << MORTON_BITS) | (spread(iu) << 1) | spread(iv))
+    }
+}
+
 /// Bits kept by a cell at `depth`: the diamond ID plus `2·depth` Morton bits.
 fn prefix_mask(depth: u8) -> u64 {
     // depth 30 keeps everything; !0 << 0 would also work but be explicit.
@@ -515,5 +570,83 @@ mod tests {
     fn resolution_floor_is_sub_centimeter() {
         assert!(cell_edge_m(MAX_DEPTH) < 0.01);
         assert!(cell_edge_m(MAX_DEPTH) > 0.004);
+    }
+}
+
+#[cfg(test)]
+mod tri_tests {
+    use super::*;
+
+    /// Reference: descend the triangle tree in floating point, one level at
+    /// a time, with the barycentric rule (apex if that corner's weight
+    /// exceeds 1/2, else center).
+    fn float_tri_code(c: Coord) -> u64 {
+        let (iu, iv) = c.uv();
+        let (mut u, mut v) = (iu as f64 / 2f64.powi(30), iv as f64 / 2f64.powi(30));
+        let mut upper = u + v >= 1.0;
+        let mut code = ((c.diamond() as u64) << 59) | ((upper as u64) << 58);
+        for level in 0..TRI_LEVELS {
+            // Local coords within the current UV square, doubled.
+            let (lu, lv) = (u.fract() * 2.0, v.fract() * 2.0);
+            let digit;
+            if !upper {
+                // Lower triangle: corners A=(0,0), Q=(2,0), R=(0,2) in doubled coords.
+                if lu + lv < 1.0 {
+                    digit = 0;
+                } else if lu >= 1.0 {
+                    digit = 2;
+                } else if lv >= 1.0 {
+                    digit = 1;
+                } else {
+                    digit = 3;
+                    upper = true;
+                }
+            } else {
+                // Upper triangle: corners B=(2,2), Q=(2,0), R=(0,2).
+                if lu + lv >= 3.0 {
+                    digit = 0;
+                } else if lv < 1.0 {
+                    digit = 2;
+                } else if lu < 1.0 {
+                    digit = 1;
+                } else {
+                    digit = 3;
+                    upper = false;
+                }
+            }
+            code |= digit << (56 - 2 * level);
+            u = lu;
+            v = lv;
+        }
+        code
+    }
+
+    #[test]
+    fn tri_code_matches_barycentric_descent() {
+        let mut seed = 0x9E3779B97F4A7C15u64;
+        for _ in 0..20_000 {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            let lat = (seed % 170_000) as f64 / 1000.0 - 85.0;
+            let lon = ((seed >> 20) % 360_000) as f64 / 1000.0 - 180.0;
+            let c = Coord::from_lat_lon(lat, lon);
+            assert_eq!(c.tri_code(), float_tri_code(c), "at {lat},{lon}");
+        }
+    }
+
+    #[test]
+    fn tri_code_round_trips_and_nests() {
+        let c = Coord::from_lat_lon(46.2024, -121.4909);
+        let code = c.tri_code();
+        let back = Coord::from_tri_code(code);
+        assert_eq!(back.tri_code(), code);
+        // Prefix = containing triangle: the point and its reconstruction
+        // share every ancestor, and so does a nearby point at coarse depth.
+        let near = Coord::from_lat_lon(46.2025, -121.4910).tri_code();
+        for depth in 1..=10 {
+            let sh = 58 - 2 * depth;
+            assert_eq!(code >> sh, near >> sh, "diverged at depth {depth}");
+        }
     }
 }
