@@ -40,6 +40,7 @@ class MahereActivity : Activity(), SurfaceHolder.Callback, Choreographer.FrameCa
         x0: Float, y0: Float, x1: Float, y1: Float,
     ): Int
     private external fun nativeOnLocation(ptr: Long, lat: Double, lon: Double, accuracy: Float)
+    private external fun nativeOnPause(ptr: Long)
 
     private lateinit var surfaceView: SurfaceView
     @Volatile private var nativePtr = 0L
@@ -179,6 +180,7 @@ class MahereActivity : Activity(), SurfaceHolder.Callback, Choreographer.FrameCa
     override fun onPause() {
         super.onPause()
         Choreographer.getInstance().removeFrameCallback(this)
+        if (nativePtr != 0L) nativeOnPause(nativePtr)
     }
 
     // ---- Input: raw pointers, no detectors ----

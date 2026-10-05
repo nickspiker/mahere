@@ -10,6 +10,7 @@ description = "mahere desktop app: offline trail map on the fluor compositor"
 mahere-dem = { path = "../mahere-dem" }
 mahere-engine = { path = "../mahere-engine" }
 mahere-osm = { path = "../mahere-osm" }
+mahere-store = { path = "../mahere-store" }
 fluor = { git = "https://github.com/nickspiker/fluor", rev = "d538a0a", features = ["host-winit"] }
 
 [dev-dependencies]

@@ -17,6 +17,8 @@ struct MahereApp {
     chrome: DefaultChrome,
     dragging: bool,
     last_cursor: (f64, f64),
+    store: Option<std::sync::Arc<mahere_store::FlatStorage>>,
+    last_save: Instant,
 }
 
 impl MahereApp {
@@ -29,7 +31,14 @@ impl MahereApp {
             Some("drag pan · wheel zoom · A/D W/S sun · Q/E rotate · R home".to_string()),
             &mut hit_counter,
         );
-        MahereApp { map, chrome, dragging: false, last_cursor: (0., 0.) }
+        MahereApp {
+            map,
+            chrome,
+            dragging: false,
+            last_cursor: (0., 0.),
+            store: None,
+            last_save: Instant::now(),
+        }
     }
 
     fn dims(ctx: &Context) -> (usize, usize) {
@@ -229,6 +238,25 @@ impl FluorApp for MahereApp {
 
     fn tick(&mut self, ctx: &mut Context) -> bool {
         let (w, h) = Self::dims(ctx);
+        // Session persistence rides the refinement ticks: at most one vault
+        // write per few seconds, only while the view is actually changing.
+        if self.last_save.elapsed().as_secs() >= 3 {
+            self.last_save = Instant::now();
+            if let Some(store) = &self.store {
+                let c = &self.map.cam;
+                let _ = mahere_store::save_session(
+                    store,
+                    &mahere_store::Session {
+                        lat: c.lat,
+                        lon: c.lon,
+                        ppd: c.ppd,
+                        bearing: c.bearing,
+                        sun_az: self.map.sun_az as f64,
+                        sun_alt: self.map.sun_alt as f64,
+                    },
+                );
+            }
+        }
         self.map.tick(w, h)
     }
 
@@ -291,10 +319,18 @@ fn main() {
     let dem = mahere_dem::DemStore::load(&dem_paths).expect("failed to load DEM tiles");
     eprintln!("{} DEM tiles, {:.1}s", dem.tile_count(), t.elapsed().as_secs_f32());
 
-    let map = MapCore::new(
-        roads,
-        mahere_engine::terrain::Terrain::new(dem),
-        Camera { lat: 47.6062, lon: -122.3321, ppd: PPD_REF, bearing: 0.0 },
-    );
-    run_app(MahereApp::new(map)).expect("fluor event loop failed");
+    let store = mahere_store::open(None).ok();
+    let session = store.as_ref().and_then(|s| mahere_store::load_session(s));
+    let cam = match session {
+        Some(s) => Camera { lat: s.lat, lon: s.lon, ppd: s.ppd, bearing: s.bearing },
+        None => Camera { lat: 47.6062, lon: -122.3321, ppd: PPD_REF, bearing: 0.0 },
+    };
+    let mut map = MapCore::new(roads, mahere_engine::terrain::Terrain::new(dem), cam);
+    if let Some(s) = session {
+        map.sun_az = s.sun_az as f32;
+        map.sun_alt = s.sun_alt as f32;
+    }
+    let mut app = MahereApp::new(map);
+    app.store = store;
+    run_app(app).expect("fluor event loop failed");
 }

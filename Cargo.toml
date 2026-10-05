@@ -9,6 +9,7 @@ default-members = [
     "crates/mahere-dem",
     "crates/mahere-engine",
     "crates/mahere-osm",
+    "crates/mahere-store",
 ]
 
 [workspace.package]
@@ -20,4 +21,19 @@ repository = "https://github.com/nickspiker/mahere"
 # fluor's dev tree declares vsf as a sibling path dep (../vsf), which a git
 # checkout of fluor doesn't contain — point it at the pushed vsf repo.
 [patch."https://github.com/nickspiker/fluor"]
+vsf = { git = "https://github.com/nickspiker/vsf", rev = "5f2bb06c8d96ee417a2571944882ef36d6c9ca8f" }
+
+# kete (and its manifestus/tohu deps) declare sibling path deps like fluor
+# does — redirect each git source's path deps to the pushed repos, all vsf
+# references unified on one rev.
+[patch."https://github.com/nickspiker/kete"]
+manifestus = { git = "https://github.com/nickspiker/manifestus", rev = "d4aed47f415e7b56dbd6c1a2ff4efcb4cf8e1239" }
+tohu = { git = "https://github.com/nickspiker/tohu", rev = "a0b6b0af38b8967cc436f618e5cf0edbac968bda" }
+vsf = { git = "https://github.com/nickspiker/vsf", rev = "5f2bb06c8d96ee417a2571944882ef36d6c9ca8f" }
+
+[patch."https://github.com/nickspiker/manifestus"]
+vsf = { git = "https://github.com/nickspiker/vsf", rev = "5f2bb06c8d96ee417a2571944882ef36d6c9ca8f" }
+
+[patch."https://github.com/nickspiker/tohu"]
+ihi = { git = "https://github.com/nickspiker/ihi", rev = "ac72c54f60662406a7c1de19d49354566d48beac" }
 vsf = { git = "https://github.com/nickspiker/vsf", rev = "5f2bb06c8d96ee417a2571944882ef36d6c9ca8f" }

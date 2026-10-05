@@ -47,6 +47,9 @@ pub struct AndroidApp {
     /// after a pinch would otherwise jump by the stale delta).
     suppress_move: bool,
     centered_once: bool,
+    store: Option<std::sync::Arc<mahere_store::FlatStorage>>,
+    recorder: Option<mahere_store::TrackRecorder>,
+    fixes_since_save: u32,
 }
 
 impl AndroidApp {
@@ -98,6 +101,34 @@ impl AndroidApp {
             self.map.camera_moved(self.w, self.h);
         }
         self.map.set_gps(fix);
+        // Track recording: every fix into the vault (chunk-flushed), the
+        // session (camera + sun) refreshed every tenth fix.
+        if let Some(rec) = &mut self.recorder {
+            let elev = self.map.gps_elevation().unwrap_or(f32::NAN) as f64;
+            rec.on_fix(fix.lat, fix.lon, elev);
+        }
+        self.fixes_since_save += 1;
+        if self.fixes_since_save >= 10 {
+            self.fixes_since_save = 0;
+            self.save_session();
+        }
+    }
+
+    fn save_session(&self) {
+        if let Some(store) = &self.store {
+            let c = &self.map.cam;
+            let _ = mahere_store::save_session(
+                store,
+                &mahere_store::Session {
+                    lat: c.lat,
+                    lon: c.lon,
+                    ppd: c.ppd,
+                    bearing: c.bearing,
+                    sun_az: self.map.sun_az as f64,
+                    sun_alt: self.map.sun_alt as f64,
+                },
+            );
+        }
     }
 }
 
@@ -212,20 +243,33 @@ pub extern "system" fn Java_nz_mahere_app_MahereActivity_nativeInit(
     };
     // Trails, roads, streams, rail, powerlines: the bundled featpack.
     let feats = mahere_osm::read_featpack(&format!("{dir}/features.vsf")).unwrap_or_default();
+    // The vault: session restore + track recording (kete/manifestus).
+    let store = mahere_store::open(Some(&dir)).ok();
+    let session = store.as_ref().and_then(|s| mahere_store::load_session(s));
+    let cam = match session {
+        Some(s) => Camera { lat: s.lat, lon: s.lon, ppd: s.ppd, bearing: s.bearing },
+        // Mt Adams until the first GPS fix recenters us.
+        None => Camera { lat: 46.2024, lon: -121.4909, ppd: 12_000.0, bearing: 0.0 },
+    };
+    let mut map = MapCore::new(feats, mahere_engine::terrain::Terrain::new(dem), cam);
+    if let Some(s) = session {
+        map.sun_az = s.sun_az as f32;
+        map.sun_alt = s.sun_alt as f32;
+    }
+    let recorder = store.clone().map(mahere_store::TrackRecorder::new);
     let app = AndroidApp {
-        map: MapCore::new(
-            feats,
-            mahere_engine::terrain::Terrain::new(dem),
-            // Mt Adams until the first GPS fix recenters us.
-            Camera { lat: 46.2024, lon: -121.4909, ppd: 12_000.0, bearing: 0.0 },
-        ),
+        map,
         w: width as usize,
         h: height as usize,
         dragging: false,
         last_cursor: (0., 0.),
         two: None,
         suppress_move: false,
-        centered_once: false,
+        // A restored session IS the view; don't let the first fix yank it.
+        centered_once: session.is_some(),
+        store,
+        recorder,
+        fixes_since_save: 0,
     };
     Box::into_raw(Box::new(AndroidShell::new(app, width as u32, height as u32))) as jlong
 }
@@ -297,6 +341,22 @@ pub extern "system" fn Java_nz_mahere_app_MahereActivity_nativeOnTouch(
         s.app().two_end();
     }
     s.on_touch(action, x0, y0)
+}
+
+/// Pause = the durability moment: session saved, track chunk flushed.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_nz_mahere_app_MahereActivity_nativeOnPause(
+    _env: JNIEnv,
+    _class: JClass,
+    ptr: jlong,
+) {
+    if ptr != 0 {
+        let app = shell(ptr).app();
+        app.save_session();
+        if let Some(rec) = &mut app.recorder {
+            rec.flush();
+        }
+    }
 }
 
 #[unsafe(no_mangle)]
