@@ -120,6 +120,37 @@ impl Coord {
         Coord::from_xyz([phi.cos() * lam.cos(), phi.cos() * lam.sin(), phi.sin()])
     }
 
+    /// Encode searching only the given diamonds (both halves of each) —
+    /// the renderer's diamond-straddle fast path: a screen block knows its
+    /// corner diamonds, so the 20-face search shrinks to <= 8.
+    pub fn from_lat_lon_in_diamonds(lat_deg: f64, lon_deg: f64, diamonds: &[u8]) -> Coord {
+        let (phi, lam) = (lat_deg.to_radians(), lon_deg.to_radians());
+        let p = [phi.cos() * lam.cos(), phi.cos() * lam.sin(), phi.sin()];
+        let mut best = 0usize;
+        let mut best_dot = f64::NEG_INFINITY;
+        for (i, (verts, d, _)) in FACES.iter().enumerate() {
+            if !diamonds.contains(d) {
+                continue;
+            }
+            let c = centroid(verts);
+            let dot = c[0] * p[0] + c[1] * p[1] + c[2] * p[2];
+            if dot > best_dot {
+                best_dot = dot;
+                best = i;
+            }
+        }
+        Coord::encode_on_face(p, best)
+    }
+
+    fn encode_on_face(p: [f64; 3], face: usize) -> Coord {
+        let (verts, diamond, upper) = FACES[face];
+        let (s, t) = gnomonic_barycentric(p, verts);
+        let (u, v) = if upper { (1. - t, 1. - s) } else { (s, t) };
+        let iu = quantize(u);
+        let iv = quantize(v);
+        Coord(((diamond as u64) << MORTON_BITS) | (spread(iu) << 1) | spread(iv))
+    }
+
     /// Encode a direction from the sphere's center (need not be unit length).
     pub fn from_xyz(p: [f64; 3]) -> Coord {
         // Containing face = face whose centroid direction is nearest: for a
@@ -135,15 +166,7 @@ impl Coord {
                 best = i;
             }
         }
-        let (verts, diamond, upper) = FACES[best];
-        let (s, t) = gnomonic_barycentric(p, verts);
-        // Lower triangle (a0,q,r): UV = barycentric directly. Upper triangle
-        // (b0,q,r): fp = βb·b0 + βq·q + βr·r with (βq, βr) = (s, t), and the
-        // continuous diamond parametrization is u = 1−βr, v = 1−βq.
-        let (u, v) = if upper { (1. - t, 1. - s) } else { (s, t) };
-        let iu = quantize(u);
-        let iv = quantize(v);
-        Coord(((diamond as u64) << MORTON_BITS) | (spread(iu) << 1) | spread(iv))
+        Coord::encode_on_face(p, best)
     }
 
     /// Decode to a unit vector (the center of the finest cell).

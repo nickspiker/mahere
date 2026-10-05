@@ -63,24 +63,7 @@ class MahereActivity : Activity(), SurfaceHolder.Callback, Choreographer.FrameCa
         // Stage bundled DEM tiles into filesDir once (the tiff reader wants
         // real file paths; assets are zip entries).
         thread {
-            val demDir = java.io.File(filesDir, "dem")
-            demDir.mkdirs()
-            for (name in assets.list("dem").orEmpty()) {
-                val out = java.io.File(demDir, name)
-                if (!out.exists() || out.length() == 0L) {
-                    assets.open("dem/$name").use { input ->
-                        out.outputStream().use { input.copyTo(it) }
-                    }
-                }
-            }
-            for (name in assets.list("").orEmpty().filter { it.endsWith(".vsf") }) {
-                val out = java.io.File(filesDir, name)
-                if (!out.exists() || out.length() == 0L) {
-                    assets.open(name).use { input ->
-                        out.outputStream().use { input.copyTo(it) }
-                    }
-                }
-            }
+            stageAssetDir("cells")
             runOnUiThread {
                 assetsStaged = true
                 maybeInit()
@@ -97,6 +80,23 @@ class MahereActivity : Activity(), SurfaceHolder.Callback, Choreographer.FrameCa
         } else {
             startLocation()
         }
+    }
+
+    /// Recursively copy an asset directory into filesDir (skip already-staged
+    /// files by size). The cells dir is {layer}/{depth}/{prefix}.vsf.zst.
+    private fun stageAssetDir(rel: String) {
+        val children = assets.list(rel).orEmpty()
+        if (children.isEmpty()) {
+            val out = java.io.File(filesDir, rel)
+            if (!out.exists() || out.length() == 0L) {
+                out.parentFile?.mkdirs()
+                assets.open(rel).use { input ->
+                    out.outputStream().use { input.copyTo(it) }
+                }
+            }
+            return
+        }
+        for (c in children) stageAssetDir("$rel/$c")
     }
 
     private fun hideSystemBars() {

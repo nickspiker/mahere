@@ -67,7 +67,7 @@ impl CellKey {
     }
 
     pub fn path(self, layer: &str) -> String {
-        format!("{layer}/{:02}/{:016x}.vsf", self.depth, self.prefix)
+        format!("{layer}/{:02}/{:016x}.vsf.zst", self.depth, self.prefix)
     }
 
     /// Diamond-UV rectangle covered by this cell.
@@ -312,17 +312,30 @@ fn write_file(out: &Path, rel: &str, bytes: &[u8]) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
-    std::fs::write(&path, bytes).map_err(|e| format!("{}: {e}", path.display()))
+    // Whole-file zstd: VSF internals untouched, the R2 layout keeps the
+    // .vsf.zst names, and near-empty line cells shrink ~100x.
+    let z = zstd::encode_all(bytes, 3).map_err(|e| e.to_string())?;
+    std::fs::write(&path, z).map_err(|e| format!("{}: {e}", path.display()))
 }
 
 /// Read any cell file's fields (width-agnostic, per VSF doctrine).
 pub fn read_cell_fields(path: &Path) -> Result<HashMap<String, VsfType>, String> {
     let data = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
-    let (header, end) =
-        vsf::VsfHeader::decode(&data).map_err(|e| format!("{}: {e}", path.display()))?;
-    let section = header
-        .primary_section(&data, end)
-        .map_err(|e| format!("{}: {e}", path.display()))?;
+    decode_cell_fields(&data).map_err(|e| format!("{}: {e}", path.display()))
+}
+
+/// Decode a cell from raw file bytes (zstd or plain VSF) — the loader
+/// thread's entry point; no filesystem coupling.
+pub fn decode_cell_fields(data: &[u8]) -> Result<HashMap<String, VsfType>, String> {
+    let plain: Vec<u8>;
+    let data = if data.starts_with(&[0x28, 0xB5, 0x2F, 0xFD]) {
+        plain = zstd::decode_all(data).map_err(|e| e.to_string())?;
+        &plain[..]
+    } else {
+        data
+    };
+    let (header, end) = vsf::VsfHeader::decode(data).map_err(|e| e.to_string())?;
+    let section = header.primary_section(data, end).map_err(|e| e.to_string())?;
     Ok(section
         .fields
         .into_iter()

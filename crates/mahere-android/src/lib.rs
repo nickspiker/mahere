@@ -228,21 +228,9 @@ pub extern "system" fn Java_nz_mahere_app_MahereActivity_nativeInit(
         Ok(s) => s.into(),
         Err(_) => return 0,
     };
-    let mut tifs: Vec<String> = match std::fs::read_dir(format!("{dir}/dem")) {
-        Ok(rd) => rd
-            .filter_map(|e| e.ok())
-            .map(|e| e.path().to_string_lossy().into_owned())
-            .filter(|p| p.ends_with(".tif"))
-            .collect(),
-        Err(_) => return 0,
-    };
-    tifs.sort(); // "USGS_13_*" (10 m) sorts before "USGS_1_*" (30 m): finer wins
-    let dem = match mahere_dem::DemStore::load(&tifs) {
-        Ok(d) => d,
-        Err(_) => return 0,
-    };
-    // Trails, roads, streams, rail, powerlines: the bundled featpack.
-    let feats = mahere_osm::read_featpack(&format!("{dir}/features.vsf")).unwrap_or_default();
+    // The #pagetable pipeline: the only map data is the baked cells dir.
+    let cell_store =
+        std::sync::Arc::new(mahere_engine::residency::DirStore(format!("{dir}/cells").into()));
     // The vault: session restore + track recording (kete/manifestus).
     let store = mahere_store::open(Some(&dir)).ok();
     let session = store.as_ref().and_then(|s| mahere_store::load_session(s));
@@ -251,7 +239,7 @@ pub extern "system" fn Java_nz_mahere_app_MahereActivity_nativeInit(
         // Mt Adams until the first GPS fix recenters us.
         None => Camera { lat: 46.2024, lon: -121.4909, ppd: 12_000.0, bearing: 0.0 },
     };
-    let mut map = MapCore::new(feats, mahere_engine::terrain::Terrain::new(dem), cam);
+    let mut map = MapCore::new(cell_store, cam);
     if let Some(s) = session {
         map.sun_az = s.sun_az as f32;
         map.sun_alt = s.sun_alt as f32;

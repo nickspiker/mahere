@@ -22,7 +22,10 @@ fn main() {
         (bbox[0].min(bbox[2]), bbox[1].min(bbox[3]), bbox[0].max(bbox[2]), bbox[1].max(bbox[3]));
     let line_base: u8 = arg(&args, "--line-base").map(|v| v.parse().unwrap()).unwrap_or(13);
     let line_min: u8 = arg(&args, "--line-min").map(|v| v.parse().unwrap()).unwrap_or(7);
-    let dem_depth: u8 = arg(&args, "--dem-depth").map(|v| v.parse().unwrap()).unwrap_or(12);
+    let dem_depths: Vec<u8> = arg(&args, "--dem-depths")
+        .or_else(|| arg(&args, "--dem-depth"))
+        .map(|v| v.split(',').map(|x| x.parse().unwrap()).collect())
+        .unwrap_or_else(|| vec![12, 10, 8, 6]);
     let tifs: Vec<String> = {
         let i = args.iter().position(|a| a == "--dem").expect("--dem") + 1;
         args[i..].iter().take_while(|a| !a.starts_with("--")).cloned().collect()
@@ -51,14 +54,16 @@ fn main() {
 
     let t = std::time::Instant::now();
     let dem = mahere_dem::DemStore::load(&tifs).expect("dem");
-    let keys = mahere_tiles::cells_covering(lat0, lon0, lat1, lon1, dem_depth);
-    eprintln!("{} dem cells at depth {dem_depth}, source loaded {:.1}s", keys.len(), t.elapsed().as_secs_f32());
-    let t = std::time::Instant::now();
-    let baked = mahere_tiles::bake_dem(&dem, &keys);
-    for (key, cell) in &baked {
-        mahere_tiles::write_dem_cell(out, *key, cell).expect("write dem cell");
+    eprintln!("dem source loaded {:.1}s", t.elapsed().as_secs_f32());
+    for &dem_depth in &dem_depths {
+        let t = std::time::Instant::now();
+        let keys = mahere_tiles::cells_covering(lat0, lon0, lat1, lon1, dem_depth);
+        let baked = mahere_tiles::bake_dem(&dem, &keys);
+        for (key, cell) in &baked {
+            mahere_tiles::write_dem_cell(out, *key, cell).expect("write dem cell");
+        }
+        eprintln!("depth {dem_depth}: {} dem cells, {:.1}s", keys.len(), t.elapsed().as_secs_f32());
     }
-    eprintln!("dem baked + written, {:.1}s", t.elapsed().as_secs_f32());
 
     // Size census.
     let du = std::process::Command::new("du").args(["-sh", out.to_str().unwrap()]).output();

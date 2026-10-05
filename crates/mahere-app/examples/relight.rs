@@ -1,7 +1,7 @@
-// Headless engine check: converge the reservoir over Mt Rainier and splat
-// at two sun azimuths. Distinct relief in both = hillshade works; the pair
-// differing = splat-time relighting works (zero re-evaluation between them).
-use mahere_engine::{Camera, MapCore, terrain::Terrain};
+// Headless pipeline check: load cells for Mt Adams, settle residency, render
+// at two sun azimuths from the SAME resident cells (zero re-bakes), plus a
+// rotation render. Prints frame times — the perf receipt.
+use mahere_engine::{Camera, MapCore, residency::DirStore};
 
 fn save(path: &str, canvas: &[u32], w: usize, h: usize) {
     let f = std::fs::File::create(path).unwrap();
@@ -15,41 +15,42 @@ fn save(path: &str, canvas: &[u32], w: usize, h: usize) {
     wr.write_image_data(&buf).unwrap();
 }
 
-fn main() {
-    let dem = mahere_dem::DemStore::load(&[
-        "data/USGS_1_n47w122.tif".into(),
-        "data/USGS_1_n47w123.tif".into(),
-    ])
-    .unwrap();
-    let mut map = MapCore::new(
-        Vec::new(),
-        Terrain::new(dem),
-        Camera { lat: 46.8523, lon: -121.7603, ppd: 2800.0, bearing: 0.0 },
-    );
-    let (w, h) = (1024usize, 768usize);
-    map.camera_moved(w, h);
-    let start = std::time::Instant::now();
-    let mut ticks = 0;
-    while !map.converged() {
+fn settle(map: &mut MapCore, w: usize, h: usize) {
+    // render issues want-lists; tick drains. Loop until the loader is idle.
+    for _ in 0..600 {
+        map.render(w, h);
+        if map.converged() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
         map.tick(w, h);
-        ticks += 1;
     }
-    eprintln!("converged in {} ticks, {:.1}s", ticks, start.elapsed().as_secs_f32());
+}
+
+fn main() {
+    let store = std::sync::Arc::new(DirStore("data/cells".into()));
+    let mut map = MapCore::new(store, Camera { lat: 46.2024, lon: -121.4909, ppd: 2800.0, bearing: 0.0 });
+    let (w, h) = (1024usize, 768usize);
+    settle(&mut map, w, h);
     map.render(w, h);
-    save("/tmp/claude-1000/rainier_nw.png", &map.canvas, w, h);
+    eprintln!("frame: {:.2} ms ({} straddle blocks)", map.last_frame_ms, map.last_straddle_blocks);
+    save("/tmp/claude-1000/adams_nw.png", &map.canvas, w, h);
+    // find first magenta pixel and probe its chain
     map.sun_az = 135.0;
     map.sun_alt = 25.0;
-    map.mark_dirty();
-    let start = std::time::Instant::now();
+    let t = std::time::Instant::now();
     map.render(w, h);
-    eprintln!("relight: {:.0} ms", start.elapsed().as_secs_f32() * 1000.0);
-    save("/tmp/claude-1000/rainier_se.png", &map.canvas, w, h);
-    // Rotation sanity: 90 degrees CW, re-render, save.
+    eprintln!("relight frame: {:.2} ms", t.elapsed().as_secs_f32() * 1000.0);
+    save("/tmp/claude-1000/adams_se.png", &map.canvas, w, h);
     map.set_bearing(90f64.to_radians());
-    map.camera_moved(w, h);
-    while !map.converged() {
-        map.tick(w, h);
-    }
+    settle(&mut map, w, h);
     map.render(w, h);
-    save("/tmp/claude-1000/rainier_rot90.png", &map.canvas, w, h);
+    eprintln!("rotated frame: {:.2} ms", map.last_frame_ms);
+    save("/tmp/claude-1000/adams_rot90.png", &map.canvas, w, h);
+    // Timing sweep: 20 frames, report mean.
+    let t = std::time::Instant::now();
+    for _ in 0..20 {
+        map.render(w, h);
+    }
+    eprintln!("mean over 20 frames: {:.2} ms", t.elapsed().as_secs_f32() * 50.0);
 }

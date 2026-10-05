@@ -240,8 +240,12 @@ impl FluorApp for MahereApp {
         let (w, h) = Self::dims(ctx);
         // Session persistence rides the refinement ticks: at most one vault
         // write per few seconds, only while the view is actually changing.
-        if self.last_save.elapsed().as_secs() >= 3 {
+        if self.last_save.elapsed().as_secs() >= 1 {
             self.last_save = Instant::now();
+            self.chrome.set_status_text(Some(format!(
+                "{:.1} ms/frame · sun {:.0}°/{:.0}° · Q/E rotate · R home",
+                self.map.last_frame_ms, self.map.sun_az, self.map.sun_alt
+            )));
             if let Some(store) = &self.store {
                 let c = &self.map.cam;
                 let _ = mahere_store::save_session(
@@ -298,39 +302,22 @@ impl FluorApp for MahereApp {
 }
 
 fn main() {
-    let pbf = std::env::args()
-        .nth(1)
-        .unwrap_or_else(|| "data/washington-latest.osm.pbf".into());
-    eprintln!("loading {pbf} ...");
-    let t = Instant::now();
-    let roads = mahere_osm::load_roads(&pbf).expect("failed to read extract");
-    let pts: usize = roads.iter().map(|r| r.pts.len()).sum();
-    eprintln!("{} roads, {} points, {:.1}s", roads.len(), pts, t.elapsed().as_secs_f32());
+    let cells = std::env::args().nth(1).unwrap_or_else(|| "data/cells".into());
+    eprintln!("cells: {cells}");
+    let store = std::sync::Arc::new(mahere_engine::residency::DirStore(cells.into()));
 
-    let t = Instant::now();
-    let mut dem_paths: Vec<String> = ["n47w122", "n47w123", "n48w122", "n48w123"]
-        .iter()
-        .map(|t| format!("data/USGS_1_{t}.tif"))
-        .collect();
-    // Finer tiles first: DemStore answers from the first tile that covers.
-    if std::path::Path::new("data/USGS_13_n47w122.tif").exists() {
-        dem_paths.insert(0, "data/USGS_13_n47w122.tif".into());
-    }
-    let dem = mahere_dem::DemStore::load(&dem_paths).expect("failed to load DEM tiles");
-    eprintln!("{} DEM tiles, {:.1}s", dem.tile_count(), t.elapsed().as_secs_f32());
-
-    let store = mahere_store::open(None).ok();
-    let session = store.as_ref().and_then(|s| mahere_store::load_session(s));
+    let vault = mahere_store::open(None).ok();
+    let session = vault.as_ref().and_then(|s| mahere_store::load_session(s));
     let cam = match session {
         Some(s) => Camera { lat: s.lat, lon: s.lon, ppd: s.ppd, bearing: s.bearing },
-        None => Camera { lat: 47.6062, lon: -122.3321, ppd: PPD_REF, bearing: 0.0 },
+        None => Camera { lat: 46.2024, lon: -121.4909, ppd: PPD_REF, bearing: 0.0 },
     };
-    let mut map = MapCore::new(roads, mahere_engine::terrain::Terrain::new(dem), cam);
+    let mut map = MapCore::new(store, cam);
     if let Some(s) = session {
         map.sun_az = s.sun_az as f32;
         map.sun_alt = s.sun_alt as f32;
     }
     let mut app = MahereApp::new(map);
-    app.store = store;
+    app.store = vault;
     run_app(app).expect("fluor event loop failed");
 }
