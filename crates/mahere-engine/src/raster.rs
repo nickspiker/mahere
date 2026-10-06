@@ -742,6 +742,7 @@ mod tests {
         pool.map.insert(
             key,
             Entry {
+                present: crate::residency::PRESENT_DEM | crate::residency::PRESENT_LINE | crate::residency::PRESENT_LAND | crate::residency::PRESENT_WATER,
                 dem: Some(DemPacked { texel: texel.into_boxed_slice() }),
                 dem_q: None,
                 line: Some(ClassCell::new_line()),

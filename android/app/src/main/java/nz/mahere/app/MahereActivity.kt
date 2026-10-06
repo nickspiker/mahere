@@ -5,6 +5,7 @@ import android.app.Activity
 import android.content.Context
 import android.content.pm.PackageManager
 import android.graphics.PixelFormat
+import android.hardware.GeomagneticField
 import android.hardware.Sensor
 import android.hardware.SensorEvent
 import android.hardware.SensorEventListener
@@ -44,6 +45,7 @@ class MahereActivity : Activity(), SurfaceHolder.Callback, Choreographer.FrameCa
         x0: Float, y0: Float, x1: Float, y1: Float,
     ): Int
     private external fun nativeOnLocation(ptr: Long, lat: Double, lon: Double, accuracy: Float)
+    private external fun nativeOnDeclination(ptr: Long, declinationDeg: Float)
     private external fun nativeOnOrientation(ptr: Long, r0: Float, r1: Float, r2: Float, r3: Float, r4: Float, r5: Float, r6: Float, r7: Float, r8: Float)
     private external fun nativeOnPause(ptr: Long)
 
@@ -209,6 +211,9 @@ class MahereActivity : Activity(), SurfaceHolder.Callback, Choreographer.FrameCa
     private val locationListener = LocationListener { loc: Location ->
         if (nativePtr != 0L) {
             nativeOnLocation(nativePtr, loc.latitude, loc.longitude, loc.accuracy)
+            // The sensor's north is magnetic; the engine needs the local declination to light by the true sun.
+            val field = GeomagneticField(loc.latitude.toFloat(), loc.longitude.toFloat(), loc.altitude.toFloat(), System.currentTimeMillis())
+            nativeOnDeclination(nativePtr, field.declination)
         }
     }
 

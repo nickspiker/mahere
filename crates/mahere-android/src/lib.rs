@@ -447,6 +447,19 @@ pub extern "system" fn Java_nz_mahere_app_MahereActivity_nativeOnOrientation(
     }
 }
 
+/// Magnetic declination at the fix, degrees east positive, from Android's geomagnetic model: the sensor's north is magnetic, the almanac's is true.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_nz_mahere_app_MahereActivity_nativeOnDeclination(
+    _env: JNIEnv,
+    _class: JClass,
+    ptr: jlong,
+    declination_deg: jfloat,
+) {
+    if ptr != 0 {
+        shell(ptr).app().map.set_declination(declination_deg);
+    }
+}
+
 /// Pause = the durability moment: session saved, track chunk flushed.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_nz_mahere_app_MahereActivity_nativeOnPause(
