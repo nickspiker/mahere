@@ -17,6 +17,8 @@ struct MahereApp {
     map: MapCore,
     chrome: DefaultChrome,
     dragging: bool,
+    /// Pixels the cursor travelled since the press: a few at release is a click on the map, a measurement.
+    travel: f64,
     /// Right-button drag: rotate about the screen centre.
     rotating: bool,
     last_cursor: (f64, f64),
@@ -39,6 +41,7 @@ impl MahereApp {
             map,
             chrome,
             dragging: false,
+            travel: 0.0,
             rotating: false,
             last_cursor: (0., 0.),
             store: None,
@@ -136,7 +139,7 @@ impl FluorApp for MahereApp {
                     return EventResponse::StartWindowDrag;
                 }
                 let mut mask = self.map.layers();
-                let mut ctl = Controls { real_sun: self.map.real_sun, follow_heading: self.map.follow_heading };
+                let mut ctl = Controls { real_sun: self.map.real_sun, follow_heading: self.map.follow_heading, lock_to_fix: self.map.lock_to_fix };
                 if self.panel.tap(cx as f32, cy as f32, w, h, &mut mask, &mut ctl) {
                     self.map.set_layers(mask);
                     if ctl.real_sun != self.map.real_sun {
@@ -145,13 +148,22 @@ impl FluorApp for MahereApp {
                     if ctl.follow_heading != self.map.follow_heading {
                         self.map.set_follow_heading(ctl.follow_heading);
                     }
+                    if ctl.lock_to_fix != self.map.lock_to_fix {
+                        self.map.set_lock_to_fix(ctl.lock_to_fix);
+                    }
                     ctx.window.request_redraw();
                     return EventResponse::Handled;
                 }
                 self.dragging = true;
+                self.travel = 0.0;
                 EventResponse::Handled
             }
             FEvent::MouseInput { state: ElementState::Released, button: MouseButton::Left } => {
+                // A click that never travelled is a tap: a new measurement to that point.
+                if self.dragging && self.travel < 6.0 {
+                    self.map.tap(ctx.cursor_x as f64, ctx.cursor_y as f64, w, h);
+                    ctx.window.request_redraw();
+                }
                 self.dragging = false;
                 EventResponse::Handled
             }
@@ -168,6 +180,7 @@ impl FluorApp for MahereApp {
                 let (x, y) = (hx as f64, hy as f64);
                 if self.dragging {
                     let (dx, dy) = (x - self.last_cursor.0, y - self.last_cursor.1);
+                    self.travel += dx.abs() + dy.abs();
                     self.map.pan(dx, dy, w, h);
                     ctx.window.request_redraw();
                 } else if self.rotating {
@@ -332,7 +345,8 @@ impl FluorApp for MahereApp {
             heading -= 360.0;
         }
         let readouts = Readouts { lat: c.lat, lon: c.lon, elev: self.map.elevation_at(c.lat, c.lon), heading_deg: heading, m_per_px: 111_320.0 / c.ppd, frame_ms: self.map.last_frame_ms, resident: self.map.pool().map.len(), phone_heading: None };
-        self.panel.paint(w, h, self.map.layers(), Controls { real_sun: self.map.real_sun, follow_heading: self.map.follow_heading }, &readouts);
+        let measure = self.map.measure_view(w, h, Panel::strip_samples(w));
+        self.panel.paint(w, h, self.map.layers(), Controls { real_sun: self.map.real_sun, follow_heading: self.map.follow_heading, lock_to_fix: self.map.lock_to_fix }, &readouts, measure.as_ref());
         let mut map = self.map.canvas.clone();
         self.panel.composite_rgb(&mut map, w, h);
         self.chrome.rasterize_bg(ctx.damage, |c| {

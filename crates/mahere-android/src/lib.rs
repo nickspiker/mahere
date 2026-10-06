@@ -39,6 +39,8 @@ pub struct AndroidApp {
     w: usize,
     h: usize,
     dragging: bool,
+    /// Pixels the finger has travelled since the press: under a dozen at release is a tap.
+    travel: f64,
     last_cursor: (f64, f64),
     two: Option<TwoFinger>,
     /// Re-anchor the next CursorMoved instead of panning (finger handoff after a pinch would otherwise jump by the stale delta).
@@ -150,7 +152,7 @@ impl FluorApp for AndroidApp {
             FEvent::MouseInput { state: ElementState::Pressed, button: MouseButton::Left } => {
                 // The panel first: the gear and its rows take the tap; the map gets the rest.
                 let mut mask = self.map.layers();
-                let mut ctl = Controls { real_sun: self.map.real_sun, follow_heading: self.map.follow_heading };
+                let mut ctl = Controls { real_sun: self.map.real_sun, follow_heading: self.map.follow_heading, lock_to_fix: self.map.lock_to_fix };
                 if self.panel.tap(ctx.cursor_x as f32, ctx.cursor_y as f32, self.w, self.h, &mut mask, &mut ctl) {
                     self.map.set_layers(mask);
                     if ctl.real_sun != self.map.real_sun {
@@ -159,16 +161,24 @@ impl FluorApp for AndroidApp {
                     if ctl.follow_heading != self.map.follow_heading {
                         self.map.set_follow_heading(ctl.follow_heading);
                     }
+                    if ctl.lock_to_fix != self.map.lock_to_fix {
+                        self.map.set_lock_to_fix(ctl.lock_to_fix);
+                    }
                     self.dragging = false;
                     return EventResponse::Handled;
                 }
                 if self.two.is_none() {
                     self.dragging = true;
+                    self.travel = 0.0;
                     self.last_cursor = (ctx.cursor_x as f64, ctx.cursor_y as f64);
                 }
                 EventResponse::Handled
             }
             FEvent::MouseInput { state: ElementState::Released, button: MouseButton::Left } => {
+                // A press and release that never travelled is a tap: a new measurement to that point.
+                if self.dragging && self.two.is_none() && self.travel < 12.0 {
+                    self.map.tap(ctx.cursor_x as f64, ctx.cursor_y as f64, self.w, self.h);
+                }
                 self.dragging = false;
                 EventResponse::Handled
             }
@@ -178,8 +188,11 @@ impl FluorApp for AndroidApp {
                     self.suppress_move = false;
                 } else if self.dragging && self.two.is_none() {
                     let (dx, dy) = (x - self.last_cursor.0, y - self.last_cursor.1);
-                    self.map.pan(dx, dy, self.w, self.h);
-                    ctx.window.request_redraw();
+                    self.travel += dx.abs() + dy.abs();
+                    if self.travel >= 12.0 {
+                        self.map.pan(dx, dy, self.w, self.h);
+                        ctx.window.request_redraw();
+                    }
                 }
                 self.last_cursor = (x, y);
                 EventResponse::Handled
@@ -309,6 +322,7 @@ pub extern "system" fn Java_nz_mahere_app_MahereActivity_nativeInit(
         w: width as usize,
         h: height as usize,
         dragging: false,
+        travel: 0.0,
         last_cursor: (0., 0.),
         two: None,
         suppress_move: false,

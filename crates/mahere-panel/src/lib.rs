@@ -7,13 +7,15 @@ use fluor::paint::{self, HitId, HIT_NONE};
 use fluor::text::{TextRenderer, TextStyle};
 use fluor::theme;
 use fluor::widgets::Checkbox;
-use mahere_engine::LayerMask;
+use mahere_engine::{LayerMask, MeasureView};
 
 /// The two modes the panel switches besides the layers.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Controls {
     pub real_sun: bool,
     pub follow_heading: bool,
+    /// Measure from the fix rather than the screen centre.
+    pub lock_to_fix: bool,
 }
 
 /// What the readouts show.
@@ -35,6 +37,7 @@ pub struct Readouts {
 enum Layer {
     RealSun,
     FollowHeading,
+    LockToFix,
     Dem,
     Hypso,
     Land,
@@ -47,7 +50,7 @@ enum Layer {
     Debug,
 }
 
-const LAYERS: [(Layer, &str); 12] = [
+const LAYERS: [(Layer, &str); 13] = [
     (Layer::Dem, "Terrain"),
     (Layer::Hypso, "Elevation tint"),
     (Layer::Land, "Land cover"),
@@ -60,12 +63,14 @@ const LAYERS: [(Layer, &str); 12] = [
     (Layer::Debug, "Residency"),
     (Layer::RealSun, "Real sun"),
     (Layer::FollowHeading, "Follow heading"),
+    (Layer::LockToFix, "Measure from me"),
 ];
 
 fn get(mask: &LayerMask, ctl: &Controls, l: Layer) -> bool {
     match l {
         Layer::RealSun => ctl.real_sun,
         Layer::FollowHeading => ctl.follow_heading,
+        Layer::LockToFix => ctl.lock_to_fix,
         Layer::Dem => mask.dem,
         Layer::Hypso => mask.hypso,
         Layer::Land => mask.land,
@@ -83,6 +88,7 @@ fn set(mask: &mut LayerMask, ctl: &mut Controls, l: Layer, v: bool) {
     match l {
         Layer::RealSun => ctl.real_sun = v,
         Layer::FollowHeading => ctl.follow_heading = v,
+        Layer::LockToFix => ctl.lock_to_fix = v,
         Layer::Dem => mask.dem = v,
         Layer::Hypso => mask.hypso = v,
         Layer::Land => mask.land = v,
@@ -104,6 +110,8 @@ const fn ink(rgb: u32, alpha: u8) -> u32 {
 const PANEL_BG: u32 = ink(0x0E_12_1A, 222);
 const GEAR_BG: u32 = ink(0x14_18_22, 230);
 const PANEL_DIM: u32 = ink(0x0E_12_1A, 170);
+const STRIP_FILL: u32 = ink(0x3A_5A_7A, 200);
+const STRIP_EDGE: u32 = ink(0xFF_C4_40, 255);
 const READOUT: u32 = ink(0xC8_CC_D4, 255);
 const READOUT_DIM: u32 = ink(0x80_86_92, 255);
 
@@ -162,7 +170,7 @@ impl Panel {
         let top = self.gear.1 + r + self.font * 0.9;
         for (i, (l, cb)) in self.checks.iter_mut().enumerate() {
             // The two modes sit a little apart from the layers.
-            let gap = if matches!(l, Layer::RealSun | Layer::FollowHeading) { row * 0.5 } else { 0.0 };
+            let gap = if matches!(l, Layer::RealSun | Layer::FollowHeading | Layer::LockToFix) { row * 0.5 } else { 0.0 };
             let cy = top + row * (i as f32 + 0.5) + gap;
             cb.set_font_size(self.font);
             cb.set_rect(x0 + (self.panel_w - x0 * 1.5) * 0.5, cy, self.panel_w - x0 * 1.5, row);
@@ -200,7 +208,7 @@ impl Panel {
     }
 
     /// Paint for a `w × h` screen: the gear always, the column when open. Returns the buffer in fluor's pixel convention.
-    pub fn paint(&mut self, w: usize, h: usize, mask: LayerMask, ctl: Controls, r: &Readouts) -> &[u32] {
+    pub fn paint(&mut self, w: usize, h: usize, mask: LayerMask, ctl: Controls, r: &Readouts, measure: Option<&MeasureView>) -> &[u32] {
         self.layout(w, h);
         self.buf.clear();
         self.buf.resize(w * h, 0);
@@ -224,6 +232,9 @@ impl Panel {
         paint::circle_filled(&mut canvas, gx as isize, gy as isize, (gr * 0.52) as isize, GEAR_BG, None, None);
         paint::circle_filled(&mut canvas, gx as isize, gy as isize, (gr * 0.44) as isize, ink_col, None, None);
         paint::circle_filled(&mut canvas, gx as isize, gy as isize, gr as isize, GEAR_BG, None, None);
+        if let Some(m) = measure {
+            Self::paint_strip(&mut canvas, &mut self.text, w, h, font, m);
+        }
         if !self.open {
             return &self.buf;
         }
@@ -334,5 +345,53 @@ impl Panel {
 
     pub fn hit_count(&self) -> HitId {
         self.hits
+    }
+}
+
+impl Panel {
+    /// How many profile samples a strip on a `w`-wide screen shows: one per pixel of its width.
+    pub fn strip_samples(w: usize) -> usize {
+        let font = (w.min(2400) as f32 / 26.0).clamp(14.0, 36.0);
+        (w as f32 - font * 2.0).max(2.0) as usize
+    }
+
+    /// The measurement strip along the bottom: the elevation profile from origin to target as a filled area, with distance and bearing on the left and the elevations on the right.
+    fn paint_strip(canvas: &mut Canvas, text: &mut TextRenderer, w: usize, h: usize, font: f32, m: &MeasureView) {
+        let band = font * 6.5;
+        let top = h as f32 - band;
+        let margin = font;
+        let (lo, hi) = m.profile.iter().filter(|e| !e.is_nan()).fold((f32::MAX, f32::MIN), |(a, b), &e| (a.min(e), b.max(e)));
+        let have = lo <= hi;
+        let span = (hi - lo).max(1.0);
+        // Text first (topmost), then the profile, then the band under both.
+        let small = TextStyle::new(font * 0.9, READOUT);
+        let dim = TextStyle::new(font * 0.75, READOUT_DIM);
+        let dist = if m.distance_m < 1000.0 { format!("{} m", m.distance_m.round() as i64) } else { format!("{:.2} km", m.distance_m / 1000.0) };
+        text.draw_text_left(canvas, &format!("{dist}   {}°", m.bearing_deg.round() as i64), margin, top + font * 0.9, &small, None, None);
+        let e = |v: Option<f32>| v.map_or("—".to_string(), |e| format!("{} m", e.round() as i64));
+        let rise = match (m.elev_origin, m.elev_target) {
+            (Some(a), Some(b)) => format!("   {:+} m", (b - a).round() as i64),
+            _ => String::new(),
+        };
+        text.draw_text_right(canvas, &format!("{} → {}{rise}", e(m.elev_origin), e(m.elev_target)), w as f32 - margin, top + font * 0.9, &small, None, None);
+        if have {
+            text.draw_text_left(canvas, &format!("{} m", hi.round() as i64), margin, top + font * 1.9, &dim, None, None);
+            text.draw_text_left(canvas, &format!("{} m", lo.round() as i64), margin, h as f32 - font * 0.6, &dim, None, None);
+        }
+        // The profile: one column per sample, from the band's floor up to the elevation.
+        let floor_y = h as f32 - font * 0.5;
+        let ceil_y = top + font * 1.8;
+        let x0 = margin;
+        let n = m.profile.len().max(1);
+        for (i, &el) in m.profile.iter().enumerate() {
+            if el.is_nan() {
+                continue;
+            }
+            let x = x0 + i as f32 * (w as f32 - 2.0 * margin) / n as f32;
+            let y = floor_y - (el - lo) / span * (floor_y - ceil_y);
+            paint::fill_rect(canvas, x as isize, y as isize, 1, (floor_y - y).max(1.0) as isize, STRIP_FILL, None, None);
+            paint::fill_rect(canvas, x as isize, y as isize - 1, 1, 2, STRIP_EDGE, None, None);
+        }
+        paint::fill_rect(canvas, 0, top as isize, w as isize, band as isize, PANEL_BG, None, None);
     }
 }

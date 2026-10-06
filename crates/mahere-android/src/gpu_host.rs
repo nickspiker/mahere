@@ -157,9 +157,12 @@ impl GpuHost {
         let mask = map.layers();
         let mask_bits = mahere_gpu::mask_bits(mask);
         // The overlay repaints when what it shows changes: the panel (open: its readouts follow the camera), the compass (bearing), the size. The pin is the shader's.
-        let cam_part = if panel.is_open() { (c.lat.to_bits(), c.lon.to_bits(), c.ppd.to_bits()) } else { (0, 0, 0) };
-        let stamp: OverlayStamp = (cam_part.0, cam_part.1, cam_part.2, c.bearing.to_bits(), None, w, h, panel.is_open(), mask_bits | (map.real_sun as u32) << 20 | (map.follow_heading as u32) << 21 | if panel.is_open() && map.have_rotation { (map.true_heading().round() as u32) << 22 } else { 0 });
+        // An unlocked measurement's profile follows the screen centre, so the camera is part of the stamp while one exists.
+        let cam_part = if panel.is_open() || map.has_measure() { (c.lat.to_bits(), c.lon.to_bits(), c.ppd.to_bits()) } else { (0, 0, 0) };
+        let measure_part = map.measure_view(w as usize, h as usize, 2).map(|m| (m.target_px.0.to_bits() as u64, m.target_px.1.to_bits() as u64, (m.distance_m.round() as u32)));
+        let stamp: OverlayStamp = (cam_part.0, cam_part.1, cam_part.2, c.bearing.to_bits(), measure_part, w, h, panel.is_open(), mask_bits | (map.real_sun as u32) << 20 | (map.follow_heading as u32) << 21 | if panel.is_open() && map.have_rotation { (map.true_heading().round() as u32) << 22 } else { 0 });
         self.map.pin = map.gps_screen(w as usize, h as usize);
+        self.map.measure = map.measure_view(w as usize, h as usize, 2).map(|m| (m.origin_px.0, m.origin_px.1, m.target_px.0, m.target_px.1));
         // A bearing or readout change repaints at most a few times a second (the orientation sensor would otherwise repaint the panel's text every frame); the panel opening, closing or a row flipping repaints at once.
         let structural = self.overlay_stamp.is_none_or(|s| (s.5, s.6, s.7, s.8) != (w, h, panel.is_open(), stamp.8));
         if self.overlay_stamp != Some(stamp) && (structural || self.overlay_at.elapsed().as_millis() >= 150) {
@@ -169,7 +172,8 @@ impl GpuHost {
                 heading -= 360.0;
             }
             let readouts = Readouts { lat: c.lat, lon: c.lon, elev: map.elevation_at(c.lat, c.lon), heading_deg: heading, m_per_px: 111_320.0 / c.ppd, frame_ms: map.last_frame_ms, resident: map.pool().map.len(), phone_heading: map.have_rotation.then(|| map.true_heading()) };
-            panel.paint(w as usize, h as usize, mask, Controls { real_sun: map.real_sun, follow_heading: map.follow_heading }, &readouts);
+            let measure = map.measure_view(w as usize, h as usize, Panel::strip_samples(w as usize));
+            panel.paint(w as usize, h as usize, mask, Controls { real_sun: map.real_sun, follow_heading: map.follow_heading, lock_to_fix: map.lock_to_fix }, &readouts, measure.as_ref());
             let marks = map.overlay(w as usize, h as usize, false).to_vec();
             let rgba = panel.overlay_rgba(&marks, w as usize, h as usize);
             self.map.set_overlay_rgba(&self.device, &self.queue, w, h, &rgba);

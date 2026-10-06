@@ -108,6 +108,10 @@ pub struct MapCore {
     last_pin: Option<(f32, f32)>,
     /// The last plan and what it was for.
     plan_cache: Option<(PlanKey, Arc<plan::FramePlan>)>,
+    /// The current measurement, if a point was tapped.
+    measure: Option<Measure>,
+    /// Measure from the fix rather than the screen centre, until the camera moves.
+    pub lock_to_fix: bool,
 }
 
 type PlanKey = (u64, u64, u64, u64, usize, usize, u64, u8, u8);
@@ -151,6 +155,8 @@ impl MapCore {
             layer_mask: LayerMask::default(),
             last_pin: None,
             plan_cache: None,
+            measure: None,
+            lock_to_fix: false,
         }
     }
 
@@ -198,11 +204,13 @@ impl MapCore {
 
     pub fn set_bearing(&mut self, bearing: f64) {
         self.cam.bearing = bearing.rem_euclid(core::f64::consts::TAU);
+        self.unlock_measure();
         self.dirty = true;
     }
 
     pub fn set_ppd(&mut self, ppd: f64) {
         self.cam.ppd = ppd.clamp(40., 4_000_000.);
+        self.unlock_measure();
         self.dirty = true;
     }
 
@@ -337,6 +345,7 @@ impl MapCore {
     }
 
     pub fn camera_moved(&mut self, _w: usize, _h: usize) {
+        self.unlock_measure();
         self.dirty = true;
     }
 
@@ -510,7 +519,20 @@ impl MapCore {
 
         self.draw_gps(w, h);
         self.draw_compass(w, h);
+        self.draw_measure(w, h);
         self.last_frame_ms = t0.elapsed().as_secs_f32() * 1000.0;
+    }
+
+    /// The measurement for a CPU frontend: the line from origin to target and a crosshair on the target.
+    fn draw_measure(&mut self, w: usize, h: usize) {
+        let Some(m) = self.measure_view(w, h, 2) else { return };
+        const INK: [u8; 3] = [255, 196, 64];
+        let (ox, oy) = m.origin_px;
+        let (tx, ty) = m.target_px;
+        draw_segment(&mut self.canvas, w, h, ox, oy, tx, ty, 1.3, INK);
+        for (dx0, dy0, dx1, dy1) in [(-12., 0., 12., 0.), (0., -12., 0., 12.)] {
+            draw_segment(&mut self.canvas, w, h, tx + dx0, ty + dy0, tx + dx1, ty + dy1, 1.6, INK);
+        }
     }
 
     /// North arrow, top-right, with the view's heading below it: degrees the screen's up is turned from true north, clockwise positive, -180..180. No letters.
@@ -785,5 +807,102 @@ mod frame_tests {
         // Earth's up leans toward the top of the screen and still comes out of it.
         let up = f.up();
         assert!(up[1] > 0.8 && up[2] > 0.4, "{up:?}");
+    }
+}
+
+// ==================== MEASUREMENT ====================
+
+/// A tapped point and where it is measured from: the fix while locked to it, the screen centre otherwise. A pan, zoom or rotate unlocks; a tap starts a new one.
+#[derive(Clone, Copy, Debug)]
+pub struct Measure {
+    pub target: (f64, f64),
+    pub from_fix: bool,
+}
+
+/// A measurement as seen this frame: screen points, distance and bearing from origin to target, elevation at both ends, and the profile along the way.
+#[derive(Clone, Debug)]
+pub struct MeasureView {
+    pub origin_px: (f32, f32),
+    pub target_px: (f32, f32),
+    pub distance_m: f64,
+    pub bearing_deg: f64,
+    pub elev_origin: Option<f32>,
+    pub elev_target: Option<f32>,
+    /// Elevation every step from origin to target, NaN where no terrain is resident.
+    pub profile: Vec<f32>,
+}
+
+impl MapCore {
+    /// A tap on the map at screen (x, y): a new measurement to that point.
+    pub fn tap(&mut self, x: f64, y: f64, w: usize, h: usize) {
+        let target = self.cam.screen_to_geo(x, y, w, h);
+        self.measure = Some(Measure { target, from_fix: self.lock_to_fix && self.gps.is_some() });
+        self.dirty = true;
+    }
+
+    pub fn clear_measure(&mut self) {
+        self.measure = None;
+        self.dirty = true;
+    }
+
+    pub fn set_lock_to_fix(&mut self, on: bool) {
+        self.lock_to_fix = on;
+        if let Some(m) = &mut self.measure {
+            m.from_fix = on && self.gps.is_some();
+        }
+        self.dirty = true;
+    }
+
+    /// The camera moved: a measurement from the fix now measures from the screen centre.
+    fn unlock_measure(&mut self) {
+        if let Some(m) = &mut self.measure {
+            m.from_fix = false;
+        }
+    }
+
+    /// The origin of the current measurement, geographic.
+    fn measure_origin(&self, w: usize, h: usize) -> Option<(f64, f64)> {
+        let m = self.measure?;
+        if m.from_fix {
+            if let Some(g) = self.gps {
+                return Some((g.lat, g.lon));
+            }
+        }
+        Some(self.cam.screen_to_geo(w as f64 * 0.5, h as f64 * 0.5, w, h))
+    }
+
+    /// The measurement for a `w × h` screen with a profile of `samples` points, if one is set.
+    pub fn measure_view(&self, w: usize, h: usize, samples: usize) -> Option<MeasureView> {
+        let m = self.measure?;
+        let (olat, olon) = self.measure_origin(w, h)?;
+        let (tlat, tlon) = m.target;
+        let (ox, oy) = self.cam.geo_to_screen(olat, olon, w, h);
+        let (tx, ty) = self.cam.geo_to_screen(tlat, tlon, w, h);
+        // Flat-earth over the span a screen can show: metres east and north.
+        let m_lat = 111_320.0;
+        let m_lon = 111_320.0 * ((olat + tlat) * 0.5).to_radians().cos();
+        let (de, dn) = ((tlon - olon) * m_lon, (tlat - olat) * m_lat);
+        let distance_m = (de * de + dn * dn).sqrt();
+        let bearing_deg = de.atan2(dn).to_degrees().rem_euclid(360.0);
+        let n = samples.max(2);
+        let profile = (0..n)
+            .map(|i| {
+                let t = i as f64 / (n - 1) as f64;
+                self.elevation_at(olat + (tlat - olat) * t, olon + (tlon - olon) * t).unwrap_or(f32::NAN)
+            })
+            .collect();
+        Some(MeasureView {
+            origin_px: (ox as f32, oy as f32),
+            target_px: (tx as f32, ty as f32),
+            distance_m,
+            bearing_deg,
+            elev_origin: self.elevation_at(olat, olon),
+            elev_target: self.elevation_at(tlat, tlon),
+            profile,
+        })
+    }
+
+    pub fn has_measure(&self) -> bool {
+        self.measure.is_some()
     }
 }

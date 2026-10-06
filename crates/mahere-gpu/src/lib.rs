@@ -54,6 +54,7 @@ struct Uniforms {
     offset: [f32; 4],
     pin: [f32; 4],
     line_hi: [[f32; 4]; 4],
+    measure: [f32; 4],
 }
 
 /// The layer mask as the shader's bits.
@@ -230,6 +231,8 @@ pub struct GpuMap {
     pub sample_offset: [f32; 2],
     /// The GPS pin, drawn by the present pass: screen centre and accuracy radius in pixels.
     pub pin: Option<(f32, f32, f32)>,
+    /// The measurement, drawn by the present pass: origin and target in screen pixels.
+    pub measure: Option<(f32, f32, f32, f32)>,
 }
 
 impl GpuMap {
@@ -327,6 +330,7 @@ impl GpuMap {
             scale: SCALE,
             sample_offset: [0.0, 0.0],
             pin: None,
+            measure: None,
         }
     }
 
@@ -614,7 +618,10 @@ impl GpuMap {
                 None => [0.0, 0.0, 0.0, 0.0],
             },
             line_hi: std::array::from_fn(|i| std::array::from_fn(|j| plan.line_mag_hi[4 * i + j].max(1) as f32)),
+            measure: self.measure.map_or([0.0; 4], |(ox, oy, tx, ty)| [ox, oy, tx, ty]),
         };
+        let measure_on = self.measure.is_some();
+        let u = Uniforms { depths: [plan.dem_depth as u32, plan.vec_depth as u32, plan.magnified as u32, measure_on as u32], ..u };
         queue.write_buffer(&self.uniforms, 0, bytemuck::bytes_of(&u));
 
         let scale = self.scale.max(1);

@@ -40,6 +40,7 @@ struct Uniforms {
     offset: vec4<f32>,
     pin: vec4<f32>,
     line_hi: array<vec4<f32>, 4>,
+    measure: vec4<f32>,
 };
 
 // a: diamond, depth, cu, cv. b: dem slot, line slot, land+water slot, img slot. c: flags. d: base, step, eu, nu. e: ev, nv, inv det.
@@ -493,6 +494,20 @@ fn fs_present(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         let cross = select(0.0, clamp(1.6 - min(abs(d.x), abs(d.y)) + 0.5, 0.0, 1.0), max(abs(d.x), abs(d.y)) <= 9.0);
         let cov = max(ring, cross);
         rgb = mix(rgb, vec3<f32>(64.0, 156.0, 255.0) / 255.0, cov);
+    }
+    // The measurement: a line from origin to target and a crosshair on the target, feathered over a pixel.
+    if (U.depths.w != 0u) {
+        let o = U.measure.xy;
+        let t = U.measure.zw;
+        let ab = t - o;
+        let len2 = max(dot(ab, ab), 1.0);
+        let tt = clamp(dot(pos.xy - o, ab) / len2, 0.0, 1.0);
+        let dline = length(pos.xy - (o + ab * tt));
+        let line_cov = clamp(1.3 - dline + 0.5, 0.0, 1.0);
+        let dt = pos.xy - t;
+        let cross = select(0.0, clamp(1.6 - min(abs(dt.x), abs(dt.y)) + 0.5, 0.0, 1.0), max(abs(dt.x), abs(dt.y)) <= 12.0 && min(abs(dt.x), abs(dt.y)) <= 1.6 && length(dt) > 3.0);
+        let cov = max(line_cov * 0.85, cross);
+        rgb = mix(rgb, vec3<f32>(255.0, 196.0, 64.0) / 255.0, cov);
     }
     return vec4<f32>(rgb, 1.0);
 }
