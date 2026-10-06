@@ -17,6 +17,8 @@ struct MahereApp {
     map: MapCore,
     chrome: DefaultChrome,
     dragging: bool,
+    /// Right-button drag: rotate about the screen centre.
+    rotating: bool,
     last_cursor: (f64, f64),
     store: Option<std::sync::Arc<mahere_store::FlatStorage>>,
     last_save: Instant,
@@ -29,13 +31,14 @@ impl MahereApp {
             Viewport::new(1280, 800),
             "mahere",
             None,
-            Some("drag pan · wheel zoom · A/D W/S sun · Q/E rotate · R home".to_string()),
+            Some("drag pan · right-drag rotate · wheel zoom · A/D W/S sun · Q/E rotate · R home · 1-4 layers".to_string()),
             &mut hit_counter,
         );
         MahereApp {
             map,
             chrome,
             dragging: false,
+            rotating: false,
             last_cursor: (0., 0.),
             store: None,
             last_save: Instant::now(),
@@ -137,6 +140,11 @@ impl FluorApp for MahereApp {
                 self.dragging = false;
                 EventResponse::Handled
             }
+            FEvent::MouseInput { state, button: MouseButton::Right } => {
+                self.rotating = *state == ElementState::Pressed;
+                self.last_cursor = (ctx.cursor_x as f64, ctx.cursor_y as f64);
+                EventResponse::Handled
+            }
             FEvent::CursorMoved { .. } => {
                 let (hx, hy) = (ctx.cursor_x, ctx.cursor_y);
                 if self.chrome.set_hover(self.chrome.hit_at(hx, hy)) {
@@ -147,12 +155,28 @@ impl FluorApp for MahereApp {
                     let (dx, dy) = (x - self.last_cursor.0, y - self.last_cursor.1);
                     self.map.pan(dx, dy, w, h);
                     ctx.window.request_redraw();
+                } else if self.rotating {
+                    // Angle swept by the cursor around the screen centre, so the
+                    // map turns with the hand instead of at a fixed rate.
+                    let (cx, cy) = (w as f64 * 0.5, h as f64 * 0.5);
+                    let a0 = (self.last_cursor.1 - cy).atan2(self.last_cursor.0 - cx);
+                    let a1 = (y - cy).atan2(x - cx);
+                    let mut da = a1 - a0;
+                    if da > std::f64::consts::PI {
+                        da -= std::f64::consts::TAU;
+                    } else if da < -std::f64::consts::PI {
+                        da += std::f64::consts::TAU;
+                    }
+                    self.map.set_bearing(self.map.cam.bearing - da);
+                    self.map.camera_moved(w, h);
+                    ctx.window.request_redraw();
                 }
                 self.last_cursor = (x, y);
                 EventResponse::Handled
             }
             FEvent::CursorLeft => {
                 self.dragging = false;
+                self.rotating = false;
                 if self.chrome.set_hover(HIT_NONE) {
                     ctx.window.request_redraw();
                 }
