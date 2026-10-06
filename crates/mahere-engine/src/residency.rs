@@ -100,6 +100,9 @@ pub struct Entry {
     pub present: u8,
     /// The largest waterway magnitude in the cell's line plane, so a view can scale water to what it shows.
     pub water_mag_max: u8,
+    /// The cell's elevation span, quantised (ELEV_NODATA, 0 when it has none): the contour interval is fit to the union over the view.
+    pub elev_lo: u16,
+    pub elev_hi: u16,
     pub dem: Option<DemPacked>,
     /// The same elevation as `dem`, in the layout a GPU uploads; kept beside the packed texels so either renderer can run.
     pub dem_q: Option<DemQ>,
@@ -326,6 +329,12 @@ fn load_cell(store: &dyn CellStore, key: CellKey, pack_cpu: bool) -> Loaded {
             return Loaded { key, entry: None };
         }
     };
+    let (elev_lo, elev_hi) = planes.dem.as_ref().map_or((mahere_tiles::ELEV_NODATA, 0), |d| {
+        d.elev.iter().filter(|e| !e.is_nan()).fold((mahere_tiles::ELEV_NODATA, 0u16), |(lo, hi), &e| {
+            let q = mahere_tiles::quantize_elev(e);
+            (lo.min(q), hi.max(q))
+        })
+    });
     let dem_q = planes.dem.as_ref().map(DemQ::from_planes);
     let dem = if pack_cpu { planes.dem.map(|d| DemPacked { texel: d.pack_texels(key).into_boxed_slice() }) } else { None };
     if std::env::var_os("MAHERE_TRACE").is_some() || cfg!(target_os = "android") {
@@ -337,7 +346,7 @@ fn load_cell(store: &dyn CellStore, key: CellKey, pack_cpu: bool) -> Loaded {
         | (planes.water.is_some() as u8) * PRESENT_WATER
         | (planes.img.is_some() as u8) * PRESENT_IMG;
     let water_mag_max = planes.line.as_ref().map_or(0, |l| (0..mahere_tiles::TRI).filter(|&i| l.class[i] as usize == crate::raster::WATERWAY_CLASS).map(|i| l.mag_at(i)).max().unwrap_or(0));
-    Loaded { key, entry: Some(Entry { present, water_mag_max, dem, dem_q, line: planes.line, land: planes.land, water: planes.water, img: planes.img }) }
+    Loaded { key, entry: Some(Entry { present, water_mag_max, elev_lo, elev_hi, dem, dem_q, line: planes.line, land: planes.land, water: planes.water, img: planes.img }) }
 }
 
 // ==================== TIERED STORE: VAULT CACHE OVER THE BUCKET ====================

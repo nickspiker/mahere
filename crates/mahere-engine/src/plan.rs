@@ -8,7 +8,7 @@ use rayon::prelude::*;
 
 
 use crate::Camera;
-use crate::raster::{BLOCK, CornerPt, ElevRange, MIN_DEPTH, corner, probe, raw_of, tri_index};
+use crate::raster::{BLOCK, CornerPt, ElevRange, MIN_DEPTH, corner, raw_of};
 use crate::residency::Pool;
 
 pub const NONE: u32 = u32::MAX;
@@ -88,24 +88,6 @@ pub fn table_hash(diamond: u32, depth: u32, cu: u32, cv: u32) -> u32 {
     (h ^ (h >> 15)) & (TABLE_N as u32 - 1)
 }
 
-/// Elevation under a lattice corner from either dem form, climbing parents past no-data like the shader does.
-fn lattice_elev(pool: &Pool, depth: u8, raw: u64, uq: i64, vq: i64) -> Option<u16> {
-    let mut depth = depth;
-    loop {
-        let prefix = raw >> (60 - 2 * depth as u32);
-        let (e, d, _) = probe(pool, depth, prefix, |e| e.has_dem())?;
-        let i = tri_index(uq, vq, 16 + (22 - d as u32));
-        match e.elev_q_at(i) {
-            Some(eq) if eq != ELEV_NODATA => return Some(eq),
-            _ => {}
-        }
-        if d <= MIN_DEPTH {
-            return None;
-        }
-        depth = d - 1;
-    }
-}
-
 fn jacobian(key: CellKey) -> [f32; 5] {
     let (u0, v0, size) = key.uv_rect();
     let d = key.diamond();
@@ -156,14 +138,9 @@ pub fn plan_frame(w: usize, h: usize, cam: &Camera, pool: &Pool, dem_depth: u8, 
     // Desired set and the elevation range, from the lattice. The corners dedupe to their finest cells first (a few hundred from a few thousand corners), then each walks its parents; at the coarse depths the ring of neighbours comes too, so a zoom out lands on cells already resident instead of a blank screen (Nick 2026-10-06), and they are small.
     let fine = dem_depth.max(vec_depth);
     let mut fine_cells: rustc_hash::FxHashSet<u64> = rustc_hash::FxHashSet::default();
-    let mut elev = ElevRange::EMPTY;
     for c in &corners {
         let raw = raw_of(c.diamond, c.u, c.v);
         fine_cells.insert(raw >> (60 - 2 * fine as u32));
-        if let Some(eq) = lattice_elev(pool, dem_depth, raw, c.u, c.v) {
-            elev.lo = elev.lo.min(eq);
-            elev.hi = elev.hi.max(eq);
-        }
     }
     let mut desired: rustc_hash::FxHashSet<CellKey> = rustc_hash::FxHashSet::default();
     for &fp in &fine_cells {
@@ -276,6 +253,24 @@ pub fn plan_frame(w: usize, h: usize, cam: &Camera, pool: &Pool, dem_depth: u8, 
         }
     }
 
+    // The elevation span of the terrain on screen: the union of the cells' spans at the terrain depth (or the nearest coarser depth that has any), each recorded once at load — no sampling, no corner that misses a summit.
+    let mut elev = ElevRange::EMPTY;
+    let mut d = dem_depth;
+    loop {
+        for r in &refs {
+            if r.key.depth == d {
+                let e = &pool.map[&r.key];
+                if e.elev_lo != ELEV_NODATA {
+                    elev.lo = elev.lo.min(e.elev_lo);
+                    elev.hi = elev.hi.max(e.elev_hi);
+                }
+            }
+        }
+        if !elev.is_empty() || d <= MIN_DEPTH {
+            break;
+        }
+        d -= 1;
+    }
     let magnified = crate::raster::texel_px(cam.ppd, dem_depth) >= 1.5;
     let water_mag_hi = refs.iter().filter(|r| r.key.depth == vec_depth || r.key.depth + 1 == vec_depth).map(|r| pool.map[&r.key].water_mag_max).max().unwrap_or(0);
     FramePlan { blocks, refs, table, want: desired.into_iter().collect(), elev, straddle_blocks, dem_depth, vec_depth, magnified, water_mag_hi }

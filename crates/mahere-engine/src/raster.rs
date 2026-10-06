@@ -782,6 +782,8 @@ mod tests {
             Entry {
                 present: crate::residency::PRESENT_DEM | crate::residency::PRESENT_LINE | crate::residency::PRESENT_LAND | crate::residency::PRESENT_WATER,
                 water_mag_max: 0,
+                elev_lo: 6000,
+                elev_hi: 6000,
                 dem: Some(DemPacked { texel: texel.into_boxed_slice() }),
                 dem_q: None,
                 line: Some(ClassCell::new_line()),
