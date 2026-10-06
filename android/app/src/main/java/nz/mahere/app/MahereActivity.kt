@@ -63,7 +63,9 @@ class MahereActivity : Activity(), SurfaceHolder.Callback, Choreographer.FrameCa
         // Cells stream from the bucket into the vault now; nothing ships in
         // the APK. Drop the staged copy earlier builds left behind.
         thread {
-            java.io.File(filesDir, "cells").deleteRecursively()
+            for (legacy in listOf("cells", "dem", "featpack.vsf")) {
+                java.io.File(filesDir, legacy).deleteRecursively()
+            }
             runOnUiThread {
                 assetsStaged = true
                 maybeInit()
