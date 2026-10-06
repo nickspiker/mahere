@@ -310,6 +310,32 @@ pub fn apron_idx(side: usize, half: usize, i: usize) -> usize {
     (side * 2 + half) * TEX + i
 }
 
+/// Imagery bands, 8-bit, 0 = no data: NAIP red and near-infrared (passive, ~650 / ~850 nm) and the lidar return intensity at 1064 nm (active — no sun, no shadows). Never baked finer than depth 14 (IMG_MAX_DEPTH).
+#[derive(Clone)]
+pub struct ImgCell {
+    pub red: Vec<u8>,
+    pub nir: Vec<u8>,
+    pub i1064: Vec<u8>,
+}
+
+impl ImgCell {
+    pub fn new() -> ImgCell {
+        ImgCell { red: vec![0; TRI], nir: vec![0; TRI], i1064: vec![0; TRI] }
+    }
+    pub fn is_empty(&self) -> bool {
+        self.red.iter().all(|&v| v == 0) && self.nir.iter().all(|&v| v == 0) && self.i1064.iter().all(|&v| v == 0)
+    }
+}
+
+impl Default for ImgCell {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Imagery is never baked finer than this (1.2 m texels): NAIP's 60 cm is a downsample into it, never an upsample.
+pub const IMG_MAX_DEPTH: u8 = 14;
+
 /// Everything a cell can carry. Vector layers at a vector depth are always all present (empty planes compress to nothing), so a reader finding one of them knows the cell's vector truth is complete.
 #[derive(Clone, Default)]
 pub struct Cell {
@@ -317,6 +343,7 @@ pub struct Cell {
     pub line: Option<ClassCell>,
     pub land: Option<ClassCell>,
     pub water: Option<CovCell>,
+    pub img: Option<ImgCell>,
 }
 
 // ==================== LINE LAYER ====================
@@ -693,6 +720,96 @@ pub fn dem_pyramid(base: &[(CellKey, DemCell)], min_depth: u8) -> Vec<(CellKey, 
     out
 }
 
+// ==================== IMAGERY LAYER ====================
+
+/// Sample NAIP (red, nir) and lidar intensity at every triangle centroid of `keys` (depth <= IMG_MAX_DEPTH); cells with nothing are dropped.
+pub fn bake_img(naip: Option<&mahere_dem::ImgStore>, intensity: Option<&mahere_dem::IntensityStore>, keys: &[CellKey]) -> Vec<(CellKey, ImgCell)> {
+    keys.par_iter()
+        .map(|&key| {
+            let (u0, v0, size) = key.uv_rect();
+            let d = key.diamond();
+            let step = size / TEX as f64;
+            let mut cell = ImgCell::new();
+            for ty in 0..TEX {
+                for tx in 0..TEX {
+                    for half in 0..2 {
+                        let (cx, cy) = tri_centroid(tx, ty, half);
+                        let (lat, lon) = uv_to_lat_lon(d, u0 + cx * step, v0 + cy * step);
+                        let i = tri_idx(tx, ty, half);
+                        if let Some(px) = naip.and_then(|n| n.sample(lat, lon)) {
+                            cell.red[i] = px[0].max(1);
+                            cell.nir[i] = px[3].max(1);
+                        }
+                        if let Some(v) = intensity.and_then(|s| s.sample(lat, lon)) {
+                            cell.i1064[i] = v;
+                        }
+                    }
+                }
+            }
+            (key, cell)
+        })
+        .filter(|(_, c)| !c.is_empty())
+        .collect()
+}
+
+/// Parent texel = mean of the lit children per band (0 = no data, ignored).
+pub fn img_pyramid(base: &[(CellKey, ImgCell)], min_depth: u8) -> Vec<(CellKey, ImgCell)> {
+    let mut out: Vec<(CellKey, ImgCell)> = Vec::new();
+    let mut last: Option<usize> = None;
+    loop {
+        let cur: &[(CellKey, ImgCell)] = match last {
+            None => base,
+            Some(i) => &out[i..],
+        };
+        let Some(&(k0, _)) = cur.first() else { break };
+        if k0.depth <= min_depth {
+            break;
+        }
+        let mut parents: Vec<CellKey> = cur.iter().map(|(k, _)| k.parent()).collect();
+        parents.sort();
+        parents.dedup();
+        let by_key: HashMap<CellKey, &ImgCell> = cur.iter().map(|(k, c)| (*k, c)).collect();
+        let next: Vec<(CellKey, ImgCell)> = parents
+            .par_iter()
+            .map(|&p| {
+                let kids: [Option<&&ImgCell>; 4] = std::array::from_fn(|q| by_key.get(&p.child(q as u64)));
+                let mut cell = ImgCell::new();
+                for ty in 0..TEX {
+                    for tx in 0..TEX {
+                        for half in 0..2 {
+                            let mut acc = [0u32; 3];
+                            let mut n = [0u32; 3];
+                            for (q, i) in child_cell_texels(tx, ty, half) {
+                                let Some(child) = kids[q as usize] else { continue };
+                                for (b, plane) in [&child.red, &child.nir, &child.i1064].into_iter().enumerate() {
+                                    if plane[i] != 0 {
+                                        acc[b] += plane[i] as u32;
+                                        n[b] += 1;
+                                    }
+                                }
+                            }
+                            let i = tri_idx(tx, ty, half);
+                            if n[0] > 0 {
+                                cell.red[i] = (acc[0] / n[0]) as u8;
+                            }
+                            if n[1] > 0 {
+                                cell.nir[i] = (acc[1] / n[1]) as u8;
+                            }
+                            if n[2] > 0 {
+                                cell.i1064[i] = (acc[2] / n[2]) as u8;
+                            }
+                        }
+                    }
+                }
+                (p, cell)
+            })
+            .collect();
+        last = Some(out.len());
+        out.extend(next);
+    }
+    out
+}
+
 /// All cells at `depth` that intersect a lat/lon bbox. Scanned at half-cell resolution, never coarser than an eighth of the box — a slanted rhombus cell can cut through a box without containing any corner of it.
 pub fn cells_covering(lat0: f64, lon0: f64, lat1: f64, lon1: f64, depth: u8) -> Vec<CellKey> {
     let mut keys = std::collections::HashSet::new();
@@ -765,11 +882,15 @@ pub fn assemble(
     line: HashMap<CellKey, ClassCell>,
     land: HashMap<CellKey, ClassCell>,
     water: HashMap<CellKey, CovCell>,
+    img: Vec<(CellKey, ImgCell)>,
 ) -> HashMap<CellKey, Cell> {
     let mut cells: HashMap<CellKey, Cell> = HashMap::new();
     let dem = fill_aprons(dem);
     for (k, d) in dem {
         cells.entry(k).or_default().dem = Some(d);
+    }
+    for (k, i) in img {
+        cells.entry(k).or_default().img = Some(i);
     }
     let mut vec_keys: Vec<CellKey> = line.keys().chain(land.keys()).chain(water.keys()).copied().collect();
     vec_keys.sort();
@@ -795,6 +916,7 @@ pub struct CellPlanes {
     pub line: Option<ClassCell>,
     pub land: Option<ClassCell>,
     pub water: Option<CovCell>,
+    pub img: Option<ImgCell>,
 }
 
 /// Decoded dem: elevation (NaN = no data) and the apron, memory order.
@@ -970,6 +1092,7 @@ impl Cell {
             line: self.line.clone(),
             land: self.land.clone(),
             water: self.water.clone(),
+            img: self.img.clone(),
         }
     }
 }
@@ -978,8 +1101,21 @@ impl CellPlanes {
     /// Overlay `self` (a new bake) onto `old`. A bake's footprint is where it has elevation: inside it the new vector planes win, outside the old ones stay; without a dem the new planes replace wholesale.
     pub fn merge_over(self, old: CellPlanes) -> CellPlanes {
         let mut out = self;
-        let CellPlanes { dem: old_dem, line: old_line, land: old_land, water: old_water } = old;
+        let CellPlanes { dem: old_dem, line: old_line, land: old_land, water: old_water, img: old_img } = old;
         let (mut old_line, mut old_land, mut old_water) = (old_line, old_land, old_water);
+        match (&mut out.img, old_img) {
+            (Some(n), Some(o)) => {
+                for (np, op) in [(&mut n.red, &o.red), (&mut n.nir, &o.nir), (&mut n.i1064, &o.i1064)] {
+                    for i in 0..TRI {
+                        if np[i] == 0 {
+                            np[i] = op[i];
+                        }
+                    }
+                }
+            }
+            (n @ None, Some(o)) => *n = Some(o),
+            _ => {}
+        }
         // The new bake's footprint, if it has one.
         let mask: Option<Vec<bool>> = out.dem.as_ref().map(|d| d.elev.iter().map(|e| !e.is_nan()).collect());
         match (&mut out.dem, old_dem) {
@@ -1073,6 +1209,16 @@ impl CellPlanes {
                 vec![("cov".to_string(), VsfType::t_u3(Tensor::new(vec![2, TEX * TEX], mem_to_disk(&w.cov))))],
             );
         }
+        if let Some(im) = &self.img {
+            b = b.add_section(
+                "img",
+                vec![
+                    ("red".to_string(), VsfType::t_u3(Tensor::new(vec![2, TEX * TEX], mem_to_disk(&im.red)))),
+                    ("nir".to_string(), VsfType::t_u3(Tensor::new(vec![2, TEX * TEX], mem_to_disk(&im.nir)))),
+                    ("i1064".to_string(), VsfType::t_u3(Tensor::new(vec![2, TEX * TEX], mem_to_disk(&im.i1064)))),
+                ],
+            );
+        }
         b.build().map_err(|e| format!("cell build: {e:?}"))
     }
 }
@@ -1142,6 +1288,15 @@ pub fn decode_cell(data: &[u8]) -> Result<CellPlanes, String> {
             "water" => {
                 if let Some(cov) = fields.get("cov").and_then(plane_u8_mem) {
                     out.water = Some(CovCell { cov });
+                }
+            }
+            "img" => {
+                if let (Some(red), Some(nir), Some(i1064)) = (
+                    fields.get("red").and_then(plane_u8_mem),
+                    fields.get("nir").and_then(plane_u8_mem),
+                    fields.get("i1064").and_then(plane_u8_mem),
+                ) {
+                    out.img = Some(ImgCell { red, nir, i1064 });
                 }
             }
             _ => {}
@@ -1345,7 +1500,7 @@ mod tests {
         let mut line = ClassCell::new();
         line.class[5] = 3;
         line.cov[5] = 200;
-        let cell = Cell { dem: Some(dem.clone()), line: Some(line), land: Some(ClassCell::new()), water: None };
+        let cell = Cell { dem: Some(dem.clone()), line: Some(line), land: Some(ClassCell::new()), water: None, img: None };
         let bytes = cell.quantize().encode().unwrap();
         let back = decode_cell(&bytes).unwrap();
         let d = back.dem.as_ref().unwrap();
@@ -1376,7 +1531,7 @@ mod tests {
         let mut line2 = ClassCell::new();
         line2.cov[5] = 1; // outside dem2's footprint: must NOT win
         line2.cov[TRI - 1] = 9;
-        let cell2 = Cell { dem: Some(dem2), line: Some(line2), land: None, water: None };
+        let cell2 = Cell { dem: Some(dem2), line: Some(line2), land: None, water: None, img: None };
         let merged = cell2.quantize().merge_over(back);
         let d = merged.dem.as_ref().unwrap();
         assert!((d.elev[3] - dem.elev[3]).abs() <= 0.03);

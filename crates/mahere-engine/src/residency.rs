@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, channel};
 
-use mahere_tiles::{CellKey, ClassCell, CovCell, decode_cell};
+use mahere_tiles::{CellKey, ClassCell, CovCell, ImgCell, decode_cell};
 use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
 
@@ -47,11 +47,12 @@ pub struct Entry {
     pub line: Option<ClassCell>,
     pub land: Option<ClassCell>,
     pub water: Option<CovCell>,
+    pub img: Option<ImgCell>,
 }
 
 impl Entry {
     pub fn is_absent(&self) -> bool {
-        self.dem.is_none() && self.line.is_none() && self.land.is_none() && self.water.is_none()
+        self.dem.is_none() && self.line.is_none() && self.land.is_none() && self.water.is_none() && self.img.is_none()
     }
     pub fn has_vec(&self) -> bool {
         self.line.is_some() || self.land.is_some() || self.water.is_some()
@@ -207,7 +208,7 @@ fn load_cell(store: &dyn CellStore, key: CellKey) -> Loaded {
     if std::env::var_os("MAHERE_TRACE").is_some() || cfg!(target_os = "android") {
         eprintln!("cell {} d{} loaded: dem={} line={} land={} water={} ({} bytes)", key.name(), key.depth, dem.is_some(), planes.line.is_some(), planes.land.is_some(), planes.water.is_some(), bytes.len());
     }
-    Loaded { key, entry: Some(Entry { dem, line: planes.line, land: planes.land, water: planes.water }) }
+    Loaded { key, entry: Some(Entry { dem, line: planes.line, land: planes.land, water: planes.water, img: planes.img }) }
 }
 
 // ==================== TIERED STORE: VAULT CACHE OVER THE BUCKET ====================

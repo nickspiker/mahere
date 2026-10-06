@@ -30,7 +30,7 @@ impl MahereApp {
             Viewport::new(1280, 800),
             "mahere",
             None,
-            Some("drag pan · right-drag rotate · wheel zoom · A/D W/S sun · Q/E rotate · R home · 1-4 layers".to_string()),
+            Some("drag pan · right-drag rotate · wheel zoom · A/D W/S sun · Q/E rotate · R home · 1-4 layers · 5 imagery".to_string()),
             &mut hit_counter,
         );
         MahereApp {
@@ -239,13 +239,14 @@ impl FluorApp for MahereApp {
                         true
                     }
                     // The layer filter: 1 terrain, 2 land cover, 3 water, 4 lines; 0 shows residency (fallback tint).
-                    Some(k @ ("1" | "2" | "3" | "4" | "0")) => {
+                    Some(k @ ("1" | "2" | "3" | "4" | "5" | "0")) => {
                         let mut m = self.map.layers();
                         match k {
                             "1" => m.dem = !m.dem,
                             "2" => m.land = !m.land,
                             "3" => m.water = !m.water,
                             "4" => m.line = !m.line,
+                            "5" => m.imagery = !m.imagery,
                             _ => m.debug = !m.debug,
                         }
                         self.map.set_layers(m);

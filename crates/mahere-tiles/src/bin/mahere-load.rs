@@ -18,10 +18,18 @@ fn main() {
     let vec_base: u8 = arg(&args, "--vec-base").map(|v| v.parse().unwrap()).unwrap_or(13);
     let dem_base: u8 = arg(&args, "--dem-base").map(|v| v.parse().unwrap()).unwrap_or(11);
     let min_depth: u8 = arg(&args, "--min").map(|v| v.parse().unwrap()).unwrap_or(6);
-    let tifs: Vec<String> = {
-        let i = args.iter().position(|a| a == "--dem").expect("--dem") + 1;
-        args[i..].iter().take_while(|a| !a.starts_with("--")).cloned().collect()
+    let list = |flag: &str| -> Vec<String> {
+        match args.iter().position(|a| a == flag) {
+            Some(i) => args[i + 1..].iter().take_while(|a| !a.starts_with("--")).cloned().collect(),
+            None => Vec::new(),
+        }
     };
+    let tifs = list("--dem");
+    assert!(!tifs.is_empty(), "--dem <tif>...");
+    // Imagery: --naip <4-band tif>... and/or --laz <tiles>... (lidar intensity, UTM zone from --utm-zone, default 10).
+    let naip = list("--naip");
+    let laz = list("--laz");
+    let utm_zone: u8 = arg(&args, "--utm-zone").map(|v| v.parse().unwrap()).unwrap_or(10);
     let in_box = |la: f32, lo: f32| {
         (la as f64) >= lat0 && (la as f64) <= lat1 && (lo as f64) >= lon0 && (lo as f64) <= lon1
     };
@@ -56,8 +64,24 @@ fn main() {
     eprintln!("dem pyramid {}..{min_depth}: {} cells, {:.1}s", dem_base - 1, pyramid.len(), t.elapsed().as_secs_f32());
     dem_cells.extend(pyramid);
 
+    let mut img_cells: Vec<(mahere_tiles::CellKey, mahere_tiles::ImgCell)> = Vec::new();
+    if !naip.is_empty() || !laz.is_empty() {
+        let t = std::time::Instant::now();
+        let naip_store = if naip.is_empty() { None } else { Some(mahere_dem::ImgStore::load(&naip).expect("naip")) };
+        let intensity = if laz.is_empty() { None } else { Some(mahere_dem::IntensityStore::from_laz(&laz, utm_zone).expect("laz")) };
+        eprintln!("imagery sources loaded {:.1}s", t.elapsed().as_secs_f32());
+        let t = std::time::Instant::now();
+        let img_base = vec_base.min(mahere_tiles::IMG_MAX_DEPTH);
+        let keys = mahere_tiles::cells_covering(lat0, lon0, lat1, lon1, img_base);
+        img_cells = mahere_tiles::bake_img(naip_store.as_ref(), intensity.as_ref(), &keys);
+        eprintln!("depth {img_base}: {} img cells sampled, {:.1}s", img_cells.len(), t.elapsed().as_secs_f32());
+        let pyramid = mahere_tiles::img_pyramid(&img_cells, min_depth);
+        eprintln!("img pyramid: {} cells", pyramid.len());
+        img_cells.extend(pyramid);
+    }
+
     let t = std::time::Instant::now();
-    let cells = mahere_tiles::assemble(dem_cells, line, land, water);
+    let cells = mahere_tiles::assemble(dem_cells, line, land, water, img_cells);
     let n = cells.len();
     use rayon::prelude::*;
     cells.par_iter().for_each(|(key, cell)| {

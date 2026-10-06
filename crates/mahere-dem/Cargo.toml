@@ -8,3 +8,5 @@ description = "mahere's raster elevation boundary: USGS 3DEP GeoTIFFs in, elevat
 
 [dependencies]
 tiff = "0.9"
+las = { version = "0.11", features = ["laz"] }
+rayon = "1"

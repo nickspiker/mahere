@@ -295,3 +295,190 @@ mod tests {
         assert!(matches!(grid_of(&geo), Some(Grid::Geographic)));
     }
 }
+
+// ==================== IMAGERY: MULTI-BAND u8 GeoTIFF (NAIP) ====================
+
+/// A multi-band 8-bit orthoimage tile (NAIP: red, green, blue, near-infrared at 60 cm), geographic or UTM grid like a dem tile, interleaved samples.
+pub struct ImgTile {
+    width: usize,
+    height: usize,
+    bands: usize,
+    grid: Grid,
+    origin: (f64, f64),
+    step: (f64, f64),
+    data: Vec<u8>,
+}
+
+pub struct ImgStore {
+    tiles: Vec<ImgTile>,
+}
+
+impl ImgTile {
+    pub fn load(path: &str) -> Result<ImgTile, String> {
+        let file = File::open(path).map_err(|e| format!("{path}: {e}"))?;
+        let mut dec = Decoder::new(BufReader::new(file)).map_err(|e| format!("{path}: {e}"))?.with_limits(tiff::decoder::Limits::unlimited());
+        let (w, h) = dec.dimensions().map_err(|e| format!("{path}: {e}"))?;
+        let scale = dec.get_tag_f64_vec(Tag::ModelPixelScaleTag).map_err(|e| format!("{path}: ModelPixelScale: {e}"))?;
+        let tie = dec.get_tag_f64_vec(Tag::ModelTiepointTag).map_err(|e| format!("{path}: ModelTiepoint: {e}"))?;
+        let grid = match dec.get_tag_u32_vec(Tag::GeoKeyDirectoryTag) {
+            Ok(keys) => grid_of(&keys).ok_or_else(|| format!("{path}: unsupported CRS"))?,
+            Err(e) => return Err(format!("{path}: GeoKeyDirectory: {e}")),
+        };
+        let origin = (tie[3] - tie[0] * scale[0], tie[4] + tie[1] * scale[1]);
+        let data = match dec.read_image().map_err(|e| format!("{path}: {e}"))? {
+            DecodingResult::U8(v) => v,
+            other => return Err(format!("{path}: expected U8 samples, got {}", sample_kind(&other))),
+        };
+        let px = w as usize * h as usize;
+        if data.len() % px != 0 {
+            return Err(format!("{path}: sample count {} is not a multiple of {px} pixels", data.len()));
+        }
+        let bands = data.len() / px;
+        eprintln!("img tile {path}: {w}x{h} x{bands} {grid:?}");
+        Ok(ImgTile { width: w as usize, height: h as usize, bands, grid, origin, step: (scale[0], scale[1]), data })
+    }
+
+    fn pixel_at(&self, lat: f64, lon: f64) -> Option<(usize, usize)> {
+        let (x, y) = match self.grid {
+            Grid::Geographic => (lon, lat),
+            Grid::UtmNorth(zone) => utm_forward(lat, lon, zone),
+        };
+        let px = (x - self.origin.0) / self.step.0;
+        let py = (self.origin.1 - y) / self.step.1;
+        if px < 0.0 || py < 0.0 || px >= self.width as f64 || py >= self.height as f64 {
+            return None;
+        }
+        Some((px as usize, py as usize))
+    }
+}
+
+impl ImgStore {
+    pub fn load(paths: &[String]) -> Result<ImgStore, String> {
+        let mut tiles = Vec::new();
+        for p in paths {
+            tiles.push(ImgTile::load(p)?);
+        }
+        Ok(ImgStore { tiles })
+    }
+
+    pub fn tile_count(&self) -> usize {
+        self.tiles.len()
+    }
+
+    /// Nearest-pixel sample of up to four bands at (lat, lon): None outside coverage or where every band is 0 (NAIP's no-data collar).
+    pub fn sample(&self, lat: f64, lon: f64) -> Option<[u8; 4]> {
+        for t in &self.tiles {
+            if let Some((px, py)) = t.pixel_at(lat, lon) {
+                let i = (py * t.width + px) * t.bands;
+                let mut out = [0u8; 4];
+                for b in 0..t.bands.min(4) {
+                    out[b] = t.data[i + b];
+                }
+                if out.iter().any(|&v| v != 0) {
+                    return Some(out);
+                }
+            }
+        }
+        None
+    }
+}
+
+// ==================== LIDAR INTENSITY: LAZ -> 1 m GRID ====================
+
+/// The 1064 nm return intensity of a lidar point cloud, binned to a 1 m UTM grid (mean of first returns per cell) and stretched to 1..=255 between the 1st and 99th percentile; 0 = no returns. An active-illumination near-infrared image: no sun, no shadows.
+pub struct IntensityStore {
+    zone: u8,
+    x0: f64,
+    y0: f64,
+    width: usize,
+    height: usize,
+    data: Vec<u8>,
+}
+
+impl IntensityStore {
+    /// Build from LAZ tiles (all in one northern UTM `zone`, metres). Tiles decode in parallel; the grid covers their union.
+    pub fn from_laz(paths: &[String], zone: u8) -> Result<IntensityStore, String> {
+        use rayon::prelude::*;
+        // Pass 1: bounds.
+        let bounds: Vec<las::Bounds> = paths
+            .par_iter()
+            .map(|p| las::Reader::from_path(p).map(|r| r.header().bounds()).map_err(|e| format!("{p}: {e}")))
+            .collect::<Result<_, _>>()?;
+        let (mut x0, mut y0, mut x1, mut y1) = (f64::MAX, f64::MAX, f64::MIN, f64::MIN);
+        for b in &bounds {
+            x0 = x0.min(b.min.x);
+            y0 = y0.min(b.min.y);
+            x1 = x1.max(b.max.x);
+            y1 = y1.max(b.max.y);
+        }
+        let (x0, y0) = (x0.floor(), y0.floor());
+        let width = (x1.ceil() - x0) as usize + 1;
+        let height = (y1.ceil() - y0) as usize + 1;
+        eprintln!("intensity grid {width}x{height} m from {} tiles", paths.len());
+        // Pass 2: per-tile accumulation into the shared grid (tiles don't overlap, so disjoint writes; merged by addition).
+        let partial: Vec<(Vec<u32>, Vec<u16>)> = paths
+            .par_iter()
+            .map(|p| {
+                let mut sum = vec![0u32; width * height];
+                let mut cnt = vec![0u16; width * height];
+                if let Ok(data) = las::Reader::from_path(p).and_then(|mut r| r.read_all()) {
+                    // Column accessors skip the full-record decode.
+                    for (((x, y), inten), rn) in data.x().zip(data.y()).zip(data.intensity()).zip(data.return_number()) {
+                        if rn != 1 {
+                            continue;
+                        }
+                        let gx = (x - x0) as isize;
+                        let gy = (y1.ceil() - y) as isize;
+                        if gx < 0 || gy < 0 || gx as usize >= width || gy as usize >= height {
+                            continue;
+                        }
+                        let i = gy as usize * width + gx as usize;
+                        sum[i] = sum[i].saturating_add(inten as u32);
+                        cnt[i] = cnt[i].saturating_add(1);
+                    }
+                }
+                (sum, cnt)
+            })
+            .collect();
+        let mut sum = vec![0u32; width * height];
+        let mut cnt = vec![0u16; width * height];
+        for (s, c) in partial {
+            for i in 0..sum.len() {
+                sum[i] = sum[i].saturating_add(s[i]);
+                cnt[i] = cnt[i].saturating_add(c[i]);
+            }
+        }
+        // Percentile stretch over cells with returns.
+        let mut means: Vec<u32> = (0..sum.len()).filter(|&i| cnt[i] > 0).map(|i| sum[i] / cnt[i] as u32).collect();
+        if means.is_empty() {
+            return Err("no returns".into());
+        }
+        means.sort_unstable();
+        let lo = means[means.len() / 100] as f32;
+        let hi = means[means.len() * 99 / 100].max(means[means.len() / 100] + 1) as f32;
+        let data: Vec<u8> = (0..sum.len())
+            .map(|i| {
+                if cnt[i] == 0 {
+                    0
+                } else {
+                    let m = (sum[i] / cnt[i] as u32) as f32;
+                    (1.0 + 254.0 * ((m - lo) / (hi - lo)).clamp(0.0, 1.0)) as u8
+                }
+            })
+            .collect();
+        eprintln!("intensity stretch {lo}..{hi}, {} of {} cells lit", means.len(), data.len());
+        Ok(IntensityStore { zone, x0, y0: y1.ceil(), width, height, data })
+    }
+
+    /// Nearest 1 m cell at (lat, lon); None outside the grid or with no returns.
+    pub fn sample(&self, lat: f64, lon: f64) -> Option<u8> {
+        let (x, y) = utm_forward(lat, lon, self.zone);
+        let gx = x - self.x0;
+        let gy = self.y0 - y;
+        if gx < 0.0 || gy < 0.0 || gx >= self.width as f64 || gy >= self.height as f64 {
+            return None;
+        }
+        let v = self.data[gy as usize * self.width + gx as usize];
+        (v != 0).then_some(v)
+    }
+}

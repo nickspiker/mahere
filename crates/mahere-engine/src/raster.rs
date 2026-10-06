@@ -3,7 +3,7 @@
 //! Two depth selections: the dem's and the vector layers' (line, land, water share a base and live in the same cell). Each block resolves one dem ref and one vector ref; a pixel composes dem → land tint → shade → water → line, each gated by the client's layer mask.
 
 use mahere_coord::Coord;
-use mahere_tiles::{CellKey, ClassCell, CovCell, ELEV_NODATA};
+use mahere_tiles::{CellKey, ClassCell, CovCell, ELEV_NODATA, ImgCell};
 use rayon::prelude::*;
 use rustc_hash::FxHashSet;
 
@@ -38,11 +38,13 @@ pub struct LayerMask {
     pub line: bool,
     /// Residency debug: tint pixels whose dem came from a parent of the wanted depth (one level amber, two or more red) and blocks with no dem at all magenta — so streaming and eviction are visible.
     pub debug: bool,
+    /// Imagery instead of terrain: the false-colour composite 1064 nm → R, NIR → G, red → B, in place of dem/land/water (lines still obey `line`).
+    pub imagery: bool,
 }
 
 impl Default for LayerMask {
     fn default() -> Self {
-        LayerMask { dem: true, land: true, water: true, line: true, debug: false }
+        LayerMask { dem: true, land: true, water: true, line: true, debug: false, imagery: false }
     }
 }
 
@@ -135,6 +137,7 @@ enum VecRef<'a> {
         line: Option<&'a ClassCell>,
         land: Option<&'a ClassCell>,
         water: Option<&'a CovCell>,
+        img: Option<&'a ImgCell>,
         shift: u32,
         prefix_shift: u32,
         prefix: u64,
@@ -266,6 +269,7 @@ fn resolve_vec<'a>(pool: &'a Pool, depth: u8, raw: u64) -> VecRef<'a> {
             line: e.line.as_ref(),
             land: e.land.as_ref(),
             water: e.water.as_ref(),
+            img: e.img.as_ref(),
             shift: 16 + (22 - d as u32),
             prefix_shift: 60 - 2 * d as u32,
             prefix: pfx,
@@ -374,8 +378,25 @@ fn compose_rgb(dem: &DemRef, vec: &VecRef, pool: &Pool, diamond: u8, uq: i64, vq
         }
     }
     let mut rgb = tint;
-    if let VecRef::Cell { line, land, water, shift, .. } = vec {
+    if let VecRef::Cell { line, land, water, img, shift, .. } = vec {
         let i = tri_index(uq, vq, *shift);
+        if mask.imagery {
+            // False colour: 1064 nm → R, NIR → G, red → B; no-data stays background.
+            if let Some(im) = img {
+                if im.red[i] != 0 || im.nir[i] != 0 || im.i1064[i] != 0 {
+                    rgb = [im.i1064[i] as f32, im.nir[i] as f32, im.red[i] as f32];
+                }
+            }
+            if mask.line {
+                if let Some(line) = line {
+                    let cov = line.cov[i];
+                    if cov != 0 {
+                        rgb = lerp3(rgb, CLASS_LUT[(line.class[i] as usize).min(12)], cov as f32 / 255.0);
+                    }
+                }
+            }
+            return ((rgb[0] as u32) << 16) | ((rgb[1] as u32) << 8) | rgb[2] as u32;
+        }
         if mask.land {
             if let Some(land) = land {
                 let lc = land.cov[i];
@@ -594,6 +615,7 @@ mod tests {
                 line: Some(ClassCell::new()),
                 land: Some(land),
                 water: Some(CovCell::new()),
+                img: None,
             },
         );
 
