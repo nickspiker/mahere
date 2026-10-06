@@ -265,7 +265,10 @@ impl Residency {
 /// The newest want-list is the only one that matters: an older list's leftovers are cells the view no longer needs (the main side forgets them as pending too, so they're re-requested if they come back).
 /// Cells decode in parallel a small chunk at a time so the nearest-first order still holds and a newer list preempts within a few cells.
 fn loader_thread(store: Arc<dyn CellStore>, want_rx: Receiver<WantList>, done_tx: Sender<Loaded>, pack_cpu: Arc<std::sync::atomic::AtomicBool>) {
-    let chunk = rayon::current_num_threads().clamp(2, 8);
+    // Decoding runs in its own pool: on the global one a frame's lattice waited behind cells mid-decode, and a plan took fifty milliseconds while the view streamed.
+    let threads = (rayon::current_num_threads() / 2).clamp(2, 4);
+    let pool = rayon::ThreadPoolBuilder::new().num_threads(threads).thread_name(|i| format!("mahere-load-{i}")).build().expect("loader pool");
+    let chunk = threads * 2;
     let mut current: Option<WantList> = None;
     // Cells finished in the last moment: a newer list arrives before the main side has drained them, and would load them twice.
     let mut done: FxHashMap<CellKey, std::time::Instant> = FxHashMap::default();
@@ -288,7 +291,7 @@ fn loader_thread(store: Arc<dyn CellStore>, want_rx: Receiver<WantList>, done_tx
             let n = list.len().min(chunk);
             let batch: Vec<CellKey> = list.drain(..n).collect();
             let pack = pack_cpu.load(std::sync::atomic::Ordering::Relaxed);
-            let loaded: Vec<Loaded> = batch.par_iter().map(|&k| load_cell(&*store, k, pack)).collect();
+            let loaded: Vec<Loaded> = pool.install(|| batch.par_iter().map(|&k| load_cell(&*store, k, pack)).collect());
             let t = std::time::Instant::now();
             for l in loaded {
                 done.insert(l.key, t);
