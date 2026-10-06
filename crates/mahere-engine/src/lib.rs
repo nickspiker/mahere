@@ -2,6 +2,7 @@
 
 pub mod raster;
 pub mod residency;
+pub mod sh;
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -82,6 +83,8 @@ pub struct MapCore {
     dirty: bool,
     /// Elevation range the last frame saw; the next frame's contour interval is fit to it (one loop, a frame late — close enough).
     last_range: ElevRange,
+    /// The lighting environment (device frame); folded into `luts.light` with the bearing each time either changes.
+    env: sh::Sh9,
     /// Contours on screen the interval is fit to.
     pub contours_on_screen: f32,
     /// The interval the last frame drew, metres.
@@ -99,7 +102,9 @@ impl MapCore {
                 mask: LayerMask::default(),
                 dem_depth: DEM_BASE_DEPTH,
                 contours: Contours { interval: 0.0, index_every: 5, m_per_px: 1.0 },
+                light: sh::Sh9::sun_and_sky(315.0, 40.0).quadratic((0.0, 1.0)),
             },
+            env: sh::Sh9::sun_and_sky(315.0, 40.0),
             luts_sun: (f32::NAN, f32::NAN, f64::NAN),
             sun_az: 315.0,
             sun_alt: 40.0,
@@ -258,7 +263,7 @@ impl MapCore {
         if w == 0 || h == 0 {
             return;
         }
-        // Sun vector: screen-space azimuth converted to world by bearing.
+        // Lighting lives in the device frame: the environment (sun + sky as SH) is fixed to the screen, and normals are rotated by the bearing at lookup. The world-frame sun vector stays for the water glint.
         if self.luts_sun != (self.sun_az, self.sun_alt, self.cam.bearing) {
             let az = (self.sun_az as f64 + self.cam.bearing.to_degrees()).to_radians();
             let alt = (self.sun_alt as f64).to_radians();
@@ -267,6 +272,11 @@ impl MapCore {
                 (az.cos() * alt.cos()) as f32,
                 alt.sin() as f32,
             ];
+            if self.luts_sun.0 != self.sun_az || self.luts_sun.1 != self.sun_alt {
+                self.env = sh::Sh9::sun_and_sky(self.sun_az, self.sun_alt);
+            }
+            let (sb, cb) = self.cam.bearing.sin_cos();
+            self.luts.light = self.env.quadratic((sb as f32, cb as f32));
             self.luts_sun = (self.sun_az, self.sun_alt, self.cam.bearing);
         }
         self.vec_depth = select_depth(self.cam.ppd, self.vec_depth, VEC_BASE_DEPTH);

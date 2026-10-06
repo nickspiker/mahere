@@ -212,6 +212,8 @@ pub struct FrameLuts {
     /// The depth the frame asked the dem for (debug tint reference).
     pub dem_depth: u8,
     pub contours: Contours,
+    /// The lighting environment, as the per-channel quadratic form the pixel loop evaluates on world normals (device-frame SH conjugated by the bearing once per frame).
+    pub light: crate::sh::Quad,
 }
 
 pub struct FrameStats {
@@ -438,6 +440,7 @@ fn compose_rgb(dem: &DemRef, vec: &VecRef, pool: &Pool, diamond: u8, uq: i64, vq
     // Terrain: tint from elevation, shade from the normal.
     let mut tint = [FLAT_RGB[0] as f32, FLAT_RGB[1] as f32, FLAT_RGB[2] as f32];
     let mut diffuse = 1.0f32;
+    let mut light = [1.0f32; 3];
     let mut have_ground = false;
     let mut contour = (0.0f32, false);
     let mut slope_band: Option<[u8; 3]> = None;
@@ -450,6 +453,10 @@ fn compose_rgb(dem: &DemRef, vec: &VecRef, pool: &Pool, diamond: u8, uq: i64, vq
                 let ny = (t >> 32) as u16 as i16 as f32;
                 let nz = (t >> 48) as u16 as i16 as f32;
                 diffuse = ((nx * luts.sun[0] + ny * luts.sun[1] + nz * luts.sun[2]) / 32767.0).max(0.0);
+                // Irradiance from the environment: ten multiply-adds per channel on the world normal.
+                const K: f32 = 1.0 / 32767.0;
+                let e = luts.light.eval(nx * K, ny * K, nz * K);
+                light = [e[0].clamp(0.0, 1.3), e[1].clamp(0.0, 1.3), e[2].clamp(0.0, 1.3)];
                 let c = luts.hypso[(eq >> 4) as usize];
                 tint = [c[0] as f32, c[1] as f32, c[2] as f32];
                 have_ground = true;
@@ -510,8 +517,9 @@ fn compose_rgb(dem: &DemRef, vec: &VecRef, pool: &Pool, diamond: u8, uq: i64, vq
                 }
             }
         }
-        let shade = if have_ground { 0.30 + 0.70 * diffuse } else { 1.0 };
-        rgb = [rgb[0] * shade, rgb[1] * shade, rgb[2] * shade];
+        if have_ground {
+            rgb = [rgb[0] * light[0], rgb[1] * light[1], rgb[2] * light[2]];
+        }
         if let Some(col) = slope_band {
             rgb = lerp3(rgb, col, 0.45);
         }
@@ -538,8 +546,9 @@ fn compose_rgb(dem: &DemRef, vec: &VecRef, pool: &Pool, diamond: u8, uq: i64, vq
             }
         }
     } else {
-        let shade = if have_ground { 0.30 + 0.70 * diffuse } else { 1.0 };
-        rgb = [rgb[0] * shade, rgb[1] * shade, rgb[2] * shade];
+        if have_ground {
+            rgb = [rgb[0] * light[0], rgb[1] * light[1], rgb[2] * light[2]];
+        }
         if let Some(col) = slope_band {
             rgb = lerp3(rgb, col, 0.45);
         }
@@ -744,16 +753,18 @@ mod tests {
             mask: LayerMask { contours: false, ..LayerMask::default() },
             dem_depth: 12,
             contours: Contours { interval: 0.0, index_every: 5, m_per_px: 1.0 },
+            light: crate::sh::Sh9::sun_and_sky(315.0, 40.0).quadratic((0.0, 1.0)),
         };
         let (w, h) = (64usize, 64usize);
         let mut canvas = vec![0u32; w * h];
         let (stats, _want) = render_frame(&mut canvas, w, h, &cam, &pool, &luts, 12, 13);
         assert_eq!(stats.straddle_blocks, 0);
-        // Expected: diffuse = 1, shade = 1.0, tint = hypso[375] lerped 85% to forest.
+        // Expected: tint = hypso[375] lerped 85% to forest, lit by the SH irradiance at a flat normal in the device frame.
         let t = luts.hypso[375];
         let f = LAND_LUT[5];
-        let mix = |a: u8, b: u8| (a as f32 + (b as f32 - a as f32) * 0.85) as u32;
-        let expect = (mix(t[0], f[0]) << 16) | (mix(t[1], f[1]) << 8) | mix(t[2], f[2]);
+        let e = luts.light.eval(0.0, 0.0, 1.0);
+        let mix = |a: u8, b: u8, l: f32| ((a as f32 + (b as f32 - a as f32) * 0.85) * l.clamp(0.0, 1.3)) as u32;
+        let expect = (mix(t[0], f[0], e[0]) << 16) | (mix(t[1], f[1], e[1]) << 8) | mix(t[2], f[2], e[2]);
         let center = canvas[(h / 2) * w + w / 2];
         assert_eq!(center, expect, "center {center:#08x} vs expected {expect:#08x}");
         assert!(canvas.iter().all(|&p| p == expect), "unresolved pixels in frame");
@@ -761,7 +772,8 @@ mod tests {
         // Mask off land: pure hypso.
         let luts = FrameLuts { mask: LayerMask { land: false, ..LayerMask::default() }, ..luts };
         render_frame(&mut canvas, w, h, &cam, &pool, &luts, 12, 13);
-        let expect = ((t[0] as u32) << 16) | ((t[1] as u32) << 8) | t[2] as u32;
+        let lit = |a: u8, l: f32| (a as f32 * l.clamp(0.0, 1.3)) as u32;
+        let expect = (lit(t[0], e[0]) << 16) | (lit(t[1], e[1]) << 8) | lit(t[2], e[2]);
         assert_eq!(canvas[(h / 2) * w + w / 2], expect);
     }
 }

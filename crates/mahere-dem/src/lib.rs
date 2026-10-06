@@ -418,49 +418,65 @@ impl IntensityStore {
         let height = (y1.ceil() - y0) as usize + 1;
         eprintln!("intensity grid {width}x{height} m from {} tiles", paths.len());
         // Pass 2: per-tile accumulation into the shared grid (tiles don't overlap, so disjoint writes; merged by addition).
-        // Per tile: intensity sum/count of first returns, the highest first return (canopy top) and the lowest ground-classified return per cell. Tiles don't overlap, so the merge is add / max / min.
-        let partial: Vec<(Vec<u32>, Vec<u16>, Vec<f32>, Vec<f32>)> = paths
+        // Per tile: intensity sum/count of first returns, the highest first return (canopy top) and the lowest ground-classified return per cell — on the TILE's own sub-grid (its bounds, not the whole box), copied into the shared grids afterwards. Tiles don't overlap.
+        struct TileGrid {
+            ox: usize,
+            oy: usize,
+            w: usize,
+            h: usize,
+            sum: Vec<u32>,
+            cnt: Vec<u16>,
+            top: Vec<f32>,
+            ground: Vec<f32>,
+        }
+        let y_top = y1.ceil();
+        let partial: Vec<TileGrid> = paths
             .par_iter()
-            .map(|p| {
-                let mut sum = vec![0u32; width * height];
-                let mut cnt = vec![0u16; width * height];
-                let mut top = vec![f32::MIN; width * height];
-                let mut ground = vec![f32::MAX; width * height];
-                if let Ok(data) = las::Reader::from_path(p).and_then(|mut r| r.read_all()) {
-                    // Column accessors skip the full-record decode.
-                    for (((((x, y), z), inten), rn), cls) in
-                        data.x().zip(data.y()).zip(data.z()).zip(data.intensity()).zip(data.return_number()).zip(data.classification())
-                    {
-                        let gx = (x - x0) as isize;
-                        let gy = (y1.ceil() - y) as isize;
-                        if gx < 0 || gy < 0 || gx as usize >= width || gy as usize >= height {
-                            continue;
-                        }
-                        let i = gy as usize * width + gx as usize;
-                        if cls == 2 {
-                            ground[i] = ground[i].min(z as f32);
-                        }
-                        if rn != 1 {
-                            continue;
-                        }
-                        sum[i] = sum[i].saturating_add(inten as u32);
-                        cnt[i] = cnt[i].saturating_add(1);
-                        top[i] = top[i].max(z as f32);
+            .zip(bounds.par_iter())
+            .filter_map(|(p, b)| {
+                let ox = (b.min.x.floor() - x0).max(0.0) as usize;
+                let oy = (y_top - b.max.y.ceil()).max(0.0) as usize;
+                let w = ((b.max.x.ceil() - b.min.x.floor()) as usize + 1).min(width - ox);
+                let h = ((b.max.y.ceil() - b.min.y.floor()) as usize + 1).min(height - oy);
+                let mut g = TileGrid { ox, oy, w, h, sum: vec![0; w * h], cnt: vec![0; w * h], top: vec![f32::MIN; w * h], ground: vec![f32::MAX; w * h] };
+                let data = las::Reader::from_path(p).and_then(|mut r| r.read_all()).ok()?;
+                // Column accessors skip the full-record decode.
+                for (((((x, y), z), inten), rn), cls) in
+                    data.x().zip(data.y()).zip(data.z()).zip(data.intensity()).zip(data.return_number()).zip(data.classification())
+                {
+                    let gx = (x - x0) as isize - ox as isize;
+                    let gy = (y_top - y) as isize - oy as isize;
+                    if gx < 0 || gy < 0 || gx as usize >= w || gy as usize >= h {
+                        continue;
                     }
+                    let i = gy as usize * w + gx as usize;
+                    if cls == 2 {
+                        g.ground[i] = g.ground[i].min(z as f32);
+                    }
+                    if rn != 1 {
+                        continue;
+                    }
+                    g.sum[i] = g.sum[i].saturating_add(inten as u32);
+                    g.cnt[i] = g.cnt[i].saturating_add(1);
+                    g.top[i] = g.top[i].max(z as f32);
                 }
-                (sum, cnt, top, ground)
+                Some(g)
             })
             .collect();
         let mut sum = vec![0u32; width * height];
         let mut cnt = vec![0u16; width * height];
         let mut top = vec![f32::MIN; width * height];
         let mut ground = vec![f32::MAX; width * height];
-        for (s, c, t, g) in partial {
-            for i in 0..sum.len() {
-                sum[i] = sum[i].saturating_add(s[i]);
-                cnt[i] = cnt[i].saturating_add(c[i]);
-                top[i] = top[i].max(t[i]);
-                ground[i] = ground[i].min(g[i]);
+        for g in partial {
+            for y in 0..g.h {
+                let src = y * g.w;
+                let dst = (g.oy + y) * width + g.ox;
+                for x in 0..g.w {
+                    sum[dst + x] = sum[dst + x].saturating_add(g.sum[src + x]);
+                    cnt[dst + x] = cnt[dst + x].saturating_add(g.cnt[src + x]);
+                    top[dst + x] = top[dst + x].max(g.top[src + x]);
+                    ground[dst + x] = ground[dst + x].min(g.ground[src + x]);
+                }
             }
         }
         // Canopy: top minus the lowest ground return within a 3x3 m neighbourhood (ground returns are sparse under dense canopy), metres, clamped to 255.
