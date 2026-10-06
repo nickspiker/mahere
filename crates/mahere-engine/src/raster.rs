@@ -444,7 +444,8 @@ fn compose_rgb(dem: &DemRef, vec: &VecRef, pool: &Pool, diamond: u8, uq: i64, vq
     let mut have_ground = false;
     let mut contour = (0.0f32, false);
     let mut slope_band: Option<[u8; 3]> = None;
-    if mask.dem {
+    // The terrain sample feeds the tint and light (terrain on), and the contours and slope bands on their own.
+    if mask.dem || mask.contours || mask.slope {
         if let Some(t) = dem_texel(dem, pool, diamond, uq, vq) {
             let eq = (t & 0xFFFF) as u16;
             range.see(eq);
@@ -452,14 +453,16 @@ fn compose_rgb(dem: &DemRef, vec: &VecRef, pool: &Pool, diamond: u8, uq: i64, vq
                 let nx = (t >> 16) as u16 as i16 as f32;
                 let ny = (t >> 32) as u16 as i16 as f32;
                 let nz = (t >> 48) as u16 as i16 as f32;
-                diffuse = ((nx * luts.sun[0] + ny * luts.sun[1] + nz * luts.sun[2]) / 32767.0).max(0.0);
-                // Irradiance from the environment: ten multiply-adds per channel on the world normal.
-                const K: f32 = 1.0 / 32767.0;
-                let e = luts.light.eval(nx * K, ny * K, nz * K);
-                light = [e[0].clamp(0.0, 1.3), e[1].clamp(0.0, 1.3), e[2].clamp(0.0, 1.3)];
-                let c = luts.hypso[(eq >> 4) as usize];
-                tint = [c[0] as f32, c[1] as f32, c[2] as f32];
-                have_ground = true;
+                if mask.dem {
+                    diffuse = ((nx * luts.sun[0] + ny * luts.sun[1] + nz * luts.sun[2]) / 32767.0).max(0.0);
+                    // Irradiance from the environment: ten multiply-adds per channel on the world normal.
+                    const K: f32 = 1.0 / 32767.0;
+                    let e = luts.light.eval(nx * K, ny * K, nz * K);
+                    light = [e[0].clamp(0.0, 1.3), e[1].clamp(0.0, 1.3), e[2].clamp(0.0, 1.3)];
+                    let c = luts.hypso[(eq >> 4) as usize];
+                    tint = [c[0] as f32, c[1] as f32, c[2] as f32];
+                    have_ground = true;
+                }
                 let nzn = (nz / 32767.0).max(1e-4);
                 let slope = (1.0 - nzn * nzn).max(0.0).sqrt() / nzn;
                 if mask.contours {
@@ -475,7 +478,7 @@ fn compose_rgb(dem: &DemRef, vec: &VecRef, pool: &Pool, diamond: u8, uq: i64, vq
                     }
                 }
             }
-        } else {
+        } else if mask.dem {
             tint = [BG_RGB8[0] as f32, BG_RGB8[1] as f32, BG_RGB8[2] as f32];
         }
     }

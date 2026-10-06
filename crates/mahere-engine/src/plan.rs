@@ -149,13 +149,22 @@ pub fn plan_frame(w: usize, h: usize, cam: &Camera, pool: &Pool, dem_depth: u8, 
         })
         .collect();
 
-    // Desired set and the elevation range, from the lattice. At the coarse depths the ring of neighbours comes too: a zoom out then lands on cells already resident instead of a blank screen (Nick 2026-10-06), and they are small.
-    let mut desired: rustc_hash::FxHashSet<CellKey> = rustc_hash::FxHashSet::default();
+    // Desired set and the elevation range, from the lattice. The corners dedupe to their finest cells first (a few hundred from a few thousand corners), then each walks its parents; at the coarse depths the ring of neighbours comes too, so a zoom out lands on cells already resident instead of a blank screen (Nick 2026-10-06), and they are small.
+    let fine = dem_depth.max(vec_depth);
+    let mut fine_cells: rustc_hash::FxHashSet<u64> = rustc_hash::FxHashSet::default();
     let mut elev = ElevRange::EMPTY;
     for c in &corners {
         let raw = raw_of(c.diamond, c.u, c.v);
-        for d in MIN_DEPTH..=dem_depth.max(vec_depth) {
-            let key = CellKey { depth: d, prefix: raw >> (60 - 2 * d as u32) };
+        fine_cells.insert(raw >> (60 - 2 * fine as u32));
+        if let Some(eq) = lattice_elev(pool, dem_depth, raw, c.u, c.v) {
+            elev.lo = elev.lo.min(eq);
+            elev.hi = elev.hi.max(eq);
+        }
+    }
+    let mut desired: rustc_hash::FxHashSet<CellKey> = rustc_hash::FxHashSet::default();
+    for &fp in &fine_cells {
+        for d in MIN_DEPTH..=fine {
+            let key = CellKey { depth: d, prefix: fp >> (2 * (fine - d) as u32) };
             desired.insert(key);
             if d <= PREFETCH_DEPTH {
                 let (cu, cv) = key.grid();
@@ -167,10 +176,6 @@ pub fn plan_frame(w: usize, h: usize, cam: &Camera, pool: &Pool, dem_depth: u8, 
                     }
                 }
             }
-        }
-        if let Some(eq) = lattice_elev(pool, dem_depth, raw, c.u, c.v) {
-            elev.lo = elev.lo.min(eq);
-            elev.hi = elev.hi.max(eq);
         }
     }
 

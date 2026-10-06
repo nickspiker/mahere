@@ -155,11 +155,13 @@ impl Sh9 {
 
     /// The default environment: a warm sun at (azimuth clockwise from screen-up, altitude) in the device frame plus a cool sky dome, scaled so flat ground under the sun's zenith reads about as bright as today's hillshade (ambient ≈ 0.3, sun ≈ 0.7).
     pub fn sun_and_sky(az_deg: f32, alt_deg: f32) -> Sh9 {
-        let (az, alt) = (az_deg.to_radians(), alt_deg.to_radians());
+        // The direct light fades out over the last five degrees above the horizon and is gone below it; the sky dome stays, so dusk is dim and flat rather than black.
+        let strength = (alt_deg / 5.0).clamp(0.0, 1.0);
+        let (az, alt) = (az_deg.to_radians(), alt_deg.max(0.0).to_radians());
         // Device frame: x right, y up (screen), z out of the screen; "up" for the sky is +z.
         let dir = [az.sin() * alt.cos(), az.cos() * alt.cos(), alt.sin()];
         let mut sh = Sh9::ZERO;
-        sh.add_sun(dir, [0.74, 0.70, 0.62]);
+        sh.add_sun(dir, [0.74 * strength, 0.70 * strength, 0.62 * strength]);
         // A sky of radiance S gives πS onto an upward normal: πS ≈ 0.3.
         let s = 0.3 / std::f32::consts::PI;
         sh.add_sky([0.0, 0.0, 1.0], [s * 0.85, s * 0.95, s * 1.15]);

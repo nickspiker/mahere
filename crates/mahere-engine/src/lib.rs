@@ -349,7 +349,7 @@ impl MapCore {
             let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0.0, |d| d.as_secs_f64());
             let (az, alt) = sh::sun_position(lat, lon, now);
             self.sun_az = ((az - self.cam.bearing.to_degrees()).rem_euclid(360.0)) as f32;
-            self.sun_alt = alt.clamp(5.0, 85.0) as f32;
+            self.sun_alt = alt.clamp(-10.0, 85.0) as f32;
         }
         // Lighting lives in the device frame: the environment (sun + sky as SH) is fixed to the screen, and normals are rotated by the bearing at lookup. The world-frame sun vector stays for the water glint.
         if self.luts_sun != (self.sun_az, self.sun_alt, self.cam.bearing) {

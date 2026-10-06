@@ -227,15 +227,19 @@ fn compose(d: u32, u: u32, v: u32) -> vec3<f32> {
     var band = vec3<f32>(0.0);
     var have_band = false;
     var found_depth = NONE;
-    if ((mask & M_DEM) != 0u) {
+    // The terrain sample feeds the tint and light (terrain on), and the contours and slope bands on their own.
+    let want_dem = (mask & (M_DEM | M_CONTOURS | M_SLOPE)) != 0u;
+    if (want_dem) {
         let s = sample_dem(d, u, v);
         if (s.ok) {
             found_depth = s.depth;
-            diffuse = max(dot(s.n, U.sun.xyz), 0.0);
-            light = clamp(light_eval(s.n), vec3<f32>(0.0), vec3<f32>(1.3));
             let eq = u32(clamp((s.elev + 500.0) * 4.0, 0.0, 65534.0));
-            tint = unpack_rgb(lut[eq >> 4u]);
-            have_ground = true;
+            if ((mask & M_DEM) != 0u) {
+                diffuse = max(dot(s.n, U.sun.xyz), 0.0);
+                light = clamp(light_eval(s.n), vec3<f32>(0.0), vec3<f32>(1.3));
+                tint = unpack_rgb(lut[eq >> 4u]);
+                have_ground = true;
+            }
             let nzn = max(s.n.z, 1e-4);
             let slope = sqrt(max(1.0 - nzn * nzn, 0.0)) / nzn;
             if ((mask & M_CONTOURS) != 0u && slope >= 0.02 && U.contour.x > 0.0) {
@@ -266,7 +270,7 @@ fn compose(d: u32, u: u32, v: u32) -> vec3<f32> {
                     have_band = true;
                 }
             }
-        } else {
+        } else if ((mask & M_DEM) != 0u) {
             tint = vec3<f32>(18.0, 20.0, 26.0);
         }
     }
