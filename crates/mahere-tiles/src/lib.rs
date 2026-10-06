@@ -341,8 +341,11 @@ pub struct Cell {
 
 // ==================== LINE LAYER ====================
 
-/// Stamp every feature at its physical width into base-depth cells, then
-/// build the pyramid up to `min_depth` (major class wins per texel).
+/// Stamp every feature ONCE, at its physical width, into base-depth cells;
+/// the pyramid does the rest. Lines are measure-zero features, so a parent
+/// texel's coverage is the SUM of its four children (saturating): a road
+/// stays a texel wide at every depth instead of averaging away, and dense
+/// networks saturate into a glow. Major class wins per texel.
 pub fn bake_lines(feats: &[Road], base_depth: u8, min_depth: u8) -> HashMap<CellKey, ClassCell> {
     assert!(base_depth as u32 + TEX_BITS as u32 <= 30);
     let mut cells: HashMap<CellKey, ClassCell> = HashMap::new();
@@ -539,14 +542,16 @@ fn fill_rings(rings: &[Vec<(f64, f64)>], depth: u8, mut visit: impl FnMut(usize,
 
 #[derive(Clone, Copy)]
 pub enum ClassMerge {
-    /// Lines: the most major class present among the children wins.
+    /// Lines: coverage is the SUM of the children (a line has no area, so
+    /// its amount adds); the most major class present wins.
     Major,
-    /// Land cover: the class with the most coverage among the children.
+    /// Land cover: coverage is the MEAN of the children (an area fraction);
+    /// the class with the most coverage wins.
     Dominant,
 }
 
-/// Parent texel = mean coverage of its four triangle children (missing
-/// children are empty), class per `merge`.
+/// Parent texel from its four triangle children (missing children are
+/// empty): coverage summed or averaged, class per `merge`.
 pub fn pyramid_class(
     mut cells: HashMap<CellKey, ClassCell>,
     base_depth: u8,
@@ -594,7 +599,10 @@ pub fn pyramid_class(
                                 }
                             }
                             let i = tri_idx(tx, ty, half);
-                            cell.cov[i] = (covsum / 4) as u8;
+                            cell.cov[i] = match merge {
+                                ClassMerge::Major => covsum.min(255) as u8,
+                                ClassMerge::Dominant => (covsum / 4) as u8,
+                            };
                             cell.class[i] = best;
                         }
                     }
@@ -1113,14 +1121,18 @@ mod tests {
     #[test]
     fn stamped_line_survives_pyramid() {
         let cells = bake_lines(&[trail(mahere_osm::RoadClass::Path, 0.0)], 12, 10);
-        let sum = |d: u8| -> u64 {
-            cells.iter().filter(|(k, _)| k.depth == d).map(|(_, c)| c.cov.iter().map(|&x| x as u64).sum::<u64>()).sum()
+        let lit = |d: u8| -> usize {
+            cells.iter().filter(|(k, _)| k.depth == d).map(|(_, c)| c.cov.iter().filter(|&&x| x > 0).count()).sum()
         };
-        let (base_cov, top_cov) = (sum(12), sum(10));
-        assert!(base_cov > 0, "base stamping produced nothing");
-        assert!(top_cov > 0, "pyramid lost the line");
-        let ratio = base_cov as f64 / top_cov as f64;
-        assert!((0.7..=1.5).contains(&(ratio / 16.0)), "coverage not conserved: base {base_cov} top {top_cov}");
+        let peak = |d: u8| -> u8 {
+            cells.iter().filter(|(k, _)| k.depth == d).map(|(_, c)| *c.cov.iter().max().unwrap()).max().unwrap()
+        };
+        assert!(lit(12) > 0, "base stamping produced nothing");
+        // Summing children: the path stays fully covered along its length at
+        // every depth (it shrinks in texel count, never in intensity).
+        assert_eq!(peak(10), 255);
+        let r = lit(12) as f64 / lit(10) as f64;
+        assert!((2.0..=8.0).contains(&r), "line texel count should shrink several-fold over 2 levels, got {r}");
     }
 
     /// A motorway covers more ground than a path along the same line, in
