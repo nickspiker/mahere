@@ -98,8 +98,8 @@ pub const PRESENT_IMG: u8 = 16;
 pub struct Entry {
     /// Which planes the cell carried when it loaded (PRESENT_ bits): the truth about the cell even after a GPU host has released a plane's CPU copy.
     pub present: u8,
-    /// The largest waterway magnitude in the cell's line plane, so a view can scale water to what it shows.
-    pub water_mag_max: u8,
+    /// The largest magnitude per line class in the cell's line plane (index = class id), so a view can scale every line against what it shows.
+    pub line_mag_max: [u8; 16],
     /// The cell's elevation span, quantised (ELEV_NODATA, 0 when it has none): the contour interval is fit to the union over the view.
     pub elev_lo: u16,
     pub elev_hi: u16,
@@ -345,8 +345,16 @@ fn load_cell(store: &dyn CellStore, key: CellKey, pack_cpu: bool) -> Loaded {
         | (planes.land.is_some() as u8) * PRESENT_LAND
         | (planes.water.is_some() as u8) * PRESENT_WATER
         | (planes.img.is_some() as u8) * PRESENT_IMG;
-    let water_mag_max = planes.line.as_ref().map_or(0, |l| (0..mahere_tiles::TRI).filter(|&i| l.class[i] as usize == crate::raster::WATERWAY_CLASS).map(|i| l.mag_at(i)).max().unwrap_or(0));
-    Loaded { key, entry: Some(Entry { present, water_mag_max, elev_lo, elev_hi, dem, dem_q, line: planes.line, land: planes.land, water: planes.water, img: planes.img }) }
+    let mut line_mag_max = [0u8; 16];
+    if let Some(l) = &planes.line {
+        for i in 0..mahere_tiles::TRI {
+            if l.cov[i] != 0 {
+                let c = (l.class[i] as usize).min(15);
+                line_mag_max[c] = line_mag_max[c].max(l.mag_at(i));
+            }
+        }
+    }
+    Loaded { key, entry: Some(Entry { present, line_mag_max, elev_lo, elev_hi, dem, dem_q, line: planes.line, land: planes.land, water: planes.water, img: planes.img }) }
 }
 
 // ==================== TIERED STORE: VAULT CACHE OVER THE BUCKET ====================

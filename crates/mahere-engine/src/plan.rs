@@ -77,8 +77,8 @@ pub struct FramePlan {
     pub vec_depth: u8,
     /// The dem's texels are wider than about a pixel and a half: the shader interpolates elevation between texels so contours stay smooth past the base depth.
     pub magnified: bool,
-    /// The largest waterway magnitude among the cells in view: water is drawn on a linear scale up to it, so a view of creeks still has a brightest creek.
-    pub water_mag_hi: u8,
+    /// The largest magnitude per line class among the cells in view: every line is drawn on a linear scale up to its class's, so a view of creeks still has a brightest creek and a view of lanes a boldest lane.
+    pub line_mag_hi: [u8; 16],
 }
 
 /// The hash every lookup agrees on, CPU and shader.
@@ -272,8 +272,13 @@ pub fn plan_frame(w: usize, h: usize, cam: &Camera, pool: &Pool, dem_depth: u8, 
         d -= 1;
     }
     let magnified = crate::raster::texel_px(cam.ppd, dem_depth) >= 1.5;
-    let water_mag_hi = refs.iter().filter(|r| r.key.depth == vec_depth || r.key.depth + 1 == vec_depth).map(|r| pool.map[&r.key].water_mag_max).max().unwrap_or(0);
-    FramePlan { blocks, refs, table, want: desired.into_iter().collect(), elev, straddle_blocks, dem_depth, vec_depth, magnified, water_mag_hi }
+    let mut line_mag_hi = [0u8; 16];
+    for r in refs.iter().filter(|r| r.key.depth == vec_depth || r.key.depth + 1 == vec_depth) {
+        for (hi, &m) in line_mag_hi.iter_mut().zip(&pool.map[&r.key].line_mag_max) {
+            *hi = (*hi).max(m);
+        }
+    }
+    FramePlan { blocks, refs, table, want: desired.into_iter().collect(), elev, straddle_blocks, dem_depth, vec_depth, magnified, line_mag_hi }
 }
 
 #[cfg(test)]

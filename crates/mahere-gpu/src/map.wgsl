@@ -39,6 +39,7 @@ struct Uniforms {
     depths: vec4<u32>,
     offset: vec4<f32>,
     pin: vec4<f32>,
+    line_hi: array<vec4<f32>, 4>,
 };
 
 // a: diamond, depth, cu, cv. b: dem slot, line slot, land+water slot, img slot. c: flags. d: base, step, eu, nu. e: ev, nv, inv det.
@@ -268,14 +269,28 @@ fn unpack_rgb(p: u32) -> vec3<f32> {
     return vec3<f32>(f32((p >> 16u) & 255u), f32((p >> 8u) & 255u), f32(p & 255u));
 }
 
+// A line's magnitude against the largest of its class in view, 0..1.
+fn line_scale(cls: u32, mag: u32) -> f32 {
+    return clamp(f32(mag) / U.line_hi[cls >> 2u][cls & 3u], 0.0, 1.0);
+}
+
 fn line_colour(cls_id: u32, mag: u32) -> vec3<f32> {
     let cls = min(cls_id, CLASS_MAX);
     let c = unpack_rgb(lut[CLASS_BASE + cls]);
     if (cls == WATERWAY_CLASS) {
         // Water on a linear scale up to the largest magnitude in view: the biggest river on screen is full, a trickle a third.
-        return floor(c * (0.35 + 0.65 * clamp(f32(mag) / U.contour.w, 0.0, 1.0)));
+        return floor(c * (0.35 + 0.65 * line_scale(cls, mag)));
     }
     return c;
+}
+
+// Coverage of a line as drawn: every class but water fades against the boldest of its class in view, so a lane next to a highway falls back and the same lane alone is full.
+fn line_alpha(cls_id: u32, cov: u32, mag: u32) -> f32 {
+    let cls = min(cls_id, CLASS_MAX);
+    if (cls == WATERWAY_CLASS) {
+        return f32(cov) / 255.0;
+    }
+    return f32(cov) / 255.0 * (0.5 + 0.5 * line_scale(cls, mag));
 }
 
 fn lerp3(a: vec3<f32>, b: vec3<f32>, t: f32) -> vec3<f32> {
@@ -372,7 +387,7 @@ fn compose(d: u32, u: u32, v: u32) -> vec3<f32> {
                 rgb = vec3<f32>(f32(im.z), f32(im.y), f32(im.x));
             }
             if ((mask & M_LINE) != 0u && line.y != 0u) {
-                rgb = lerp3(rgb, line_colour(line.x, line.z), f32(line.y) / 255.0);
+                rgb = lerp3(rgb, line_colour(line.x, line.z), line_alpha(line.x, line.y, line.z));
             }
             return floor(rgb);
         }
@@ -400,7 +415,7 @@ fn compose(d: u32, u: u32, v: u32) -> vec3<f32> {
             rgb = lerp3(rgb, ink, contour_cov * 0.85);
         }
         if ((mask & M_LINE) != 0u && line.y != 0u) {
-            rgb = lerp3(rgb, line_colour(line.x, line.z), f32(line.y) / 255.0);
+            rgb = lerp3(rgb, line_colour(line.x, line.z), line_alpha(line.x, line.y, line.z));
         }
     } else {
         if (have_ground) {
