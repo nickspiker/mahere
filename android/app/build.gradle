@@ -9,15 +9,31 @@ android {
         applicationId "nz.mahere.app"
         minSdk 26
         targetSdk 35
-        versionCode 1
-        versionName "0.1.0"
+        // The publish script passes the version from git (commit count + short hash); a local build is 1 / dev.
+        def vcode = System.getenv("MAHERE_VERSION_CODE") ?: "1"
+        def vname = System.getenv("MAHERE_VERSION_NAME") ?: "dev"
+        versionCode vcode.toInteger()
+        versionName vname
         ndk { abiFilters 'arm64-v8a' }
+    }
+
+    // Release signing comes from the keys dir via the environment (scripts/publish-android.sh); nothing secret lives in the tree. Without it a release build falls back to the debug key, which is fine for sideloading over a debug install but not for updating a published one.
+    signingConfigs {
+        release {
+            def ks = System.getenv("MAHERE_KEYSTORE")
+            if (ks != null) {
+                storeFile file(ks)
+                storePassword System.getenv("MAHERE_KEYSTORE_PASS")
+                keyAlias "mahere"
+                keyPassword System.getenv("MAHERE_KEYSTORE_PASS")
+            }
+        }
     }
 
     buildTypes {
         release {
             minifyEnabled false
-            signingConfig signingConfigs.debug // field-test builds; real signing later
+            signingConfig System.getenv("MAHERE_KEYSTORE") != null ? signingConfigs.release : signingConfigs.debug
         }
     }
 

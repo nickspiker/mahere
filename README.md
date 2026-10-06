@@ -63,7 +63,7 @@ cargo run --release -p mahere-app   # Linux/macOS; reads data/cells if present
 cargo test                          # coordinates, tiles, engine, store
 ```
 
-Without a local `data/cells`, both frontends stream cells from the public bucket (`https://brobdingnagian.holdmyoscilloscope.com/mahere/cells/…`, the same `{layer}/{cell}.vsf.zst` layout) into the kete vault on the device, and serve them from there afterwards — the Android APK carries no map data. `scripts/publish-cells.sh` syncs a bake to the bucket.
+Without a local `data/cells`, both frontends stream cells from the public bucket (`https://brobdingnagian.holdmyoscilloscope.com/mahere/cells/…`, the same `{layer}/{cell}.vsf.zst` layout) into the kete vault on the device, and serve them from there afterwards — the Android APK carries no map data. `scripts/publish-cells.sh` syncs a bake to the bucket; `scripts/publish-android.sh` builds the release-signed APK and puts it at `https://brobdingnagian.holdmyoscilloscope.com/mahere/mahere.apk`, which the project page links.
 
 ## License
 
