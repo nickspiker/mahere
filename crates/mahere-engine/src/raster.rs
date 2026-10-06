@@ -44,13 +44,40 @@ pub struct LayerMask {
     pub contours: bool,
     /// Slope-angle bands over the terrain (25/30/35/45°), from the normal at draw time.
     pub slope: bool,
-    /// Canopy height tint over the terrain (needs the img section's canopy band).
+    /// Canopy height tint over the terrain (needs the img section.s canopy band).
     pub canopy: bool,
+    /// The hypsometric gradient under the light; off leaves a flat white landscape lit by the sun alone.
+    pub hypso: bool,
 }
 
 impl Default for LayerMask {
     fn default() -> Self {
-        LayerMask { dem: true, land: true, water: true, line: true, debug: false, imagery: false, contours: true, slope: false, canopy: false }
+        LayerMask { dem: true, land: true, water: true, line: true, debug: false, imagery: false, contours: true, slope: false, canopy: false, hypso: true }
+    }
+}
+
+impl LayerMask {
+    /// Which rows a dominating layer makes inert: imagery replaces everything but lines, land cover and a terrain that is off make the elevation tint moot. The panel greys these; the renderer treats them as off through [`LayerMask::effective`].
+    pub fn inert(self) -> LayerMask {
+        let im = self.imagery;
+        LayerMask { dem: im, land: im, water: im, line: false, debug: false, imagery: false, contours: im, slope: im, canopy: im, hypso: im || self.land || !self.dem }
+    }
+
+    /// The mask as drawn: every inert row off.
+    pub fn effective(self) -> LayerMask {
+        let i = self.inert();
+        LayerMask {
+            dem: self.dem && !i.dem,
+            land: self.land && !i.land,
+            water: self.water && !i.water,
+            line: self.line,
+            debug: self.debug,
+            imagery: self.imagery,
+            contours: self.contours && !i.contours,
+            slope: self.slope && !i.slope,
+            canopy: self.canopy && !i.canopy,
+            hypso: self.hypso && !i.hypso,
+        }
     }
 }
 
@@ -127,6 +154,8 @@ pub const BG_RGB8: [u8; 3] = [18, 20, 26];
 pub const WATER_RGB: [u8; 3] = [26, 58, 82];
 /// Terrain tint when the dem layer is off or absent: a neutral ground.
 const FLAT_RGB: [u8; 3] = [96, 100, 96];
+/// The barren landscape under the light alone, with the elevation tint off.
+const FLAT_WHITE: [u8; 3] = [232, 232, 230];
 
 /// Line class id (1-based, 0 = empty) -> visible RGB. Index 12 = Waterway, whose brightness is scaled by the texel's log magnitude at draw time so water is never uniform.
 pub const CLASS_LUT: [[u8; 3]; 13] = [
@@ -459,8 +488,12 @@ fn compose_rgb(dem: &DemRef, vec: &VecRef, pool: &Pool, diamond: u8, uq: i64, vq
                     const K: f32 = 1.0 / 32767.0;
                     let e = luts.light.eval(nx * K, ny * K, nz * K);
                     light = [e[0].clamp(0.0, 1.3), e[1].clamp(0.0, 1.3), e[2].clamp(0.0, 1.3)];
-                    let c = luts.hypso[(eq >> 4) as usize];
-                    tint = [c[0] as f32, c[1] as f32, c[2] as f32];
+                    tint = if mask.hypso {
+                        let c = luts.hypso[(eq >> 4) as usize];
+                        [c[0] as f32, c[1] as f32, c[2] as f32]
+                    } else {
+                        [FLAT_WHITE[0] as f32, FLAT_WHITE[1] as f32, FLAT_WHITE[2] as f32]
+                    };
                     have_ground = true;
                 }
                 let nzn = (nz / 32767.0).max(1e-4);
@@ -755,7 +788,7 @@ mod tests {
         let luts = FrameLuts {
             hypso: build_hypso_lut(),
             sun: [0.0, 0.0, 1.0],
-            mask: LayerMask { contours: false, ..LayerMask::default() },
+            mask: LayerMask { contours: false, ..LayerMask::default() }.effective(),
             dem_depth: 12,
             contours: Contours { interval: 0.0, index_every: 5, m_per_px: 1.0 },
             light: crate::sh::Sh9::sun_and_sky(315.0, 40.0).quadratic((0.0, 1.0)),
@@ -764,8 +797,8 @@ mod tests {
         let mut canvas = vec![0u32; w * h];
         let (stats, _want) = render_frame(&mut canvas, w, h, &cam, &pool, &luts, 12, 13);
         assert_eq!(stats.straddle_blocks, 0);
-        // Expected: tint = hypso[375] lerped 85% to forest, lit by the SH irradiance at a flat normal in the device frame.
-        let t = luts.hypso[375];
+        // Expected: the flat white (land cover makes the elevation tint inert) lerped 85% to forest, lit by the SH irradiance at a flat normal in the device frame.
+        let t = FLAT_WHITE;
         let f = LAND_LUT[5];
         let e = luts.light.eval(0.0, 0.0, 1.0);
         let mix = |a: u8, b: u8, l: f32| ((a as f32 + (b as f32 - a as f32) * 0.85) * l.clamp(0.0, 1.3)) as u32;
@@ -775,8 +808,9 @@ mod tests {
         assert!(canvas.iter().all(|&p| p == expect), "unresolved pixels in frame");
 
         // Mask off land: pure hypso.
-        let luts = FrameLuts { mask: LayerMask { land: false, ..LayerMask::default() }, ..luts };
+        let luts = FrameLuts { mask: LayerMask { land: false, contours: false, ..LayerMask::default() }.effective(), ..luts };
         render_frame(&mut canvas, w, h, &cam, &pool, &luts, 12, 13);
+        let t = luts.hypso[375];
         let lit = |a: u8, l: f32| (a as f32 * l.clamp(0.0, 1.3)) as u32;
         let expect = (lit(t[0], e[0]) << 16) | (lit(t[1], e[1]) << 8) | lit(t[2], e[2]);
         assert_eq!(canvas[(h / 2) * w + w / 2], expect);

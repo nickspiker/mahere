@@ -102,6 +102,10 @@ pub struct MapCore {
     pub declination_deg: f32,
     /// Whether an orientation sensor has ever reported.
     pub have_rotation: bool,
+    /// The layers as chosen (the drawn mask is their `effective()`).
+    layer_mask: LayerMask,
+    /// Where the pin was last drawn, so a fix that leaves it still or off screen costs no frame.
+    last_pin: Option<(f32, f32)>,
     /// The last plan and what it was for.
     plan_cache: Option<(PlanKey, Arc<plan::FramePlan>)>,
 }
@@ -144,6 +148,8 @@ impl MapCore {
             follow_heading: false,
             declination_deg: 0.0,
             have_rotation: false,
+            layer_mask: LayerMask::default(),
+            last_pin: None,
             plan_cache: None,
         }
     }
@@ -211,18 +217,35 @@ impl MapCore {
         self.dirty = true;
     }
 
+    /// A fix redraws only when the pin is on screen and has moved by a pixel (Nick 2026-10-06): a phone sitting still gets no frame per second from its GPS.
     pub fn set_gps(&mut self, fix: GpsFix) {
         self.gps = Some(fix);
-        self.dirty = true;
+        let (w, h) = (self.canvas_w, self.canvas_h);
+        if w == 0 || h == 0 {
+            self.dirty = true;
+            return;
+        }
+        let (x, y) = self.cam.geo_to_screen(fix.lat, fix.lon, w, h);
+        let (x, y) = (x as f32, y as f32);
+        let px_per_m = (self.cam.ppd / 111_320.0) as f32;
+        let r = (fix.accuracy_m * px_per_m).clamp(6.0, 4000.0);
+        let on_screen = x + r >= 0.0 && y + r >= 0.0 && x - r <= w as f32 && y - r <= h as f32;
+        let moved = self.last_pin.is_none_or(|(lx, ly)| (lx - x).abs() >= 1.0 || (ly - y).abs() >= 1.0);
+        if on_screen && moved {
+            self.last_pin = Some((x, y));
+            self.dirty = true;
+        }
     }
 
     /// The client's layer filter: which of dem / land / water / line draw.
     pub fn layers(&self) -> LayerMask {
-        self.luts.mask
+        self.layer_mask
     }
 
+    /// The client's choices as made; what draws is `effective()` of them.
     pub fn set_layers(&mut self, mask: LayerMask) {
-        self.luts.mask = mask;
+        self.layer_mask = mask;
+        self.luts.mask = mask.effective();
         self.dirty = true;
     }
 

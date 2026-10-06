@@ -8,7 +8,7 @@ use mahere_tiles::{CellKey, TEX, TRI};
 use rustc_hash::FxHashMap;
 
 /// Default supersampling factor: the map pass renders this many pixels per screen pixel on each axis, binned once.
-pub const SCALE: u32 = 2;
+pub const SCALE: u32 = 3;
 
 /// Layers a plane's texture array starts with; it doubles whenever the resident set outgrows it, up to the device's limit, so memory tracks what is on screen.
 pub const INITIAL_LAYERS: u32 = 32;
@@ -55,7 +55,8 @@ struct Uniforms {
     pin: [f32; 4],
 }
 
-fn mask_bits(m: LayerMask) -> u32 {
+/// The layer mask as the shader's bits.
+pub fn mask_bits(m: LayerMask) -> u32 {
     (m.dem as u32)
         | (m.land as u32) << 1
         | (m.water as u32) << 2
@@ -65,6 +66,7 @@ fn mask_bits(m: LayerMask) -> u32 {
         | (m.contours as u32) << 6
         | (m.slope as u32) << 7
         | (m.canopy as u32) << 8
+        | (m.hypso as u32) << 9
 }
 
 /// One plane's texture array and its slots, keyed by cell. Grows by doubling, copying the old layers on the GPU.

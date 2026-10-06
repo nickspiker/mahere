@@ -36,6 +36,7 @@ enum Layer {
     RealSun,
     FollowHeading,
     Dem,
+    Hypso,
     Land,
     Water,
     Line,
@@ -46,8 +47,9 @@ enum Layer {
     Debug,
 }
 
-const LAYERS: [(Layer, &str); 11] = [
+const LAYERS: [(Layer, &str); 12] = [
     (Layer::Dem, "Terrain"),
+    (Layer::Hypso, "Elevation tint"),
     (Layer::Land, "Land cover"),
     (Layer::Water, "Water"),
     (Layer::Line, "Lines"),
@@ -65,6 +67,7 @@ fn get(mask: &LayerMask, ctl: &Controls, l: Layer) -> bool {
         Layer::RealSun => ctl.real_sun,
         Layer::FollowHeading => ctl.follow_heading,
         Layer::Dem => mask.dem,
+        Layer::Hypso => mask.hypso,
         Layer::Land => mask.land,
         Layer::Water => mask.water,
         Layer::Line => mask.line,
@@ -81,6 +84,7 @@ fn set(mask: &mut LayerMask, ctl: &mut Controls, l: Layer, v: bool) {
         Layer::RealSun => ctl.real_sun = v,
         Layer::FollowHeading => ctl.follow_heading = v,
         Layer::Dem => mask.dem = v,
+        Layer::Hypso => mask.hypso = v,
         Layer::Land => mask.land = v,
         Layer::Water => mask.water = v,
         Layer::Line => mask.line = v,
@@ -99,6 +103,7 @@ const fn ink(rgb: u32, alpha: u8) -> u32 {
 
 const PANEL_BG: u32 = ink(0x0E_12_1A, 222);
 const GEAR_BG: u32 = ink(0x14_18_22, 230);
+const PANEL_DIM: u32 = ink(0x0E_12_1A, 170);
 const READOUT: u32 = ink(0xC8_CC_D4, 255);
 const READOUT_DIM: u32 = ink(0x80_86_92, 255);
 
@@ -176,8 +181,13 @@ impl Panel {
         if !self.open {
             return false;
         }
+        let inert = mask.inert();
         for (l, cb) in &mut self.checks {
             if cb.bbox().contains(x, y) {
+                // A row a dominating layer has greyed takes the tap but changes nothing.
+                if get(&inert, &Controls::default(), *l) {
+                    return true;
+                }
                 let v = !get(mask, ctl, *l);
                 set(mask, ctl, *l, v);
                 cb.set_checked(v);
@@ -217,8 +227,14 @@ impl Panel {
         if !self.open {
             return &self.buf;
         }
+        let inert = mask.inert();
         for (l, cb) in &mut self.checks {
             cb.set_checked(get(&mask, &ctl, *l));
+            // Greyed: a wash of the panel colour over the row, painted first so it lies on top.
+            if get(&inert, &Controls::default(), *l) {
+                let b = cb.bbox();
+                paint::fill_rect(&mut canvas, b.x as isize, b.y as isize, b.w as isize, b.h as isize, PANEL_DIM, None, None);
+            }
             cb.render_content_into(&mut canvas, &mut self.text, None, None);
         }
         // Readouts below the rows, one line each, dim labels.

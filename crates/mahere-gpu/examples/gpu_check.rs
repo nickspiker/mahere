@@ -34,6 +34,7 @@ fn main() {
             match tok.trim() {
                 "imagery" => m.imagery = true,
                 "nocontours" => m.contours = false,
+                "nohypso" => m.hypso = false,
                 "nolines" => m.line = false,
                 "noland" => m.land = false,
                 "nowater" => m.water = false,

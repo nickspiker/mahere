@@ -21,6 +21,7 @@ const M_IMAGERY: u32 = 32u;
 const M_CONTOURS: u32 = 64u;
 const M_SLOPE: u32 = 128u;
 const M_CANOPY: u32 = 256u;
+const M_HYPSO: u32 = 512u;
 
 // Where the style tables sit in the LUT buffer after the 4096 hypsometric rows.
 const CLASS_BASE: u32 = 4096u;
@@ -237,7 +238,11 @@ fn compose(d: u32, u: u32, v: u32) -> vec3<f32> {
             if ((mask & M_DEM) != 0u) {
                 diffuse = max(dot(s.n, U.sun.xyz), 0.0);
                 light = clamp(light_eval(s.n), vec3<f32>(0.0), vec3<f32>(1.3));
-                tint = unpack_rgb(lut[eq >> 4u]);
+                if ((mask & M_HYPSO) != 0u) {
+                    tint = unpack_rgb(lut[eq >> 4u]);
+                } else {
+                    tint = vec3<f32>(232.0, 232.0, 230.0);
+                }
                 have_ground = true;
             }
             let nzn = max(s.n.z, 1e-4);
