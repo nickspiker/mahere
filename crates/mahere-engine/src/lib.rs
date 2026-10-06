@@ -1,5 +1,6 @@
 //! mahere's host-independent map core — the #pagetable edition. A frame is fetches: 32 px block grid → diamond UV → page table → plane fetch → LUT composite. No vectors, no reservoir, no source data at runtime: the renderer's entire diet is baked cells served by a CellStore through the clipmap residency layer. Frontends feed input and blit `canvas`.
 
+pub mod plan;
 pub mod raster;
 pub mod residency;
 pub mod sh;
@@ -251,18 +252,48 @@ impl MapCore {
 
     // ==================== RENDER ====================
 
-    /// Render the full frame into `self.canvas` (visible 0xRRGGBB). Cheap by construction (fetch + composite), so it runs every host frame.
-    pub fn render(&mut self, w: usize, h: usize) {
+    /// The resident cells, for a renderer that mirrors them (the GPU).
+    pub fn pool(&self) -> &residency::Pool {
+        &self.res.pool
+    }
+
+    /// The frame's style and lighting parameters.
+    pub fn luts(&self) -> &FrameLuts {
+        &self.luts
+    }
+
+    /// Plan a frame for a GPU: the same preparation as `render`, then the lattice, references and page table instead of pixels. Residency is driven from the plan's desired set; the contour interval is fit to the lattice's elevation range.
+    pub fn plan(&mut self, w: usize, h: usize) -> plan::FramePlan {
         let t0 = Instant::now();
+        self.prepare(w, h);
+        let p = plan::plan_frame(w, h, &self.cam, &self.res.pool, self.dem_depth, self.vec_depth);
+        self.last_straddle_blocks = p.straddle_blocks;
+        self.last_range = p.elev;
+        let center = Coord::from_lat_lon(self.cam.lat, self.cam.lon);
+        let (cu, cv) = center.uv();
+        self.res.want(p.want.clone(), (cu, cv));
+        self.last_frame_ms = t0.elapsed().as_secs_f32() * 1000.0;
+        p
+    }
+
+    /// The screen-space marks (GPS pin, compass) on a cleared canvas, for a renderer that composites them itself. 0xRRGGBB over black; the ink's brightness is its coverage.
+    pub fn overlay(&mut self, w: usize, h: usize) -> &[u32] {
+        let mut scratch = std::mem::take(&mut self.canvas);
+        scratch.clear();
+        scratch.resize(w * h, 0);
+        self.canvas = scratch;
+        self.draw_gps(w, h);
+        self.draw_compass(w, h);
+        &self.canvas
+    }
+
+    /// Everything a frame needs before any pixel: drain arrivals, lighting for the current sun and bearing, depth selection, the contour interval fit to the previous frame's range.
+    fn prepare(&mut self, w: usize, h: usize) {
         self.dirty = false;
         self.res.frame += 1;
         self.res.drain();
-        self.canvas.resize(w * h, BG_RGB);
         self.canvas_w = w;
         self.canvas_h = h;
-        if w == 0 || h == 0 {
-            return;
-        }
         // Lighting lives in the device frame: the environment (sun + sky as SH) is fixed to the screen, and normals are rotated by the bearing at lookup. The world-frame sun vector stays for the water glint.
         if self.luts_sun != (self.sun_az, self.sun_alt, self.cam.bearing) {
             let az = (self.sun_az as f64 + self.cam.bearing.to_degrees()).to_radians();
@@ -290,7 +321,16 @@ impl MapCore {
         };
         self.contour_interval = interval;
         self.luts.contours = Contours { interval, index_every: 5, m_per_px: (111_320.0 / self.cam.ppd) as f32 };
+    }
 
+    /// Render the full frame into `self.canvas` (visible 0xRRGGBB). Cheap by construction (fetch + composite), so it runs every host frame.
+    pub fn render(&mut self, w: usize, h: usize) {
+        let t0 = Instant::now();
+        self.prepare(w, h);
+        self.canvas.resize(w * h, BG_RGB);
+        if w == 0 || h == 0 {
+            return;
+        }
         let (stats, want) = raster::render_frame(
             &mut self.canvas,
             w,

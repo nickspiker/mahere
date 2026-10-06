@@ -40,10 +40,59 @@ pub struct DemPacked {
     pub texel: Box<[u64]>,
 }
 
+/// The elevation plane for a GPU: the cell's own quantisation (`base` + k·`step`, k a u16, 0xFFFF no data) laid out as one 516×258 image — the 256×256×2 texels plus the one-texel apron on every side, so a shader derives edge normals from the neighbour's data exactly as the CPU does. Column `2·(tx+1)+half`, row `ty+1`.
+pub struct DemQ {
+    pub base: f32,
+    pub step: f32,
+    pub tex: Box<[u16]>,
+}
+
+pub const DEMQ_W: usize = 2 * (mahere_tiles::TEX + 2);
+pub const DEMQ_H: usize = mahere_tiles::TEX + 2;
+
+impl DemQ {
+    pub fn from_planes(d: &mahere_tiles::DemPlanes) -> DemQ {
+        use mahere_tiles::{APRON, TEX, apron_idx, tri_idx};
+        let (mut lo, mut hi) = (f32::MAX, f32::MIN);
+        for &e in d.elev.iter().chain(d.apron.iter()) {
+            if !e.is_nan() {
+                lo = lo.min(e);
+                hi = hi.max(e);
+            }
+        }
+        if lo == f32::MAX {
+            lo = 0.0;
+            hi = 0.0;
+        }
+        let step = ((hi - lo) / 65000.0).max(0.05);
+        let q = |e: f32| -> u16 { if e.is_nan() { 0xFFFF } else { (((e - lo) / step).round() as i32).clamp(0, 65534) as u16 } };
+        let mut tex = vec![0xFFFFu16; DEMQ_W * DEMQ_H].into_boxed_slice();
+        for ty in 0..TEX {
+            for tx in 0..TEX {
+                for half in 0..2 {
+                    tex[(ty + 1) * DEMQ_W + 2 * (tx + 1) + half] = q(d.elev[tri_idx(tx, ty, half)]);
+                }
+            }
+        }
+        debug_assert_eq!(d.apron.len(), APRON);
+        for half in 0..2 {
+            for i in 0..TEX {
+                tex[(i + 1) * DEMQ_W + half] = q(d.apron[apron_idx(0, half, i)]);
+                tex[(i + 1) * DEMQ_W + 2 * (TEX + 1) + half] = q(d.apron[apron_idx(1, half, i)]);
+                tex[2 * (i + 1) + half] = q(d.apron[apron_idx(2, half, i)]);
+                tex[(TEX + 1) * DEMQ_W + 2 * (i + 1) + half] = q(d.apron[apron_idx(3, half, i)]);
+            }
+        }
+        DemQ { base: lo, step, tex }
+    }
+}
+
 /// A resident cell: whichever layers it carried. All `None` = the loader confirmed the object does not exist (absent), which still ends probing.
 #[derive(Default)]
 pub struct Entry {
     pub dem: Option<DemPacked>,
+    /// The same elevation as `dem`, in the layout a GPU uploads; kept beside the packed texels so either renderer can run.
+    pub dem_q: Option<DemQ>,
     pub line: Option<ClassCell>,
     pub land: Option<ClassCell>,
     pub water: Option<CovCell>,
@@ -204,11 +253,12 @@ fn load_cell(store: &dyn CellStore, key: CellKey) -> Loaded {
             return Loaded { key, entry: None };
         }
     };
+    let dem_q = planes.dem.as_ref().map(DemQ::from_planes);
     let dem = planes.dem.map(|d| DemPacked { texel: d.pack_texels(key).into_boxed_slice() });
     if std::env::var_os("MAHERE_TRACE").is_some() || cfg!(target_os = "android") {
         eprintln!("cell {} d{} loaded: dem={} line={} land={} water={} ({} bytes)", key.name(), key.depth, dem.is_some(), planes.line.is_some(), planes.land.is_some(), planes.water.is_some(), bytes.len());
     }
-    Loaded { key, entry: Some(Entry { dem, line: planes.line, land: planes.land, water: planes.water, img: planes.img }) }
+    Loaded { key, entry: Some(Entry { dem, dem_q, line: planes.line, land: planes.land, water: planes.water, img: planes.img }) }
 }
 
 // ==================== TIERED STORE: VAULT CACHE OVER THE BUCKET ====================

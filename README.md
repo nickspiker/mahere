@@ -2,7 +2,7 @@
 
 An offline-first trail map, built from scratch.
 
-mahere (Māori: *map*) is a Rust mapping app for backcountry and MTB use that owns its whole stack: its own global coordinate system, its own binary tile format, its own build pipeline from OpenStreetMap data, and its own CPU-rendered cartography — fully user-configurable at render time, no third-party basemaps, no protobuf, no GPU required.
+mahere (Māori: *map*) is a Rust mapping app for backcountry and MTB use that owns its whole stack: its own global coordinate system, its own binary tile format, its own build pipeline from OpenStreetMap data, and its own cartography rendered from scratch on the CPU or the GPU — fully user-configurable at render time, no third-party basemaps, no protobuf.
 
 ## Why from scratch
 
@@ -10,7 +10,7 @@ Mainstream map stacks inherit Web Mercator's distortion, Mapbox Vector Tiles' pr
 
 - **Coordinates** ([docs/coord-spec.md](docs/coord-spec.md)): one `u64` is a position on Earth at ~6.6 mm resolution — 4 bits of icosahedral diamond ID plus 60 bits of Morton-interleaved face-local UV. Truncating low bits yields the enclosing quadtree cell, so a tile address is a coordinate prefix and containment tests are integer compares. Ground resolution is near-uniform globally: no pole singularities, no cos(latitude) anywhere. The closest relatives are Google's S2 (indexing only, ~2.1× cell-area spread) and astronomy's HEALPix/HiPS (equal-area diamonds serving all-sky imagery); mahere does the latter for Earth, on a better solid.
 - **Tiles**: encoded in [VSF](https://github.com/nickspiker/vsf) instead of protobuf — O(1) skip, per-layer sections the renderer can ignore without parsing, bitpacked coordinate streams at exactly the bit width each tile needs.
-- **Rendering**: CPU, front-to-back, via [fluor](https://github.com/nickspiker/fluor). Styling lives in a hot-reloadable text document, never in tiles; colour, stroke, transparency and effects are user-tweakable without retiling anything.
+- **Rendering**: the `#pagetable` compositor, pure raster over baked cells, on the CPU (presented by [fluor](https://github.com/nickspiker/fluor)) or on the GPU through wgpu — the same frame either way. Styling lives in lookup tables the client owns, never in tiles.
 
 Data sources are all open: OpenStreetMap vectors (ODbL), USGS 3DEP elevation and NAIP imagery (public domain).
 
@@ -34,11 +34,14 @@ Early. Working today:
 
   Each parent texel is the mean of its four children (three corners and the inverted centre), so coverage up the pyramid is exact box filtering: minor ways fade and towns glow with no styling tricks and no aliasing.
 - `mahere-engine` — the `#pagetable` renderer. Pure raster: a frame is fetches. A 32 px block grid gets exact screen→diamond-UV corners; inside a block UV steps in Q30.16 fixed point; each block resolves its cell(s) once through a page table of decoded planes, falling back to resident parents while finer cells stream in from a loader thread. Per pixel: unpack a dem texel (u16 elevation, snorm16 normal), light it by the sun through a hypsometric LUT, tint by land cover, lerp in water and the line class colour by coverage — each layer gated by the client's layer mask (desktop keys 1–4). No vectors, no per-pixel hashing, no locks. Sun lives in screen space, so the terrain is lit from the top-left at any bearing.
-- `mahere-app` (desktop, fluor) and `mahere-android` (chromeless, JNI) are thin frontends over the same `MapCore`: drag/pinch to pan, two-finger rotate, Q/E rotate, A/D/W/S move the sun, R goes home. Session and GPS tracks persist in a kete vault (`mahere-store`).
+- `mahere-gpu` — the same compositor as a wgpu fragment shader. The engine plans the frame (the block lattice with exact corners, every resident cell as a reference, a hash page table over them); the shader resolves each sample by table lookup, climbing parents like the CPU probe, fetches the planes from texture arrays (one layer per cell, grown on demand), derives the normal from the apron-padded elevation and runs the same compose. It renders at 2× and bins once — the anti-aliasing rule — then lays the pin and compass over. Verified against the CPU raster pixel for pixel with the `gpu_check` example.
+- `mahere-app` (desktop, fluor) and `mahere-android` (chromeless, JNI) are thin frontends over the same `MapCore`: drag/pinch to pan, two-finger rotate, Q/E rotate, A/D/W/S move the sun, R goes home. Android draws through `mahere-gpu` (Vulkan) and falls back to the CPU raster when it cannot; the desktop still draws on the CPU. Session and GPS tracks persist in a kete vault (`mahere-store`).
 
-Measured: a 1024×768 frame of Mount Adams renders in ~1.4 ms on a desktop CPU (the previous reservoir/vector engine took ~300 ms).
+Cells are stored through a pyramid codec (`mahere-tiles::pyr`): each plane as its own triangle quadtree, coarse first, every level predicted from the reconstructed coarser one, Rice-coded, and quantised with a dead zone where a bake allows loss (default 0.2 m for elevation at the finest level, 16 levels for imagery, both under the data's own noise). The first levels of a stream are a coarser plane, so a reader can stop early.
 
-Next: contours stamped from elevation at bake, anti-aliasing (render at 2× with texels at 1–2 px, bin once), the GUI cache and settings, the GPU path, imagery.
+Measured: a 1024×768 frame of Spirit Lake renders in ~6.5 ms on a desktop CPU and ~1 ms on the GPU at 2× supersampling (the previous reservoir/vector engine took ~300 ms).
+
+Next: the layer panel and readouts on Android, the macOS GPU surface under fluor's chrome, per-section range fetch over the coarse-first streams.
 
 ## Building
 

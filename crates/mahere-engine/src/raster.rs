@@ -170,7 +170,7 @@ pub const LAND_LUT: [[u8; 3]; 14] = [
 
 /// One resolved layer reference for a block: planes plus the shift that maps Q30.16 UV to this entry's texel grid (depends on the entry's ACTUAL depth — a parent fallback is just a different shift).
 #[derive(Clone, Copy)]
-enum DemRef<'a> {
+pub(crate) enum DemRef<'a> {
     Cell { planes: &'a DemPacked, shift: u32, prefix_shift: u32, prefix: u64 },
     None,
 }
@@ -190,7 +190,7 @@ enum VecRef<'a> {
 }
 
 /// Probe the pool at `depth`, climbing parents to MIN_DEPTH until an entry satisfies `has`. Absent cells climb too (for dem a parent is coarser truth; for vector layers the parent IS the box-filtered truth).
-fn probe<'a>(pool: &'a Pool, mut depth: u8, mut prefix: u64, has: impl Fn(&Entry) -> bool) -> Option<(&'a Entry, u8, u64)> {
+pub(crate) fn probe<'a>(pool: &'a Pool, mut depth: u8, mut prefix: u64, has: impl Fn(&Entry) -> bool) -> Option<(&'a Entry, u8, u64)> {
     loop {
         if let Some(e) = pool.map.get(&CellKey { depth, prefix }) {
             if has(e) {
@@ -224,13 +224,13 @@ pub struct FrameStats {
 
 /// Corner lattice entry: diamond + Q30.16 UV (i64).
 #[derive(Clone, Copy)]
-struct CornerPt {
-    diamond: u8,
-    u: i64,
-    v: i64,
+pub(crate) struct CornerPt {
+    pub diamond: u8,
+    pub u: i64,
+    pub v: i64,
 }
 
-fn corner(cam: &Camera, px: f64, py: f64, w: usize, h: usize) -> CornerPt {
+pub(crate) fn corner(cam: &Camera, px: f64, py: f64, w: usize, h: usize) -> CornerPt {
     let (lat, lon) = cam.screen_to_geo(px, py, w, h);
     let c = Coord::from_lat_lon(lat, lon);
     let (iu, iv) = c.uv();
@@ -299,7 +299,7 @@ pub fn render_frame(
 }
 
 /// Resolve a dem ref for a full-res raw prefix base. Shift maps Q30.16 u to texel at the found depth: tx = (uQ >> (16 + 22 - d)) & 255.
-fn resolve_dem<'a>(pool: &'a Pool, depth: u8, raw: u64) -> DemRef<'a> {
+pub(crate) fn resolve_dem<'a>(pool: &'a Pool, depth: u8, raw: u64) -> DemRef<'a> {
     let prefix = raw >> (60 - 2 * depth as u32);
     match probe(pool, depth, prefix, |e| e.dem.is_some()) {
         Some((e, d, pfx)) => DemRef::Cell {
@@ -329,7 +329,7 @@ fn resolve_vec<'a>(pool: &'a Pool, depth: u8, raw: u64) -> VecRef<'a> {
 }
 
 #[inline(always)]
-fn raw_of(diamond: u8, uq: i64, vq: i64) -> u64 {
+pub(crate) fn raw_of(diamond: u8, uq: i64, vq: i64) -> u64 {
     ((diamond as u64) << 60)
         | (mahere_coord::morton_spread((uq >> 16) as u64) << 1)
         | mahere_coord::morton_spread((vq >> 16) as u64)
@@ -379,7 +379,7 @@ fn dem_ref_depth(r: &DemRef) -> Option<u8> {
 
 /// The dem texel for a pixel: the block's ref, and on a NODATA texel the parents below it — a merged cell can carry elevation only inside the newer bake's footprint while an older, coarser bake covers the rest.
 #[inline(always)]
-fn dem_texel(dem: &DemRef, pool: &Pool, diamond: u8, uq: i64, vq: i64) -> Option<u64> {
+pub(crate) fn dem_texel(dem: &DemRef, pool: &Pool, diamond: u8, uq: i64, vq: i64) -> Option<u64> {
     let mut r = *dem;
     loop {
         let DemRef::Cell { planes, shift, .. } = r else { return None };
@@ -740,6 +740,7 @@ mod tests {
             key,
             Entry {
                 dem: Some(DemPacked { texel: texel.into_boxed_slice() }),
+                dem_q: None,
                 line: Some(ClassCell::new_line()),
                 land: Some(land),
                 water: Some(CovCell::new()),

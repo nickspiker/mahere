@@ -19,6 +19,9 @@ use mahere_engine::{Camera, GpsFix, MapCore};
 use ndk::native_window::NativeWindow;
 use std::time::Instant;
 
+mod gpu_host;
+use gpu_host::GpuHost;
+
 struct TwoFinger {
     /// Geography captured under each finger at gesture start.
     geo_a: (f64, f64),
@@ -43,6 +46,9 @@ pub struct AndroidApp {
     store: Option<std::sync::Arc<mahere_store::FlatStorage>>,
     recorder: Option<mahere_store::TrackRecorder>,
     fixes_since_save: u32,
+    /// The GPU path, created on the first draw; None after a failure means the CPU present is in use.
+    gpu: Option<GpuHost>,
+    gpu_failed: bool,
 }
 
 impl AndroidApp {
@@ -291,6 +297,8 @@ pub extern "system" fn Java_nz_mahere_app_MahereActivity_nativeInit(
         store,
         recorder,
         fixes_since_save: 0,
+        gpu: None,
+        gpu_failed: false,
     };
     Box::into_raw(Box::new(AndroidShell::new(app, width as u32, height as u32))) as jlong
 }
@@ -327,6 +335,25 @@ pub extern "system" fn Java_nz_mahere_app_MahereActivity_nativeDraw(
         Some(w) => w,
         None => return 0,
     };
+    // The GPU draws when it can; fluor.s CPU present is the fallback (no Vulkan, or a surface it cannot wrap).
+    let app = shell(ptr).app();
+    if !app.gpu_failed {
+        if app.gpu.is_none() {
+            match GpuHost::new(&window) {
+                Some(g) => app.gpu = Some(g),
+                None => {
+                    app.gpu_failed = true;
+                    eprintln!("gpu: unavailable, CPU present");
+                }
+            }
+        }
+        let AndroidApp { gpu: Some(g), map, w, h, .. } = app else {
+            return shell(ptr).draw(&window) as jboolean;
+        };
+        if g.ensure_window(&window) {
+            return g.draw(map, *w as u32, *h as u32) as jboolean;
+        }
+    }
     shell(ptr).draw(&window) as jboolean
 }
 

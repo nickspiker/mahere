@@ -7,6 +7,7 @@ default-members = [
     "crates/mahere-coord",
     "crates/mahere-dem",
     "crates/mahere-engine",
+    "crates/mahere-gpu",
     "crates/mahere-osm",
     "crates/mahere-store",
 ]

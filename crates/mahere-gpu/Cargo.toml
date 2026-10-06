@@ -1,0 +1,25 @@
+[package]
+name = "mahere-gpu"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "mahere's #pagetable compositor on the GPU: resident cells as texture arrays, the frame plan's page table in a storage buffer, one fragment shader per pixel"
+
+[dependencies]
+mahere-engine = { path = "../mahere-engine" }
+mahere-tiles = { path = "../mahere-tiles" }
+bytemuck = { version = "1", features = ["derive"] }
+rustc-hash = "2"
+wgpu = { version = "28", default-features = false, features = ["wgsl"] }
+
+# Vulkan everywhere it exists (Android first), Metal on Apple.
+[target.'cfg(any(target_os = "linux", target_os = "android", target_os = "windows"))'.dependencies]
+wgpu = { version = "28", default-features = false, features = ["wgsl", "vulkan"] }
+
+[target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies]
+wgpu = { version = "28", default-features = false, features = ["wgsl", "metal"] }
+
+[dev-dependencies]
+pollster = "0.4"
+png = "0.17"
