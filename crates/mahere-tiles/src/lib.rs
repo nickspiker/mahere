@@ -245,19 +245,33 @@ fn texel_of(c: Coord, depth: u8) -> (u8, f64, f64) {
 
 // ==================== PLANES ====================
 
-/// (class, coverage) planes: lines and land cover.
+/// (class, coverage) planes: lines and land cover. Lines also carry `mag` (a log-scaled magnitude whose meaning is per class — catchment for water, voltage for power, lanes/traffic for roads) and `uses` (the [`mahere_osm::use_bits`]); both stay empty for land cover.
 #[derive(Clone)]
 pub struct ClassCell {
     pub class: Vec<u8>, // 0 = empty; else class + 1
     pub cov: Vec<u8>,
+    pub mag: Vec<u8>,
+    pub uses: Vec<u8>,
 }
 
 impl ClassCell {
     pub fn new() -> ClassCell {
-        ClassCell { class: vec![0; TRI], cov: vec![0; TRI] }
+        ClassCell { class: vec![0; TRI], cov: vec![0; TRI], mag: Vec::new(), uses: Vec::new() }
+    }
+    /// A line cell: with the attribute planes.
+    pub fn new_line() -> ClassCell {
+        ClassCell { class: vec![0; TRI], cov: vec![0; TRI], mag: vec![0; TRI], uses: vec![0; TRI] }
     }
     pub fn is_empty(&self) -> bool {
         self.cov.iter().all(|&c| c == 0)
+    }
+    #[inline(always)]
+    pub fn mag_at(&self, i: usize) -> u8 {
+        self.mag.get(i).copied().unwrap_or(0)
+    }
+    #[inline(always)]
+    pub fn uses_at(&self, i: usize) -> u8 {
+        self.uses.get(i).copied().unwrap_or(0)
     }
 }
 
@@ -366,13 +380,14 @@ pub fn bake_lines(feats: &[Road], base_depth: u8, min_depth: u8) -> HashMap<Cell
         let class = road.class_id();
         let r = (road.width_m() as f64 / 2.0 / tm).max(0.5);
         let cov_max = road.cov_max();
+        let attrs = (road.mag_byte(), road.uses);
         let mut prev: Option<(u8, f64, f64)> = None;
         for &(lat, lon) in &road.pts {
             let c = Coord::from_lat_lon(lat as f64, lon as f64);
             let (d, gu, gv) = texel_of(c, base_depth);
             if let Some((pd, pu, pv)) = prev {
                 if pd == d {
-                    stamp_segment(&mut cells, base_depth, d, (pu, pv), (gu, gv), r, class, cov_max);
+                    stamp_segment(&mut cells, base_depth, d, (pu, pv), (gu, gv), r, class, cov_max, attrs);
                 } else {
                     cross_diamond += 1;
                 }
@@ -397,6 +412,7 @@ fn stamp_segment(
     r: f64,
     class: u8,
     cov_max: u8,
+    attrs: (u8, u8),
 ) {
     let extent = ((1u64 << depth) * TEX as u64) as f64;
     let len = uv_dist2(b.0 - a.0, b.1 - a.1).sqrt();
@@ -424,12 +440,14 @@ fn stamp_segment(
                     }
                     let (tx, ty) = (tx as usize, ty as usize);
                     let key = CellKey::from_grid(diamond, depth, (tx / TEX) as u64, (ty / TEX) as u64);
-                    let cell = cells.entry(key).or_default();
+                    let cell = cells.entry(key).or_insert_with(ClassCell::new_line);
                     let i = tri_idx(tx % TEX, ty % TEX, half);
                     if cov > cell.cov[i] || (cov == cell.cov[i] && class < cell.class[i]) {
                         cell.cov[i] = cov;
                         cell.class[i] = class;
+                        cell.mag[i] = attrs.0;
                     }
+                    cell.uses[i] |= attrs.1;
                 }
             }
         }
@@ -565,11 +583,12 @@ pub fn pyramid_class(
         let mut parents: Vec<CellKey> = cells.keys().filter(|k| k.depth == depth).map(|k| k.parent()).collect();
         parents.sort();
         parents.dedup();
+        let with_attrs = matches!(merge, ClassMerge::Major);
         let built: Vec<(CellKey, ClassCell)> = parents
             .par_iter()
             .map(|&p| {
                 let kids: [Option<&ClassCell>; 4] = std::array::from_fn(|q| cells.get(&p.child(q as u64)));
-                let mut cell = ClassCell::new();
+                let mut cell = if with_attrs { ClassCell::new_line() } else { ClassCell::new() };
                 for ty in 0..TEX {
                     for tx in 0..TEX {
                         for half in 0..2 {
@@ -577,10 +596,16 @@ pub fn pyramid_class(
                             let mut best = 0u8;
                             let mut best_cov = 0u32;
                             let mut per_class = [0u32; 32];
+                            let mut mag = 0u8;
+                            let mut uses = 0u8;
                             for (q, i) in child_cell_texels(tx, ty, half) {
                                 let Some(child) = kids[q as usize] else { continue };
                                 let cv = child.cov[i] as u32;
                                 covsum += cv;
+                                if with_attrs {
+                                    mag = mag.max(child.mag_at(i));
+                                    uses |= child.uses_at(i);
+                                }
                                 let cl = child.class[i];
                                 if cl != 0 && cv > 0 {
                                     match merge {
@@ -606,6 +631,10 @@ pub fn pyramid_class(
                                 ClassMerge::Dominant => (covsum / 4) as u8,
                             };
                             cell.class[i] = best;
+                            if with_attrs {
+                                cell.mag[i] = mag;
+                                cell.uses[i] = uses;
+                            }
                         }
                     }
                 }
@@ -907,7 +936,7 @@ pub fn assemble(
     let mut water = water;
     for k in vec_keys {
         let c = cells.entry(k).or_default();
-        c.line = Some(line.remove(&k).unwrap_or_default());
+        c.line = Some(line.remove(&k).unwrap_or_else(ClassCell::new_line));
         c.land = Some(land.remove(&k).unwrap_or_default());
         c.water = Some(water.remove(&k).unwrap_or_default());
     }
@@ -1146,10 +1175,15 @@ impl CellPlanes {
             fn keep_old_class(new: &mut Option<ClassCell>, old: Option<ClassCell>, mask: &[bool]) {
                 match (new, old) {
                     (Some(n), Some(o)) => {
+                        let attrs = n.mag.len() == TRI && o.mag.len() == TRI;
                         for i in 0..TRI {
                             if !mask[i] {
                                 n.class[i] = o.class[i];
                                 n.cov[i] = o.cov[i];
+                                if attrs {
+                                    n.mag[i] = o.mag[i];
+                                    n.uses[i] = o.uses[i];
+                                }
                             }
                         }
                     }
@@ -1201,13 +1235,17 @@ impl CellPlanes {
         }
         for (name, planes) in [("line", &self.line), ("land", &self.land)] {
             if let Some(p) = planes {
-                b = b.add_section(
-                    name,
-                    vec![
-                        ("class".to_string(), VsfType::t_u3(Tensor::new(vec![2, TEX * TEX], mem_to_disk(&p.class)))),
-                        ("cov".to_string(), VsfType::t_u3(Tensor::new(vec![2, TEX * TEX], mem_to_disk(&p.cov)))),
-                    ],
-                );
+                let mut fields = vec![
+                    ("class".to_string(), VsfType::t_u3(Tensor::new(vec![2, TEX * TEX], mem_to_disk(&p.class)))),
+                    ("cov".to_string(), VsfType::t_u3(Tensor::new(vec![2, TEX * TEX], mem_to_disk(&p.cov)))),
+                ];
+                if p.mag.len() == TRI {
+                    fields.push(("mag".to_string(), VsfType::t_u3(Tensor::new(vec![2, TEX * TEX], mem_to_disk(&p.mag)))));
+                }
+                if p.uses.len() == TRI {
+                    fields.push(("use".to_string(), VsfType::t_u3(Tensor::new(vec![2, TEX * TEX], mem_to_disk(&p.uses)))));
+                }
+                b = b.add_section(name, fields);
             }
         }
         if let Some(w) = &self.water {
@@ -1285,7 +1323,9 @@ pub fn decode_cell(data: &[u8]) -> Result<CellPlanes, String> {
                 if let (Some(class), Some(cov)) =
                     (fields.get("class").and_then(plane_u8_mem), fields.get("cov").and_then(plane_u8_mem))
                 {
-                    let planes = Some(ClassCell { class, cov });
+                    let mag = fields.get("mag").and_then(plane_u8_mem).unwrap_or_default();
+                    let uses = fields.get("use").and_then(plane_u8_mem).unwrap_or_default();
+                    let planes = Some(ClassCell { class, cov, mag, uses });
                     if s.name == "line" {
                         out.line = planes;
                     } else {
@@ -1423,6 +1463,7 @@ mod tests {
         Road {
             class,
             weight,
+            uses: 0,
             pts: (0..200)
                 .map(|i| {
                     let t = i as f32 / 199.0;
@@ -1506,9 +1547,11 @@ mod tests {
             }
         }
         dem.apron[apron_idx(0, 0, 3)] = 999.5;
-        let mut line = ClassCell::new();
+        let mut line = ClassCell::new_line();
         line.class[5] = 3;
         line.cov[5] = 200;
+        line.mag[5] = 77;
+        line.uses[5] = 0b101;
         let cell = Cell { dem: Some(dem.clone()), line: Some(line), land: Some(ClassCell::new()), water: None, img: None };
         let bytes = cell.quantize().encode().unwrap();
         let back = decode_cell(&bytes).unwrap();
@@ -1521,6 +1564,8 @@ mod tests {
         assert!((d.apron[apron_idx(0, 0, 3)] - 999.5).abs() <= 0.03);
         assert!(d.apron[apron_idx(1, 1, 7)].is_nan());
         assert_eq!(back.line.as_ref().unwrap().cov[5], 200);
+        assert_eq!(back.line.as_ref().unwrap().mag[5], 77);
+        assert_eq!(back.line.as_ref().unwrap().uses[5], 0b101);
         assert!(back.water.is_none());
 
         // Normals: a plane tilted along +u lights as a slope, flat ground as +z.
@@ -1537,7 +1582,7 @@ mod tests {
         for i in TRI / 2..TRI {
             dem2.elev[i] = 50.0;
         }
-        let mut line2 = ClassCell::new();
+        let mut line2 = ClassCell::new_line();
         line2.cov[5] = 1; // outside dem2's footprint: must NOT win
         line2.cov[TRI - 1] = 9;
         let cell2 = Cell { dem: Some(dem2), line: Some(line2), land: None, water: None, img: None };

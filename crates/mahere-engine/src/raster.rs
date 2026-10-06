@@ -128,8 +128,8 @@ pub const WATER_RGB: [u8; 3] = [26, 58, 82];
 /// Terrain tint when the dem layer is off or absent: a neutral ground.
 const FLAT_RGB: [u8; 3] = [96, 100, 96];
 
-/// Line class id (1-based, 0 = empty) -> visible RGB. 1..=11 road classes; 12..=19 waterways from the biggest river (12, bright) to a trickle (19, dim) — a log brightness ramp over the weight bins, so water is never uniform.
-pub const CLASS_LUT: [[u8; 3]; 20] = [
+/// Line class id (1-based, 0 = empty) -> visible RGB. Index 12 = Waterway, whose brightness is scaled by the texel's log magnitude at draw time so water is never uniform.
+pub const CLASS_LUT: [[u8; 3]; 13] = [
     [0, 0, 0],
     [245, 150, 60],
     [238, 175, 62],
@@ -143,15 +143,9 @@ pub const CLASS_LUT: [[u8; 3]; 20] = [
     [125, 122, 128],
     [148, 136, 160],
     [120, 190, 255],
-    [104, 174, 238],
-    [90, 158, 220],
-    [78, 142, 202],
-    [66, 126, 184],
-    [56, 110, 164],
-    [46, 94, 144],
-    [38, 80, 124],
 ];
-pub const CLASS_MAX: usize = 19;
+pub const CLASS_MAX: usize = 12;
+const WATERWAY_CLASS: usize = 12;
 
 /// Slope-angle bands (degrees) and their overlay colours: the avalanche / rideability layer, from the normal at draw time.
 const SLOPE_BANDS: [(f32, [u8; 3]); 4] = [(25.0, [250, 220, 60]), (30.0, [250, 150, 40]), (35.0, [230, 50, 40]), (45.0, [150, 40, 200])];
@@ -350,6 +344,19 @@ pub fn tri_index(uq: i64, vq: i64, shift: u32) -> usize {
     (((ty << 8) | tx) << 1) | half
 }
 
+/// A line texel's colour: the class LUT, with waterways darkened by their log magnitude (a trickle at ~40%, a big river at full).
+#[inline(always)]
+fn line_colour(line: &ClassCell, i: usize) -> [u8; 3] {
+    let cls = (line.class[i] as usize).min(CLASS_MAX);
+    let c = CLASS_LUT[cls];
+    if cls == WATERWAY_CLASS {
+        let m = 0.4 + 0.6 * line.mag_at(i) as f32 / 255.0;
+        [(c[0] as f32 * m) as u8, (c[1] as f32 * m) as u8, (c[2] as f32 * m) as u8]
+    } else {
+        c
+    }
+}
+
 #[inline(always)]
 fn lerp3(a: [f32; 3], b: [u8; 3], t: f32) -> [f32; 3] {
     [
@@ -479,7 +486,7 @@ fn compose_rgb(dem: &DemRef, vec: &VecRef, pool: &Pool, diamond: u8, uq: i64, vq
                 if let Some(line) = line {
                     let cov = line.cov[i];
                     if cov != 0 {
-                        rgb = lerp3(rgb, CLASS_LUT[(line.class[i] as usize).min(CLASS_MAX)], cov as f32 / 255.0);
+                        rgb = lerp3(rgb, line_colour(line, i), cov as f32 / 255.0);
                     }
                 }
             }
@@ -526,7 +533,7 @@ fn compose_rgb(dem: &DemRef, vec: &VecRef, pool: &Pool, diamond: u8, uq: i64, vq
             if let Some(line) = line {
                 let cov = line.cov[i];
                 if cov != 0 {
-                    rgb = lerp3(rgb, CLASS_LUT[(line.class[i] as usize).min(CLASS_MAX)], cov as f32 / 255.0);
+                    rgb = lerp3(rgb, line_colour(line, i), cov as f32 / 255.0);
                 }
             }
         }
@@ -724,7 +731,7 @@ mod tests {
             key,
             Entry {
                 dem: Some(DemPacked { texel: texel.into_boxed_slice() }),
-                line: Some(ClassCell::new()),
+                line: Some(ClassCell::new_line()),
                 land: Some(land),
                 water: Some(CovCell::new()),
                 img: None,

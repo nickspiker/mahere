@@ -29,10 +29,19 @@ pub enum RoadClass {
 }
 
 pub const CLASS_COUNT: usize = 12;
-/// Waterway texel classes: WATERWAY_CLASS0 is the biggest river, WATERWAY_CLASS0 + WATERWAY_BINS - 1 the smallest trickle.
-pub const WATERWAY_CLASS0: u8 = 12;
-pub const WATERWAY_BINS: u8 = 8;
-pub const CLASS_IDS: usize = WATERWAY_CLASS0 as usize + WATERWAY_BINS as usize;
+
+/// Line `use` bits: what a way is for, from its tags. A theme draws a path differently when bikes or horses are allowed, hides motor roads on a ski map, and so on.
+pub mod use_bits {
+    pub const FOOT: u8 = 1 << 0;
+    pub const BIKE: u8 = 1 << 1;
+    pub const HORSE: u8 = 1 << 2;
+    pub const SKI: u8 = 1 << 3;
+    pub const MOTOR: u8 = 1 << 4;
+    pub const UNPAVED: u8 = 1 << 5;
+    pub const FREEWAY: u8 = 1 << 6;
+    /// Seasonal, gated, private, or otherwise not generally open.
+    pub const RESTRICTED: u8 = 1 << 7;
+}
 
 impl RoadClass {
     /// Map an OSM `highway=` tag value. `None` = a highway type mahere doesn't draw (construction, proposed, bus_stop, ...).
@@ -156,12 +165,92 @@ impl AreaClass {
     }
 }
 
-/// One drawable way. Points are (lat, lon) degrees, already quantized by a round trip through the mahere coordinate codec. `weight` is 0..1:
-/// for waterways, log-scaled upstream network length (a catchment proxy); for everything else it's unused (width comes from the class).
+/// One drawable way. Points are (lat, lon) degrees, already quantized by a round trip through the mahere coordinate codec. `weight` is 0..1: for waterways, log-scaled upstream network length (a catchment proxy) set after the network pass; for other classes a log-scaled magnitude from tags (power: voltage; roads: lanes until traffic counts exist; rail: usage). `uses` are the [`use_bits`].
 pub struct Road {
     pub class: RoadClass,
     pub pts: Vec<(f32, f32)>,
     pub weight: f32,
+    pub uses: u8,
+}
+
+/// What a way is for and how big it is, from its tags, for the non-waterway classes (waterways get their magnitude from the network pass).
+fn uses_and_magnitude<'a>(class: RoadClass, tags: impl Iterator<Item = (&'a str, &'a str)>) -> (u8, f32) {
+    use RoadClass::*;
+    use use_bits::*;
+    let mut uses = match class {
+        Motorway => MOTOR | FREEWAY,
+        Trunk | Primary | Secondary | Tertiary | Residential | Service => MOTOR | BIKE | FOOT,
+        Track => MOTOR | BIKE | FOOT | HORSE | UNPAVED,
+        Path => FOOT | BIKE,
+        Rail | Power | Waterway => 0,
+    };
+    let mut mag: Option<f32> = None;
+    let mut lanes: Option<f32> = None;
+    let no = |v: &str| matches!(v, "no" | "private" | "discouraged");
+    let yes = |v: &str| matches!(v, "yes" | "designated" | "permissive" | "official");
+    for (k, v) in tags {
+        match k {
+            "foot" if no(v) => uses &= !FOOT,
+            "foot" if yes(v) => uses |= FOOT,
+            "bicycle" if no(v) => uses &= !BIKE,
+            "bicycle" if yes(v) => uses |= BIKE,
+            "horse" if yes(v) => uses |= HORSE,
+            "horse" if no(v) => uses &= !HORSE,
+            "ski" if yes(v) => uses |= SKI,
+            "piste:type" => uses |= SKI,
+            "motor_vehicle" | "motorcar" if no(v) => uses &= !MOTOR,
+            "highway" if v == "bridleway" => uses |= HORSE,
+            "highway" if v == "cycleway" => uses |= BIKE,
+            "highway" if v == "footway" || v == "steps" => uses &= !BIKE,
+            "surface" => {
+                if matches!(v, "gravel" | "dirt" | "ground" | "unpaved" | "compacted" | "fine_gravel" | "sand" | "grass" | "earth" | "mud" | "rock" | "pebblestone" | "wood") {
+                    uses |= UNPAVED;
+                } else if matches!(v, "asphalt" | "paved" | "concrete" | "paving_stones") {
+                    uses &= !UNPAVED;
+                }
+            }
+            "tracktype" if v != "grade1" => uses |= UNPAVED,
+            "access" if no(v) => uses |= RESTRICTED,
+            "seasonal" if v != "no" => uses |= RESTRICTED,
+            "barrier" if v == "gate" => uses |= RESTRICTED,
+            "lanes" => lanes = v.split(';').next().and_then(|x| x.parse().ok()),
+            "voltage" if class == Power => {
+                // Highest circuit, log over 400 V .. 765 kV.
+                if let Some(volts) = v.split(';').filter_map(|x| x.trim().parse::<f32>().ok()).fold(None, |m: Option<f32>, x| Some(m.map_or(x, |m| m.max(x)))) {
+                    mag = Some(((volts.max(400.0).log10() - 2.6) / (5.9 - 2.6)).clamp(0.0, 1.0));
+                }
+            }
+            "usage" if class == Rail => {
+                mag = Some(match v {
+                    "main" => 1.0,
+                    "branch" => 0.6,
+                    "industrial" | "military" => 0.4,
+                    _ => 0.3,
+                });
+            }
+            _ => {}
+        }
+    }
+    let mag = mag.unwrap_or_else(|| match class {
+        Motorway => 1.0,
+        Trunk => 0.85,
+        Primary => 0.7,
+        Secondary => 0.6,
+        Tertiary => 0.5,
+        Residential => 0.35,
+        Service => 0.25,
+        Track => 0.2,
+        Path => 0.15,
+        Rail => 0.5,
+        Power => 0.3,
+        Waterway => 0.0,
+    });
+    // Lanes refine a road's magnitude until traffic counts exist: log over 1..8 lanes, blended with the class default.
+    let mag = match lanes {
+        Some(l) if class != Waterway && class != Power && class != Rail => (mag * 0.6 + (l.clamp(1.0, 8.0).log2() / 3.0) * 0.4).clamp(0.0, 1.0),
+        _ => mag,
+    };
+    (uses, mag)
 }
 
 impl Road {
@@ -181,15 +270,14 @@ impl Road {
         }
     }
 
-    /// The texel class id (0 = empty): road classes 1..=11 as `RoadClass + 1`; waterways 12..=19 by weight bin, the BIGGEST river at 12 so that "most major wins" in the pyramid keeps the Columbia over a ditch, and a theme can map each bin to its own brightness and width.
+    /// The texel class id (0 = empty): `RoadClass + 1`. Size and kind travel in the line layer's `mag` and `use` planes, not the id.
     pub fn class_id(&self) -> u8 {
-        match self.class {
-            RoadClass::Waterway => {
-                let bin = (self.weight * (WATERWAY_BINS - 1) as f32).round() as u8;
-                WATERWAY_CLASS0 + (WATERWAY_BINS - 1 - bin)
-            }
-            c => c as u8 + 1,
-        }
+        self.class as u8 + 1
+    }
+
+    /// Log-scaled magnitude as a texel byte (1..=255 so a stamped texel is never "no data").
+    pub fn mag_byte(&self) -> u8 {
+        1 + (self.weight.clamp(0.0, 1.0) * 254.0) as u8
     }
 }
 
@@ -205,7 +293,7 @@ pub struct Features {
 }
 
 enum WayRec {
-    Line(RoadClass, Vec<i64>),
+    Line(RoadClass, Vec<i64>, u8, f32),
     Area(AreaClass, Vec<i64>),
     /// A multipolygon member, kept by id for ring assembly.
     Member(i64, Vec<i64>),
@@ -260,7 +348,8 @@ pub fn load_features(path: &str) -> Result<Features, osmpbf::Error> {
                     _ => None,
                 });
                 if let Some(class) = line {
-                    out.push(WayRec::Line(class, refs.clone()));
+                    let (uses, mag) = uses_and_magnitude(class, w.tags());
+                    out.push(WayRec::Line(class, refs.clone(), uses, mag));
                 }
                 let closed = refs.len() >= 4 && refs.first() == refs.last();
                 if closed && !is_member {
@@ -282,7 +371,7 @@ pub fn load_features(path: &str) -> Result<Features, osmpbf::Error> {
     let mut needed: Vec<i64> = ways
         .iter()
         .flat_map(|r| match r {
-            WayRec::Line(_, refs) | WayRec::Area(_, refs) | WayRec::Member(_, refs) => refs.iter().copied(),
+            WayRec::Line(_, refs, _, _) | WayRec::Area(_, refs) | WayRec::Member(_, refs) => refs.iter().copied(),
         })
         .collect();
     needed.sort_unstable();
@@ -319,11 +408,15 @@ pub fn load_features(path: &str) -> Result<Features, osmpbf::Error> {
 
     // Lines, with the waterway network weighted.
     let mut lines: Vec<(RoadClass, Vec<i64>)> = Vec::new();
+    let mut line_attrs: Vec<(u8, f32)> = Vec::new();
     let mut areas: Vec<Area> = Vec::new();
     let mut members: HashMap<i64, Vec<i64>> = HashMap::new();
     for rec in ways {
         match rec {
-            WayRec::Line(class, refs) => lines.push((class, refs)),
+            WayRec::Line(class, refs, uses, mag) => {
+                lines.push((class, refs));
+                line_attrs.push((uses, mag));
+            }
             WayRec::Area(class, refs) => {
                 let ring = locate_all(&refs);
                 if ring.len() >= 4 {
@@ -340,7 +433,9 @@ pub fn load_features(path: &str) -> Result<Features, osmpbf::Error> {
     for (i, (class, refs)) in lines.into_iter().enumerate() {
         let pts = locate_all(&refs);
         if pts.len() >= 2 {
-            roads.push(Road { class, pts, weight: weights[i] });
+            let (uses, mag) = line_attrs[i];
+            let weight = if class == RoadClass::Waterway { weights[i] } else { mag };
+            roads.push(Road { class, pts, weight, uses });
         }
     }
 
