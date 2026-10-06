@@ -8,7 +8,7 @@ use rayon::prelude::*;
 
 
 use crate::Camera;
-use crate::raster::{BLOCK, CornerPt, ElevRange, MIN_DEPTH, corner, dem_texel, raw_of, resolve_dem};
+use crate::raster::{BLOCK, CornerPt, ElevRange, MIN_DEPTH, corner, probe, raw_of, tri_index};
 use crate::residency::Pool;
 
 pub const NONE: u32 = u32::MAX;
@@ -84,6 +84,24 @@ pub fn table_hash(diamond: u32, depth: u32, cu: u32, cv: u32) -> u32 {
     (h ^ (h >> 15)) & (TABLE_N as u32 - 1)
 }
 
+/// Elevation under a lattice corner from either dem form, climbing parents past no-data like the shader does.
+fn lattice_elev(pool: &Pool, depth: u8, raw: u64, uq: i64, vq: i64) -> Option<u16> {
+    let mut depth = depth;
+    loop {
+        let prefix = raw >> (60 - 2 * depth as u32);
+        let (e, d, _) = probe(pool, depth, prefix, |e| e.has_dem())?;
+        let i = tri_index(uq, vq, 16 + (22 - d as u32));
+        match e.elev_q_at(i) {
+            Some(eq) if eq != ELEV_NODATA => return Some(eq),
+            _ => {}
+        }
+        if d <= MIN_DEPTH {
+            return None;
+        }
+        depth = d - 1;
+    }
+}
+
 fn jacobian(key: CellKey) -> [f32; 5] {
     let (u0, v0, size) = key.uv_rect();
     let d = key.diamond();
@@ -150,12 +168,9 @@ pub fn plan_frame(w: usize, h: usize, cam: &Camera, pool: &Pool, dem_depth: u8, 
                 }
             }
         }
-        if let Some(t) = dem_texel(&resolve_dem(pool, dem_depth, raw), pool, c.diamond, c.u, c.v) {
-            let eq = (t & 0xFFFF) as u16;
-            if eq != ELEV_NODATA {
-                elev.lo = elev.lo.min(eq);
-                elev.hi = elev.hi.max(eq);
-            }
+        if let Some(eq) = lattice_elev(pool, dem_depth, raw, c.u, c.v) {
+            elev.lo = elev.lo.min(eq);
+            elev.hi = elev.hi.max(eq);
         }
     }
 

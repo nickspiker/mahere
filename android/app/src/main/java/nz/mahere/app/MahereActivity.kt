@@ -5,6 +5,10 @@ import android.app.Activity
 import android.content.Context
 import android.content.pm.PackageManager
 import android.graphics.PixelFormat
+import android.hardware.Sensor
+import android.hardware.SensorEvent
+import android.hardware.SensorEventListener
+import android.hardware.SensorManager
 import android.location.Location
 import android.location.LocationListener
 import android.location.LocationManager
@@ -40,6 +44,7 @@ class MahereActivity : Activity(), SurfaceHolder.Callback, Choreographer.FrameCa
         x0: Float, y0: Float, x1: Float, y1: Float,
     ): Int
     private external fun nativeOnLocation(ptr: Long, lat: Double, lon: Double, accuracy: Float)
+    private external fun nativeOnHeading(ptr: Long, headingDeg: Float)
     private external fun nativeOnPause(ptr: Long)
 
     private lateinit var surfaceView: SurfaceView
@@ -154,10 +159,12 @@ class MahereActivity : Activity(), SurfaceHolder.Callback, Choreographer.FrameCa
         super.onResume()
         hideSystemBars()
         startFrames()
+        startHeading()
     }
 
     override fun onPause() {
         super.onPause()
+        stopHeading()
         Choreographer.getInstance().removeFrameCallback(this)
         if (nativePtr != 0L) nativeOnPause(nativePtr)
     }
@@ -174,6 +181,30 @@ class MahereActivity : Activity(), SurfaceHolder.Callback, Choreographer.FrameCa
             event.getX(0), event.getY(0), x1, y1,
         )
         return true
+    }
+
+    // ---- Heading: the rotation vector, as degrees clockwise from north, so the engine can keep the sun where it physically is ----
+
+    private val headingListener = object : SensorEventListener {
+        private val rot = FloatArray(9)
+        private val orient = FloatArray(3)
+        override fun onSensorChanged(event: SensorEvent) {
+            if (nativePtr == 0L) return
+            SensorManager.getRotationMatrixFromVector(rot, event.values)
+            SensorManager.getOrientation(rot, orient)
+            val deg = Math.toDegrees(orient[0].toDouble()).toFloat()
+            nativeOnHeading(nativePtr, if (deg < 0f) deg + 360f else deg)
+        }
+        override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {}
+    }
+
+    private fun startHeading() {
+        val sm = getSystemService(Context.SENSOR_SERVICE) as SensorManager
+        sm.getDefaultSensor(Sensor.TYPE_ROTATION_VECTOR)?.let { sm.registerListener(headingListener, it, SensorManager.SENSOR_DELAY_UI) }
+    }
+
+    private fun stopHeading() {
+        (getSystemService(Context.SENSOR_SERVICE) as SensorManager).unregisterListener(headingListener)
     }
 
     // ---- GPS ----

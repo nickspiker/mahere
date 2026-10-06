@@ -201,3 +201,57 @@ mod tests {
         }
     }
 }
+
+/// Where the sun is: azimuth clockwise from true north and altitude above the horizon, degrees, for a place and a Unix time. NOAA's solar position approximation, good to a few tenths of a degree — the real sun the terrain can be lit by when the phone knows the time and where it is.
+pub fn sun_position(lat_deg: f64, lon_deg: f64, unix_secs: f64) -> (f64, f64) {
+    // Julian centuries since J2000.
+    let jd = unix_secs / 86400.0 + 2440587.5;
+    let t = (jd - 2451545.0) / 36525.0;
+    let l0 = (280.46646 + t * (36000.76983 + t * 0.0003032)).rem_euclid(360.0);
+    let m = (357.52911 + t * (35999.05029 - 0.0001537 * t)).to_radians();
+    let c = (1.914602 - t * (0.004817 + 0.000014 * t)) * m.sin() + (0.019993 - 0.000101 * t) * (2.0 * m).sin() + 0.000289 * (3.0 * m).sin();
+    let true_long = l0 + c;
+    let omega = (125.04 - 1934.136 * t).to_radians();
+    let lambda = (true_long - 0.00569 - 0.00478 * omega.sin()).to_radians();
+    let eps0 = 23.0 + (26.0 + (21.448 - t * (46.815 + t * (0.00059 - t * 0.001813))) / 60.0) / 60.0;
+    let eps = (eps0 + 0.00256 * omega.cos()).to_radians();
+    let decl = (eps.sin() * lambda.sin()).asin();
+    // Equation of time, minutes.
+    let y = (eps / 2.0).tan().powi(2);
+    let e = (0.016708634 - t * (0.000042037 + 0.0000001267 * t)) as f64;
+    let l0r = l0.to_radians();
+    let eot = 4.0 * (y * (2.0 * l0r).sin() - 2.0 * e * m.sin() + 4.0 * e * y * m.sin() * (2.0 * l0r).cos() - 0.5 * y * y * (4.0 * l0r).sin() - 1.25 * e * e * (2.0 * m).sin()).to_degrees();
+    // True solar time and hour angle.
+    let minutes = (unix_secs.rem_euclid(86400.0)) / 60.0;
+    let tst = (minutes + eot + 4.0 * lon_deg).rem_euclid(1440.0);
+    let ha = (tst / 4.0 - 180.0).to_radians();
+    let lat = lat_deg.to_radians();
+    let cos_zen = lat.sin() * decl.sin() + lat.cos() * decl.cos() * ha.cos();
+    let zen = cos_zen.clamp(-1.0, 1.0).acos();
+    let alt = 90.0 - zen.to_degrees();
+    let az = {
+        let d = lat.cos() * zen.sin();
+        if d.abs() < 1e-9 {
+            180.0
+        } else {
+            let cos_az = ((lat.sin() * zen.cos() - decl.sin()) / d).clamp(-1.0, 1.0);
+            let a = cos_az.acos().to_degrees();
+            if ha > 0.0 { (a + 180.0).rem_euclid(360.0) } else { (540.0 - a).rem_euclid(360.0) }
+        }
+    };
+    (az, alt)
+}
+
+#[cfg(test)]
+mod sun_tests {
+    #[test]
+    fn noon_sun_at_st_helens_in_october_is_south_and_low() {
+        // 2026-10-06 20:00 UTC = 13:00 PDT at Mount St Helens: the sun is a little west of south, about 38° up.
+        let (az, alt) = super::sun_position(46.2, -122.19, 1_791_316_800.0);
+        assert!((170.0..200.0).contains(&az), "azimuth {az}");
+        assert!((30.0..45.0).contains(&alt), "altitude {alt}");
+        // Midnight: below the horizon.
+        let (_, night) = super::sun_position(46.2, -122.19, 1_791_316_800.0 - 12.0 * 3600.0);
+        assert!(night < 0.0, "altitude {night}");
+    }
+}

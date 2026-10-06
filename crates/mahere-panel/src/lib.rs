@@ -9,6 +9,13 @@ use fluor::theme;
 use fluor::widgets::Checkbox;
 use mahere_engine::LayerMask;
 
+/// The two modes the panel switches besides the layers.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Controls {
+    pub real_sun: bool,
+    pub follow_heading: bool,
+}
+
 /// What the readouts show.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Readouts {
@@ -24,6 +31,8 @@ pub struct Readouts {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Layer {
+    RealSun,
+    FollowHeading,
     Dem,
     Land,
     Water,
@@ -35,7 +44,7 @@ enum Layer {
     Debug,
 }
 
-const LAYERS: [(Layer, &str); 9] = [
+const LAYERS: [(Layer, &str); 11] = [
     (Layer::Dem, "Terrain"),
     (Layer::Land, "Land cover"),
     (Layer::Water, "Water"),
@@ -45,10 +54,14 @@ const LAYERS: [(Layer, &str); 9] = [
     (Layer::Canopy, "Canopy"),
     (Layer::Imagery, "Imagery"),
     (Layer::Debug, "Residency"),
+    (Layer::RealSun, "Real sun"),
+    (Layer::FollowHeading, "Follow heading"),
 ];
 
-fn get(mask: &LayerMask, l: Layer) -> bool {
+fn get(mask: &LayerMask, ctl: &Controls, l: Layer) -> bool {
     match l {
+        Layer::RealSun => ctl.real_sun,
+        Layer::FollowHeading => ctl.follow_heading,
         Layer::Dem => mask.dem,
         Layer::Land => mask.land,
         Layer::Water => mask.water,
@@ -61,8 +74,10 @@ fn get(mask: &LayerMask, l: Layer) -> bool {
     }
 }
 
-fn set(mask: &mut LayerMask, l: Layer, v: bool) {
+fn set(mask: &mut LayerMask, ctl: &mut Controls, l: Layer, v: bool) {
     match l {
+        Layer::RealSun => ctl.real_sun = v,
+        Layer::FollowHeading => ctl.follow_heading = v,
         Layer::Dem => mask.dem = v,
         Layer::Land => mask.land = v,
         Layer::Water => mask.water = v,
@@ -138,15 +153,17 @@ impl Panel {
         let row = self.font * 1.7;
         let x0 = self.font * 0.8;
         let top = self.gear.1 + r + self.font * 0.9;
-        for (i, (_, cb)) in self.checks.iter_mut().enumerate() {
-            let cy = top + row * (i as f32 + 0.5);
+        for (i, (l, cb)) in self.checks.iter_mut().enumerate() {
+            // The two modes sit a little apart from the layers.
+            let gap = if matches!(l, Layer::RealSun | Layer::FollowHeading) { row * 0.5 } else { 0.0 };
+            let cy = top + row * (i as f32 + 0.5) + gap;
             cb.set_font_size(self.font);
             cb.set_rect(x0 + (self.panel_w - x0 * 1.5) * 0.5, cy, self.panel_w - x0 * 1.5, row);
         }
     }
 
     /// A tap at screen (x, y): true if the panel took it. The gear toggles the panel; a row flips its layer in `mask`.
-    pub fn tap(&mut self, x: f32, y: f32, w: usize, h: usize, mask: &mut LayerMask) -> bool {
+    pub fn tap(&mut self, x: f32, y: f32, w: usize, h: usize, mask: &mut LayerMask, ctl: &mut Controls) -> bool {
         self.layout(w, h);
         let (gx, gy, r) = self.gear;
         if (x - gx).powi(2) + (y - gy).powi(2) <= (r * 1.3).powi(2) {
@@ -159,8 +176,8 @@ impl Panel {
         }
         for (l, cb) in &mut self.checks {
             if cb.bbox().contains(x, y) {
-                let v = !get(mask, *l);
-                set(mask, *l, v);
+                let v = !get(mask, ctl, *l);
+                set(mask, ctl, *l, v);
                 cb.set_checked(v);
                 self.dirty = true;
                 return true;
@@ -171,7 +188,7 @@ impl Panel {
     }
 
     /// Paint for a `w × h` screen: the gear always, the column when open. Returns the buffer in fluor's pixel convention.
-    pub fn paint(&mut self, w: usize, h: usize, mask: LayerMask, r: &Readouts) -> &[u32] {
+    pub fn paint(&mut self, w: usize, h: usize, mask: LayerMask, ctl: Controls, r: &Readouts) -> &[u32] {
         self.layout(w, h);
         self.buf.clear();
         self.buf.resize(w * h, 0);
@@ -199,7 +216,7 @@ impl Panel {
             return &self.buf;
         }
         for (l, cb) in &mut self.checks {
-            cb.set_checked(get(&mask, *l));
+            cb.set_checked(get(&mask, &ctl, *l));
             cb.render_content_into(&mut canvas, &mut self.text, None, None);
         }
         // Readouts below the rows, one line each, dim labels.

@@ -90,6 +90,12 @@ pub struct MapCore {
     pub contours_on_screen: f32,
     /// The interval the last frame drew, metres.
     pub contour_interval: f32,
+    /// Degrees the device is turned clockwise from north (0 when no sensor feeds it); the lighting turns against it.
+    pub device_heading: f32,
+    /// Light the terrain by where the sun actually is, from the clock and the position.
+    pub real_sun: bool,
+    /// Turn the map with the device so screen-up is the way the phone points.
+    pub follow_heading: bool,
 }
 
 impl MapCore {
@@ -122,6 +128,9 @@ impl MapCore {
             last_range: ElevRange::EMPTY,
             contours_on_screen: 32.0,
             contour_interval: 0.0,
+            device_heading: 0.0,
+            real_sun: false,
+            follow_heading: false,
         }
     }
 
@@ -215,16 +224,46 @@ impl MapCore {
         let (iu, iv) = c.uv();
         for depth in (raster::MIN_DEPTH..=DEM_BASE_DEPTH).rev() {
             let key = mahere_tiles::CellKey { depth, prefix: raw >> (60 - 2 * depth as u32) };
-            if let Some(p) = self.res.pool.map.get(&key).and_then(|e| e.dem.as_ref()) {
+            if let Some(e) = self.res.pool.map.get(&key).filter(|e| e.has_dem()) {
                 let shift = 16 + (22 - depth as u32);
                 let i = raster::tri_index((iu as i64) << 16, (iv as i64) << 16, shift);
-                let eq = (p.texel[i] & 0xFFFF) as u16;
-                if eq != mahere_tiles::ELEV_NODATA {
+                if let Some(eq) = e.elev_q_at(i).filter(|&eq| eq != mahere_tiles::ELEV_NODATA) {
                     return Some(mahere_tiles::dequantize_elev(eq));
                 }
             }
         }
         None
+    }
+
+    /// A host that draws with the GPU only: the loader stops packing the CPU raster's texels, saving a megabyte and the normal pass per cell.
+    pub fn set_gpu_only(&mut self) {
+        self.res.set_pack_cpu(false);
+    }
+
+    /// The device's heading, degrees clockwise from north, from an orientation sensor: the lighting environment turns against it so the sun stays where it physically is as the phone turns (Nick's "sun top-left" with the room, not the screen).
+    pub fn set_device_heading(&mut self, heading_deg: f32) {
+        if (self.device_heading - heading_deg).abs() > 0.5 {
+            self.device_heading = heading_deg;
+            self.luts_sun = (f32::NAN, f32::NAN, f64::NAN);
+            if self.follow_heading {
+                self.cam.bearing = (heading_deg as f64).to_radians().rem_euclid(core::f64::consts::TAU);
+            }
+            self.dirty = true;
+        }
+    }
+
+    pub fn set_real_sun(&mut self, on: bool) {
+        self.real_sun = on;
+        self.luts_sun = (f32::NAN, f32::NAN, f64::NAN);
+        self.dirty = true;
+    }
+
+    pub fn set_follow_heading(&mut self, on: bool) {
+        self.follow_heading = on;
+        if on {
+            self.cam.bearing = (self.device_heading as f64).to_radians().rem_euclid(core::f64::consts::TAU);
+        }
+        self.dirty = true;
     }
 
     pub fn camera_moved(&mut self, _w: usize, _h: usize) {
@@ -304,6 +343,14 @@ impl MapCore {
         self.res.drain();
         self.canvas_w = w;
         self.canvas_h = h;
+        // The real sun: azimuth and altitude from the clock and the position (the fix, or the view), as a screen-relative azimuth; below the horizon the light stays low and grazing rather than going out.
+        if self.real_sun {
+            let (lat, lon) = self.gps.map_or((self.cam.lat, self.cam.lon), |g| (g.lat, g.lon));
+            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0.0, |d| d.as_secs_f64());
+            let (az, alt) = sh::sun_position(lat, lon, now);
+            self.sun_az = ((az - self.cam.bearing.to_degrees()).rem_euclid(360.0)) as f32;
+            self.sun_alt = alt.clamp(5.0, 85.0) as f32;
+        }
         // Lighting lives in the device frame: the environment (sun + sky as SH) is fixed to the screen, and normals are rotated by the bearing at lookup. The world-frame sun vector stays for the water glint.
         if self.luts_sun != (self.sun_az, self.sun_alt, self.cam.bearing) {
             let az = (self.sun_az as f64 + self.cam.bearing.to_degrees()).to_radians();
@@ -313,8 +360,8 @@ impl MapCore {
                 (az.cos() * alt.cos()) as f32,
                 alt.sin() as f32,
             ];
-            if self.luts_sun.0 != self.sun_az || self.luts_sun.1 != self.sun_alt {
-                self.env = sh::Sh9::sun_and_sky(self.sun_az, self.sun_alt);
+            if self.luts_sun.0 != self.sun_az || self.luts_sun.1 != self.sun_alt || self.device_heading != 0.0 {
+                self.env = sh::Sh9::sun_and_sky(self.sun_az - self.device_heading, self.sun_alt);
             }
             let (sb, cb) = self.cam.bearing.sin_cos();
             self.luts.light = self.env.quadratic((sb as f32, cb as f32));

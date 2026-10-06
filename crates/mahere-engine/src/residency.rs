@@ -100,6 +100,19 @@ pub struct Entry {
 }
 
 impl Entry {
+    /// Quantised elevation (0.25 m steps from -500 m, ELEV_NODATA for none) at a memory-order texel, from whichever dem form is held.
+    pub fn elev_q_at(&self, i: usize) -> Option<u16> {
+        if let Some(p) = &self.dem {
+            return Some((p.texel[i] & 0xFFFF) as u16);
+        }
+        let d = self.dem_q.as_ref()?;
+        let (tx, ty, half) = ((i >> 1) & (mahere_tiles::TEX - 1), i >> 9, i & 1);
+        let q = d.tex[(ty + 1) * DEMQ_W + 2 * (tx + 1) + half];
+        Some(if q == 0xFFFF { mahere_tiles::ELEV_NODATA } else { mahere_tiles::quantize_elev(d.base + q as f32 * d.step) })
+    }
+    pub fn has_dem(&self) -> bool {
+        self.dem.is_some() || self.dem_q.is_some()
+    }
     pub fn is_absent(&self) -> bool {
         self.dem.is_none() && self.line.is_none() && self.land.is_none() && self.water.is_none() && self.img.is_none()
     }
@@ -126,6 +139,8 @@ pub struct Pool {
 }
 
 pub struct Residency {
+    /// Whether the loader packs the CPU raster's u64 texels (normals included) for each dem; a GPU-only host turns it off and saves a megabyte and a few milliseconds per cell.
+    pack_cpu: Arc<std::sync::atomic::AtomicBool>,
     want_tx: Sender<WantList>,
     done_rx: Receiver<Loaded>,
     pub pool: Pool,
@@ -145,8 +160,11 @@ impl Residency {
     pub fn new(store: Arc<dyn CellStore>) -> Residency {
         let (want_tx, want_rx) = channel::<WantList>();
         let (done_tx, done_rx) = channel::<Loaded>();
-        std::thread::spawn(move || loader_thread(store, want_rx, done_tx));
+        let pack_cpu = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let pack = pack_cpu.clone();
+        std::thread::spawn(move || loader_thread(store, want_rx, done_tx, pack));
         Residency {
+            pack_cpu,
             want_tx,
             done_rx,
             pool: Pool::default(),
@@ -155,6 +173,10 @@ impl Residency {
             desired: FxHashSet::default(),
             frame: 0,
         }
+    }
+
+    pub fn set_pack_cpu(&self, pack: bool) {
+        self.pack_cpu.store(pack, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Drain finished cells into the pool. Returns how many arrived.
@@ -208,7 +230,7 @@ impl Residency {
 
 /// The newest want-list is the only one that matters: an older list's leftovers are cells the view no longer needs (the main side forgets them as pending too, so they're re-requested if they come back).
 /// Cells decode in parallel a small chunk at a time so the nearest-first order still holds and a newer list preempts within a few cells.
-fn loader_thread(store: Arc<dyn CellStore>, want_rx: Receiver<WantList>, done_tx: Sender<Loaded>) {
+fn loader_thread(store: Arc<dyn CellStore>, want_rx: Receiver<WantList>, done_tx: Sender<Loaded>, pack_cpu: Arc<std::sync::atomic::AtomicBool>) {
     let chunk = rayon::current_num_threads().clamp(2, 8);
     let mut current: Option<WantList> = None;
     loop {
@@ -226,7 +248,8 @@ fn loader_thread(store: Arc<dyn CellStore>, want_rx: Receiver<WantList>, done_tx
         while !list.is_empty() {
             let n = list.len().min(chunk);
             let batch: Vec<CellKey> = list.drain(..n).collect();
-            let loaded: Vec<Loaded> = batch.par_iter().map(|&k| load_cell(&*store, k)).collect();
+            let pack = pack_cpu.load(std::sync::atomic::Ordering::Relaxed);
+            let loaded: Vec<Loaded> = batch.par_iter().map(|&k| load_cell(&*store, k, pack)).collect();
             for l in loaded {
                 if done_tx.send(l).is_err() {
                     return;
@@ -240,7 +263,7 @@ fn loader_thread(store: Arc<dyn CellStore>, want_rx: Receiver<WantList>, done_tx
     }
 }
 
-fn load_cell(store: &dyn CellStore, key: CellKey) -> Loaded {
+fn load_cell(store: &dyn CellStore, key: CellKey, pack_cpu: bool) -> Loaded {
     let bytes = match store.get(key) {
         Fetch::Bytes(b) => b,
         Fetch::Absent => return Loaded { key, entry: Some(Entry::default()) },
@@ -258,7 +281,7 @@ fn load_cell(store: &dyn CellStore, key: CellKey) -> Loaded {
         }
     };
     let dem_q = planes.dem.as_ref().map(DemQ::from_planes);
-    let dem = planes.dem.map(|d| DemPacked { texel: d.pack_texels(key).into_boxed_slice() });
+    let dem = if pack_cpu { planes.dem.map(|d| DemPacked { texel: d.pack_texels(key).into_boxed_slice() }) } else { None };
     if std::env::var_os("MAHERE_TRACE").is_some() || cfg!(target_os = "android") {
         eprintln!("cell {} d{} loaded: dem={} line={} land={} water={} ({} bytes)", key.name(), key.depth, dem.is_some(), planes.line.is_some(), planes.land.is_some(), planes.water.is_some(), bytes.len());
     }

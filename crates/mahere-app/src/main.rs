@@ -10,7 +10,7 @@ use fluor::host::chrome_widget::DefaultChrome;
 use fluor::paint::{Clip, HitId, pack_argb};
 use mahere_engine::residency::{CellStore, DirStore, HttpStore, TieredStore, DEFAULT_CELLS_URL};
 use mahere_engine::{Camera, MapCore};
-use mahere_panel::{Panel, Readouts};
+use mahere_panel::{Controls, Panel, Readouts};
 use std::time::Instant;
 
 struct MahereApp {
@@ -136,8 +136,15 @@ impl FluorApp for MahereApp {
                     return EventResponse::StartWindowDrag;
                 }
                 let mut mask = self.map.layers();
-                if self.panel.tap(cx as f32, cy as f32, w, h, &mut mask) {
+                let mut ctl = Controls { real_sun: self.map.real_sun, follow_heading: self.map.follow_heading };
+                if self.panel.tap(cx as f32, cy as f32, w, h, &mut mask, &mut ctl) {
                     self.map.set_layers(mask);
+                    if ctl.real_sun != self.map.real_sun {
+                        self.map.set_real_sun(ctl.real_sun);
+                    }
+                    if ctl.follow_heading != self.map.follow_heading {
+                        self.map.set_follow_heading(ctl.follow_heading);
+                    }
                     ctx.window.request_redraw();
                     return EventResponse::Handled;
                 }
@@ -325,7 +332,7 @@ impl FluorApp for MahereApp {
             heading -= 360.0;
         }
         let readouts = Readouts { lat: c.lat, lon: c.lon, elev: self.map.elevation_at(c.lat, c.lon), heading_deg: heading, m_per_px: 111_320.0 / c.ppd, frame_ms: self.map.last_frame_ms, resident: self.map.pool().map.len() };
-        self.panel.paint(w, h, self.map.layers(), &readouts);
+        self.panel.paint(w, h, self.map.layers(), Controls { real_sun: self.map.real_sun, follow_heading: self.map.follow_heading }, &readouts);
         let mut map = self.map.canvas.clone();
         self.panel.composite_rgb(&mut map, w, h);
         self.chrome.rasterize_bg(ctx.damage, |c| {

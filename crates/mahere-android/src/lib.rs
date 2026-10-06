@@ -16,7 +16,7 @@ use jni::objects::{JClass, JObject, JString};
 use jni::sys::{jboolean, jdouble, jfloat, jint, jlong};
 use mahere_engine::residency::{CellStore, DirStore, HttpStore, TieredStore, DEFAULT_CELLS_URL};
 use mahere_engine::{Camera, GpsFix, MapCore};
-use mahere_panel::Panel;
+use mahere_panel::{Controls, Panel};
 use ndk::native_window::NativeWindow;
 use std::time::Instant;
 
@@ -148,8 +148,15 @@ impl FluorApp for AndroidApp {
             FEvent::MouseInput { state: ElementState::Pressed, button: MouseButton::Left } => {
                 // The panel first: the gear and its rows take the tap; the map gets the rest.
                 let mut mask = self.map.layers();
-                if self.panel.tap(ctx.cursor_x as f32, ctx.cursor_y as f32, self.w, self.h, &mut mask) {
+                let mut ctl = Controls { real_sun: self.map.real_sun, follow_heading: self.map.follow_heading };
+                if self.panel.tap(ctx.cursor_x as f32, ctx.cursor_y as f32, self.w, self.h, &mut mask, &mut ctl) {
                     self.map.set_layers(mask);
+                    if ctl.real_sun != self.map.real_sun {
+                        self.map.set_real_sun(ctl.real_sun);
+                    }
+                    if ctl.follow_heading != self.map.follow_heading {
+                        self.map.set_follow_heading(ctl.follow_heading);
+                    }
                     self.dragging = false;
                     return EventResponse::Handled;
                 }
@@ -398,6 +405,19 @@ pub extern "system" fn Java_nz_mahere_app_MahereActivity_nativeOnTouch(
         s.app().two_end();
     }
     s.on_touch(action, x0, y0)
+}
+
+/// The device heading from the rotation-vector sensor, degrees clockwise from north: the lighting turns against it so the sun stays where it physically is.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_nz_mahere_app_MahereActivity_nativeOnHeading(
+    _env: JNIEnv,
+    _class: JClass,
+    ptr: jlong,
+    heading_deg: jfloat,
+) {
+    if ptr != 0 {
+        shell(ptr).app().map.set_device_heading(heading_deg);
+    }
 }
 
 /// Pause = the durability moment: session saved, track chunk flushed.

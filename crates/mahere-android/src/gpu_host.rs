@@ -2,7 +2,7 @@
 
 use mahere_engine::MapCore;
 use mahere_gpu::GpuMap;
-use mahere_panel::{Panel, Readouts};
+use mahere_panel::{Controls, Panel, Readouts};
 use ndk::native_window::NativeWindow;
 use raw_window_handle::{AndroidDisplayHandle, AndroidNdkWindowHandle, RawDisplayHandle, RawWindowHandle};
 
@@ -20,6 +20,9 @@ pub struct GpuHost {
     overlay_stamp: Option<OverlayStamp>,
     frames: u64,
     frame_ms: f32,
+    work_ms: f32,
+    plan_ms: f32,
+    sync_ms: f32,
     report: std::time::Instant,
 }
 
@@ -64,6 +67,9 @@ impl GpuHost {
             overlay_stamp: None,
             frames: 0,
             frame_ms: 0.0,
+            work_ms: 0.0,
+            plan_ms: 0.0,
+            sync_ms: 0.0,
             report: std::time::Instant::now(),
         })
     }
@@ -114,19 +120,27 @@ impl GpuHost {
             );
             self.configured = (w, h);
         }
-        // Nothing changed and nothing arrived: the surface keeps its last image, and the CPU keeps its budget.
+        // Nothing changed and nothing arrived: the surface keeps its last image, and the CPU keeps its budget. The poll still runs so finished uploads release their staging memory.
         let fresh = self.configured != (w, h) || self.frames == 0;
         if !map.tick(w as usize, h as usize) && !fresh && !panel.take_dirty() {
+            self.device.poll(wgpu::PollType::Poll).ok();
             return !map.converged();
         }
+        if self.frames == 0 {
+            map.set_gpu_only();
+        }
         let plan = map.plan(w as usize, h as usize);
+        let t_plan = t0.elapsed().as_secs_f32() * 1000.0;
         self.map.sync(&self.device, &self.queue, map.pool());
+        let t_sync = t0.elapsed().as_secs_f32() * 1000.0 - t_plan;
+        self.plan_ms += t_plan;
+        self.sync_ms += t_sync;
         let c = map.cam;
         let mask = map.layers();
         let mask_bits = (mask.dem as u32) | (mask.land as u32) << 1 | (mask.water as u32) << 2 | (mask.line as u32) << 3 | (mask.debug as u32) << 4 | (mask.imagery as u32) << 5 | (mask.contours as u32) << 6 | (mask.slope as u32) << 7 | (mask.canopy as u32) << 8;
         // The overlay repaints when what it shows changes: the panel (open: its readouts follow the camera), the compass (bearing), the size. The pin is the shader's.
         let cam_part = if panel.is_open() { (c.lat.to_bits(), c.lon.to_bits(), c.ppd.to_bits()) } else { (0, 0, 0) };
-        let stamp: OverlayStamp = (cam_part.0, cam_part.1, cam_part.2, c.bearing.to_bits(), None, w, h, panel.is_open(), mask_bits);
+        let stamp: OverlayStamp = (cam_part.0, cam_part.1, cam_part.2, c.bearing.to_bits(), None, w, h, panel.is_open(), mask_bits | (map.real_sun as u32) << 9 | (map.follow_heading as u32) << 10);
         self.map.pin = map.gps_screen(w as usize, h as usize);
         if self.overlay_stamp != Some(stamp) {
             let mut heading = c.bearing.to_degrees().rem_euclid(360.0);
@@ -134,12 +148,13 @@ impl GpuHost {
                 heading -= 360.0;
             }
             let readouts = Readouts { lat: c.lat, lon: c.lon, elev: map.elevation_at(c.lat, c.lon), heading_deg: heading, m_per_px: 111_320.0 / c.ppd, frame_ms: map.last_frame_ms, resident: map.pool().map.len() };
-            panel.paint(w as usize, h as usize, mask, &readouts);
+            panel.paint(w as usize, h as usize, mask, Controls { real_sun: map.real_sun, follow_heading: map.follow_heading }, &readouts);
             let marks = map.overlay(w as usize, h as usize, false).to_vec();
             let rgba = panel.overlay_rgba(&marks, w as usize, h as usize);
             self.map.set_overlay_rgba(&self.device, &self.queue, w, h, &rgba);
             self.overlay_stamp = Some(stamp);
         }
+        self.work_ms += t0.elapsed().as_secs_f32() * 1000.0;
         let frame = match self.surface.get_current_texture() {
             Ok(f) => f,
             Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
@@ -156,12 +171,18 @@ impl GpuHost {
         self.map.render(&self.device, &self.queue, &mut enc, &view, &plan, map.luts(), w, h);
         self.queue.submit([enc.finish()]);
         frame.present();
+        // Reclaim what finished: staging buffers behind every upload and the arrays replaced by growth are only freed when the device is polled.
+        self.device.poll(wgpu::PollType::Poll).ok();
         self.frames += 1;
         self.frame_ms += t0.elapsed().as_secs_f32() * 1000.0;
         if self.report.elapsed().as_secs() >= 10 {
-            eprintln!("gpu: {} frames, {:.2} ms CPU side per frame, {} resident, {} uploads", self.frames, self.frame_ms / self.frames.max(1) as f32, map.pool().map.len(), self.map.uploads);
+            let n = self.frames.max(1) as f32;
+            eprintln!("gpu: {} frames, per frame {:.2} ms plan + {:.2} ms sync + {:.2} ms overlay and encode + {:.2} ms waiting for the swapchain, {} resident, {} uploads, layers {:?}", self.frames, self.plan_ms / n, self.sync_ms / n, (self.work_ms - self.plan_ms - self.sync_ms) / n, (self.frame_ms - self.work_ms) / n, map.pool().map.len(), self.map.uploads, self.map.layers());
             self.frames = 0;
             self.frame_ms = 0.0;
+            self.work_ms = 0.0;
+            self.plan_ms = 0.0;
+            self.sync_ms = 0.0;
             self.report = std::time::Instant::now();
         }
         !map.converged()
