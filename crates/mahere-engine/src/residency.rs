@@ -149,6 +149,8 @@ pub struct Residency {
     failed: FxHashMap<CellKey, std::time::Instant>,
     pub desired: FxHashSet<CellKey>,
     pub frame: u64,
+    /// The last missing list sent to the loader, so an unchanged one is not sent again.
+    last_sent: Vec<CellKey>,
 }
 
 const RETRY_AFTER: std::time::Duration = std::time::Duration::from_secs(3);
@@ -172,6 +174,7 @@ impl Residency {
             failed: FxHashMap::default(),
             desired: FxHashSet::default(),
             frame: 0,
+            last_sent: Vec::new(),
         }
     }
 
@@ -184,6 +187,7 @@ impl Residency {
         let mut n = 0;
         while let Ok(l) = self.done_rx.try_recv() {
             self.pending.remove(&l.key);
+            self.last_sent.retain(|k| *k != l.key);
             match l.entry {
                 Some(e) => {
                     self.pool.map.insert(l.key, e);
@@ -206,10 +210,8 @@ impl Residency {
         self.pending.retain(|k| desired.contains(k));
         let now = std::time::Instant::now();
         self.failed.retain(|k, t| desired.contains(k) && now.duration_since(*t) < RETRY_AFTER);
-        list.retain(|k| !self.pending.contains(k) && !self.pool.map.contains_key(k) && !self.failed.contains_key(k));
-        if list.is_empty() {
-            return;
-        }
+        // Everything still missing goes every time, pending or not: the loader keeps only the newest list, so a cell dropped from an older one would otherwise stay pending forever and never arrive (the holes Nick saw once the orientation sensor made every frame a new list). Nothing is sent while the missing set is unchanged.
+        list.retain(|k| !self.pool.map.contains_key(k) && !self.failed.contains_key(k));
         list.sort_by_key(|k| {
             let (cu, cv) = k.grid();
             // Chebyshev distance in this depth's grid, normalized by shifting the center (given at depth 30-ish precision) down.
@@ -217,10 +219,22 @@ impl Residency {
             let (ku, kv) = (center.0 >> sh, center.1 >> sh);
             (cu.abs_diff(ku)).max(cv.abs_diff(kv))
         });
+        if list == self.last_sent {
+            return;
+        }
+        self.pending.clear();
         for &k in &list {
             self.pending.insert(k);
         }
-        let _ = self.want_tx.send(WantList { list });
+        self.last_sent = list.clone();
+        if !list.is_empty() {
+            let _ = self.want_tx.send(WantList { list });
+        }
+    }
+
+    /// Cells asked for and not yet arrived.
+    pub fn pending_count(&self) -> usize {
+        self.pending.len()
     }
 
     pub fn converged(&self) -> bool {

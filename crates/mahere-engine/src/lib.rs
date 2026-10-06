@@ -300,6 +300,10 @@ impl MapCore {
         self.res.converged()
     }
 
+    pub fn pending_cells(&self) -> usize {
+        self.res.pending_count()
+    }
+
     pub fn needs_render(&self, _w: usize, _h: usize) -> bool {
         true
     }

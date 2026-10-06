@@ -18,6 +18,7 @@ pub struct GpuHost {
     pub map: GpuMap,
     configured: (u32, u32),
     overlay_stamp: Option<OverlayStamp>,
+    overlay_at: std::time::Instant,
     frames: u64,
     frame_ms: f32,
     work_ms: f32,
@@ -65,6 +66,7 @@ impl GpuHost {
             map,
             configured: (0, 0),
             overlay_stamp: None,
+            overlay_at: std::time::Instant::now(),
             frames: 0,
             frame_ms: 0.0,
             work_ms: 0.0,
@@ -142,7 +144,10 @@ impl GpuHost {
         let cam_part = if panel.is_open() { (c.lat.to_bits(), c.lon.to_bits(), c.ppd.to_bits()) } else { (0, 0, 0) };
         let stamp: OverlayStamp = (cam_part.0, cam_part.1, cam_part.2, c.bearing.to_bits(), None, w, h, panel.is_open(), mask_bits | (map.real_sun as u32) << 9 | (map.follow_heading as u32) << 10);
         self.map.pin = map.gps_screen(w as usize, h as usize);
-        if self.overlay_stamp != Some(stamp) {
+        // A bearing or readout change repaints at most a few times a second (the orientation sensor would otherwise repaint the panel's text every frame); the panel opening, closing or a row flipping repaints at once.
+        let structural = self.overlay_stamp.is_none_or(|s| (s.5, s.6, s.7, s.8) != (w, h, panel.is_open(), stamp.8));
+        if self.overlay_stamp != Some(stamp) && (structural || self.overlay_at.elapsed().as_millis() >= 150) {
+            self.overlay_at = std::time::Instant::now();
             let mut heading = c.bearing.to_degrees().rem_euclid(360.0);
             if heading > 180.0 {
                 heading -= 360.0;
@@ -177,7 +182,7 @@ impl GpuHost {
         self.frame_ms += t0.elapsed().as_secs_f32() * 1000.0;
         if self.report.elapsed().as_secs() >= 10 {
             let n = self.frames.max(1) as f32;
-            eprintln!("gpu: {} frames, per frame {:.2} ms plan + {:.2} ms sync + {:.2} ms overlay and encode + {:.2} ms waiting for the swapchain, {} resident, {} uploads, layers {:?}", self.frames, self.plan_ms / n, self.sync_ms / n, (self.work_ms - self.plan_ms - self.sync_ms) / n, (self.frame_ms - self.work_ms) / n, map.pool().map.len(), self.map.uploads, self.map.layers());
+            eprintln!("gpu: {} frames, per frame {:.2} ms plan + {:.2} ms sync + {:.2} ms overlay and encode + {:.2} ms waiting for the swapchain, {} resident, {} pending, {} uploads, layers {:?}", self.frames, self.plan_ms / n, self.sync_ms / n, (self.work_ms - self.plan_ms - self.sync_ms) / n, (self.frame_ms - self.work_ms) / n, map.pool().map.len(), map.pending_cells(), self.map.uploads, self.map.layers());
             self.frames = 0;
             self.frame_ms = 0.0;
             self.work_ms = 0.0;
