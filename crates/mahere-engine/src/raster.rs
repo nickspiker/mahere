@@ -40,11 +40,46 @@ pub struct LayerMask {
     pub debug: bool,
     /// Imagery instead of terrain: the false-colour composite 1064 nm → R, NIR → G, red → B, in place of dem/land/water (lines still obey `line`).
     pub imagery: bool,
+    /// Contours, drawn from elevation and slope at draw time (no data behind them): a constant-width anti-aliased line wherever the elevation crosses a multiple of the interval, the interval auto-fit to the previous frame's elevation range.
+    pub contours: bool,
 }
 
 impl Default for LayerMask {
     fn default() -> Self {
-        LayerMask { dem: true, land: true, water: true, line: true, debug: false, imagery: false }
+        LayerMask { dem: true, land: true, water: true, line: true, debug: false, imagery: false, contours: true }
+    }
+}
+
+/// Draw-time contour parameters for a frame.
+#[derive(Clone, Copy)]
+pub struct Contours {
+    /// Vertical interval, metres.
+    pub interval: f32,
+    /// Every n-th level is an index contour (heavier).
+    pub index_every: u32,
+    /// Ground metres per screen pixel at the view's scale.
+    pub m_per_px: f32,
+}
+
+/// Elevation range seen while composing a frame (quantised units), reduced over row bands; next frame's contour interval is fit to it.
+#[derive(Clone, Copy)]
+pub struct ElevRange {
+    pub lo: u16,
+    pub hi: u16,
+}
+
+impl ElevRange {
+    pub const EMPTY: ElevRange = ElevRange { lo: u16::MAX, hi: 0 };
+    #[inline(always)]
+    fn see(&mut self, eq: u16) {
+        self.lo = self.lo.min(eq);
+        self.hi = self.hi.max(eq);
+    }
+    fn merge(self, o: ElevRange) -> ElevRange {
+        ElevRange { lo: self.lo.min(o.lo), hi: self.hi.max(o.hi) }
+    }
+    pub fn is_empty(&self) -> bool {
+        self.lo > self.hi
     }
 }
 
@@ -167,6 +202,13 @@ pub struct FrameLuts {
     pub mask: LayerMask,
     /// The depth the frame asked the dem for (debug tint reference).
     pub dem_depth: u8,
+    pub contours: Contours,
+}
+
+pub struct FrameStats {
+    pub blocks: usize,
+    pub straddle_blocks: usize,
+    pub elev: ElevRange,
 }
 
 /// Corner lattice entry: diamond + Q30.16 UV (i64).
@@ -182,11 +224,6 @@ fn corner(cam: &Camera, px: f64, py: f64, w: usize, h: usize) -> CornerPt {
     let c = Coord::from_lat_lon(lat, lon);
     let (iu, iv) = c.uv();
     CornerPt { diamond: c.diamond(), u: (iu as i64) << 16, v: (iv as i64) << 16 }
-}
-
-pub struct FrameStats {
-    pub blocks: usize,
-    pub straddle_blocks: usize,
 }
 
 /// Render one frame into `canvas` (0xRRGGBB). Returns per-frame stats and the desired cell set (for residency) derived from the corner lattice.
@@ -224,8 +261,9 @@ pub fn render_frame(
 
     let straddle_count = std::sync::atomic::AtomicUsize::new(0);
 
-    canvas.par_chunks_mut(w * BLOCK).enumerate().for_each(|(by, band)| {
+    let elev = canvas.par_chunks_mut(w * BLOCK).enumerate().map(|(by, band)| {
         let band_h = band.len() / w;
+        let mut range = ElevRange::EMPTY;
         for bx in 0..bw {
             let c00 = corners[by * (bw + 1) + bx];
             let c10 = corners[by * (bw + 1) + bx + 1];
@@ -237,15 +275,16 @@ pub fn render_frame(
                 straddle_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 render_block_exact(
                     band, w, x0, bweff, band_h, by, cam, pool, luts, dem_depth, vec_depth, h,
-                    &[c00.diamond, c10.diamond, c01.diamond, c11.diamond],
+                    &[c00.diamond, c10.diamond, c01.diamond, c11.diamond], &mut range,
                 );
                 continue;
             }
-            render_block_interp(band, w, x0, bweff, band_h, c00, c10, c01, c11, pool, luts, dem_depth, vec_depth);
+            render_block_interp(band, w, x0, bweff, band_h, c00, c10, c01, c11, pool, luts, dem_depth, vec_depth, &mut range);
         }
-    });
+        range
+    }).reduce(|| ElevRange::EMPTY, ElevRange::merge);
 
-    (FrameStats { blocks: bw * bh, straddle_blocks: straddle_count.into_inner() }, want)
+    (FrameStats { blocks: bw * bh, straddle_blocks: straddle_count.into_inner(), elev }, want)
 }
 
 /// Resolve a dem ref for a full-res raw prefix base. Shift maps Q30.16 u to texel at the found depth: tx = (uQ >> (16 + 22 - d)) & 255.
@@ -333,8 +372,8 @@ fn dem_texel(dem: &DemRef, pool: &Pool, diamond: u8, uq: i64, vq: i64) -> Option
 }
 
 #[inline(always)]
-fn compose(dem: &DemRef, vec: &VecRef, pool: &Pool, diamond: u8, uq: i64, vq: i64, luts: &FrameLuts) -> u32 {
-    let rgb = compose_rgb(dem, vec, pool, diamond, uq, vq, luts);
+fn compose(dem: &DemRef, vec: &VecRef, pool: &Pool, diamond: u8, uq: i64, vq: i64, luts: &FrameLuts, range: &mut ElevRange) -> u32 {
+    let rgb = compose_rgb(dem, vec, pool, diamond, uq, vq, luts, range);
     if !luts.mask.debug {
         return rgb;
     }
@@ -354,16 +393,35 @@ fn compose(dem: &DemRef, vec: &VecRef, pool: &Pool, diamond: u8, uq: i64, vq: i6
     }
 }
 
+/// Contour coverage at a pixel: distance (in metres) to the nearest multiple of the interval, over the slope and the metres per pixel, gives the distance on screen; feather over one pixel. Flat ground (where the distance would be meaningless) draws nothing. Returns (coverage, is_index).
 #[inline(always)]
-fn compose_rgb(dem: &DemRef, vec: &VecRef, pool: &Pool, diamond: u8, uq: i64, vq: i64, luts: &FrameLuts) -> u32 {
+fn contour_cov(elev_m: f32, slope: f32, c: &Contours) -> (f32, bool) {
+    if slope < 0.02 || c.interval <= 0.0 {
+        return (0.0, false);
+    }
+    let level = (elev_m / c.interval).round();
+    let d_m = (elev_m - level * c.interval).abs();
+    let d_px = d_m / (slope * c.m_per_px);
+    let is_index = (level as i64).rem_euclid(c.index_every as i64) == 0;
+    let w = if is_index { 0.9 } else { 0.55 };
+    ((w + 0.5 - d_px).clamp(0.0, 1.0), is_index)
+}
+
+const CONTOUR_RGB: [u8; 3] = [92, 62, 34];
+const CONTOUR_INDEX_RGB: [u8; 3] = [64, 40, 18];
+
+#[inline(always)]
+fn compose_rgb(dem: &DemRef, vec: &VecRef, pool: &Pool, diamond: u8, uq: i64, vq: i64, luts: &FrameLuts, range: &mut ElevRange) -> u32 {
     let mask = luts.mask;
     // Terrain: tint from elevation, shade from the normal.
     let mut tint = [FLAT_RGB[0] as f32, FLAT_RGB[1] as f32, FLAT_RGB[2] as f32];
     let mut diffuse = 1.0f32;
     let mut have_ground = false;
+    let mut contour = (0.0f32, false);
     if mask.dem {
         if let Some(t) = dem_texel(dem, pool, diamond, uq, vq) {
             let eq = (t & 0xFFFF) as u16;
+            range.see(eq);
             {
                 let nx = (t >> 16) as u16 as i16 as f32;
                 let ny = (t >> 32) as u16 as i16 as f32;
@@ -372,6 +430,11 @@ fn compose_rgb(dem: &DemRef, vec: &VecRef, pool: &Pool, diamond: u8, uq: i64, vq
                 let c = luts.hypso[(eq >> 4) as usize];
                 tint = [c[0] as f32, c[1] as f32, c[2] as f32];
                 have_ground = true;
+                if mask.contours {
+                    let nzn = (nz / 32767.0).max(1e-4);
+                    let slope = (1.0 - nzn * nzn).max(0.0).sqrt() / nzn;
+                    contour = contour_cov(eq as f32 * 0.25 - 500.0, slope, &luts.contours);
+                }
             }
         } else {
             tint = [BG_RGB8[0] as f32, BG_RGB8[1] as f32, BG_RGB8[2] as f32];
@@ -418,6 +481,9 @@ fn compose_rgb(dem: &DemRef, vec: &VecRef, pool: &Pool, diamond: u8, uq: i64, vq
                 }
             }
         }
+        if contour.0 > 0.0 {
+            rgb = lerp3(rgb, if contour.1 { CONTOUR_INDEX_RGB } else { CONTOUR_RGB }, contour.0 * 0.85);
+        }
         if mask.line {
             if let Some(line) = line {
                 let cov = line.cov[i];
@@ -429,6 +495,9 @@ fn compose_rgb(dem: &DemRef, vec: &VecRef, pool: &Pool, diamond: u8, uq: i64, vq
     } else {
         let shade = if have_ground { 0.30 + 0.70 * diffuse } else { 1.0 };
         rgb = [rgb[0] * shade, rgb[1] * shade, rgb[2] * shade];
+        if contour.0 > 0.0 {
+            rgb = lerp3(rgb, if contour.1 { CONTOUR_INDEX_RGB } else { CONTOUR_RGB }, contour.0 * 0.85);
+        }
     }
     ((rgb[0] as u32) << 16) | ((rgb[1] as u32) << 8) | rgb[2] as u32
 }
@@ -448,6 +517,7 @@ fn render_block_interp(
     luts: &FrameLuts,
     dem_depth: u8,
     vec_depth: u8,
+    range: &mut ElevRange,
 ) {
     let d = c00.diamond;
     // Per-block cell resolve from corner prefixes (1-4 per layer).
@@ -498,7 +568,7 @@ fn render_block_interp(
             let dref = &dem_refs[0].1;
             let vref = &vec_refs[0].1;
             for px in row.iter_mut() {
-                *px = compose(dref, vref, pool, d, uq, vq, luts);
+                *px = compose(dref, vref, pool, d, uq, vq, luts, range);
                 uq += dux;
                 vq += dvx;
             }
@@ -531,7 +601,7 @@ fn render_block_interp(
                 if matches!(vref, VecRef::None) {
                     vref = resolve_vec(pool, vec_depth, raw);
                 }
-                *px = compose(&dref, &vref, pool, d, uq, vq, luts);
+                *px = compose(&dref, &vref, pool, d, uq, vq, luts, range);
                 uq += dux;
                 vq += dvx;
             }
@@ -555,6 +625,7 @@ fn render_block_exact(
     vec_depth: u8,
     h: usize,
     diamonds: &[u8; 4],
+    range: &mut ElevRange,
 ) {
     let mut ds: Vec<u8> = diamonds.to_vec();
     ds.sort_unstable();
@@ -570,7 +641,7 @@ fn render_block_exact(
             let raw = c.raw();
             let dref = resolve_dem(pool, dem_depth, raw);
             let vref = resolve_vec(pool, vec_depth, raw);
-            *px = compose(&dref, &vref, pool, c.diamond(), uq, vq, luts);
+            *px = compose(&dref, &vref, pool, c.diamond(), uq, vq, luts, range);
         }
     }
 }
@@ -619,7 +690,13 @@ mod tests {
             },
         );
 
-        let luts = FrameLuts { hypso: build_hypso_lut(), sun: [0.0, 0.0, 1.0], mask: LayerMask::default(), dem_depth: 12 };
+        let luts = FrameLuts {
+            hypso: build_hypso_lut(),
+            sun: [0.0, 0.0, 1.0],
+            mask: LayerMask { contours: false, ..LayerMask::default() },
+            dem_depth: 12,
+            contours: Contours { interval: 0.0, index_every: 5, m_per_px: 1.0 },
+        };
         let (w, h) = (64usize, 64usize);
         let mut canvas = vec![0u32; w * h];
         let (stats, _want) = render_frame(&mut canvas, w, h, &cam, &pool, &luts, 12, 13);

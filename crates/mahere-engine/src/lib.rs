@@ -9,7 +9,7 @@ use std::time::Instant;
 use mahere_coord::Coord;
 use mahere_tiles::TEX;
 pub use raster::LayerMask;
-use raster::{DEM_BASE_DEPTH, FrameLuts, VEC_BASE_DEPTH, build_hypso_lut, select_depth};
+use raster::{Contours, DEM_BASE_DEPTH, ElevRange, FrameLuts, VEC_BASE_DEPTH, build_hypso_lut, select_depth};
 use residency::{CellStore, Residency};
 
 pub const PPD_REF: f64 = 6000.;
@@ -80,6 +80,12 @@ pub struct MapCore {
     pub last_straddle_blocks: usize,
     /// Something changed since the last render (camera, sun, GPS). Reported by `tick` so shells that only draw on demand get a frame.
     dirty: bool,
+    /// Elevation range the last frame saw; the next frame's contour interval is fit to it (one loop, a frame late — close enough).
+    last_range: ElevRange,
+    /// Contours on screen the interval is fit to.
+    pub contours_on_screen: f32,
+    /// The interval the last frame drew, metres.
+    pub contour_interval: f32,
 }
 
 impl MapCore {
@@ -87,7 +93,13 @@ impl MapCore {
         MapCore {
             cam: home,
             res: Residency::new(store),
-            luts: FrameLuts { hypso: build_hypso_lut(), sun: [0.0, 0.0, 1.0], mask: LayerMask::default(), dem_depth: DEM_BASE_DEPTH },
+            luts: FrameLuts {
+                hypso: build_hypso_lut(),
+                sun: [0.0, 0.0, 1.0],
+                mask: LayerMask::default(),
+                dem_depth: DEM_BASE_DEPTH,
+                contours: Contours { interval: 0.0, index_every: 5, m_per_px: 1.0 },
+            },
             luts_sun: (f32::NAN, f32::NAN, f64::NAN),
             sun_az: 315.0,
             sun_alt: 40.0,
@@ -101,6 +113,9 @@ impl MapCore {
             last_frame_ms: 0.0,
             last_straddle_blocks: 0,
             dirty: true,
+            last_range: ElevRange::EMPTY,
+            contours_on_screen: 32.0,
+            contour_interval: 0.0,
         }
     }
 
@@ -257,6 +272,14 @@ impl MapCore {
         self.vec_depth = select_depth(self.cam.ppd, self.vec_depth, VEC_BASE_DEPTH);
         self.dem_depth = select_depth(self.cam.ppd, self.dem_depth, DEM_BASE_DEPTH);
         self.luts.dem_depth = self.dem_depth;
+        // Contours: fit N levels to the previous frame's elevation span.
+        let interval = if self.last_range.is_empty() {
+            0.0
+        } else {
+            ((self.last_range.hi - self.last_range.lo) as f32 * 0.25 / self.contours_on_screen).max(0.5)
+        };
+        self.contour_interval = interval;
+        self.luts.contours = Contours { interval, index_every: 5, m_per_px: (111_320.0 / self.cam.ppd) as f32 };
 
         let (stats, want) = raster::render_frame(
             &mut self.canvas,
@@ -269,6 +292,7 @@ impl MapCore {
             self.vec_depth,
         );
         self.last_straddle_blocks = stats.straddle_blocks;
+        self.last_range = stats.elev;
 
         // Residency: request what the lattice says we need, nearest-first.
         let center = Coord::from_lat_lon(self.cam.lat, self.cam.lon);
@@ -276,7 +300,37 @@ impl MapCore {
         self.res.want(want, (cu, cv));
 
         self.draw_gps(w, h);
+        self.draw_compass(w, h);
         self.last_frame_ms = t0.elapsed().as_secs_f32() * 1000.0;
+    }
+
+    /// North arrow, top-right, with the view's heading below it: degrees the screen's up is turned from true north, clockwise positive, -180..180. No letters.
+    fn draw_compass(&mut self, w: usize, h: usize) {
+        if w < 120 || h < 160 {
+            return;
+        }
+        const INK: [u8; 3] = [236, 238, 244];
+        let (cx, cy) = (w as f32 - 46.0, 78.0);
+        // Screen direction of true north: up = (sin B, cos B) in east/north, so north on screen is (-sin B, -cos B) in (x right, y down).
+        let (sb, cb) = self.cam.bearing.sin_cos();
+        let (nx, ny) = (-(sb as f32), -(cb as f32));
+        let len = 26.0;
+        let (tx, ty) = (cx + nx * len, cy + ny * len);
+        let (bx, by) = (cx - nx * len * 0.6, cy - ny * len * 0.6);
+        draw_segment(&mut self.canvas, w, h, bx, by, tx, ty, 1.4, INK);
+        // Arrow head: two barbs back from the tip.
+        let (px, py) = (-ny, nx);
+        for sgn in [-1.0f32, 1.0] {
+            let hx = tx - nx * 9.0 + px * sgn * 6.0;
+            let hy = ty - ny * 9.0 + py * sgn * 6.0;
+            draw_segment(&mut self.canvas, w, h, tx, ty, hx, hy, 1.4, INK);
+        }
+        let mut deg = self.cam.bearing.to_degrees().rem_euclid(360.0);
+        if deg > 180.0 {
+            deg -= 360.0;
+        }
+        let text = format!("{}", deg.round() as i64);
+        draw_seven_seg(&mut self.canvas, w, h, &text, cx, cy + len + 30.0, 18.0, INK);
     }
 
     /// GPS pin: accuracy ring, crosshair, seven-segment elevation readout.

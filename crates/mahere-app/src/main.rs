@@ -30,7 +30,7 @@ impl MahereApp {
             Viewport::new(1280, 800),
             "mahere",
             None,
-            Some("drag pan · right-drag rotate · wheel zoom · A/D W/S sun · Q/E rotate · R home · 1-4 layers · 5 imagery".to_string()),
+            Some("drag pan · right-drag rotate · wheel zoom · A/D W/S sun · Q/E rotate · R home · 1-4 layers · 5 imagery · 6 contours".to_string()),
             &mut hit_counter,
         );
         MahereApp {
@@ -239,7 +239,7 @@ impl FluorApp for MahereApp {
                         true
                     }
                     // The layer filter: 1 terrain, 2 land cover, 3 water, 4 lines; 0 shows residency (fallback tint).
-                    Some(k @ ("1" | "2" | "3" | "4" | "5" | "0")) => {
+                    Some(k @ ("1" | "2" | "3" | "4" | "5" | "6" | "0")) => {
                         let mut m = self.map.layers();
                         match k {
                             "1" => m.dem = !m.dem,
@@ -247,6 +247,7 @@ impl FluorApp for MahereApp {
                             "3" => m.water = !m.water,
                             "4" => m.line = !m.line,
                             "5" => m.imagery = !m.imagery,
+                            "6" => m.contours = !m.contours,
                             _ => m.debug = !m.debug,
                         }
                         self.map.set_layers(m);
@@ -256,8 +257,8 @@ impl FluorApp for MahereApp {
                 };
                 if handled {
                     self.chrome.set_status_text(Some(format!(
-                        "sun {:.0}° az / {:.0}° alt · R home",
-                        self.map.sun_az, self.map.sun_alt
+                        "sun {:.0}° az / {:.0}° alt · contour {:.0} m · R home",
+                        self.map.sun_az, self.map.sun_alt, self.map.contour_interval
                     )));
                     ctx.window.request_redraw();
                     EventResponse::Handled
