@@ -31,7 +31,7 @@ pub struct GpuHost {
 }
 
 /// Supersampling while the camera moves and once it has stopped.
-const MOVING_SCALE: u32 = 2;
+const MOVING_SCALE: u32 = 1;
 const STILL_SCALE: u32 = 3;
 
 type OverlayStamp = (u64, u64, u64, u64, Option<(u64, u64, u32)>, u32, u32, bool, u32);

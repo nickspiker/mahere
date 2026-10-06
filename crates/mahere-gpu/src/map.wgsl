@@ -141,7 +141,7 @@ fn diffq(m: u32, p: u32, c: u32) -> f32 {
     return 0.0;
 }
 
-struct Dem { ok: bool, elev: f32, n: vec3<f32>, depth: u32 };
+struct Dem { ok: bool, elev: f32, n: vec3<f32>, depth: u32, slot: u32, base: f32, step: f32 };
 
 // Elevation and normal at a UV: the wanted depth's cell, or parents while the texel is no-data (a merged cell carries elevation only inside the newer bake's footprint).
 fn sample_dem(d: u32, u: u32, v: u32) -> Dem {
@@ -176,6 +176,9 @@ fn sample_dem(d: u32, u: u32, v: u32) -> Dem {
             out.elev = r.d.x + f32(q) * step;
             out.n = vec3<f32>(-ge * s, -gn * s, s);
             out.depth = rd;
+            out.slot = slot;
+            out.base = r.d.x;
+            out.step = step;
             return out;
         }
         if (rd == MIN_DEPTH) {
@@ -184,6 +187,67 @@ fn sample_dem(d: u32, u: u32, v: u32) -> Dem {
         depth = rd - 1u;
     }
     return out;
+}
+
+// The six centroid samples around a triangle vertex of the texel grid: the lower triangles of three squares and the upper triangles of three others, with no-data left out. Returns (sum, count).
+fn dem_vertex(slot: u32, x: i32, y: i32) -> vec2<f32> {
+    var sum = 0.0;
+    var n = 0.0;
+    let lows = array<vec2<i32>, 3>(vec2<i32>(x, y), vec2<i32>(x - 1, y), vec2<i32>(x, y - 1));
+    let ups = array<vec2<i32>, 3>(vec2<i32>(x - 1, y - 1), vec2<i32>(x, y - 1), vec2<i32>(x - 1, y));
+    for (var i = 0; i < 3; i++) {
+        let l = lows[i];
+        let ql = dem_q(slot, 2 * (l.x + 1), l.y + 1);
+        if (ql != ELEV_NODATA) {
+            sum += f32(ql);
+            n += 1.0;
+        }
+        let p = ups[i];
+        let qu = dem_q(slot, 2 * (p.x + 1) + 1, p.y + 1);
+        if (qu != ELEV_NODATA) {
+            sum += f32(qu);
+            n += 1.0;
+        }
+    }
+    return vec2<f32>(sum, n);
+}
+
+// Elevation interpolated across the texel: barycentric between the triangle's three vertices, each the mean of the six samples around it — a continuous surface, so contours drawn past the base depth are smooth instead of stepping along texel edges.
+fn dem_smooth(d: Dem, u: u32, v: u32) -> f32 {
+    let s = 22u - d.depth;
+    let m = (1u << s) - 1u;
+    let tx = i32((u >> s) & 255u);
+    let ty = i32((v >> s) & 255u);
+    let fu = f32(u & m) / f32(1u << s);
+    let fv = f32(v & m) / f32(1u << s);
+    var va: vec2<i32>;
+    var vb: vec2<i32>;
+    var vc: vec2<i32>;
+    var la: f32;
+    var lb: f32;
+    var lc: f32;
+    if (fu + fv < 1.0) {
+        va = vec2<i32>(tx, ty);
+        vb = vec2<i32>(tx + 1, ty);
+        vc = vec2<i32>(tx, ty + 1);
+        la = 1.0 - fu - fv;
+        lb = fu;
+        lc = fv;
+    } else {
+        va = vec2<i32>(tx + 1, ty + 1);
+        vb = vec2<i32>(tx, ty + 1);
+        vc = vec2<i32>(tx + 1, ty);
+        la = fu + fv - 1.0;
+        lb = 1.0 - fu;
+        lc = 1.0 - fv;
+    }
+    let a = dem_vertex(d.slot, va.x, va.y);
+    let b = dem_vertex(d.slot, vb.x, vb.y);
+    let c = dem_vertex(d.slot, vc.x, vc.y);
+    if (a.y == 0.0 || b.y == 0.0 || c.y == 0.0) {
+        return d.elev;
+    }
+    return d.base + (la * a.x / a.y + lb * b.x / b.y + lc * c.x / c.y) * d.step;
 }
 
 fn light_eval(n: vec3<f32>) -> vec3<f32> {
@@ -249,7 +313,11 @@ fn compose(d: u32, u: u32, v: u32) -> vec3<f32> {
             let slope = sqrt(max(1.0 - nzn * nzn, 0.0)) / nzn;
             if ((mask & M_CONTOURS) != 0u && slope >= 0.02 && U.contour.x > 0.0) {
                 let interval = U.contour.x;
-                let elev_m = f32(eq) * 0.25 - 500.0;
+                // Magnified: the interpolated, unquantised elevation; at the base and below, the texel's.
+                var elev_m = f32(eq) * 0.25 - 500.0;
+                if (U.depths.z != 0u) {
+                    elev_m = dem_smooth(s, u, v);
+                }
                 let level = round(elev_m / interval);
                 let d_m = abs(elev_m - level * interval);
                 let d_px = d_m / (slope * U.contour.z);

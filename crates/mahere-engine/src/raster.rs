@@ -19,6 +19,11 @@ pub const MIN_DEPTH: u8 = 6;
 /// texel/pixel ratio constant: diamond edge 7054 km, 111320 m/deg, 256 texels/cell. ratio r(d) = ppd * K / 2^d; pick d so r ∈ (0.5, 1].
 const K: f64 = 7_054_000.0 / (111_320.0 * 256.0);
 
+/// Screen pixels per texel at a depth: above one the texels are magnified.
+pub fn texel_px(ppd: f64, depth: u8) -> f64 {
+    (ppd * K) / f64::powi(2.0, depth as i32)
+}
+
 pub fn select_depth(ppd: f64, last: u8, base: u8) -> u8 {
     let ideal = (ppd * K).log2();
     // Hysteresis: keep the current depth while r stays within [0.45, 1.05].
