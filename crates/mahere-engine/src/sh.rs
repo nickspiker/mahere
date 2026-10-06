@@ -159,12 +159,16 @@ impl Sh9 {
         let strength = (alt_deg / 5.0).clamp(0.0, 1.0);
         let (az, alt) = (az_deg.to_radians(), alt_deg.max(0.0).to_radians());
         // Device frame: x right, y up (screen), z out of the screen; "up" for the sky is +z.
-        let dir = [az.sin() * alt.cos(), az.cos() * alt.cos(), alt.sin()];
+        Sh9::environment([az.sin() * alt.cos(), az.cos() * alt.cos(), alt.sin()], strength, [0.0, 0.0, 1.0])
+    }
+
+    /// The environment from vectors in the device frame: the sun's direction and strength, and which way the sky is. A phone tilted away from the sun sees neither and goes dark; one facing it is lit flat.
+    pub fn environment(sun_dir: [f32; 3], strength: f32, up: [f32; 3]) -> Sh9 {
         let mut sh = Sh9::ZERO;
-        sh.add_sun(dir, [0.74 * strength, 0.70 * strength, 0.62 * strength]);
+        sh.add_sun(sun_dir, [0.74 * strength, 0.70 * strength, 0.62 * strength]);
         // A sky of radiance S gives πS onto an upward normal: πS ≈ 0.3.
         let s = 0.3 / std::f32::consts::PI;
-        sh.add_sky([0.0, 0.0, 1.0], [s * 0.85, s * 0.95, s * 1.15]);
+        sh.add_sky(up, [s * 0.85, s * 0.95, s * 1.15]);
         sh
     }
 }

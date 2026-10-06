@@ -420,6 +420,28 @@ pub extern "system" fn Java_nz_mahere_app_MahereActivity_nativeOnHeading(
     }
 }
 
+/// The device's rotation matrix from the rotation-vector sensor, row-major, world = R · device: the full orientation, so the real sun lights the landscape exactly as the phone is held.
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub extern "system" fn Java_nz_mahere_app_MahereActivity_nativeOnOrientation(
+    _env: JNIEnv,
+    _class: JClass,
+    ptr: jlong,
+    r0: jfloat,
+    r1: jfloat,
+    r2: jfloat,
+    r3: jfloat,
+    r4: jfloat,
+    r5: jfloat,
+    r6: jfloat,
+    r7: jfloat,
+    r8: jfloat,
+) {
+    if ptr != 0 {
+        shell(ptr).app().map.set_device_rotation([r0, r1, r2, r3, r4, r5, r6, r7, r8]);
+    }
+}
+
 /// Pause = the durability moment: session saved, track chunk flushed.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_nz_mahere_app_MahereActivity_nativeOnPause(

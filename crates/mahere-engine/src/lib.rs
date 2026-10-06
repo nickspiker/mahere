@@ -92,6 +92,8 @@ pub struct MapCore {
     pub contour_interval: f32,
     /// Degrees the device is turned clockwise from north (0 when no sensor feeds it); the lighting turns against it.
     pub device_heading: f32,
+    /// The device's rotation matrix from the orientation sensor, world (east, north, up) = R · device (x right, y up the screen, z out of it); identity without a sensor.
+    pub device_rot: [f32; 9],
     /// Light the terrain by where the sun actually is, from the clock and the position.
     pub real_sun: bool,
     /// Turn the map with the device so screen-up is the way the phone points.
@@ -129,6 +131,7 @@ impl MapCore {
             contours_on_screen: 32.0,
             contour_interval: 0.0,
             device_heading: 0.0,
+            device_rot: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
             real_sun: false,
             follow_heading: false,
         }
@@ -252,6 +255,18 @@ impl MapCore {
         }
     }
 
+    /// The full orientation: the sensor's rotation matrix, row-major, world = R · device. The heading falls out of it (Android's own formula), and with the real sun on the landscape is lit exactly as the phone is held.
+    pub fn set_device_rotation(&mut self, r: [f32; 9]) {
+        let changed = self.device_rot.iter().zip(&r).any(|(a, b)| (a - b).abs() > 0.002);
+        self.device_rot = r;
+        let heading = r[1].atan2(r[4]).to_degrees().rem_euclid(360.0);
+        self.set_device_heading(heading);
+        if changed {
+            self.luts_sun = (f32::NAN, f32::NAN, f64::NAN);
+            self.dirty = true;
+        }
+    }
+
     pub fn set_real_sun(&mut self, on: bool) {
         self.real_sun = on;
         self.luts_sun = (f32::NAN, f32::NAN, f64::NAN);
@@ -360,7 +375,18 @@ impl MapCore {
                 (az.cos() * alt.cos()) as f32,
                 alt.sin() as f32,
             ];
-            if self.luts_sun.0 != self.sun_az || self.luts_sun.1 != self.sun_alt || self.device_heading != 0.0 {
+            if self.real_sun {
+                // The real sun and the real sky in the device frame: the landscape is lit exactly as the phone is held. Below the horizon the direct light is gone and only the sky remains.
+                let (lat, lon) = self.gps.map_or((self.cam.lat, self.cam.lon), |g| (g.lat, g.lon));
+                let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0.0, |d| d.as_secs_f64());
+                let (az, alt) = sh::sun_position(lat, lon, now);
+                let (azr, altr) = (az.to_radians(), alt.to_radians());
+                let enu = [(azr.sin() * altr.cos()) as f32, (azr.cos() * altr.cos()) as f32, altr.sin() as f32];
+                let r = self.device_rot;
+                let dev = |v: [f32; 3]| [r[0] * v[0] + r[3] * v[1] + r[6] * v[2], r[1] * v[0] + r[4] * v[1] + r[7] * v[2], r[2] * v[0] + r[5] * v[1] + r[8] * v[2]];
+                let strength = (alt as f32 / 5.0).clamp(0.0, 1.0);
+                self.env = sh::Sh9::environment(dev(enu), strength, dev([0.0, 0.0, 1.0]));
+            } else if self.luts_sun.0 != self.sun_az || self.luts_sun.1 != self.sun_alt || self.device_heading != 0.0 {
                 self.env = sh::Sh9::sun_and_sky(self.sun_az - self.device_heading, self.sun_alt);
             }
             let (sb, cb) = self.cam.bearing.sin_cos();

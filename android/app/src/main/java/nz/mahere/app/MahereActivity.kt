@@ -44,7 +44,7 @@ class MahereActivity : Activity(), SurfaceHolder.Callback, Choreographer.FrameCa
         x0: Float, y0: Float, x1: Float, y1: Float,
     ): Int
     private external fun nativeOnLocation(ptr: Long, lat: Double, lon: Double, accuracy: Float)
-    private external fun nativeOnHeading(ptr: Long, headingDeg: Float)
+    private external fun nativeOnOrientation(ptr: Long, r0: Float, r1: Float, r2: Float, r3: Float, r4: Float, r5: Float, r6: Float, r7: Float, r8: Float)
     private external fun nativeOnPause(ptr: Long)
 
     private lateinit var surfaceView: SurfaceView
@@ -187,13 +187,10 @@ class MahereActivity : Activity(), SurfaceHolder.Callback, Choreographer.FrameCa
 
     private val headingListener = object : SensorEventListener {
         private val rot = FloatArray(9)
-        private val orient = FloatArray(3)
         override fun onSensorChanged(event: SensorEvent) {
             if (nativePtr == 0L) return
             SensorManager.getRotationMatrixFromVector(rot, event.values)
-            SensorManager.getOrientation(rot, orient)
-            val deg = Math.toDegrees(orient[0].toDouble()).toFloat()
-            nativeOnHeading(nativePtr, if (deg < 0f) deg + 360f else deg)
+            nativeOnOrientation(nativePtr, rot[0], rot[1], rot[2], rot[3], rot[4], rot[5], rot[6], rot[7], rot[8])
         }
         override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {}
     }
