@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, channel};
 
-use mahere_tiles::{CellKey, ClassCell, CovCell, TRI, decode_cell};
+use mahere_tiles::{CellKey, ClassCell, CovCell, decode_cell};
 use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
 
@@ -185,16 +185,7 @@ fn load_cell(store: &dyn CellStore, key: CellKey) -> Loaded {
     let Ok(planes) = decode_cell(&bytes) else {
         return Loaded { key, entry: Entry::default() };
     };
-    let dem = planes.dem.map(|d| {
-        let mut texel = vec![0u64; TRI].into_boxed_slice();
-        for i in 0..TRI {
-            texel[i] = (d.elev[i] as u64)
-                | ((d.nx[i] as u16 as u64) << 16)
-                | ((d.ny[i] as u16 as u64) << 32)
-                | ((d.nz[i] as u16 as u64) << 48);
-        }
-        DemPacked { texel }
-    });
+    let dem = planes.dem.map(|d| DemPacked { texel: d.pack_texels(key).into_boxed_slice() });
     Loaded { key, entry: Entry { dem, line: planes.line, land: planes.land, water: planes.water } }
 }
 

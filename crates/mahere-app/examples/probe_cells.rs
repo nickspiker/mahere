@@ -2,7 +2,7 @@
 // that point — dem present / nodata, vector planes present, coverage.
 use mahere_coord::Coord;
 use mahere_engine::raster::tri_index;
-use mahere_tiles::{CellKey, ELEV_NODATA, decode_cell, dequantize_elev};
+use mahere_tiles::{CellKey, decode_cell};
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -22,11 +22,11 @@ fn main() {
         let i = tri_index((iu as i64) << 16, (iv as i64) << 16, shift);
         let dem = match &p.dem {
             None => "no dem".to_string(),
-            Some(d) if d.elev[i] == ELEV_NODATA => {
-                let valid = d.elev.iter().filter(|&&e| e != ELEV_NODATA).count();
+            Some(d) if d.elev[i].is_nan() => {
+                let valid = d.elev.iter().filter(|e| !e.is_nan()).count();
                 format!("dem NODATA here ({valid}/131072 valid)")
             }
-            Some(d) => format!("elev {:.1}", dequantize_elev(d.elev[i])),
+            Some(d) => format!("elev {:.1}", d.elev[i]),
         };
         let vec = match (&p.line, &p.land, &p.water) {
             (None, None, None) => "no vec".to_string(),

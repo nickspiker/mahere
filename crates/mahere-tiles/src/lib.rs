@@ -314,18 +314,30 @@ impl Default for CovCell {
     }
 }
 
-/// Baker-side dem planes (f32 so the pyramid averages at full precision).
+/// Baker-side dem planes: elevation only (f32 so the pyramid averages at
+/// full precision), plus a one-texel apron copied from neighbour cells so
+/// the loader can derive exact normals at the cell edge. Normals are never
+/// stored — they're six of the eight bytes a texel used to cost.
 #[derive(Clone)]
 pub struct DemCell {
     pub elev: Vec<f32>,
-    pub ge: Vec<f32>,
-    pub gn: Vec<f32>,
+    /// Neighbour edge texels: `[side][half][index]`, sides west (tx=-1),
+    /// east (tx=256), south (ty=-1), north (ty=256); NaN where unknown.
+    pub apron: Vec<f32>,
 }
+
+pub const APRON: usize = 4 * 2 * TEX;
 
 impl DemCell {
     fn new() -> DemCell {
-        DemCell { elev: vec![f32::NAN; TRI], ge: vec![0.0; TRI], gn: vec![0.0; TRI] }
+        DemCell { elev: vec![f32::NAN; TRI], apron: vec![f32::NAN; APRON] }
     }
+}
+
+/// Apron slot for a texel just outside the cell.
+#[inline(always)]
+pub fn apron_idx(side: usize, half: usize, i: usize) -> usize {
+    (side * 2 + half) * TEX + i
 }
 
 /// Everything a cell can carry. Vector layers at a vector depth are always
@@ -652,7 +664,7 @@ pub fn pyramid_cov(mut cells: HashMap<CellKey, CovCell>, base_depth: u8, min_dep
 // ==================== DEM LAYER ====================
 
 /// Bake dem cells covering `keys` from the source store: each triangle
-/// texel sampled at its centroid.
+/// texel's elevation sampled at its centroid.
 pub fn bake_dem(dem: &DemStore, keys: &[CellKey]) -> Vec<(CellKey, DemCell)> {
     keys.par_iter()
         .map(|&key| {
@@ -665,11 +677,8 @@ pub fn bake_dem(dem: &DemStore, keys: &[CellKey]) -> Vec<(CellKey, DemCell)> {
                     for half in 0..2 {
                         let (cx, cy) = tri_centroid(tx, ty, half);
                         let (lat, lon) = uv_to_lat_lon(d, u0 + cx * step, v0 + cy * step);
-                        if let Some((e, (ge, gn))) = dem.elev_and_gradient(lat, lon) {
-                            let i = tri_idx(tx, ty, half);
-                            cell.elev[i] = e;
-                            cell.ge[i] = ge;
-                            cell.gn[i] = gn;
+                        if let Some(e) = dem.elevation(lat, lon) {
+                            cell.elev[tri_idx(tx, ty, half)] = e;
                         }
                     }
                 }
@@ -710,21 +719,16 @@ pub fn dem_pyramid(base: &[(CellKey, DemCell)], min_depth: u8) -> Vec<(CellKey, 
                 for ty in 0..TEX {
                     for tx in 0..TEX {
                         for half in 0..2 {
-                            let (mut e, mut ge, mut gn, mut n) = (0.0f32, 0.0f32, 0.0f32, 0u32);
+                            let (mut e, mut n) = (0.0f32, 0u32);
                             for (q, i) in child_cell_texels(tx, ty, half) {
                                 let Some(child) = kids[q as usize] else { continue };
                                 if !child.elev[i].is_nan() {
                                     e += child.elev[i];
-                                    ge += child.ge[i];
-                                    gn += child.gn[i];
                                     n += 1;
                                 }
                             }
                             if n > 0 {
-                                let i = tri_idx(tx, ty, half);
-                                cell.elev[i] = e / n as f32;
-                                cell.ge[i] = ge / n as f32;
-                                cell.gn[i] = gn / n as f32;
+                                cell.elev[tri_idx(tx, ty, half)] = e / n as f32;
                             }
                         }
                     }
@@ -764,6 +768,51 @@ pub fn cells_covering(lat0: f64, lon0: f64, lat1: f64, lon1: f64, depth: u8) -> 
 
 // ==================== ASSEMBLY ====================
 
+/// Copy each cell's neighbours' edge texels into its apron (same depth,
+/// same diamond; a missing neighbour leaves NaN and the loader uses a
+/// one-sided gradient there).
+pub fn fill_aprons(mut dem: Vec<(CellKey, DemCell)>) -> Vec<(CellKey, DemCell)> {
+    let edges: HashMap<CellKey, [Vec<f32>; 4]> = dem
+        .iter()
+        .map(|(k, c)| {
+            // What THIS cell offers its neighbours: its own edge texels,
+            // indexed so the neighbour can copy them straight in.
+            let mut west = vec![f32::NAN; 2 * TEX]; // this cell's tx=0 column -> east neighbour's... see below
+            let mut east = vec![f32::NAN; 2 * TEX];
+            let mut south = vec![f32::NAN; 2 * TEX];
+            let mut north = vec![f32::NAN; 2 * TEX];
+            for i in 0..TEX {
+                for half in 0..2 {
+                    west[half * TEX + i] = c.elev[tri_idx(0, i, half)];
+                    east[half * TEX + i] = c.elev[tri_idx(TEX - 1, i, half)];
+                    south[half * TEX + i] = c.elev[tri_idx(i, 0, half)];
+                    north[half * TEX + i] = c.elev[tri_idx(i, TEX - 1, half)];
+                }
+            }
+            (*k, [west, east, south, north])
+        })
+        .collect();
+    let n = |k: CellKey, du: i64, dv: i64| -> Option<CellKey> {
+        let (cu, cv) = k.grid();
+        let lim = 1i64 << k.depth;
+        let (nu, nv) = (cu as i64 + du, cv as i64 + dv);
+        (nu >= 0 && nv >= 0 && nu < lim && nv < lim).then(|| CellKey::from_grid(k.diamond(), k.depth, nu as u64, nv as u64))
+    };
+    for (k, c) in dem.iter_mut() {
+        // My west apron (tx = -1) is the west neighbour's east column, etc.
+        let pairs = [(n(*k, -1, 0), 0usize, 1usize), (n(*k, 1, 0), 1, 0), (n(*k, 0, -1), 2, 3), (n(*k, 0, 1), 3, 2)];
+        for (nk, side, their_edge) in pairs {
+            let Some(src) = nk.and_then(|nk| edges.get(&nk)) else { continue };
+            for half in 0..2 {
+                for i in 0..TEX {
+                    c.apron[apron_idx(side, half, i)] = src[their_edge][half * TEX + i];
+                }
+            }
+        }
+    }
+    dem
+}
+
 /// Union the layers into cells. Wherever any vector layer exists at a
 /// depth, all three are present (empty planes for the missing ones) so
 /// readers never have to climb for one layer but not another.
@@ -774,6 +823,7 @@ pub fn assemble(
     water: HashMap<CellKey, CovCell>,
 ) -> HashMap<CellKey, Cell> {
     let mut cells: HashMap<CellKey, Cell> = HashMap::new();
+    let dem = fill_aprons(dem);
     for (k, d) in dem {
         cells.entry(k).or_default().dem = Some(d);
     }
@@ -804,35 +854,184 @@ pub struct CellPlanes {
     pub water: Option<CovCell>,
 }
 
+/// Decoded dem: elevation (NaN = no data) and the apron, memory order.
 #[derive(Clone)]
 pub struct DemPlanes {
-    pub elev: Vec<u16>,
-    pub nx: Vec<i16>,
-    pub ny: Vec<i16>,
-    pub nz: Vec<i16>,
+    pub elev: Vec<f32>,
+    pub apron: Vec<f32>,
 }
 
 impl DemCell {
-    /// Quantize: 0.25 m elevation steps, unit normal from the gradient as
-    /// snorm16 (i16, not u8: u8 bands on gentle slopes, exactly where
-    /// hillshade banding shows).
-    pub fn quantize(&self) -> DemPlanes {
-        let mut p = DemPlanes { elev: vec![0; TRI], nx: vec![0; TRI], ny: vec![0; TRI], nz: vec![0; TRI] };
-        for i in 0..TRI {
-            p.elev[i] = quantize_elev(self.elev[i]);
-            let inv = 1.0 / (1.0 + self.ge[i] * self.ge[i] + self.gn[i] * self.gn[i]).sqrt();
-            p.nx[i] = (-self.ge[i] * inv * 32767.0) as i16;
-            p.ny[i] = (-self.gn[i] * inv * 32767.0) as i16;
-            p.nz[i] = (inv * 32767.0) as i16;
+    pub fn planes(&self) -> DemPlanes {
+        DemPlanes { elev: self.elev.clone(), apron: self.apron.clone() }
+    }
+}
+
+/// On-disk dem coding: per-cell `base` + `step` (adaptive, >= 5 cm, so the
+/// cell's range fits i16 residuals), then LOCO-I MED prediction from the
+/// left / up / up-left texels of the same half-plane in row-major order,
+/// residuals as i16. No-data texels take the predictor (residual 0) and
+/// are marked in a `valid` plane, written only when any is missing.
+const MIN_STEP: f32 = 0.05;
+
+fn med(a: i32, b: i32, c: i32) -> i32 {
+    if c >= a.max(b) { a.min(b) } else if c <= a.min(b) { a.max(b) } else { a + b - c }
+}
+
+#[inline(always)]
+fn predict(q: &[i32], tx: usize, ty: usize, half: usize) -> i32 {
+    match (tx, ty) {
+        (0, 0) => 0,
+        (0, _) => q[tri_idx(0, ty - 1, half)],
+        (_, 0) => q[tri_idx(tx - 1, 0, half)],
+        _ => med(q[tri_idx(tx - 1, ty, half)], q[tri_idx(tx, ty - 1, half)], q[tri_idx(tx - 1, ty - 1, half)]),
+    }
+}
+
+struct DemCoded {
+    base: f32,
+    step: f32,
+    residual: Vec<i16>,
+    valid: Option<Vec<u8>>,
+    apron: Vec<u16>,
+}
+
+fn encode_dem(d: &DemPlanes) -> DemCoded {
+    let (mut lo, mut hi) = (f32::MAX, f32::MIN);
+    for &e in d.elev.iter().chain(d.apron.iter()) {
+        if !e.is_nan() {
+            lo = lo.min(e);
+            hi = hi.max(e);
         }
-        p
+    }
+    if lo == f32::MAX {
+        lo = 0.0;
+        hi = 0.0;
+    }
+    let step = ((hi - lo) / 32000.0).max(MIN_STEP);
+    let quant = |e: f32| -> Option<i32> { (!e.is_nan()).then(|| ((e - lo) / step).round() as i32) };
+    let mut q = vec![0i32; TRI];
+    let mut residual = vec![0i16; TRI];
+    let mut valid = vec![1u8; TRI];
+    let mut any_missing = false;
+    for half in 0..2 {
+        for ty in 0..TEX {
+            for tx in 0..TEX {
+                let i = tri_idx(tx, ty, half);
+                let pred = predict(&q, tx, ty, half);
+                match quant(d.elev[i]) {
+                    Some(v) => {
+                        q[i] = v;
+                        residual[i] = (v - pred).clamp(i16::MIN as i32, i16::MAX as i32) as i16;
+                    }
+                    None => {
+                        q[i] = pred;
+                        valid[i] = 0;
+                        any_missing = true;
+                    }
+                }
+            }
+        }
+    }
+    let apron = d.apron.iter().map(|&e| quant(e).map_or(u16::MAX, |v| v.clamp(0, 65534) as u16)).collect();
+    DemCoded { base: lo, step, residual, valid: any_missing.then_some(valid), apron }
+}
+
+fn decode_dem(c: &DemCoded) -> DemPlanes {
+    let mut q = vec![0i32; TRI];
+    let mut elev = vec![f32::NAN; TRI];
+    for half in 0..2 {
+        for ty in 0..TEX {
+            for tx in 0..TEX {
+                let i = tri_idx(tx, ty, half);
+                let v = predict(&q, tx, ty, half) + c.residual[i] as i32;
+                q[i] = v;
+                if c.valid.as_ref().is_none_or(|m| m[i] != 0) {
+                    elev[i] = c.base + v as f32 * c.step;
+                }
+            }
+        }
+    }
+    let apron = c.apron.iter().map(|&v| if v == u16::MAX { f32::NAN } else { c.base + v as f32 * c.step }).collect();
+    DemPlanes { elev, apron }
+}
+
+impl DemPlanes {
+    /// Pack for the renderer: `[elev_q u16 | nx i16 | ny i16 | nz i16]` per
+    /// texel (0.25 m steps from -500 m, 0xFFFF no data). Normals come from
+    /// central differences over the half-plane (apron at the edges, one-
+    /// sided next to no-data) mapped through the cell's UV→east/north
+    /// Jacobian — snorm16, not u8, because u8 bands on gentle slopes.
+    pub fn pack_texels(&self, key: CellKey) -> Vec<u64> {
+        // Jacobian: metres east/north per texel step in u and in v.
+        let (u0, v0, size) = key.uv_rect();
+        let d = key.diamond();
+        let step = size / TEX as f64;
+        let (uc, vc) = (u0 + size * 0.5, v0 + size * 0.5);
+        let (lat0, lon0) = uv_to_lat_lon(d, uc, vc);
+        let (lat_u, lon_u) = uv_to_lat_lon(d, uc + step, vc);
+        let (lat_v, lon_v) = uv_to_lat_lon(d, uc, vc + step);
+        let m_lon = 111_320.0 * lat0.to_radians().cos();
+        let (eu, nu) = ((lon_u - lon0) * m_lon, (lat_u - lat0) * 111_320.0);
+        let (ev, nv) = ((lon_v - lon0) * m_lon, (lat_v - lat0) * 111_320.0);
+        // dE/du = ge*eu + gn*nu ; dE/dv = ge*ev + gn*nv  -> solve for (ge, gn).
+        let det = eu * nv - ev * nu;
+        let inv = if det.abs() > 1e-9 { 1.0 / det } else { 0.0 };
+        let at = |tx: i64, ty: i64, half: usize| -> f32 {
+            if tx < 0 {
+                self.apron[apron_idx(0, half, ty.clamp(0, TEX as i64 - 1) as usize)]
+            } else if tx >= TEX as i64 {
+                self.apron[apron_idx(1, half, ty.clamp(0, TEX as i64 - 1) as usize)]
+            } else if ty < 0 {
+                self.apron[apron_idx(2, half, tx as usize)]
+            } else if ty >= TEX as i64 {
+                self.apron[apron_idx(3, half, tx as usize)]
+            } else {
+                self.elev[tri_idx(tx as usize, ty as usize, half)]
+            }
+        };
+        let diff = |m: f32, p: f32, c: f32| -> f32 {
+            match (m.is_nan(), p.is_nan()) {
+                (false, false) => (p - m) * 0.5,
+                (true, false) => p - c,
+                (false, true) => c - m,
+                (true, true) => 0.0,
+            }
+        };
+        let mut out = vec![0u64; TRI];
+        for ty in 0..TEX {
+            for tx in 0..TEX {
+                for half in 0..2 {
+                    let i = tri_idx(tx, ty, half);
+                    let e = self.elev[i];
+                    if e.is_nan() {
+                        out[i] = ELEV_NODATA as u64 | (32767u64 << 48);
+                        continue;
+                    }
+                    let (tx_, ty_) = (tx as i64, ty as i64);
+                    let du = diff(at(tx_ - 1, ty_, half), at(tx_ + 1, ty_, half), e) as f64;
+                    let dv = diff(at(tx_, ty_ - 1, half), at(tx_, ty_ + 1, half), e) as f64;
+                    let ge = (du * nv - dv * nu) * inv;
+                    let gn = (eu * dv - ev * du) * inv;
+                    let s = 1.0 / (1.0 + ge * ge + gn * gn).sqrt();
+                    let nx = (-ge * s * 32767.0) as i16;
+                    let ny = (-gn * s * 32767.0) as i16;
+                    let nz = (s * 32767.0) as i16;
+                    out[i] = quantize_elev(e) as u64
+                        | ((nx as u16 as u64) << 16)
+                        | ((ny as u16 as u64) << 32)
+                        | ((nz as u16 as u64) << 48);
+                }
+            }
+        }
+        out
     }
 }
 
 impl Cell {
     pub fn quantize(&self) -> CellPlanes {
         CellPlanes {
-            dem: self.dem.as_ref().map(|d| d.quantize()),
+            dem: self.dem.as_ref().map(|d| d.planes()),
             line: self.line.clone(),
             land: self.land.clone(),
             water: self.water.clone(),
@@ -849,16 +1048,18 @@ impl CellPlanes {
         let CellPlanes { dem: old_dem, line: old_line, land: old_land, water: old_water } = old;
         let (mut old_line, mut old_land, mut old_water) = (old_line, old_land, old_water);
         // The new bake's footprint, if it has one.
-        let mask: Option<Vec<bool>> = out.dem.as_ref().map(|d| d.elev.iter().map(|&e| e != ELEV_NODATA).collect());
+        let mask: Option<Vec<bool>> = out.dem.as_ref().map(|d| d.elev.iter().map(|e| !e.is_nan()).collect());
         match (&mut out.dem, old_dem) {
             (Some(new), Some(old_dem)) => {
                 let mask = mask.as_ref().unwrap();
                 for i in 0..TRI {
                     if !mask[i] {
                         new.elev[i] = old_dem.elev[i];
-                        new.nx[i] = old_dem.nx[i];
-                        new.ny[i] = old_dem.ny[i];
-                        new.nz[i] = old_dem.nz[i];
+                    }
+                }
+                for i in 0..APRON {
+                    if new.apron[i].is_nan() {
+                        new.apron[i] = old_dem.apron[i];
                     }
                 }
             }
@@ -909,15 +1110,19 @@ impl CellPlanes {
     pub fn encode(&self) -> Result<Vec<u8>, String> {
         let mut b = VsfBuilder::new();
         if let Some(d) = &self.dem {
-            b = b.add_section(
-                "dem",
-                vec![
-                    ("elev".to_string(), VsfType::t_u4(Tensor::new(vec![2, TEX * TEX], mem_to_disk(&d.elev)))),
-                    ("nx".to_string(), VsfType::t_i4(Tensor::new(vec![2, TEX * TEX], mem_to_disk(&d.nx)))),
-                    ("ny".to_string(), VsfType::t_i4(Tensor::new(vec![2, TEX * TEX], mem_to_disk(&d.ny)))),
-                    ("nz".to_string(), VsfType::t_i4(Tensor::new(vec![2, TEX * TEX], mem_to_disk(&d.nz)))),
-                ],
-            );
+            let c = encode_dem(d);
+            let mut fields = vec![
+                ("base".to_string(), VsfType::f5(c.base)),
+                ("step".to_string(), VsfType::f5(c.step)),
+                // Residuals stay in memory (row-major) order: the predictor
+                // runs over spatial neighbours, not the triangle path.
+                ("residual".to_string(), VsfType::t_i4(Tensor::new(vec![TEX, TEX, 2], c.residual))),
+                ("apron".to_string(), VsfType::t_u4(Tensor::new(vec![4, 2, TEX], c.apron))),
+            ];
+            if let Some(v) = c.valid {
+                fields.push(("valid".to_string(), VsfType::t_u3(Tensor::new(vec![TEX, TEX, 2], v))));
+            }
+            b = b.add_section("dem", fields);
         }
         for (name, planes) in [("line", &self.line), ("land", &self.land)] {
             if let Some(p) = planes {
@@ -982,13 +1187,15 @@ pub fn decode_cell(data: &[u8]) -> Result<CellPlanes, String> {
             s.fields.into_iter().filter_map(|f| f.values.into_iter().next().map(|v| (f.name, v))).collect();
         match s.name.as_str() {
             "dem" => {
-                if let (Some(elev), Some(nx), Some(ny), Some(nz)) = (
-                    fields.get("elev").and_then(plane_u16_mem),
-                    fields.get("nx").and_then(plane_i16_mem),
-                    fields.get("ny").and_then(plane_i16_mem),
-                    fields.get("nz").and_then(plane_i16_mem),
-                ) {
-                    out.dem = Some(DemPlanes { elev, nx, ny, nz });
+                let base = fields.get("base").and_then(scalar_f32);
+                let step = fields.get("step").and_then(scalar_f32);
+                let residual = fields.get("residual").and_then(raw_i16);
+                let apron = fields.get("apron").and_then(raw_u16);
+                let valid = fields.get("valid").and_then(raw_u8);
+                if let (Some(base), Some(step), Some(residual), Some(apron)) = (base, step, residual, apron) {
+                    if residual.len() == TRI && apron.len() == APRON && valid.as_ref().is_none_or(|v| v.len() == TRI) {
+                        out.dem = Some(decode_dem(&DemCoded { base, step, residual, valid, apron }));
+                    }
                 }
             }
             "line" | "land" => {
@@ -1014,34 +1221,49 @@ pub fn decode_cell(data: &[u8]) -> Result<CellPlanes, String> {
     Ok(out)
 }
 
+fn scalar_f32(v: &VsfType) -> Option<f32> {
+    match v {
+        VsfType::f5(x) => Some(*x),
+        VsfType::f6(x) => Some(*x as f32),
+        _ => None,
+    }
+}
+
+fn raw_u8(v: &VsfType) -> Option<Vec<u8>> {
+    match v {
+        VsfType::t_u3(t) => Some(t.data.clone()),
+        VsfType::v_u3(t) => Some(t.data.clone()),
+        VsfType::t_u0(t) => Some(t.data.iter().map(|&b| b as u8).collect()),
+        _ => None,
+    }
+}
+
+fn raw_u16(v: &VsfType) -> Option<Vec<u16>> {
+    match v {
+        VsfType::t_u4(t) => Some(t.data.clone()),
+        VsfType::v_u4(t) => Some(t.data.clone()),
+        VsfType::t_u3(t) => Some(t.data.iter().map(|&x| x as u16).collect()),
+        VsfType::v_u3(t) => Some(t.data.iter().map(|&x| x as u16).collect()),
+        _ => None,
+    }
+}
+
+fn raw_i16(v: &VsfType) -> Option<Vec<i16>> {
+    match v {
+        VsfType::t_i4(t) => Some(t.data.clone()),
+        VsfType::v_i4(t) => Some(t.data.clone()),
+        VsfType::t_i3(t) => Some(t.data.iter().map(|&x| x as i16).collect()),
+        VsfType::v_i3(t) => Some(t.data.iter().map(|&x| x as i16).collect()),
+        _ => None,
+    }
+}
+
 /// A u8 plane in memory order, or None if missing/malformed.
 pub fn plane_u8_mem(v: &VsfType) -> Option<Vec<u8>> {
     let disk: Vec<u8> = match v {
         VsfType::t_u3(t) => t.data.clone(),
         VsfType::v_u3(t) => t.data.clone(),
         VsfType::t_u0(t) => t.data.iter().map(|&b| b as u8).collect(),
-        _ => return None,
-    };
-    (disk.len() == TRI).then(|| disk_to_mem(&disk))
-}
-
-pub fn plane_u16_mem(v: &VsfType) -> Option<Vec<u16>> {
-    let disk: Vec<u16> = match v {
-        VsfType::t_u4(t) => t.data.clone(),
-        VsfType::v_u4(t) => t.data.clone(),
-        VsfType::t_u3(t) => t.data.iter().map(|&x| x as u16).collect(),
-        VsfType::v_u3(t) => t.data.iter().map(|&x| x as u16).collect(),
-        _ => return None,
-    };
-    (disk.len() == TRI).then(|| disk_to_mem(&disk))
-}
-
-pub fn plane_i16_mem(v: &VsfType) -> Option<Vec<i16>> {
-    let disk: Vec<i16> = match v {
-        VsfType::t_i4(t) => t.data.clone(),
-        VsfType::v_i4(t) => t.data.clone(),
-        VsfType::t_i3(t) => t.data.iter().map(|&x| x as i16).collect(),
-        VsfType::v_i3(t) => t.data.iter().map(|&x| x as i16).collect(),
         _ => return None,
     };
     (disk.len() == TRI).then(|| disk_to_mem(&disk))
@@ -1187,22 +1409,41 @@ mod tests {
     #[test]
     fn cell_round_trips_through_vsf_and_merges() {
         let mut dem = DemCell::new();
-        for i in 0..TRI / 2 {
-            dem.elev[i] = 1000.0 + (i % 7) as f32;
-            dem.ge[i] = 0.1;
+        // A gentle plane rising along u (0.5 m per texel) with a ripple.
+        for ty in 0..TEX / 2 {
+            for tx in 0..TEX {
+                for half in 0..2 {
+                    let i = tri_idx(tx, ty, half);
+                    dem.elev[i] = 1000.0 + tx as f32 * 0.5 + ((tx * 7 + ty * 3) % 11) as f32 * 0.02;
+                }
+            }
         }
+        dem.apron[apron_idx(0, 0, 3)] = 999.5;
         let mut line = ClassCell::new();
         line.class[5] = 3;
         line.cov[5] = 200;
-        let cell = Cell { dem: Some(dem), line: Some(line), land: Some(ClassCell::new()), water: None };
+        let cell = Cell { dem: Some(dem.clone()), line: Some(line), land: Some(ClassCell::new()), water: None };
         let bytes = cell.quantize().encode().unwrap();
         let back = decode_cell(&bytes).unwrap();
         let d = back.dem.as_ref().unwrap();
-        assert_eq!(d.elev[3], quantize_elev(1003.0));
-        assert_eq!(d.elev[TRI - 1], ELEV_NODATA);
-        assert!(d.nx[3] < 0 && d.nz[3] > 30000);
+        // Exact to the adaptive step (range ~80 m -> 5 cm floor).
+        for i in 0..TRI / 2 {
+            assert!((d.elev[i] - dem.elev[i]).abs() <= 0.03, "texel {i}: {} vs {}", d.elev[i], dem.elev[i]);
+        }
+        assert!(d.elev[TRI - 1].is_nan());
+        assert!((d.apron[apron_idx(0, 0, 3)] - 999.5).abs() <= 0.03);
+        assert!(d.apron[apron_idx(1, 1, 7)].is_nan());
         assert_eq!(back.line.as_ref().unwrap().cov[5], 200);
         assert!(back.water.is_none());
+
+        // Normals: a plane tilted along +u lights as a slope, flat ground as +z.
+        let key = CellKey::containing(Coord::from_lat_lon(46.2, -122.19), 11);
+        let packed = d.pack_texels(key);
+        let nz = (packed[tri_idx(10, 10, 0)] >> 48) as u16 as i16;
+        assert!(nz > 30000, "nz {nz}");
+        let nx = (packed[tri_idx(10, 10, 0)] >> 16) as u16 as i16;
+        assert!(nx != 0, "a slope along u must tilt the normal");
+        assert_eq!((packed[TRI - 1] & 0xFFFF) as u16, ELEV_NODATA);
 
         // Merge: a second bake covering the OTHER half keeps our half.
         let mut dem2 = DemCell::new();
@@ -1215,11 +1456,31 @@ mod tests {
         let cell2 = Cell { dem: Some(dem2), line: Some(line2), land: None, water: None };
         let merged = cell2.quantize().merge_over(back);
         let d = merged.dem.as_ref().unwrap();
-        assert_eq!(d.elev[3], quantize_elev(1003.0));
-        assert_eq!(d.elev[TRI - 1], quantize_elev(50.0));
+        assert!((d.elev[3] - dem.elev[3]).abs() <= 0.03);
+        assert!((d.elev[TRI - 1] - 50.0).abs() < 1e-3);
         let l = merged.line.as_ref().unwrap();
         assert_eq!(l.cov[5], 200);
         assert_eq!(l.cov[TRI - 1], 9);
         assert!(merged.land.is_some(), "a layer absent from the new bake survives from the old");
+    }
+
+    /// Aprons: a cell's west apron is its west neighbour's east column.
+    #[test]
+    fn aprons_come_from_neighbours() {
+        let k = CellKey::containing(Coord::from_lat_lon(46.2, -122.19), 10);
+        let (cu, cv) = k.grid();
+        let west = CellKey::from_grid(k.diamond(), 10, cu - 1, cv);
+        let mut a = DemCell::new();
+        let mut b = DemCell::new();
+        for i in 0..TRI {
+            a.elev[i] = 100.0;
+            b.elev[i] = 200.0;
+        }
+        b.elev[tri_idx(TEX - 1, 7, 1)] = 250.0;
+        let out = fill_aprons(vec![(k, a), (west, b)]);
+        let (_, a) = out.iter().find(|(kk, _)| *kk == k).unwrap();
+        assert_eq!(a.apron[apron_idx(0, 1, 7)], 250.0);
+        assert_eq!(a.apron[apron_idx(0, 0, 7)], 200.0);
+        assert!(a.apron[apron_idx(1, 0, 7)].is_nan(), "no east neighbour");
     }
 }
