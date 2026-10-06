@@ -1,137 +1,84 @@
 //! Clipmap residency: which cells are decoded and resident, and the loader
 //! thread that feeds them. Zero locks anywhere near the pixel loop — the
-//! main thread sends generation-stamped want-lists, the loader reads /
-//! decompresses / decodes / repacks off-thread, and the main thread drains
-//! a channel of finished planes at frame start.
+//! main thread sends want-lists, the loader reads / decompresses / decodes /
+//! repacks off-thread, and the main thread drains a channel of finished
+//! planes at frame start.
+//!
+//! One object per cell carries every layer, so residency is one pool keyed
+//! by cell; an entry holds whichever planes the cell had at its depth.
 
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, channel};
 
-use mahere_tiles::{CellKey, TRI, decode_cell_fields, plane_f32_mem, plane_u8_mem};
+use mahere_tiles::{CellKey, ClassCell, CovCell, TRI, decode_cell};
 use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
 
-/// Where cell bytes come from, addressed by (layer, cell) — a string path
-/// exists only where a filesystem or URL demands one.
+/// Where cell bytes come from, addressed by cell — a string path exists
+/// only where a filesystem or URL demands one.
 pub trait CellStore: Send + Sync + 'static {
-    fn get(&self, layer: Layer, key: CellKey) -> Option<Vec<u8>>;
+    fn get(&self, key: CellKey) -> Option<Vec<u8>>;
 }
 
 pub struct DirStore(pub PathBuf);
 
 impl CellStore for DirStore {
-    fn get(&self, layer: Layer, key: CellKey) -> Option<Vec<u8>> {
-        std::fs::read(self.0.join(key.path(layer.name()))).ok()
+    fn get(&self, key: CellKey) -> Option<Vec<u8>> {
+        std::fs::read(self.0.join(key.path())).ok()
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub enum Layer {
-    Dem,
-    Line,
-}
-
-impl Layer {
-    pub fn name(self) -> &'static str {
-        match self {
-            Layer::Dem => "dem",
-            Layer::Line => "line",
-        }
-    }
-}
-
-/// Decoded dem cell, packed one u64 per triangle texel for the hot loop
+/// Decoded dem planes packed one u64 per triangle texel for the hot loop
 /// (memory order `((ty << 8 | tx) << 1) | half`):
 /// `[elev_q u16 | nx i16 | ny i16 | nz i16]`, elev_q = (elev + 500) * 4
-/// clamped (0.25 m steps), 0xFFFF = no data. snorm16 normals (i16, not u8:
-/// u8 bands on gentle slopes, exactly where hillshade banding shows).
+/// (0.25 m steps), 0xFFFF = no data.
 pub struct DemPacked {
     pub texel: Box<[u64]>,
 }
 
-pub const ELEV_NODATA: u16 = 0xFFFF;
-
-pub struct LinePlanes {
-    pub class: Box<[u8]>,
-    pub cov: Box<[u8]>,
+/// A resident cell: whichever layers it carried. All `None` = the loader
+/// confirmed the object does not exist (absent), which still ends probing.
+#[derive(Default)]
+pub struct Entry {
+    pub dem: Option<DemPacked>,
+    pub line: Option<ClassCell>,
+    pub land: Option<ClassCell>,
+    pub water: Option<CovCell>,
 }
 
-pub enum Planes {
-    Dem(DemPacked),
-    Line(LinePlanes),
-    /// Loader confirmed the file does not exist.
-    Absent,
+impl Entry {
+    pub fn is_absent(&self) -> bool {
+        self.dem.is_none() && self.line.is_none() && self.land.is_none() && self.water.is_none()
+    }
+    pub fn has_vec(&self) -> bool {
+        self.line.is_some() || self.land.is_some() || self.water.is_some()
+    }
 }
 
 pub struct Loaded {
-    pub layer: Layer,
     pub key: CellKey,
-    pub planes: Planes,
+    pub entry: Entry,
 }
 
 struct WantList {
-    generation: u64,
     /// Pre-sorted by priority (cell distance from view center).
-    list: Vec<(Layer, CellKey)>,
+    list: Vec<CellKey>,
 }
 
-pub enum Entry {
-    Dem(DemPacked),
-    Line(LinePlanes),
-    Absent,
-}
-
-/// Resident cells for one layer: page table over decoded planes, LRU by
-/// frame stamp. Plain maps — a few hundred entries, scanned only on insert
-/// pressure, probed per BLOCK (not per pixel) during render.
+/// Resident cells: page table over decoded planes. Plain map — a few
+/// hundred entries, probed per BLOCK (not per pixel) during render.
+#[derive(Default)]
 pub struct Pool {
-    pub map: FxHashMap<(u8, u64), Entry>,
-    stamp: FxHashMap<(u8, u64), u64>,
-    cap: usize,
-}
-
-impl Pool {
-    #[cfg(test)]
-    pub fn new_for_tests() -> Pool {
-        Pool::new(64)
-    }
-
-    fn new(cap: usize) -> Pool {
-        Pool { map: FxHashMap::default(), stamp: FxHashMap::default(), cap }
-    }
-
-    pub fn touch(&mut self, depth: u8, prefix: u64, frame: u64) {
-        self.stamp.insert((depth, prefix), frame);
-    }
-
-    fn insert(&mut self, key: CellKey, e: Entry, frame: u64, desired: &FxHashSet<(Layer, u8, u64)>, layer: Layer) {
-        if self.map.len() >= self.cap {
-            // Evict the stalest resident not currently desired.
-            let victim = self
-                .map
-                .keys()
-                .filter(|&&(d, p)| !desired.contains(&(layer, d, p)))
-                .min_by_key(|&&(d, p)| self.stamp.get(&(d, p)).copied().unwrap_or(0))
-                .copied();
-            if let Some(v) = victim {
-                self.map.remove(&v);
-                self.stamp.remove(&v);
-            }
-        }
-        self.stamp.insert((key.depth, key.prefix), frame);
-        self.map.insert((key.depth, key.prefix), e);
-    }
+    pub map: FxHashMap<CellKey, Entry>,
 }
 
 pub struct Residency {
     want_tx: Sender<WantList>,
     done_rx: Receiver<Loaded>,
-    pub dem: Pool,
-    pub line: Pool,
-    pending: FxHashSet<(Layer, u8, u64)>,
-    pub desired: FxHashSet<(Layer, u8, u64)>,
-    generation: u64,
+    pub pool: Pool,
+    pending: FxHashSet<CellKey>,
+    pub desired: FxHashSet<CellKey>,
     pub frame: u64,
 }
 
@@ -143,59 +90,39 @@ impl Residency {
         Residency {
             want_tx,
             done_rx,
-            dem: Pool::new(192),
-            line: Pool::new(224),
+            pool: Pool::default(),
             pending: FxHashSet::default(),
             desired: FxHashSet::default(),
-            generation: 0,
             frame: 0,
         }
     }
 
-    /// Drain finished cells into the pools. Returns how many arrived.
+    /// Drain finished cells into the pool. Returns how many arrived.
     pub fn drain(&mut self) -> usize {
         let mut n = 0;
         while let Ok(l) = self.done_rx.try_recv() {
-            self.pending.remove(&(l.layer, l.key.depth, l.key.prefix));
-            let entry = match l.planes {
-                Planes::Dem(p) => Entry::Dem(p),
-                Planes::Line(p) => Entry::Line(p),
-                Planes::Absent => Entry::Absent,
-            };
-            match l.layer {
-                Layer::Dem => self.dem.insert(l.key, entry, self.frame, &self.desired, Layer::Dem),
-                Layer::Line => self.line.insert(l.key, entry, self.frame, &self.desired, Layer::Line),
-            }
+            self.pending.remove(&l.key);
+            self.pool.map.insert(l.key, l.entry);
             n += 1;
         }
         n
     }
 
     /// Declare the frame's desired set — the cells this view needs at its
-    /// depth plus the parents it falls back through. Everything else is
+    /// depths plus the parents it falls back through. Everything else is
     /// dropped now (out of view or zoom mismatch: gone, re-fetched if it
     /// comes back), in-flight requests outside it are forgotten, and only
     /// what's missing is requested, nearest-first.
-    pub fn want(&mut self, mut list: Vec<(Layer, CellKey)>, center: (u64, u64)) {
-        self.desired = list.iter().map(|&(l, k)| (l, k.depth, k.prefix)).collect();
+    pub fn want(&mut self, mut list: Vec<CellKey>, center: (u64, u64)) {
+        self.desired = list.iter().copied().collect();
         let desired = &self.desired;
-        self.dem.map.retain(|&(d, p), _| desired.contains(&(Layer::Dem, d, p)));
-        self.dem.stamp.retain(|&(d, p), _| desired.contains(&(Layer::Dem, d, p)));
-        self.line.map.retain(|&(d, p), _| desired.contains(&(Layer::Line, d, p)));
-        self.line.stamp.retain(|&(d, p), _| desired.contains(&(Layer::Line, d, p)));
-        self.pending.retain(|id| desired.contains(id));
-        list.retain(|&(l, k)| {
-            let id = (l, k.depth, k.prefix);
-            !self.pending.contains(&id)
-                && !match l {
-                    Layer::Dem => self.dem.map.contains_key(&(k.depth, k.prefix)),
-                    Layer::Line => self.line.map.contains_key(&(k.depth, k.prefix)),
-                }
-        });
+        self.pool.map.retain(|k, _| desired.contains(k));
+        self.pending.retain(|k| desired.contains(k));
+        list.retain(|k| !self.pending.contains(k) && !self.pool.map.contains_key(k));
         if list.is_empty() {
             return;
         }
-        list.sort_by_key(|&(_, k)| {
+        list.sort_by_key(|k| {
             let (cu, cv) = k.grid();
             // Chebyshev distance in this depth's grid, normalized by shifting
             // the center (given at depth 30-ish precision) down.
@@ -203,11 +130,10 @@ impl Residency {
             let (ku, kv) = (center.0 >> sh, center.1 >> sh);
             (cu.abs_diff(ku)).max(cv.abs_diff(kv))
         });
-        for &(l, k) in &list {
-            self.pending.insert((l, k.depth, k.prefix));
+        for &k in &list {
+            self.pending.insert(k);
         }
-        self.generation += 1;
-        let _ = self.want_tx.send(WantList { generation: self.generation, list });
+        let _ = self.want_tx.send(WantList { list });
     }
 
     pub fn converged(&self) -> bool {
@@ -237,8 +163,8 @@ fn loader_thread(store: Arc<dyn CellStore>, want_rx: Receiver<WantList>, done_tx
         let mut list = w.list;
         while !list.is_empty() {
             let n = list.len().min(chunk);
-            let batch: Vec<(Layer, CellKey)> = list.drain(..n).collect();
-            let loaded: Vec<Loaded> = batch.par_iter().map(|&(l, k)| load_cell(&*store, l, k)).collect();
+            let batch: Vec<CellKey> = list.drain(..n).collect();
+            let loaded: Vec<Loaded> = batch.par_iter().map(|&k| load_cell(&*store, k)).collect();
             for l in loaded {
                 if done_tx.send(l).is_err() {
                     return;
@@ -252,97 +178,24 @@ fn loader_thread(store: Arc<dyn CellStore>, want_rx: Receiver<WantList>, done_tx
     }
 }
 
-fn load_cell(store: &dyn CellStore, layer: Layer, key: CellKey) -> Loaded {
-    let Some(bytes) = store.get(layer, key) else {
-        return Loaded { layer, key, planes: Planes::Absent };
+fn load_cell(store: &dyn CellStore, key: CellKey) -> Loaded {
+    let Some(bytes) = store.get(key) else {
+        return Loaded { key, entry: Entry::default() };
     };
-    let Ok(fields) = decode_cell_fields(&bytes) else {
-        return Loaded { layer, key, planes: Planes::Absent };
+    let Ok(planes) = decode_cell(&bytes) else {
+        return Loaded { key, entry: Entry::default() };
     };
-    let planes = match layer {
-        Layer::Line => {
-            match (fields.get("class").and_then(plane_u8_mem), fields.get("cov").and_then(plane_u8_mem)) {
-                (Some(class), Some(cov)) => Planes::Line(LinePlanes {
-                    class: class.into_boxed_slice(),
-                    cov: cov.into_boxed_slice(),
-                }),
-                _ => Planes::Absent,
-            }
+    let dem = planes.dem.map(|d| {
+        let mut texel = vec![0u64; TRI].into_boxed_slice();
+        for i in 0..TRI {
+            texel[i] = (d.elev[i] as u64)
+                | ((d.nx[i] as u16 as u64) << 16)
+                | ((d.ny[i] as u16 as u64) << 32)
+                | ((d.nz[i] as u16 as u64) << 48);
         }
-        Layer::Dem => {
-            let (Some(elev), Some(ge), Some(gn)) = (
-                fields.get("elev").and_then(plane_f32_mem),
-                fields.get("ge").and_then(plane_f32_mem),
-                fields.get("gn").and_then(plane_f32_mem),
-            ) else {
-                return Loaded { layer, key, planes: Planes::Absent };
-            };
-            let mut texel = vec![0u64; TRI].into_boxed_slice();
-            for i in 0..TRI {
-                let e = elev[i];
-                let eq: u16 = if e.is_nan() {
-                    ELEV_NODATA
-                } else {
-                    ((e + 500.0) * 4.0).clamp(0.0, 65534.0) as u16
-                };
-                let inv = 1.0 / (1.0 + ge[i] * ge[i] + gn[i] * gn[i]).sqrt();
-                let nx = (-ge[i] * inv * 32767.0) as i16;
-                let ny = (-gn[i] * inv * 32767.0) as i16;
-                let nz = (inv * 32767.0) as i16;
-                texel[i] = (eq as u64)
-                    | ((nx as u16 as u64) << 16)
-                    | ((ny as u16 as u64) << 32)
-                    | ((nz as u16 as u64) << 48);
-            }
-            Planes::Dem(DemPacked { texel })
-        }
-    };
-    Loaded { layer, key, planes }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// A store with nothing in it: every request resolves to Absent, which
-    /// is enough to exercise the residency policy end to end.
-    struct Empty;
-    impl CellStore for Empty {
-        fn get(&self, _layer: Layer, _key: CellKey) -> Option<Vec<u8>> {
-            None
-        }
-    }
-
-    fn settle(r: &mut Residency) {
-        for _ in 0..500 {
-            r.drain();
-            if r.converged() {
-                return;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(2));
-        }
-        panic!("loader never converged");
-    }
-
-    #[test]
-    fn view_only_residency() {
-        let mut r = Residency::new(Arc::new(Empty));
-        let a = CellKey { depth: 8, prefix: 0x3_0000 };
-        let b = CellKey { depth: 8, prefix: 0x3_0001 };
-        r.want(vec![(Layer::Dem, a)], (0, 0));
-        settle(&mut r);
-        assert!(r.dem.map.contains_key(&(8, a.prefix)));
-        // A new view that no longer needs `a`: it's dropped at once, `b` is
-        // requested, and nothing stays pending for the old view.
-        r.want(vec![(Layer::Dem, b)], (0, 0));
-        assert!(!r.dem.map.contains_key(&(8, a.prefix)));
-        assert!(r.pending.contains(&(Layer::Dem, 8, b.prefix)));
-        settle(&mut r);
-        assert!(r.dem.map.contains_key(&(8, b.prefix)));
-        // Re-wanting a resident cell requests nothing.
-        r.want(vec![(Layer::Dem, b)], (0, 0));
-        assert!(r.converged());
-    }
+        DemPacked { texel }
+    });
+    Loaded { key, entry: Entry { dem, line: planes.line, land: planes.land, water: planes.water } }
 }
 
 // ==================== TIERED STORE: VAULT CACHE OVER THE BUCKET ====================
@@ -354,14 +207,14 @@ pub const DEFAULT_CELLS_URL: &str = "https://brobdingnagian.holdmyoscilloscope.c
 
 /// A store that can also keep what it's given (the vault).
 pub trait CellCache: CellStore {
-    fn put(&self, layer: Layer, key: CellKey, bytes: &[u8]);
+    fn put(&self, key: CellKey, bytes: &[u8]);
 }
 
 /// The far tier. `Ok(None)` is a definite absence (the cell was never
 /// baked); `Err` is a failure to find out (offline, timeout), which must
 /// not be remembered as absence.
 pub trait RemoteStore: Send + Sync + 'static {
-    fn fetch(&self, layer: Layer, key: CellKey) -> Result<Option<Vec<u8>>, String>;
+    fn fetch(&self, key: CellKey) -> Result<Option<Vec<u8>>, String>;
 }
 
 /// Cache first, then the bucket, writing hits through. Definite misses
@@ -371,7 +224,7 @@ pub trait RemoteStore: Send + Sync + 'static {
 pub struct TieredStore {
     cache: Arc<dyn CellCache>,
     remote: Arc<dyn RemoteStore>,
-    missing: std::sync::Mutex<FxHashSet<(Layer, u8, u64)>>,
+    missing: std::sync::Mutex<FxHashSet<CellKey>>,
 }
 
 impl TieredStore {
@@ -381,25 +234,24 @@ impl TieredStore {
 }
 
 impl CellStore for TieredStore {
-    fn get(&self, layer: Layer, key: CellKey) -> Option<Vec<u8>> {
-        if let Some(b) = self.cache.get(layer, key) {
+    fn get(&self, key: CellKey) -> Option<Vec<u8>> {
+        if let Some(b) = self.cache.get(key) {
             return Some(b);
         }
-        let id = (layer, key.depth, key.prefix);
-        if self.missing.lock().unwrap().contains(&id) {
+        if self.missing.lock().unwrap().contains(&key) {
             return None;
         }
-        match self.remote.fetch(layer, key) {
+        match self.remote.fetch(key) {
             Ok(Some(b)) => {
-                self.cache.put(layer, key, &b);
+                self.cache.put(key, &b);
                 Some(b)
             }
             Ok(None) => {
-                self.missing.lock().unwrap().insert(id);
+                self.missing.lock().unwrap().insert(key);
                 None
             }
             Err(e) => {
-                eprintln!("cell fetch {}: {e}", key.path(layer.name()));
+                eprintln!("cell fetch {}: {e}", key.path());
                 None
             }
         }
@@ -423,8 +275,8 @@ impl HttpStore {
 }
 
 impl RemoteStore for HttpStore {
-    fn fetch(&self, layer: Layer, key: CellKey) -> Result<Option<Vec<u8>>, String> {
-        let url = format!("{}/{}", self.base, key.path(layer.name()));
+    fn fetch(&self, key: CellKey) -> Result<Option<Vec<u8>>, String> {
+        let url = format!("{}/{}", self.base, key.path());
         match self.agent.get(&url).call() {
             Ok(resp) => {
                 let mut buf = Vec::new();
@@ -439,7 +291,52 @@ impl RemoteStore for HttpStore {
 
 /// The bucket with no cache at all (a desktop without a vault).
 impl CellStore for HttpStore {
-    fn get(&self, layer: Layer, key: CellKey) -> Option<Vec<u8>> {
-        self.fetch(layer, key).ok().flatten()
+    fn get(&self, key: CellKey) -> Option<Vec<u8>> {
+        self.fetch(key).ok().flatten()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A store with nothing in it: every request resolves to absent, which
+    /// is enough to exercise the residency policy end to end.
+    struct Empty;
+    impl CellStore for Empty {
+        fn get(&self, _key: CellKey) -> Option<Vec<u8>> {
+            None
+        }
+    }
+
+    fn settle(r: &mut Residency) {
+        for _ in 0..500 {
+            r.drain();
+            if r.converged() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        panic!("loader never converged");
+    }
+
+    #[test]
+    fn view_only_residency() {
+        let mut r = Residency::new(Arc::new(Empty));
+        let a = CellKey { depth: 8, prefix: 0x3_0000 };
+        let b = CellKey { depth: 8, prefix: 0x3_0001 };
+        r.want(vec![a], (0, 0));
+        settle(&mut r);
+        assert!(r.pool.map.contains_key(&a));
+        // A new view that no longer needs `a`: it's dropped at once, `b` is
+        // requested, and nothing stays pending for the old view.
+        r.want(vec![b], (0, 0));
+        assert!(!r.pool.map.contains_key(&a));
+        assert!(r.pending.contains(&b));
+        settle(&mut r);
+        assert!(r.pool.map.contains_key(&b));
+        // Re-wanting a resident cell requests nothing.
+        r.want(vec![b], (0, 0));
+        assert!(r.converged());
     }
 }

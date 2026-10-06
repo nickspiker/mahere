@@ -28,13 +28,21 @@ fn settle(map: &mut MapCore, w: usize, h: usize) {
 }
 
 fn main() {
+    // relight [lat lon ppd [out.png]]: render that view (default Mt Adams).
+    let args: Vec<String> = std::env::args().collect();
+    let num = |i: usize, d: f64| args.get(i).and_then(|s| s.parse().ok()).unwrap_or(d);
+    let cam = Camera { lat: num(1, 46.2024), lon: num(2, -121.4909), ppd: num(3, 2800.0), bearing: 0.0 };
+    let out = args.get(4).cloned().unwrap_or_else(|| "/tmp/claude-1000/adams_nw.png".into());
     let store = std::sync::Arc::new(DirStore("data/cells".into()));
-    let mut map = MapCore::new(store, Camera { lat: 46.2024, lon: -121.4909, ppd: 2800.0, bearing: 0.0 });
+    let mut map = MapCore::new(store, cam);
     let (w, h) = (1024usize, 768usize);
     settle(&mut map, w, h);
     map.render(w, h);
     eprintln!("frame: {:.2} ms ({} straddle blocks)", map.last_frame_ms, map.last_straddle_blocks);
-    save("/tmp/claude-1000/adams_nw.png", &map.canvas, w, h);
+    save(&out, &map.canvas, w, h);
+    if args.len() > 1 {
+        return;
+    }
     // find first magenta pixel and probe its chain
     map.sun_az = 135.0;
     map.sun_alt = 25.0;

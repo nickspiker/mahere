@@ -275,28 +275,26 @@ mod tests {
 
 /// The vault as the on-device cell tier: every cell fetched from the bucket
 /// is written through here and served from here afterwards (offline
-/// included). Keyed by the VSF values (`d` cell, `d` layer, `u` depth,
-/// `wm` cell) through [`vault_key`], so cells, session and tracks share the
+/// included). Keyed by the VSF values (`d` cell, `u` depth, `wm` cell) through [`vault_key`], so cells, session and tracks share the
 /// vault with the type system as the namespace.
 pub struct VaultCells(pub Arc<FlatStorage>);
 
-fn cell_key(layer: mahere_engine::residency::Layer, key: mahere_tiles::CellKey) -> String {
+fn cell_key(key: mahere_tiles::CellKey) -> String {
     vault_key(&[
         name("cell"),
-        name(layer.name()),
         VsfType::u(key.depth as usize, false),
         VsfType::wm(vsf::types::WorldCell::from_raw(key.raw())),
     ])
 }
 
 impl mahere_engine::residency::CellStore for VaultCells {
-    fn get(&self, layer: mahere_engine::residency::Layer, key: mahere_tiles::CellKey) -> Option<Vec<u8>> {
-        self.0.read_device(&cell_key(layer, key)).ok().flatten()
+    fn get(&self, key: mahere_tiles::CellKey) -> Option<Vec<u8>> {
+        self.0.read_device(&cell_key(key)).ok().flatten()
     }
 }
 
 impl mahere_engine::residency::CellCache for VaultCells {
-    fn put(&self, layer: mahere_engine::residency::Layer, key: mahere_tiles::CellKey, bytes: &[u8]) {
-        let _ = self.0.write_device(&cell_key(layer, key), bytes);
+    fn put(&self, key: mahere_tiles::CellKey, bytes: &[u8]) {
+        let _ = self.0.write_device(&cell_key(key), bytes);
     }
 }

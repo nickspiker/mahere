@@ -1,33 +1,36 @@
 //! The cell pipeline: bake source data into dymaxion-cell rasters — the
-//! #pagetable renderer's entire diet. Two layers today:
+//! #pagetable renderer's entire diet.
 //!
-//! - **dem**: per-cell elevation + gradient planes (f32), sampled from the
-//!   source DEM at bake time (so cell-edge gradients are exact — the baker
-//!   holds the whole source; no aprons needed).
-//! - **line**: the linework pyramid. Every line feature stamped 1 texel wide
-//!   at the base depth, then parents built by averaging the 4 children of
-//!   each texel up the triangle tree — coverage IS box filtering, so opacity
-//!   at every zoom is computed, not styled. No vectors exist at render time.
+//! **One object per cell, every layer inside it.** A cell is one rhombus of
+//! the diamond-Morton grid at `depth`; its file carries a VSF section per
+//! layer present at that depth, and the client decides what to decode,
+//! draw and style:
 //!
-//! **Texels are triangles.** A cell is one rhombus of the diamond-Morton
-//! grid (`depth`), and its texels are the triangular subdivision of that
-//! rhombus's two faces: 256×256 UV squares, each split along `u+v = k` into
-//! a lower and an upper equilateral triangle. The triangular tiling has
-//! 6-fold symmetry and a line always crosses it edge-to-edge, so linework
-//! is isotropic; a square/rhombus texel grid is not (a line along one
-//! diagonal touches rhombi tip-to-tip, along the other obtuse-to-obtuse).
-//! Each triangle subdivides into four — three corners and the inverted
-//! center — and that is the pyramid's box filter.
+//! - **dem**: elevation (u16, 0.25 m steps from -500 m) + unit normal
+//!   (snorm16 ×3), sampled at triangle centroids from the source DEM at
+//!   the base depth, then a pyramid of means.
+//! - **line**: every road, trail, rail, power line and waterway stamped at
+//!   its physical width as (class, coverage) texels; waterways carry their
+//!   upstream-network weight as width and coverage.
+//! - **land**: land cover (class, coverage) from OSM polygons.
+//! - **water**: lakes, ponds, reservoirs, riverbanks as coverage.
+//!
+//! **Texels are triangles.** A cell's 256×256 UV squares are each split
+//! along `u+v = k` into a lower and an upper equilateral triangle. The
+//! triangular tiling has 6-fold symmetry and a line always crosses it
+//! edge-to-edge, so linework is isotropic. Each triangle subdivides into
+//! four — three corners and the inverted center — and that is the
+//! pyramid's box filter: coverage up the pyramid IS area, so minor
+//! features fade and dense ones glow with no styling.
 //!
 //! In memory a cell's planes are indexed `((ty << 8 | tx) << 1) | half`
 //! (the renderer's stepping order). On disk they are in triangle-path
-//! order, `[face half][2 bits per level]` — the triangle code — so a
-//! parent texel's four children are contiguous. [`disk_to_mem`] /
-//! [`mem_to_disk`] convert.
+//! order — the triangle code's digits — so a parent texel's four children
+//! are contiguous. [`disk_to_mem`] / [`mem_to_disk`] convert.
 //!
-//! Texels are (class, coverage) so styling stays a draw-time LUT. Cells are
-//! written as zstd'd VSF at `{layer}/{depth:02}/{prefix:016x}.vsf.zst` —
-//! a directory layout that is byte-for-byte the future R2 bucket layout.
+//! Files are zstd'd VSF at `{name}.vsf.zst` where the name is the cell's
+//! flattened VSF value (`u` depth, `wm` cell) in base64url: no delimiters,
+//! no numerals — a directory layout that is byte-for-byte the bucket.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -35,7 +38,7 @@ use std::sync::OnceLock;
 
 use mahere_coord::{Coord, morton_compact, morton_spread, uv_to_lat_lon};
 use mahere_dem::DemStore;
-use mahere_osm::Road;
+use mahere_osm::{Area, Road};
 use rayon::prelude::*;
 use vsf::types::{Tensor, WorldCell};
 use vsf::{VsfBuilder, VsfType};
@@ -60,9 +63,18 @@ pub const TEX_BITS: u8 = 8;
 /// Texels per cell: two triangles per UV square.
 pub const TRI: usize = 2 * TEX * TEX;
 
+/// Elevation quantization: 0.25 m steps from -500 m; 0xFFFF = no data.
+pub const ELEV_NODATA: u16 = 0xFFFF;
+pub fn quantize_elev(e: f32) -> u16 {
+    if e.is_nan() { ELEV_NODATA } else { ((e + 500.0) * 4.0).clamp(0.0, 65534.0) as u16 }
+}
+pub fn dequantize_elev(q: u16) -> f32 {
+    q as f32 / 4.0 - 500.0
+}
+
 /// A cell address: dymaxion Morton prefix (diamond in the top 4 bits of the
 /// full-resolution coordinate, right-aligned here) at `depth`.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, PartialOrd, Ord)]
 pub struct CellKey {
     pub depth: u8,
     pub prefix: u64,
@@ -104,6 +116,12 @@ impl CellKey {
         )
     }
 
+    /// The cell at `depth` with grid coordinates (cu, cv) in `diamond`.
+    pub fn from_grid(diamond: u8, depth: u8, cu: u64, cv: u64) -> CellKey {
+        let m = (morton_spread(cu << (30 - depth as u32)) << 1) | morton_spread(cv << (30 - depth as u32));
+        CellKey { depth, prefix: ((diamond as u64) << (2 * depth)) | (m >> (60 - 2 * depth as u32)) }
+    }
+
     /// The full-resolution Morton value this cell is a prefix of.
     pub fn raw(self) -> u64 {
         self.prefix << (60 - 2 * self.depth as u32)
@@ -123,8 +141,8 @@ impl CellKey {
         base64url(&self.vsf_bytes())
     }
 
-    pub fn path(self, layer: &str) -> String {
-        format!("{layer}/{}.vsf.zst", self.name())
+    pub fn path(self) -> String {
+        format!("{}.vsf.zst", self.name())
     }
 
     /// Diamond-UV rectangle covered by this cell.
@@ -133,6 +151,16 @@ impl CellKey {
         let size = 1.0 / (1u64 << self.depth) as f64;
         (cu as f64 * size, cv as f64 * size, size)
     }
+
+    /// Rhombus edge length of one UV square (texel) in this cell, meters.
+    pub fn texel_m(self) -> f64 {
+        7_054_000.0 / (1u64 << self.depth) as f64 / TEX as f64
+    }
+}
+
+/// Rhombus edge of a texel at `depth`, meters.
+pub fn texel_m(depth: u8) -> f64 {
+    7_054_000.0 / (1u64 << depth) as f64 / TEX as f64
 }
 
 // ==================== TRIANGLE TEXELS ====================
@@ -152,10 +180,16 @@ pub fn tri_at(gx: f64, gy: f64) -> (usize, usize, usize) {
     (tx as usize, ty as usize, half)
 }
 
+/// Centroid offset within the UV square for each half.
+#[inline(always)]
+pub fn tri_off(half: usize) -> f64 {
+    if half == 0 { 1.0 / 3.0 } else { 2.0 / 3.0 }
+}
+
 /// UV position of a triangle texel's centroid, in texel units.
 #[inline(always)]
 pub fn tri_centroid(tx: usize, ty: usize, half: usize) -> (f64, f64) {
-    let off = if half == 0 { 1.0 / 3.0 } else { 2.0 / 3.0 };
+    let off = tri_off(half);
     (tx as f64 + off, ty as f64 + off)
 }
 
@@ -182,6 +216,13 @@ fn child_cell_texels(tx: usize, ty: usize, half: usize) -> [(u64, usize); 4] {
         let q = (((cx >> TEX_BITS) as u64) << 1) | (cy >> TEX_BITS) as u64;
         (q, tri_idx(cx & (TEX - 1), cy & (TEX - 1), ch))
     })
+}
+
+/// Squared ground distance (in rhombus-edge units) of a UV offset: the UV
+/// axes meet at 60°, so |du e_u + dv e_v|² = du² + dv² + du·dv.
+#[inline(always)]
+fn uv_dist2(du: f64, dv: f64) -> f64 {
+    du * du + dv * dv + du * dv
 }
 
 /// Disk order (triangle path) -> memory index, both halves.
@@ -221,45 +262,103 @@ pub fn disk_to_mem<T: Copy + Default>(disk: &[T]) -> Vec<T> {
 
 /// Global texel coordinates of a Coord at a given base depth: the texel grid
 /// is the cell grid times TEX.
-fn texel_of(c: Coord, depth: u8) -> (u8, u64, f64, f64) {
+fn texel_of(c: Coord, depth: u8) -> (u8, f64, f64) {
     let (iu, iv) = c.uv();
     let shift = 30 - depth as u32 - TEX_BITS as u32;
     let scale = 1.0 / (1u64 << shift) as f64;
-    (c.diamond(), c.raw() >> (60 - 2 * depth as u32), iu as f64 * scale, iv as f64 * scale)
+    (c.diamond(), iu as f64 * scale, iv as f64 * scale)
+}
+
+// ==================== PLANES ====================
+
+/// (class, coverage) planes: lines and land cover.
+#[derive(Clone)]
+pub struct ClassCell {
+    pub class: Vec<u8>, // 0 = empty; else class + 1
+    pub cov: Vec<u8>,
+}
+
+impl ClassCell {
+    pub fn new() -> ClassCell {
+        ClassCell { class: vec![0; TRI], cov: vec![0; TRI] }
+    }
+    pub fn is_empty(&self) -> bool {
+        self.cov.iter().all(|&c| c == 0)
+    }
+}
+
+impl Default for ClassCell {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Coverage-only plane: water areas.
+#[derive(Clone)]
+pub struct CovCell {
+    pub cov: Vec<u8>,
+}
+
+impl CovCell {
+    pub fn new() -> CovCell {
+        CovCell { cov: vec![0; TRI] }
+    }
+    pub fn is_empty(&self) -> bool {
+        self.cov.iter().all(|&c| c == 0)
+    }
+}
+
+impl Default for CovCell {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Baker-side dem planes (f32 so the pyramid averages at full precision).
+#[derive(Clone)]
+pub struct DemCell {
+    pub elev: Vec<f32>,
+    pub ge: Vec<f32>,
+    pub gn: Vec<f32>,
+}
+
+impl DemCell {
+    fn new() -> DemCell {
+        DemCell { elev: vec![f32::NAN; TRI], ge: vec![0.0; TRI], gn: vec![0.0; TRI] }
+    }
+}
+
+/// Everything a cell can carry. Vector layers at a vector depth are always
+/// all present (empty planes compress to nothing), so a reader finding one
+/// of them knows the cell's vector truth is complete.
+#[derive(Clone, Default)]
+pub struct Cell {
+    pub dem: Option<DemCell>,
+    pub line: Option<ClassCell>,
+    pub land: Option<ClassCell>,
+    pub water: Option<CovCell>,
 }
 
 // ==================== LINE LAYER ====================
 
-pub struct LineCell {
-    pub class: Vec<u8>, // 0 = empty; else RoadClass as u8 + 1
-    pub cov: Vec<u8>,
-}
-
-impl LineCell {
-    fn new() -> LineCell {
-        LineCell { class: vec![0; TRI], cov: vec![0; TRI] }
-    }
-}
-
-/// Stamp every feature 1 texel wide into base-depth cells, then build the
-/// pyramid up to `min_depth`. Returns cells keyed by (depth, prefix).
-pub fn bake_lines(
-    feats: &[Road],
-    base_depth: u8,
-    min_depth: u8,
-) -> HashMap<CellKey, LineCell> {
+/// Stamp every feature at its physical width into base-depth cells, then
+/// build the pyramid up to `min_depth` (major class wins per texel).
+pub fn bake_lines(feats: &[Road], base_depth: u8, min_depth: u8) -> HashMap<CellKey, ClassCell> {
     assert!(base_depth as u32 + TEX_BITS as u32 <= 30);
-    let mut cells: HashMap<CellKey, LineCell> = HashMap::new();
+    let mut cells: HashMap<CellKey, ClassCell> = HashMap::new();
     let mut cross_diamond = 0usize;
+    let tm = texel_m(base_depth);
     for road in feats {
         let class = road.class as u8 + 1;
+        let r = (road.width_m() as f64 / 2.0 / tm).max(0.5);
+        let cov_max = road.cov_max();
         let mut prev: Option<(u8, f64, f64)> = None;
         for &(lat, lon) in &road.pts {
             let c = Coord::from_lat_lon(lat as f64, lon as f64);
-            let (d, _, gu, gv) = texel_of(c, base_depth);
+            let (d, gu, gv) = texel_of(c, base_depth);
             if let Some((pd, pu, pv)) = prev {
                 if pd == d {
-                    stamp_segment(&mut cells, base_depth, d, pu, pv, gu, gv, class);
+                    stamp_segment(&mut cells, base_depth, d, (pu, pv), (gu, gv), r, class, cov_max);
                 } else {
                     cross_diamond += 1;
                 }
@@ -270,30 +369,228 @@ pub fn bake_lines(
     if cross_diamond > 0 {
         eprintln!("  (skipped {cross_diamond} cross-diamond segments)");
     }
-    // Pyramid: each parent texel the mean coverage of its four triangle
-    // children (missing children are empty), keeping the most major class.
+    pyramid_class(cells, base_depth, min_depth, ClassMerge::Major)
+}
+
+/// Stamp a segment as a band of radius `r` texels (ground metric): walk the
+/// centreline in half-texel steps and cover every triangle whose centroid
+/// is within the band, coverage feathered over the last texel. Coverage
+/// combines by max; class follows the strongest coverage.
+#[allow(clippy::too_many_arguments)]
+fn stamp_segment(
+    cells: &mut HashMap<CellKey, ClassCell>,
+    depth: u8,
+    diamond: u8,
+    a: (f64, f64),
+    b: (f64, f64),
+    r: f64,
+    class: u8,
+    cov_max: u8,
+) {
+    let extent = ((1u64 << depth) * TEX as u64) as f64;
+    let len = uv_dist2(b.0 - a.0, b.1 - a.1).sqrt();
+    let steps = (len * 2.0).ceil().max(1.0) as usize;
+    // Bounding box of a ground disc of radius r in UV units (the 60° basis
+    // stretches it by up to 2/sqrt(3)).
+    let reach = (r * 1.16 + 1.0).ceil() as i64;
+    for i in 0..=steps {
+        let t = i as f64 / steps as f64;
+        let (px, py) = (a.0 + (b.0 - a.0) * t, a.1 + (b.1 - a.1) * t);
+        let (cx, cy) = (px.floor() as i64, py.floor() as i64);
+        for ty in (cy - reach)..=(cy + reach) {
+            if ty < 0 || ty as f64 >= extent {
+                continue;
+            }
+            for tx in (cx - reach)..=(cx + reach) {
+                if tx < 0 || tx as f64 >= extent {
+                    continue;
+                }
+                for half in 0..2 {
+                    let off = tri_off(half);
+                    let d = uv_dist2(tx as f64 + off - px, ty as f64 + off - py).sqrt();
+                    let cov = (cov_max as f64 * (r + 0.5 - d).clamp(0.0, 1.0)) as u8;
+                    if cov == 0 {
+                        continue;
+                    }
+                    let (tx, ty) = (tx as usize, ty as usize);
+                    let key = CellKey::from_grid(diamond, depth, (tx / TEX) as u64, (ty / TEX) as u64);
+                    let cell = cells.entry(key).or_default();
+                    let i = tri_idx(tx % TEX, ty % TEX, half);
+                    if cov > cell.cov[i] || (cov == cell.cov[i] && class < cell.class[i]) {
+                        cell.cov[i] = cov;
+                        cell.class[i] = class;
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ==================== AREA LAYERS ====================
+
+/// Rasterize land cover and water polygons at base depth (even-odd fill,
+/// sampled at triangle centroids), then pyramid both to `min_depth`.
+pub fn bake_areas(
+    areas: &[Area],
+    base_depth: u8,
+    min_depth: u8,
+) -> (HashMap<CellKey, ClassCell>, HashMap<CellKey, CovCell>) {
+    let mut land: HashMap<CellKey, ClassCell> = HashMap::new();
+    let mut water: HashMap<CellKey, CovCell> = HashMap::new();
+    let mut cross_diamond = 0usize;
+    for area in areas {
+        let mut rings: Vec<Vec<(f64, f64)>> = Vec::new();
+        let mut diamond: Option<u8> = None;
+        let mut bad = false;
+        for ring in &area.rings {
+            let mut out = Vec::with_capacity(ring.len());
+            for &(lat, lon) in ring {
+                let c = Coord::from_lat_lon(lat as f64, lon as f64);
+                let (d, gu, gv) = texel_of(c, base_depth);
+                if diamond.get_or_insert(d) != &d {
+                    bad = true;
+                }
+                out.push((gu, gv));
+            }
+            rings.push(out);
+        }
+        if bad {
+            cross_diamond += 1;
+            continue;
+        }
+        let Some(d) = diamond else { continue };
+        let class = area.class as u8 + 1;
+        if area.class == mahere_osm::AreaClass::Water {
+            fill_rings(&rings, base_depth, |tx, ty, half| {
+                let key = CellKey::from_grid(d, base_depth, (tx / TEX) as u64, (ty / TEX) as u64);
+                water.entry(key).or_default().cov[tri_idx(tx % TEX, ty % TEX, half)] = 255;
+            });
+        } else {
+            fill_rings(&rings, base_depth, |tx, ty, half| {
+                let key = CellKey::from_grid(d, base_depth, (tx / TEX) as u64, (ty / TEX) as u64);
+                let cell = land.entry(key).or_default();
+                let i = tri_idx(tx % TEX, ty % TEX, half);
+                if cell.class[i] == 0 || class > cell.class[i] {
+                    cell.class[i] = class;
+                    cell.cov[i] = 255;
+                }
+            });
+        }
+    }
+    if cross_diamond > 0 {
+        eprintln!("  (skipped {cross_diamond} cross-diamond areas)");
+    }
+    (
+        pyramid_class(land, base_depth, min_depth, ClassMerge::Dominant),
+        pyramid_cov(water, base_depth, min_depth),
+    )
+}
+
+/// Even-odd scanline fill of rings given in global texel coordinates,
+/// visiting every triangle whose centroid is inside.
+fn fill_rings(rings: &[Vec<(f64, f64)>], depth: u8, mut visit: impl FnMut(usize, usize, usize)) {
+    let extent = ((1u64 << depth) * TEX as u64) as f64;
+    let (mut v0, mut v1) = (f64::MAX, f64::MIN);
+    for r in rings {
+        for p in r {
+            v0 = v0.min(p.1);
+            v1 = v1.max(p.1);
+        }
+    }
+    if v0 == f64::MAX {
+        return;
+    }
+    let ty0 = v0.floor().max(0.0) as i64;
+    let ty1 = v1.ceil().min(extent) as i64;
+    let mut xs: Vec<f64> = Vec::new();
+    for ty in ty0..ty1 {
+        for half in 0..2 {
+            let off = tri_off(half);
+            let vl = ty as f64 + off;
+            xs.clear();
+            for r in rings {
+                for w in r.windows(2) {
+                    let (a, b) = (w[0], w[1]);
+                    if (a.1 <= vl) != (b.1 <= vl) {
+                        xs.push(a.0 + (vl - a.1) * (b.0 - a.0) / (b.1 - a.1));
+                    }
+                }
+            }
+            if xs.len() < 2 {
+                continue;
+            }
+            xs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            for pair in xs.chunks(2) {
+                if pair.len() < 2 {
+                    break;
+                }
+                // Centroid u = tx + off inside [x0, x1).
+                let tx_min = ((pair[0] - off).ceil().max(0.0)) as i64;
+                let tx_max = ((pair[1] - off).ceil() - 1.0).min(extent - 1.0) as i64;
+                for tx in tx_min..=tx_max {
+                    visit(tx as usize, ty as usize, half);
+                }
+            }
+        }
+    }
+}
+
+// ==================== PYRAMIDS ====================
+
+#[derive(Clone, Copy)]
+pub enum ClassMerge {
+    /// Lines: the most major class present among the children wins.
+    Major,
+    /// Land cover: the class with the most coverage among the children.
+    Dominant,
+}
+
+/// Parent texel = mean coverage of its four triangle children (missing
+/// children are empty), class per `merge`.
+pub fn pyramid_class(
+    mut cells: HashMap<CellKey, ClassCell>,
+    base_depth: u8,
+    min_depth: u8,
+    merge: ClassMerge,
+) -> HashMap<CellKey, ClassCell> {
     let mut depth = base_depth;
     while depth > min_depth {
-        let mut parents: Vec<CellKey> =
-            cells.keys().filter(|k| k.depth == depth).map(|k| k.parent()).collect();
-        parents.sort_by_key(|k| k.prefix);
+        let mut parents: Vec<CellKey> = cells.keys().filter(|k| k.depth == depth).map(|k| k.parent()).collect();
+        parents.sort();
         parents.dedup();
-        let built: Vec<(CellKey, LineCell)> = parents
+        let built: Vec<(CellKey, ClassCell)> = parents
             .par_iter()
             .map(|&p| {
-                let kids: [Option<&LineCell>; 4] = std::array::from_fn(|q| cells.get(&p.child(q as u64)));
-                let mut cell = LineCell::new();
+                let kids: [Option<&ClassCell>; 4] = std::array::from_fn(|q| cells.get(&p.child(q as u64)));
+                let mut cell = ClassCell::new();
                 for ty in 0..TEX {
                     for tx in 0..TEX {
                         for half in 0..2 {
-                            let mut covsum = 0u16;
+                            let mut covsum = 0u32;
                             let mut best = 0u8;
+                            let mut best_cov = 0u32;
+                            let mut per_class = [0u32; 32];
                             for (q, i) in child_cell_texels(tx, ty, half) {
                                 let Some(child) = kids[q as usize] else { continue };
-                                covsum += child.cov[i] as u16;
+                                let cv = child.cov[i] as u32;
+                                covsum += cv;
                                 let cl = child.class[i];
-                                if cl != 0 && (best == 0 || cl < best) {
-                                    best = cl;
+                                if cl != 0 && cv > 0 {
+                                    match merge {
+                                        ClassMerge::Major => {
+                                            if best == 0 || cl < best {
+                                                best = cl;
+                                            }
+                                        }
+                                        ClassMerge::Dominant => {
+                                            let slot = (cl as usize).min(31);
+                                            per_class[slot] += cv;
+                                            if per_class[slot] > best_cov {
+                                                best_cov = per_class[slot];
+                                                best = cl;
+                                            }
+                                        }
+                                    }
                                 }
                             }
                             let i = tri_idx(tx, ty, half);
@@ -311,75 +608,40 @@ pub fn bake_lines(
     cells
 }
 
-/// Walk the triangles a segment crosses — every crossing of a `u = k`,
-/// `v = k` or `u + v = k` lattice line enters a new triangle — and stamp
-/// each one. Edge-to-edge in every direction: no corner-touching diagonals.
-#[allow(clippy::too_many_arguments)]
-fn stamp_segment(
-    cells: &mut HashMap<CellKey, LineCell>,
-    depth: u8,
-    diamond: u8,
-    x0: f64,
-    y0: f64,
-    x1: f64,
-    y1: f64,
-    class: u8,
-) {
-    let extent = ((1u64 << depth) * TEX as u64) as f64;
-    let mut ts = vec![0.0f64, 1.0];
-    for (a0, a1) in [(x0, x1), (y0, y1), (x0 + y0, x1 + y1)] {
-        if a0 == a1 {
-            continue;
-        }
-        let (lo, hi) = (a0.min(a1), a0.max(a1));
-        for k in (lo.floor() as i64 + 1)..=(hi.ceil() as i64 - 1) {
-            let t = (k as f64 - a0) / (a1 - a0);
-            if t > 0.0 && t < 1.0 {
-                ts.push(t);
-            }
-        }
+pub fn pyramid_cov(mut cells: HashMap<CellKey, CovCell>, base_depth: u8, min_depth: u8) -> HashMap<CellKey, CovCell> {
+    let mut depth = base_depth;
+    while depth > min_depth {
+        let mut parents: Vec<CellKey> = cells.keys().filter(|k| k.depth == depth).map(|k| k.parent()).collect();
+        parents.sort();
+        parents.dedup();
+        let built: Vec<(CellKey, CovCell)> = parents
+            .par_iter()
+            .map(|&p| {
+                let kids: [Option<&CovCell>; 4] = std::array::from_fn(|q| cells.get(&p.child(q as u64)));
+                let mut cell = CovCell::new();
+                for ty in 0..TEX {
+                    for tx in 0..TEX {
+                        for half in 0..2 {
+                            let mut covsum = 0u32;
+                            for (q, i) in child_cell_texels(tx, ty, half) {
+                                if let Some(child) = kids[q as usize] {
+                                    covsum += child.cov[i] as u32;
+                                }
+                            }
+                            cell.cov[tri_idx(tx, ty, half)] = (covsum / 4) as u8;
+                        }
+                    }
+                }
+                (p, cell)
+            })
+            .collect();
+        cells.extend(built);
+        depth -= 1;
     }
-    ts.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    for w in ts.windows(2) {
-        if w[1] - w[0] < 1e-12 {
-            continue;
-        }
-        let t = (w[0] + w[1]) * 0.5;
-        let gx = x0 + (x1 - x0) * t;
-        let gy = y0 + (y1 - y0) * t;
-        if gx < 0.0 || gy < 0.0 || gx >= extent || gy >= extent {
-            continue;
-        }
-        let (tx, ty, half) = tri_at(gx, gy);
-        let (cu, cv) = ((tx / TEX) as u64, (ty / TEX) as u64);
-        let m = (morton_spread(cu << (30 - depth as u32)) << 1)
-            | morton_spread(cv << (30 - depth as u32));
-        let prefix = ((diamond as u64) << (2 * depth)) | (m >> (60 - 2 * depth as u32));
-        let cell = cells
-            .entry(CellKey { depth, prefix })
-            .or_insert_with(LineCell::new);
-        let i = tri_idx(tx % TEX, ty % TEX, half);
-        cell.cov[i] = 255;
-        if cell.class[i] == 0 || class < cell.class[i] {
-            cell.class[i] = class;
-        }
-    }
+    cells
 }
 
 // ==================== DEM LAYER ====================
-
-#[derive(Clone)]
-pub struct DemCell {
-    pub elev: Vec<f32>,
-    pub ge: Vec<f32>,
-    pub gn: Vec<f32>,
-}
-
-impl DemCell {
-    fn new() -> DemCell {
-        DemCell { elev: vec![f32::NAN; TRI], ge: vec![0.0; TRI], gn: vec![0.0; TRI] }
-    }
-}
 
 /// Bake dem cells covering `keys` from the source store: each triangle
 /// texel sampled at its centroid.
@@ -406,6 +668,7 @@ pub fn bake_dem(dem: &DemStore, keys: &[CellKey]) -> Vec<(CellKey, DemCell)> {
             }
             (key, cell)
         })
+        .filter(|(_, c)| c.elev.iter().any(|e| !e.is_nan()))
         .collect()
 }
 
@@ -427,10 +690,9 @@ pub fn dem_pyramid(base: &[(CellKey, DemCell)], min_depth: u8) -> Vec<(CellKey, 
             break;
         }
         let mut parents: Vec<CellKey> = cur.iter().map(|(k, _)| k.parent()).collect();
-        parents.sort_by_key(|k| k.prefix);
+        parents.sort();
         parents.dedup();
-        let by_key: HashMap<(u8, u64), &DemCell> =
-            cur.iter().map(|(k, c)| ((k.depth, k.prefix), c)).collect();
+        let by_key: HashMap<(u8, u64), &DemCell> = cur.iter().map(|(k, c)| ((k.depth, k.prefix), c)).collect();
         let next: Vec<(CellKey, DemCell)> = parents
             .par_iter()
             .map(|&p| {
@@ -482,82 +744,217 @@ pub fn cells_covering(lat0: f64, lon0: f64, lat1: f64, lon1: f64, depth: u8) -> 
     while lat <= lat1 + step {
         let mut lon = lon0;
         while lon <= lon1 + step {
-            keys.insert(CellKey::containing(
-                Coord::from_lat_lon(lat.min(lat1), lon.min(lon1)),
-                depth,
-            ));
+            keys.insert(CellKey::containing(Coord::from_lat_lon(lat.min(lat1), lon.min(lon1)), depth));
             lon += step;
         }
         lat += step;
     }
     let mut v: Vec<CellKey> = keys.into_iter().collect();
-    v.sort_by_key(|k| k.prefix);
+    v.sort();
     v
+}
+
+// ==================== ASSEMBLY ====================
+
+/// Union the layers into cells. Wherever any vector layer exists at a
+/// depth, all three are present (empty planes for the missing ones) so
+/// readers never have to climb for one layer but not another.
+pub fn assemble(
+    dem: Vec<(CellKey, DemCell)>,
+    line: HashMap<CellKey, ClassCell>,
+    land: HashMap<CellKey, ClassCell>,
+    water: HashMap<CellKey, CovCell>,
+) -> HashMap<CellKey, Cell> {
+    let mut cells: HashMap<CellKey, Cell> = HashMap::new();
+    for (k, d) in dem {
+        cells.entry(k).or_default().dem = Some(d);
+    }
+    let mut vec_keys: Vec<CellKey> = line.keys().chain(land.keys()).chain(water.keys()).copied().collect();
+    vec_keys.sort();
+    vec_keys.dedup();
+    let mut line = line;
+    let mut land = land;
+    let mut water = water;
+    for k in vec_keys {
+        let c = cells.entry(k).or_default();
+        c.line = Some(line.remove(&k).unwrap_or_default());
+        c.land = Some(land.remove(&k).unwrap_or_default());
+        c.water = Some(water.remove(&k).unwrap_or_default());
+    }
+    cells
 }
 
 // ==================== VSF I/O ====================
 
-fn plane_u8(mem: &[u8]) -> VsfType {
-    VsfType::t_u3(Tensor::new(vec![2, TEX * TEX], mem_to_disk(mem)))
+/// Decoded, quantized planes in memory order — what the loader hands the
+/// renderer and what a merge-on-write reads back.
+#[derive(Clone, Default)]
+pub struct CellPlanes {
+    pub dem: Option<DemPlanes>,
+    pub line: Option<ClassCell>,
+    pub land: Option<ClassCell>,
+    pub water: Option<CovCell>,
 }
 
-fn plane_f32(mem: &[f32]) -> VsfType {
-    VsfType::t_f5(Tensor::new(vec![2, TEX * TEX], mem_to_disk(mem)))
+#[derive(Clone)]
+pub struct DemPlanes {
+    pub elev: Vec<u16>,
+    pub nx: Vec<i16>,
+    pub ny: Vec<i16>,
+    pub nz: Vec<i16>,
 }
 
-pub fn write_line_cell(out: &Path, key: CellKey, cell: &LineCell) -> Result<(), String> {
-    let bytes = VsfBuilder::new()
-        .add_section(
-            "linecell",
-            vec![
-                ("depth".to_string(), VsfType::u(key.depth as usize, false)),
-                ("prefix".to_string(), VsfType::u(key.prefix as usize, false)),
-                ("class".to_string(), plane_u8(&cell.class)),
-                ("cov".to_string(), plane_u8(&cell.cov)),
-            ],
-        )
-        .build()
-        .map_err(|e| format!("linecell build: {e:?}"))?;
-    write_file(out, &key.path("line"), &bytes)
+impl DemCell {
+    /// Quantize: 0.25 m elevation steps, unit normal from the gradient as
+    /// snorm16 (i16, not u8: u8 bands on gentle slopes, exactly where
+    /// hillshade banding shows).
+    pub fn quantize(&self) -> DemPlanes {
+        let mut p = DemPlanes { elev: vec![0; TRI], nx: vec![0; TRI], ny: vec![0; TRI], nz: vec![0; TRI] };
+        for i in 0..TRI {
+            p.elev[i] = quantize_elev(self.elev[i]);
+            let inv = 1.0 / (1.0 + self.ge[i] * self.ge[i] + self.gn[i] * self.gn[i]).sqrt();
+            p.nx[i] = (-self.ge[i] * inv * 32767.0) as i16;
+            p.ny[i] = (-self.gn[i] * inv * 32767.0) as i16;
+            p.nz[i] = (inv * 32767.0) as i16;
+        }
+        p
+    }
 }
 
-pub fn write_dem_cell(out: &Path, key: CellKey, cell: &DemCell) -> Result<(), String> {
-    let bytes = VsfBuilder::new()
-        .add_section(
-            "demcell",
-            vec![
-                ("depth".to_string(), VsfType::u(key.depth as usize, false)),
-                ("prefix".to_string(), VsfType::u(key.prefix as usize, false)),
-                ("elev".to_string(), plane_f32(&cell.elev)),
-                ("ge".to_string(), plane_f32(&cell.ge)),
-                ("gn".to_string(), plane_f32(&cell.gn)),
-            ],
-        )
-        .build()
-        .map_err(|e| format!("demcell build: {e:?}"))?;
-    write_file(out, &key.path("dem"), &bytes)
+impl Cell {
+    pub fn quantize(&self) -> CellPlanes {
+        CellPlanes {
+            dem: self.dem.as_ref().map(|d| d.quantize()),
+            line: self.line.clone(),
+            land: self.land.clone(),
+            water: self.water.clone(),
+        }
+    }
 }
 
-fn write_file(out: &Path, rel: &str, bytes: &[u8]) -> Result<(), String> {
-    let path = out.join(rel);
+impl CellPlanes {
+    /// Overlay `self` (a new bake) onto `old`. A bake's footprint is where
+    /// it has elevation: inside it the new vector planes win, outside the
+    /// old ones stay; without a dem the new planes replace wholesale.
+    pub fn merge_over(self, old: CellPlanes) -> CellPlanes {
+        let mut out = self;
+        let CellPlanes { dem: old_dem, line: old_line, land: old_land, water: old_water } = old;
+        let (mut old_line, mut old_land, mut old_water) = (old_line, old_land, old_water);
+        match (&mut out.dem, old_dem) {
+            (Some(new), Some(old_dem)) => {
+                let mask: Vec<bool> = new.elev.iter().map(|&e| e != ELEV_NODATA).collect();
+                for i in 0..TRI {
+                    if !mask[i] {
+                        new.elev[i] = old_dem.elev[i];
+                        new.nx[i] = old_dem.nx[i];
+                        new.ny[i] = old_dem.ny[i];
+                        new.nz[i] = old_dem.nz[i];
+                    }
+                }
+                fn keep_old_class(new: &mut Option<ClassCell>, old: Option<ClassCell>, mask: &[bool]) {
+                    match (new, old) {
+                        (Some(n), Some(o)) => {
+                            for i in 0..TRI {
+                                if !mask[i] {
+                                    n.class[i] = o.class[i];
+                                    n.cov[i] = o.cov[i];
+                                }
+                            }
+                        }
+                        (n @ None, Some(o)) => *n = Some(o),
+                        _ => {}
+                    }
+                }
+                keep_old_class(&mut out.line, old_line.take(), &mask);
+                keep_old_class(&mut out.land, old_land.take(), &mask);
+                match (&mut out.water, old_water.take()) {
+                    (Some(n), Some(o)) => {
+                        for i in 0..TRI {
+                            if !mask[i] {
+                                n.cov[i] = o.cov[i];
+                            }
+                        }
+                    }
+                    (n @ None, Some(o)) => *n = Some(o),
+                    _ => {}
+                }
+            }
+            (None, Some(old_dem)) => out.dem = Some(old_dem),
+            _ => {}
+        }
+        if out.line.is_none() {
+            out.line = old_line;
+        }
+        if out.land.is_none() {
+            out.land = old_land;
+        }
+        if out.water.is_none() {
+            out.water = old_water;
+        }
+        out
+    }
+
+    pub fn encode(&self) -> Result<Vec<u8>, String> {
+        let mut b = VsfBuilder::new();
+        if let Some(d) = &self.dem {
+            b = b.add_section(
+                "dem",
+                vec![
+                    ("elev".to_string(), VsfType::t_u4(Tensor::new(vec![2, TEX * TEX], mem_to_disk(&d.elev)))),
+                    ("nx".to_string(), VsfType::t_i4(Tensor::new(vec![2, TEX * TEX], mem_to_disk(&d.nx)))),
+                    ("ny".to_string(), VsfType::t_i4(Tensor::new(vec![2, TEX * TEX], mem_to_disk(&d.ny)))),
+                    ("nz".to_string(), VsfType::t_i4(Tensor::new(vec![2, TEX * TEX], mem_to_disk(&d.nz)))),
+                ],
+            );
+        }
+        for (name, planes) in [("line", &self.line), ("land", &self.land)] {
+            if let Some(p) = planes {
+                b = b.add_section(
+                    name,
+                    vec![
+                        ("class".to_string(), VsfType::t_u3(Tensor::new(vec![2, TEX * TEX], mem_to_disk(&p.class)))),
+                        ("cov".to_string(), VsfType::t_u3(Tensor::new(vec![2, TEX * TEX], mem_to_disk(&p.cov)))),
+                    ],
+                );
+            }
+        }
+        if let Some(w) = &self.water {
+            b = b.add_section(
+                "water",
+                vec![("cov".to_string(), VsfType::t_u3(Tensor::new(vec![2, TEX * TEX], mem_to_disk(&w.cov))))],
+            );
+        }
+        b.build().map_err(|e| format!("cell build: {e:?}"))
+    }
+}
+
+/// Write a cell, merged over whatever is already on disk under that key —
+/// so regional bakes compose instead of clobbering each other.
+pub fn write_cell(out: &Path, key: CellKey, cell: &Cell) -> Result<(), String> {
+    let path = out.join(key.path());
+    let mut planes = cell.quantize();
+    if let Ok(existing) = std::fs::read(&path) {
+        if let Ok(old) = decode_cell(&existing) {
+            planes = planes.merge_over(old);
+        }
+    }
+    let bytes = planes.encode()?;
+    write_file(&path, &bytes)
+}
+
+fn write_file(path: &Path, bytes: &[u8]) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
-    // Whole-file zstd: VSF internals untouched, the R2 layout keeps the
-    // .vsf.zst names, and near-empty line cells shrink ~100x.
+    // Whole-file zstd: VSF internals untouched, the bucket keeps the
+    // .vsf.zst names, and empty planes shrink to nothing.
     let z = zstd::encode_all(bytes, 3).map_err(|e| e.to_string())?;
-    std::fs::write(&path, z).map_err(|e| format!("{}: {e}", path.display()))
-}
-
-/// Read any cell file's fields (width-agnostic, per VSF doctrine).
-pub fn read_cell_fields(path: &Path) -> Result<HashMap<String, VsfType>, String> {
-    let data = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
-    decode_cell_fields(&data).map_err(|e| format!("{}: {e}", path.display()))
+    std::fs::write(path, z).map_err(|e| format!("{}: {e}", path.display()))
 }
 
 /// Decode a cell from raw file bytes (zstd or plain VSF) — the loader
-/// thread's entry point; no filesystem coupling.
-pub fn decode_cell_fields(data: &[u8]) -> Result<HashMap<String, VsfType>, String> {
+/// thread's entry point; no filesystem coupling. Width-agnostic reads.
+pub fn decode_cell(data: &[u8]) -> Result<CellPlanes, String> {
     let plain: Vec<u8>;
     let data = if data.starts_with(&[0x28, 0xB5, 0x2F, 0xFD]) {
         plain = zstd::decode_all(data).map_err(|e| e.to_string())?;
@@ -566,30 +963,73 @@ pub fn decode_cell_fields(data: &[u8]) -> Result<HashMap<String, VsfType>, Strin
         data
     };
     let (header, end) = vsf::VsfHeader::decode(data).map_err(|e| e.to_string())?;
-    let section = header.primary_section(data, end).map_err(|e| e.to_string())?;
-    Ok(section
-        .fields
-        .into_iter()
-        .filter_map(|f| f.values.into_iter().next().map(|v| (f.name, v)))
-        .collect())
+    let sections = header.sections(data, end).map_err(|e| e.to_string())?;
+    let mut out = CellPlanes::default();
+    for s in sections {
+        let fields: HashMap<String, VsfType> =
+            s.fields.into_iter().filter_map(|f| f.values.into_iter().next().map(|v| (f.name, v))).collect();
+        match s.name.as_str() {
+            "dem" => {
+                if let (Some(elev), Some(nx), Some(ny), Some(nz)) = (
+                    fields.get("elev").and_then(plane_u16_mem),
+                    fields.get("nx").and_then(plane_i16_mem),
+                    fields.get("ny").and_then(plane_i16_mem),
+                    fields.get("nz").and_then(plane_i16_mem),
+                ) {
+                    out.dem = Some(DemPlanes { elev, nx, ny, nz });
+                }
+            }
+            "line" | "land" => {
+                if let (Some(class), Some(cov)) =
+                    (fields.get("class").and_then(plane_u8_mem), fields.get("cov").and_then(plane_u8_mem))
+                {
+                    let planes = Some(ClassCell { class, cov });
+                    if s.name == "line" {
+                        out.line = planes;
+                    } else {
+                        out.land = planes;
+                    }
+                }
+            }
+            "water" => {
+                if let Some(cov) = fields.get("cov").and_then(plane_u8_mem) {
+                    out.water = Some(CovCell { cov });
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(out)
 }
 
 /// A u8 plane in memory order, or None if missing/malformed.
 pub fn plane_u8_mem(v: &VsfType) -> Option<Vec<u8>> {
-    let disk = match v {
-        VsfType::t_u3(t) => &t.data,
-        VsfType::v_u3(t) => &t.data,
+    let disk: Vec<u8> = match v {
+        VsfType::t_u3(t) => t.data.clone(),
+        VsfType::v_u3(t) => t.data.clone(),
+        VsfType::t_u0(t) => t.data.iter().map(|&b| b as u8).collect(),
         _ => return None,
     };
-    (disk.len() == TRI).then(|| disk_to_mem(disk))
+    (disk.len() == TRI).then(|| disk_to_mem(&disk))
 }
 
-/// An f32 plane in memory order, or None if missing/malformed.
-pub fn plane_f32_mem(v: &VsfType) -> Option<Vec<f32>> {
-    let disk: Vec<f32> = match v {
-        VsfType::t_f5(t) => t.data.clone(),
-        VsfType::v_f5(t) => t.data.clone(),
-        VsfType::t_f6(t) => t.data.iter().map(|&x| x as f32).collect(),
+pub fn plane_u16_mem(v: &VsfType) -> Option<Vec<u16>> {
+    let disk: Vec<u16> = match v {
+        VsfType::t_u4(t) => t.data.clone(),
+        VsfType::v_u4(t) => t.data.clone(),
+        VsfType::t_u3(t) => t.data.iter().map(|&x| x as u16).collect(),
+        VsfType::v_u3(t) => t.data.iter().map(|&x| x as u16).collect(),
+        _ => return None,
+    };
+    (disk.len() == TRI).then(|| disk_to_mem(&disk))
+}
+
+pub fn plane_i16_mem(v: &VsfType) -> Option<Vec<i16>> {
+    let disk: Vec<i16> = match v {
+        VsfType::t_i4(t) => t.data.clone(),
+        VsfType::v_i4(t) => t.data.clone(),
+        VsfType::t_i3(t) => t.data.iter().map(|&x| x as i16).collect(),
+        VsfType::v_i3(t) => t.data.iter().map(|&x| x as i16).collect(),
         _ => return None,
     };
     (disk.len() == TRI).then(|| disk_to_mem(&disk))
@@ -611,6 +1051,8 @@ mod tests {
             assert!(u >= u0 && u < u0 + size, "u {u} not in [{u0}, {})", u0 + size);
             assert!(v >= v0 && v < v0 + size);
             assert_eq!(key.parent().child((key.prefix & 3) as u64), key);
+            let (cu, cv) = key.grid();
+            assert_eq!(CellKey::from_grid(key.diamond(), depth, cu, cv), key);
         }
     }
 
@@ -631,8 +1073,6 @@ mod tests {
             }
         }
         assert!(seen.iter().all(|&s| s == 1), "children overlap or leave gaps");
-        // The center child really is the apex square with flipped orientation,
-        // and its centroid is the parent's centroid.
         let (px, py) = tri_centroid(3, 5, 0);
         let (cx, cy, ch) = tri_children(3, 5, 0)[3];
         let (qx, qy) = tri_centroid(cx, cy, ch);
@@ -648,68 +1088,122 @@ mod tests {
             hit[m as usize] = true;
         }
         assert!(hit.iter().all(|&h| h));
-        // A parent texel's four children are contiguous in disk order.
         let mem: Vec<u32> = (0..TRI as u32).collect();
         let disk = mem_to_disk(&mem);
         assert_eq!(disk_to_mem(&disk), mem);
-        // Disk index 0..4 of face 0 are the four children of the level-7
-        // apex chain: they share the (0,0) square or its neighbors.
-        let first: Vec<usize> = disk[..4].iter().map(|&m| m as usize).collect();
-        let (tx, ty, h) = (0, 0, 0);
-        let kids: Vec<usize> = tri_children(tx, ty, h).iter().map(|&(x, y, c)| tri_idx(x, y, c)).collect();
-        assert_eq!(first, kids);
     }
 
-    #[test]
-    fn stamped_line_survives_pyramid() {
-        // One diagonal trail across a cell at depth 12 -> coverage must
-        // appear at 12 and fade (not vanish) at 10.
-        let road = Road {
-            class: mahere_osm::RoadClass::Path,
+    fn trail(class: mahere_osm::RoadClass, weight: f32) -> Road {
+        Road {
+            class,
+            weight,
             pts: (0..200)
                 .map(|i| {
                     let t = i as f32 / 199.0;
                     (46.15 + t * 0.02, -121.52 + t * 0.03)
                 })
                 .collect(),
-        };
-        let cells = bake_lines(&[road], 12, 10);
-        let base_cov: u64 = cells
-            .iter()
-            .filter(|(k, _)| k.depth == 12)
-            .map(|(_, c)| c.cov.iter().map(|&x| x as u64).sum::<u64>())
-            .sum();
-        let top_cov: u64 = cells
-            .iter()
-            .filter(|(k, _)| k.depth == 10)
-            .map(|(_, c)| c.cov.iter().map(|&x| x as u64).sum::<u64>())
-            .sum();
-        assert!(base_cov > 0, "base stamping produced nothing");
-        assert!(top_cov > 0, "pyramid lost the line");
-        // Box filtering conserves total coverage (up to edge rounding).
-        let ratio = base_cov as f64 / top_cov as f64;
-        assert!(
-            (0.7..=1.5).contains(&(ratio / 16.0)),
-            "coverage not conserved through 2 levels: base {base_cov} top {top_cov}"
-        );
+        }
     }
 
-    /// Lines in the two diagonal directions stamp the same number of
-    /// triangles per unit length — the isotropy the rhombus grid lacked.
     #[test]
-    fn diagonal_lines_are_isotropic() {
-        let mut cells = HashMap::new();
-        let len = 100.0;
-        stamp_segment(&mut cells, 12, 3, 10.0, 10.0, 10.0 + len, 10.0 + len, 1);
-        let plus: usize = cells.values().map(|c| c.cov.iter().filter(|&&x| x > 0).count()).sum();
-        let mut cells = HashMap::new();
-        stamp_segment(&mut cells, 12, 3, 10.0, 110.0, 10.0 + len, 110.0 - len, 1);
-        let minus: usize = cells.values().map(|c| c.cov.iter().filter(|&&x| x > 0).count()).sum();
-        assert!(plus > 0 && minus > 0);
-        // In UV units (1,1) is the rhombus's long diagonal, sqrt(3) times
-        // the ground length of (1,-1): per unit of ground the two stamp the
-        // same number of triangles within the lattice's inherent 2/sqrt(3).
-        let r = plus as f64 / 3f64.sqrt() / minus as f64;
-        assert!((0.8..=1.25).contains(&r), "+45 stamped {plus} triangles, -45 stamped {minus}");
+    fn stamped_line_survives_pyramid() {
+        let cells = bake_lines(&[trail(mahere_osm::RoadClass::Path, 0.0)], 12, 10);
+        let sum = |d: u8| -> u64 {
+            cells.iter().filter(|(k, _)| k.depth == d).map(|(_, c)| c.cov.iter().map(|&x| x as u64).sum::<u64>()).sum()
+        };
+        let (base_cov, top_cov) = (sum(12), sum(10));
+        assert!(base_cov > 0, "base stamping produced nothing");
+        assert!(top_cov > 0, "pyramid lost the line");
+        let ratio = base_cov as f64 / top_cov as f64;
+        assert!((0.7..=1.5).contains(&(ratio / 16.0)), "coverage not conserved: base {base_cov} top {top_cov}");
+    }
+
+    /// A motorway covers more ground than a path along the same line, in
+    /// proportion to its width.
+    #[test]
+    fn width_scales_coverage() {
+        let path = bake_lines(&[trail(mahere_osm::RoadClass::Path, 0.0)], 13, 13);
+        let mway = bake_lines(&[trail(mahere_osm::RoadClass::Motorway, 0.0)], 13, 13);
+        let total = |m: &HashMap<CellKey, ClassCell>| -> u64 {
+            m.values().map(|c| c.cov.iter().map(|&x| x as u64).sum::<u64>()).sum()
+        };
+        let r = total(&mway) as f64 / total(&path) as f64;
+        assert!(r > 8.0 && r < 40.0, "motorway/path coverage ratio {r}");
+    }
+
+    /// A square lake fills its interior (and only its interior), and the
+    /// pyramid conserves its area.
+    #[test]
+    fn polygon_fill_is_area_exact() {
+        let (lat0, lon0, lat1, lon1) = (46.20f32, -121.50f32, 46.22f32, -121.47f32);
+        let area = Area {
+            class: mahere_osm::AreaClass::Water,
+            rings: vec![vec![(lat0, lon0), (lat0, lon1), (lat1, lon1), (lat1, lon0), (lat0, lon0)]],
+        };
+        let (_, water) = bake_areas(&[area], 12, 10);
+        let sum = |d: u8| -> u64 {
+            water.iter().filter(|(k, _)| k.depth == d).map(|(_, c)| c.cov.iter().map(|&x| x as u64).sum::<u64>()).sum()
+        };
+        let base = sum(12);
+        // Expected count: the lake's area over the LOCAL triangle area (the
+        // gnomonic face mapping varies texel size across a face, so measure
+        // one texel's parallelogram on the ground at the lake's centre).
+        let c = Coord::from_lat_lon(46.21, -121.485);
+        let (iu, iv) = c.uv();
+        let unit = 1.0 / (1u64 << 30) as f64;
+        let (u, v) = (iu as f64 * unit, iv as f64 * unit);
+        let du = 1.0 / (1u64 << (12 + 8)) as f64;
+        let m = |lat: f64, lon: f64| -> (f64, f64) { (lon * 111_320.0 * 46.21f64.to_radians().cos(), lat * 111_320.0) };
+        let p0 = uv_to_lat_lon(c.diamond(), u, v);
+        let pu = uv_to_lat_lon(c.diamond(), u + du, v);
+        let pv = uv_to_lat_lon(c.diamond(), u, v + du);
+        let (o, a, b) = (m(p0.0, p0.1), m(pu.0, pu.1), m(pv.0, pv.1));
+        let para = ((a.0 - o.0) * (b.1 - o.1) - (a.1 - o.1) * (b.0 - o.0)).abs();
+        let lake_m2 = (0.02 * 111_320.0) * (0.03 * 111_320.0 * 46.21f64.to_radians().cos());
+        let expect_texels = lake_m2 / (para / 2.0);
+        let got_texels = base as f64 / 255.0;
+        assert!((got_texels / expect_texels - 1.0).abs() < 0.05, "lake texels {got_texels} vs {expect_texels}");
+        let top = sum(10);
+        assert!((base as f64 / top as f64 / 16.0 - 1.0).abs() < 0.1, "pyramid lost water: {base} vs {top}");
+    }
+
+    #[test]
+    fn cell_round_trips_through_vsf_and_merges() {
+        let mut dem = DemCell::new();
+        for i in 0..TRI / 2 {
+            dem.elev[i] = 1000.0 + (i % 7) as f32;
+            dem.ge[i] = 0.1;
+        }
+        let mut line = ClassCell::new();
+        line.class[5] = 3;
+        line.cov[5] = 200;
+        let cell = Cell { dem: Some(dem), line: Some(line), land: Some(ClassCell::new()), water: None };
+        let bytes = cell.quantize().encode().unwrap();
+        let back = decode_cell(&bytes).unwrap();
+        let d = back.dem.as_ref().unwrap();
+        assert_eq!(d.elev[3], quantize_elev(1003.0));
+        assert_eq!(d.elev[TRI - 1], ELEV_NODATA);
+        assert!(d.nx[3] < 0 && d.nz[3] > 30000);
+        assert_eq!(back.line.as_ref().unwrap().cov[5], 200);
+        assert!(back.water.is_none());
+
+        // Merge: a second bake covering the OTHER half keeps our half.
+        let mut dem2 = DemCell::new();
+        for i in TRI / 2..TRI {
+            dem2.elev[i] = 50.0;
+        }
+        let mut line2 = ClassCell::new();
+        line2.cov[5] = 1; // outside dem2's footprint: must NOT win
+        line2.cov[TRI - 1] = 9;
+        let cell2 = Cell { dem: Some(dem2), line: Some(line2), land: None, water: None };
+        let merged = cell2.quantize().merge_over(back);
+        let d = merged.dem.as_ref().unwrap();
+        assert_eq!(d.elev[3], quantize_elev(1003.0));
+        assert_eq!(d.elev[TRI - 1], quantize_elev(50.0));
+        let l = merged.line.as_ref().unwrap();
+        assert_eq!(l.cov[5], 200);
+        assert_eq!(l.cov[TRI - 1], 9);
+        assert!(merged.land.is_some(), "a layer absent from the new bake survives from the old");
     }
 }

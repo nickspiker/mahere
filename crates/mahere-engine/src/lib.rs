@@ -12,8 +12,9 @@ use std::time::Instant;
 
 use mahere_coord::Coord;
 use mahere_tiles::TEX;
-use raster::{DEM_BASE_DEPTH, FrameLuts, LINE_BASE_DEPTH, build_hypso_lut, select_depth};
-use residency::{CellStore, Entry, Residency};
+pub use raster::LayerMask;
+use raster::{DEM_BASE_DEPTH, FrameLuts, VEC_BASE_DEPTH, build_hypso_lut, select_depth};
+use residency::{CellStore, Residency};
 
 pub const PPD_REF: f64 = 6000.;
 pub const BG_RGB: u32 = 0x12141A;
@@ -79,7 +80,7 @@ pub struct MapCore {
     pub canvas: Vec<u32>,
     canvas_w: usize,
     canvas_h: usize,
-    line_depth: u8,
+    vec_depth: u8,
     dem_depth: u8,
     home: Camera,
     /// Measured cost of the last `render` call in milliseconds.
@@ -95,7 +96,7 @@ impl MapCore {
         MapCore {
             cam: home,
             res: Residency::new(store),
-            luts: FrameLuts { hypso: build_hypso_lut(), sun: [0.0, 0.0, 1.0] },
+            luts: FrameLuts { hypso: build_hypso_lut(), sun: [0.0, 0.0, 1.0], mask: LayerMask::default() },
             luts_sun: (f32::NAN, f32::NAN, f64::NAN),
             sun_az: 315.0,
             sun_alt: 40.0,
@@ -103,7 +104,7 @@ impl MapCore {
             canvas: Vec::new(),
             canvas_w: 0,
             canvas_h: 0,
-            line_depth: LINE_BASE_DEPTH,
+            vec_depth: VEC_BASE_DEPTH,
             dem_depth: DEM_BASE_DEPTH,
             home,
             last_frame_ms: 0.0,
@@ -180,6 +181,16 @@ impl MapCore {
         self.dirty = true;
     }
 
+    /// The client's layer filter: which of dem / land / water / line draw.
+    pub fn layers(&self) -> LayerMask {
+        self.luts.mask
+    }
+
+    pub fn set_layers(&mut self, mask: LayerMask) {
+        self.luts.mask = mask;
+        self.dirty = true;
+    }
+
     /// DEM elevation at the GPS fix from resident cells (deepest first).
     pub fn gps_elevation(&self) -> Option<f32> {
         let g = self.gps?;
@@ -191,13 +202,13 @@ impl MapCore {
         let raw = c.raw();
         let (iu, iv) = c.uv();
         for depth in (raster::MIN_DEPTH..=DEM_BASE_DEPTH).rev() {
-            let prefix = raw >> (60 - 2 * depth as u32);
-            if let Some(Entry::Dem(p)) = self.res.dem.map.get(&(depth, prefix)) {
+            let key = mahere_tiles::CellKey { depth, prefix: raw >> (60 - 2 * depth as u32) };
+            if let Some(p) = self.res.pool.map.get(&key).and_then(|e| e.dem.as_ref()) {
                 let shift = 16 + (22 - depth as u32);
                 let i = raster::tri_index((iu as i64) << 16, (iv as i64) << 16, shift);
                 let eq = (p.texel[i] & 0xFFFF) as u16;
-                if eq != residency::ELEV_NODATA {
-                    return Some(eq as f32 / 4.0 - 500.0);
+                if eq != mahere_tiles::ELEV_NODATA {
+                    return Some(mahere_tiles::dequantize_elev(eq));
                 }
             }
         }
@@ -254,7 +265,7 @@ impl MapCore {
             ];
             self.luts_sun = (self.sun_az, self.sun_alt, self.cam.bearing);
         }
-        self.line_depth = select_depth(self.cam.ppd, self.line_depth, LINE_BASE_DEPTH);
+        self.vec_depth = select_depth(self.cam.ppd, self.vec_depth, VEC_BASE_DEPTH);
         self.dem_depth = select_depth(self.cam.ppd, self.dem_depth, DEM_BASE_DEPTH);
 
         let (stats, want) = raster::render_frame(
@@ -262,11 +273,10 @@ impl MapCore {
             w,
             h,
             &self.cam,
-            &self.res.dem,
-            &self.res.line,
+            &self.res.pool,
             &self.luts,
             self.dem_depth,
-            self.line_depth,
+            self.vec_depth,
         );
         self.last_straddle_blocks = stats.straddle_blocks;
 
@@ -412,7 +422,7 @@ mod tests {
 
     struct Empty;
     impl CellStore for Empty {
-        fn get(&self, _layer: residency::Layer, _key: mahere_tiles::CellKey) -> Option<Vec<u8>> {
+        fn get(&self, _key: mahere_tiles::CellKey) -> Option<Vec<u8>> {
             None
         }
     }

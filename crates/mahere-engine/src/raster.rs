@@ -1,20 +1,27 @@
 //! The hot loop: the #pagetable compositor. A frame is fetches — 32 px
 //! block grid with exact corners, fixed-point UV stepping inside, per-BLOCK
-//! cell resolution through the page table, nearest-fetch compose of the dem
-//! and line layers through style LUTs. No vectors, no re-rasterization, no
+//! cell resolution through the page table, nearest-fetch compose of the
+//! layers through style LUTs. No vectors, no re-rasterization, no
 //! allocation; rayon over row bands.
+//!
+//! Two depth selections: the dem's and the vector layers' (line, land,
+//! water share a base and live in the same cell). Each block resolves one
+//! dem ref and one vector ref; a pixel composes dem → land tint → shade →
+//! water → line, each gated by the client's layer mask.
 
 use mahere_coord::Coord;
-use mahere_tiles::CellKey;
+use mahere_tiles::{CellKey, ClassCell, CovCell, ELEV_NODATA};
 use rayon::prelude::*;
 use rustc_hash::FxHashSet;
 
 use crate::Camera;
-use crate::residency::{DemPacked, ELEV_NODATA, Entry, Layer, LinePlanes, Pool};
+use crate::residency::{DemPacked, Entry, Pool};
 
 pub const BLOCK: usize = 32;
-pub const LINE_BASE_DEPTH: u8 = 13;
-pub const DEM_BASE_DEPTH: u8 = 11;
+/// Deepest depths any bake produces; regions baked shallower simply fall
+/// back to their parents through the page table.
+pub const VEC_BASE_DEPTH: u8 = 14;
+pub const DEM_BASE_DEPTH: u8 = 14;
 pub const MIN_DEPTH: u8 = 6;
 
 /// texel/pixel ratio constant: diamond edge 7054 km, 111320 m/deg, 256
@@ -31,6 +38,21 @@ pub fn select_depth(ppd: f64, last: u8, base: u8) -> u8 {
     (ideal.ceil() as i32).clamp(MIN_DEPTH as i32, base as i32) as u8
 }
 
+/// Which layers the client wants drawn — the filter. Styling is the LUTs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LayerMask {
+    pub dem: bool,
+    pub land: bool,
+    pub water: bool,
+    pub line: bool,
+}
+
+impl Default for LayerMask {
+    fn default() -> Self {
+        LayerMask { dem: true, land: true, water: true, line: true }
+    }
+}
+
 /// Hypsometric tint LUT indexed by elev_q >> 4 (4 m buckets). Water and
 /// no-data are LUT rows, keeping the pixel loop branch-free on terrain type.
 pub fn build_hypso_lut() -> Box<[[u8; 3]; 4096]> {
@@ -45,7 +67,7 @@ pub fn build_hypso_lut() -> Box<[[u8; 3]; 4096]> {
     for (i, out) in lut.iter_mut().enumerate() {
         let elev = (i as f32 * 16.0) / 4.0 - 500.0; // bucket -> meters
         if elev < 0.5 {
-            *out = [26, 58, 82]; // water
+            *out = WATER_RGB; // the sea
             continue;
         }
         let mut tint = STOPS[STOPS.len() - 1].1;
@@ -64,11 +86,16 @@ pub fn build_hypso_lut() -> Box<[[u8; 3]; 4096]> {
         }
         *out = [tint[0] as u8, tint[1] as u8, tint[2] as u8];
     }
-    lut[4095] = [18, 20, 26]; // no-data = background
+    lut[4095] = BG_RGB8; // no-data = background
     lut
 }
 
-/// class id (1-based, 0 = empty) -> visible RGB. Index 12 = Waterway.
+pub const BG_RGB8: [u8; 3] = [18, 20, 26];
+pub const WATER_RGB: [u8; 3] = [26, 58, 82];
+/// Terrain tint when the dem layer is off or absent: a neutral ground.
+const FLAT_RGB: [u8; 3] = [96, 100, 96];
+
+/// Line class id (1-based, 0 = empty) -> visible RGB. Index 12 = Waterway.
 pub const CLASS_LUT: [[u8; 3]; 13] = [
     [0, 0, 0],
     [245, 150, 60],
@@ -85,6 +112,26 @@ pub const CLASS_LUT: [[u8; 3]; 13] = [
     [84, 150, 210],
 ];
 
+/// Land cover class id (1-based = AreaClass + 1) -> tint. Order follows
+/// mahere_osm::AreaClass: Grass, Farmland, Orchard, Scrub, Forest,
+/// Wetland, Sand, Rock, Glacier, Quarry, Industrial, Urban, Water.
+pub const LAND_LUT: [[u8; 3]; 14] = [
+    [0, 0, 0],
+    [122, 162, 90],
+    [178, 170, 108],
+    [138, 160, 88],
+    [118, 138, 88],
+    [66, 108, 66],
+    [92, 140, 128],
+    [214, 200, 160],
+    [150, 146, 140],
+    [226, 232, 240],
+    [130, 120, 110],
+    [140, 132, 142],
+    [152, 140, 138],
+    [26, 58, 82],
+];
+
 /// One resolved layer reference for a block: planes plus the shift that maps
 /// Q30.16 UV to this entry's texel grid (depends on the entry's ACTUAL
 /// depth — a parent fallback is just a different shift).
@@ -95,19 +142,25 @@ enum DemRef<'a> {
 }
 
 #[derive(Clone, Copy)]
-enum LineRef<'a> {
-    Cell { planes: &'a LinePlanes, shift: u32, prefix_shift: u32, prefix: u64 },
+enum VecRef<'a> {
+    Cell {
+        line: Option<&'a ClassCell>,
+        land: Option<&'a ClassCell>,
+        water: Option<&'a CovCell>,
+        shift: u32,
+        prefix_shift: u32,
+        prefix: u64,
+    },
     None,
 }
 
-/// Probe the pool at `depth`, climbing parents to MIN_DEPTH. Returns the
-/// entry and the depth it was found at. `Absent` entries climb too (for dem
-/// a parent is coarser truth; for lines the parent IS the box-filtered
-/// truth).
-fn probe<'a>(pool: &'a Pool, mut depth: u8, mut prefix: u64) -> Option<(&'a Entry, u8, u64)> {
+/// Probe the pool at `depth`, climbing parents to MIN_DEPTH until an entry
+/// satisfies `has`. Absent cells climb too (for dem a parent is coarser
+/// truth; for vector layers the parent IS the box-filtered truth).
+fn probe<'a>(pool: &'a Pool, mut depth: u8, mut prefix: u64, has: impl Fn(&Entry) -> bool) -> Option<(&'a Entry, u8, u64)> {
     loop {
-        if let Some(e) = pool.map.get(&(depth, prefix)) {
-            if !matches!(e, Entry::Absent) {
+        if let Some(e) = pool.map.get(&CellKey { depth, prefix }) {
+            if has(e) {
                 return Some((e, depth, prefix));
             }
         }
@@ -122,6 +175,7 @@ fn probe<'a>(pool: &'a Pool, mut depth: u8, mut prefix: u64) -> Option<(&'a Entr
 pub struct FrameLuts {
     pub hypso: Box<[[u8; 3]; 4096]>,
     pub sun: [f32; 3],
+    pub mask: LayerMask,
 }
 
 /// Corner lattice entry: diamond + Q30.16 UV (i64).
@@ -152,12 +206,11 @@ pub fn render_frame(
     w: usize,
     h: usize,
     cam: &Camera,
-    dem_pool: &Pool,
-    line_pool: &Pool,
+    pool: &Pool,
     luts: &FrameLuts,
     dem_depth: u8,
-    line_depth: u8,
-) -> (FrameStats, Vec<(Layer, CellKey)>) {
+    vec_depth: u8,
+) -> (FrameStats, Vec<CellKey>) {
     let bw = w.div_ceil(BLOCK);
     let bh = h.div_ceil(BLOCK);
     // Corner lattice (exact math), rayon'd.
@@ -170,97 +223,76 @@ pub fn render_frame(
         .collect();
 
     // Desired set from the lattice: active depths + 2 parent rings + base.
-    let mut desired: FxHashSet<(Layer, u8, u64)> = FxHashSet::default();
+    let mut desired: FxHashSet<CellKey> = FxHashSet::default();
     for c in &corners {
-        let raw = ((c.diamond as u64) << 60)
-            | (mahere_coord::morton_spread((c.u >> 16) as u64) << 1)
-            | mahere_coord::morton_spread((c.v >> 16) as u64);
-        for (layer, d0) in [(Layer::Dem, dem_depth), (Layer::Line, line_depth)] {
+        let raw = raw_of(c.diamond, c.u, c.v);
+        for d0 in [dem_depth, vec_depth] {
             let mut d = d0;
             loop {
-                desired.insert((layer, d, raw >> (60 - 2 * d as u32)));
+                desired.insert(CellKey { depth: d, prefix: raw >> (60 - 2 * d as u32) });
                 if d <= d0.saturating_sub(2) || d == MIN_DEPTH {
                     break;
                 }
                 d -= 1;
             }
-            desired.insert((layer, MIN_DEPTH, raw >> (60 - 2 * MIN_DEPTH as u32)));
+            desired.insert(CellKey { depth: MIN_DEPTH, prefix: raw >> (60 - 2 * MIN_DEPTH as u32) });
         }
     }
-    let want: Vec<(Layer, CellKey)> = desired
-        .iter()
-        .map(|&(l, depth, prefix)| (l, CellKey { depth, prefix }))
-        .collect();
+    let want: Vec<CellKey> = desired.into_iter().collect();
 
-    let straddles: Vec<usize> = Vec::new();
     let straddle_count = std::sync::atomic::AtomicUsize::new(0);
-    let _ = straddles;
 
-    canvas
-        .par_chunks_mut(w * BLOCK)
-        .enumerate()
-        .for_each(|(by, band)| {
-            let band_h = band.len() / w;
-            for bx in 0..bw {
-                let c00 = corners[by * (bw + 1) + bx];
-                let c10 = corners[by * (bw + 1) + bx + 1];
-                let c01 = corners[(by + 1) * (bw + 1) + bx];
-                let c11 = corners[(by + 1) * (bw + 1) + bx + 1];
-                let x0 = bx * BLOCK;
-                let bweff = (w - x0).min(BLOCK);
-                if c00.diamond != c10.diamond
-                    || c00.diamond != c01.diamond
-                    || c00.diamond != c11.diamond
-                {
-                    straddle_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    render_block_exact(
-                        band, w, x0, bweff, band_h, by, cam, dem_pool, line_pool, luts,
-                        dem_depth, line_depth, h,
-                        &[c00.diamond, c10.diamond, c01.diamond, c11.diamond],
-                    );
-                    continue;
-                }
-                render_block_interp(
-                    band, w, x0, bweff, band_h, c00, c10, c01, c11, dem_pool, line_pool,
-                    luts, dem_depth, line_depth,
+    canvas.par_chunks_mut(w * BLOCK).enumerate().for_each(|(by, band)| {
+        let band_h = band.len() / w;
+        for bx in 0..bw {
+            let c00 = corners[by * (bw + 1) + bx];
+            let c10 = corners[by * (bw + 1) + bx + 1];
+            let c01 = corners[(by + 1) * (bw + 1) + bx];
+            let c11 = corners[(by + 1) * (bw + 1) + bx + 1];
+            let x0 = bx * BLOCK;
+            let bweff = (w - x0).min(BLOCK);
+            if c00.diamond != c10.diamond || c00.diamond != c01.diamond || c00.diamond != c11.diamond {
+                straddle_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                render_block_exact(
+                    band, w, x0, bweff, band_h, by, cam, pool, luts, dem_depth, vec_depth, h,
+                    &[c00.diamond, c10.diamond, c01.diamond, c11.diamond],
                 );
+                continue;
             }
-        });
+            render_block_interp(band, w, x0, bweff, band_h, c00, c10, c01, c11, pool, luts, dem_depth, vec_depth);
+        }
+    });
 
-    (
-        FrameStats {
-            blocks: bw * bh,
-            straddle_blocks: straddle_count.into_inner(),
-        },
-        want,
-    )
+    (FrameStats { blocks: bw * bh, straddle_blocks: straddle_count.into_inner() }, want)
 }
 
-/// Resolve a layer ref for a given full-res raw prefix base. Shift maps
-/// Q30.16 u to texel at the found depth: tx = (uQ >> (16 + 22 - d)) & 255.
-fn resolve_dem<'a>(pool: &'a Pool, depth: u8, raw_prefix_base: u64) -> DemRef<'a> {
-    let prefix = raw_prefix_base >> (60 - 2 * depth as u32);
-    match probe(pool, depth, prefix) {
-        Some((Entry::Dem(p), d, pfx)) => DemRef::Cell {
-            planes: p,
+/// Resolve a dem ref for a full-res raw prefix base. Shift maps Q30.16 u to
+/// texel at the found depth: tx = (uQ >> (16 + 22 - d)) & 255.
+fn resolve_dem<'a>(pool: &'a Pool, depth: u8, raw: u64) -> DemRef<'a> {
+    let prefix = raw >> (60 - 2 * depth as u32);
+    match probe(pool, depth, prefix, |e| e.dem.is_some()) {
+        Some((e, d, pfx)) => DemRef::Cell {
+            planes: e.dem.as_ref().unwrap(),
             shift: 16 + (22 - d as u32),
             prefix_shift: 60 - 2 * d as u32,
             prefix: pfx,
         },
-        _ => DemRef::None,
+        None => DemRef::None,
     }
 }
 
-fn resolve_line<'a>(pool: &'a Pool, depth: u8, raw_prefix_base: u64) -> LineRef<'a> {
-    let prefix = raw_prefix_base >> (60 - 2 * depth as u32);
-    match probe(pool, depth, prefix) {
-        Some((Entry::Line(p), d, pfx)) => LineRef::Cell {
-            planes: p,
+fn resolve_vec<'a>(pool: &'a Pool, depth: u8, raw: u64) -> VecRef<'a> {
+    let prefix = raw >> (60 - 2 * depth as u32);
+    match probe(pool, depth, prefix, |e| e.has_vec()) {
+        Some((e, d, pfx)) => VecRef::Cell {
+            line: e.line.as_ref(),
+            land: e.land.as_ref(),
+            water: e.water.as_ref(),
             shift: 16 + (22 - d as u32),
             prefix_shift: 60 - 2 * d as u32,
             prefix: pfx,
         },
-        _ => LineRef::None,
+        None => VecRef::None,
     }
 }
 
@@ -284,44 +316,78 @@ pub fn tri_index(uq: i64, vq: i64, shift: u32) -> usize {
 }
 
 #[inline(always)]
-fn compose(
-    dem: &DemRef,
-    line: &LineRef,
-    uq: i64,
-    vq: i64,
-    luts: &FrameLuts,
-) -> u32 {
-    let (mut r, mut g, mut b) = (18u32, 20u32, 26u32); // background
-    if let DemRef::Cell { planes, shift, .. } = dem {
-        let t = planes.texel[tri_index(uq, vq, *shift)];
-        let eq = (t & 0xFFFF) as u16;
-        if eq != ELEV_NODATA {
-            let nx = (t >> 16) as u16 as i16 as f32;
-            let ny = (t >> 32) as u16 as i16 as f32;
-            let nz = (t >> 48) as u16 as i16 as f32;
-            let diffuse =
-                ((nx * luts.sun[0] + ny * luts.sun[1] + nz * luts.sun[2]) / 32767.0).max(0.0);
-            let shade = 0.30 + 0.70 * diffuse;
-            let tint = luts.hypso[(eq >> 4) as usize];
-            r = (tint[0] as f32 * shade) as u32;
-            g = (tint[1] as f32 * shade) as u32;
-            b = (tint[2] as f32 * shade) as u32;
+fn lerp3(a: [f32; 3], b: [u8; 3], t: f32) -> [f32; 3] {
+    [
+        a[0] + (b[0] as f32 - a[0]) * t,
+        a[1] + (b[1] as f32 - a[1]) * t,
+        a[2] + (b[2] as f32 - a[2]) * t,
+    ]
+}
+
+#[inline(always)]
+fn compose(dem: &DemRef, vec: &VecRef, uq: i64, vq: i64, luts: &FrameLuts) -> u32 {
+    let mask = luts.mask;
+    // Terrain: tint from elevation, shade from the normal.
+    let mut tint = [FLAT_RGB[0] as f32, FLAT_RGB[1] as f32, FLAT_RGB[2] as f32];
+    let mut diffuse = 1.0f32;
+    let mut have_ground = false;
+    if mask.dem {
+        if let DemRef::Cell { planes, shift, .. } = dem {
+            let t = planes.texel[tri_index(uq, vq, *shift)];
+            let eq = (t & 0xFFFF) as u16;
+            if eq != ELEV_NODATA {
+                let nx = (t >> 16) as u16 as i16 as f32;
+                let ny = (t >> 32) as u16 as i16 as f32;
+                let nz = (t >> 48) as u16 as i16 as f32;
+                diffuse = ((nx * luts.sun[0] + ny * luts.sun[1] + nz * luts.sun[2]) / 32767.0).max(0.0);
+                let c = luts.hypso[(eq >> 4) as usize];
+                tint = [c[0] as f32, c[1] as f32, c[2] as f32];
+                have_ground = true;
+            } else {
+                let c = luts.hypso[4095];
+                tint = [c[0] as f32, c[1] as f32, c[2] as f32];
+            }
         } else {
-            let tint = luts.hypso[4095];
-            (r, g, b) = (tint[0] as u32, tint[1] as u32, tint[2] as u32);
+            tint = [BG_RGB8[0] as f32, BG_RGB8[1] as f32, BG_RGB8[2] as f32];
         }
     }
-    if let LineRef::Cell { planes, shift, .. } = line {
+    let mut rgb = tint;
+    if let VecRef::Cell { line, land, water, shift, .. } = vec {
         let i = tri_index(uq, vq, *shift);
-        let cov = planes.cov[i] as u32;
-        if cov != 0 {
-            let c = CLASS_LUT[(planes.class[i] as usize).min(12)];
-            r = (r * (255 - cov) + c[0] as u32 * cov) / 255;
-            g = (g * (255 - cov) + c[1] as u32 * cov) / 255;
-            b = (b * (255 - cov) + c[2] as u32 * cov) / 255;
+        if mask.land {
+            if let Some(land) = land {
+                let lc = land.cov[i];
+                if lc != 0 {
+                    rgb = lerp3(rgb, LAND_LUT[(land.class[i] as usize).min(13)], lc as f32 / 255.0 * 0.85);
+                }
+            }
         }
+        let shade = if have_ground { 0.30 + 0.70 * diffuse } else { 1.0 };
+        rgb = [rgb[0] * shade, rgb[1] * shade, rgb[2] * shade];
+        if mask.water {
+            if let Some(water) = water {
+                let wc = water.cov[i];
+                if wc != 0 {
+                    let s = 0.85 + 0.15 * diffuse;
+                    let wr = [WATER_RGB[0] as f32 * s, WATER_RGB[1] as f32 * s, WATER_RGB[2] as f32 * s];
+                    let t = wc as f32 / 255.0;
+                    rgb = [rgb[0] + (wr[0] - rgb[0]) * t, rgb[1] + (wr[1] - rgb[1]) * t, rgb[2] + (wr[2] - rgb[2]) * t];
+                }
+            }
+        }
+        if mask.line {
+            if let Some(line) = line {
+                let cov = line.cov[i];
+                if cov != 0 {
+                    rgb = lerp3(rgb, CLASS_LUT[(line.class[i] as usize).min(12)], cov as f32 / 255.0);
+                }
+            }
+        }
+    } else {
+        let shade = if have_ground { 0.30 + 0.70 * diffuse } else { 1.0 };
+        rgb = [rgb[0] * shade, rgb[1] * shade, rgb[2] * shade];
     }
-    (r << 16) | (g << 8) | b
+    ((rgb[0] as u32) << 16) | ((rgb[1] as u32) << 8) | rgb[2] as u32
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -335,29 +401,28 @@ fn render_block_interp(
     c10: CornerPt,
     c01: CornerPt,
     c11: CornerPt,
-    dem_pool: &Pool,
-    line_pool: &Pool,
+    pool: &Pool,
     luts: &FrameLuts,
     dem_depth: u8,
-    line_depth: u8,
+    vec_depth: u8,
 ) {
     let d = c00.diamond;
     // Per-block cell resolve from corner prefixes (1-4 per layer).
     let mut dem_refs: [(u64, DemRef); 4] = [(u64::MAX, DemRef::None); 4];
-    let mut line_refs: [(u64, LineRef); 4] = [(u64::MAX, LineRef::None); 4];
+    let mut vec_refs: [(u64, VecRef); 4] = [(u64::MAX, VecRef::None); 4];
     let mut n_dem = 0usize;
-    let mut n_line = 0usize;
+    let mut n_vec = 0usize;
     for c in [c00, c10, c01, c11] {
         let raw = raw_of(d, c.u, c.v);
         let dp = raw >> (60 - 2 * dem_depth as u32);
         if !dem_refs[..n_dem].iter().any(|&(p, _)| p == dp) {
-            dem_refs[n_dem] = (dp, resolve_dem(dem_pool, dem_depth, raw));
+            dem_refs[n_dem] = (dp, resolve_dem(pool, dem_depth, raw));
             n_dem += 1;
         }
-        let lp = raw >> (60 - 2 * line_depth as u32);
-        if !line_refs[..n_line].iter().any(|&(p, _)| p == lp) {
-            line_refs[n_line] = (lp, resolve_line(line_pool, line_depth, raw));
-            n_line += 1;
+        let vp = raw >> (60 - 2 * vec_depth as u32);
+        if !vec_refs[..n_vec].iter().any(|&(p, _)| p == vp) {
+            vec_refs[n_vec] = (vp, resolve_vec(pool, vec_depth, raw));
+            n_vec += 1;
         }
     }
     // Finest ref first: a parent-fallback ref covers its resident fine
@@ -367,11 +432,11 @@ fn render_block_interp(
         DemRef::Cell { prefix_shift, .. } => *prefix_shift,
         DemRef::None => u32::MAX,
     });
-    line_refs[..n_line].sort_by_key(|(_, r)| match r {
-        LineRef::Cell { prefix_shift, .. } => *prefix_shift,
-        LineRef::None => u32::MAX,
+    vec_refs[..n_vec].sort_by_key(|(_, r)| match r {
+        VecRef::Cell { prefix_shift, .. } => *prefix_shift,
+        VecRef::None => u32::MAX,
     });
-    let one_cell = n_dem == 1 && n_line == 1;
+    let one_cell = n_dem == 1 && n_vec == 1;
 
     // Fixed-point steps across the block (divide by BLOCK).
     let du_dx = (c10.u - c00.u) / BLOCK as i64;
@@ -390,9 +455,9 @@ fn render_block_interp(
         let row = &mut band[py * w + x0..py * w + x0 + bweff];
         if one_cell {
             let dref = &dem_refs[0].1;
-            let lref = &line_refs[0].1;
+            let vref = &vec_refs[0].1;
             for px in row.iter_mut() {
-                *px = compose(dref, lref, uq, vq, luts);
+                *px = compose(dref, vref, uq, vq, luts);
                 uq += dux;
                 vq += dvx;
             }
@@ -414,21 +479,21 @@ fn render_block_interp(
                     // Boundary sliver: the pixel's cell wasn't sampled by any
                     // corner. Rare (sub-texel band along cell edges) — a full
                     // probe here is cheap and makes coverage exact.
-                    dref = resolve_dem(dem_pool, dem_depth, raw);
+                    dref = resolve_dem(pool, dem_depth, raw);
                 }
-                let mut lref = LineRef::None;
-                for (_, r) in &line_refs[..n_line] {
-                    if let LineRef::Cell { prefix, prefix_shift, .. } = r {
+                let mut vref = VecRef::None;
+                for (_, r) in &vec_refs[..n_vec] {
+                    if let VecRef::Cell { prefix, prefix_shift, .. } = r {
                         if raw >> prefix_shift == *prefix {
-                            lref = *r;
+                            vref = *r;
                             break;
                         }
                     }
                 }
-                if matches!(lref, LineRef::None) {
-                    lref = resolve_line(line_pool, line_depth, raw);
+                if matches!(vref, VecRef::None) {
+                    vref = resolve_vec(pool, vec_depth, raw);
                 }
-                *px = compose(&dref, &lref, uq, vq, luts);
+                *px = compose(&dref, &vref, uq, vq, luts);
                 uq += dux;
                 vq += dvx;
             }
@@ -447,11 +512,10 @@ fn render_block_exact(
     band_h: usize,
     by: usize,
     cam: &Camera,
-    dem_pool: &Pool,
-    line_pool: &Pool,
+    pool: &Pool,
     luts: &FrameLuts,
     dem_depth: u8,
-    line_depth: u8,
+    vec_depth: u8,
     h: usize,
     diamonds: &[u8; 4],
 ) {
@@ -467,9 +531,9 @@ fn render_block_exact(
             let (iu, iv) = c.uv();
             let (uq, vq) = ((iu as i64) << 16, (iv as i64) << 16);
             let raw = c.raw();
-            let dref = resolve_dem(dem_pool, dem_depth, raw);
-            let lref = resolve_line(line_pool, line_depth, raw);
-            *px = compose(&dref, &lref, uq, vq, luts);
+            let dref = resolve_dem(pool, dem_depth, raw);
+            let vref = resolve_vec(pool, vec_depth, raw);
+            *px = compose(&dref, &vref, uq, vq, luts);
         }
     }
 }
@@ -493,34 +557,51 @@ mod tests {
 
     /// One synthetic flat cell at depth 6; a rendered frame must light it
     /// exactly as the compose math says, through the whole block/page-table
-    /// path (including parent fallback from the nominal depth).
+    /// path (including parent fallback from the nominal depth). With a
+    /// forest over half of it, the land tint shows exactly there.
     #[test]
     fn frame_matches_compose_reference() {
-        let mut dem = Pool::new_for_tests();
-        let line = Pool::new_for_tests();
+        let mut pool = Pool::default();
         // Flat terrain at 1000 m: eq = (1000+500)*4 = 6000, normal = +z.
         let eq = 6000u64;
         let nz = 32767u64;
         let texel = vec![eq | (nz << 48); mahere_tiles::TRI];
         let cam = crate::Camera { lat: 46.2, lon: -121.5, ppd: 6000.0, bearing: 0.0 };
         let c = mahere_coord::Coord::from_lat_lon(cam.lat, cam.lon);
-        let prefix = c.raw() >> (60 - 2 * 6);
-        dem.map.insert((6, prefix), Entry::Dem(DemPacked { texel: texel.into_boxed_slice() }));
+        let key = CellKey { depth: 6, prefix: c.raw() >> (60 - 2 * 6) };
+        let mut land = ClassCell::new();
+        for i in 0..mahere_tiles::TRI {
+            land.class[i] = 5; // Forest
+            land.cov[i] = 255;
+        }
+        pool.map.insert(
+            key,
+            Entry {
+                dem: Some(DemPacked { texel: texel.into_boxed_slice() }),
+                line: Some(ClassCell::new()),
+                land: Some(land),
+                water: Some(CovCell::new()),
+            },
+        );
 
-        let luts = FrameLuts { hypso: build_hypso_lut(), sun: [0.0, 0.0, 1.0] };
+        let luts = FrameLuts { hypso: build_hypso_lut(), sun: [0.0, 0.0, 1.0], mask: LayerMask::default() };
         let (w, h) = (64usize, 64usize);
         let mut canvas = vec![0u32; w * h];
-        let (stats, _want) =
-            render_frame(&mut canvas, w, h, &cam, &dem, &line, &luts, 12, 13);
+        let (stats, _want) = render_frame(&mut canvas, w, h, &cam, &pool, &luts, 12, 13);
         assert_eq!(stats.straddle_blocks, 0);
-        // Expected: diffuse = 1 (sun straight up, flat normal), shade = 1.0,
-        // tint = hypso[6000>>4 = 375].
-        let tint = luts.hypso[375];
-        let expect = ((tint[0] as u32) << 16) | ((tint[1] as u32) << 8) | tint[2] as u32;
+        // Expected: diffuse = 1, shade = 1.0, tint = hypso[375] lerped 85% to forest.
+        let t = luts.hypso[375];
+        let f = LAND_LUT[5];
+        let mix = |a: u8, b: u8| (a as f32 + (b as f32 - a as f32) * 0.85) as u32;
+        let expect = (mix(t[0], f[0]) << 16) | (mix(t[1], f[1]) << 8) | mix(t[2], f[2]);
         let center = canvas[(h / 2) * w + w / 2];
         assert_eq!(center, expect, "center {center:#08x} vs expected {expect:#08x}");
-        // Every pixel resolved (no background) — the whole 64x64 view sits
-        // inside one depth-6 cell.
         assert!(canvas.iter().all(|&p| p == expect), "unresolved pixels in frame");
+
+        // Mask off land: pure hypso.
+        let luts = FrameLuts { mask: LayerMask { land: false, ..LayerMask::default() }, ..luts };
+        render_frame(&mut canvas, w, h, &cam, &pool, &luts, 12, 13);
+        let expect = ((t[0] as u32) << 16) | ((t[1] as u32) << 8) | t[2] as u32;
+        assert_eq!(canvas[(h / 2) * w + w / 2], expect);
     }
 }
