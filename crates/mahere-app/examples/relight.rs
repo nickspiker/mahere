@@ -34,6 +34,24 @@ fn main() {
     let store = std::sync::Arc::new(DirStore("data/cells".into()));
     let mut map = MapCore::new(store, cam);
     let (w, h) = (1024usize, 768usize);
+    // MAHERE_LAYERS=imagery,nocontours,nolines ... adjusts the mask for the render.
+    if let Ok(spec) = std::env::var("MAHERE_LAYERS") {
+        let mut m = map.layers();
+        for tok in spec.split(',') {
+            match tok {
+                "imagery" => m.imagery = true,
+                "nocontours" => m.contours = false,
+                "nolines" => m.line = false,
+                "noland" => m.land = false,
+                "nowater" => m.water = false,
+                "nodem" => m.dem = false,
+                "slope" => m.slope = true,
+                "canopy" => m.canopy = true,
+                _ => {}
+            }
+        }
+        map.set_layers(m);
+    }
     if std::env::var("MAHERE_DEBUG").is_ok() {
         // Residency debug: a cold frame mid-stream, then the settled one.
         let mut m = map.layers();

@@ -29,6 +29,10 @@ pub enum RoadClass {
 }
 
 pub const CLASS_COUNT: usize = 12;
+/// Waterway texel classes: WATERWAY_CLASS0 is the biggest river, WATERWAY_CLASS0 + WATERWAY_BINS - 1 the smallest trickle.
+pub const WATERWAY_CLASS0: u8 = 12;
+pub const WATERWAY_BINS: u8 = 8;
+pub const CLASS_IDS: usize = WATERWAY_CLASS0 as usize + WATERWAY_BINS as usize;
 
 impl RoadClass {
     /// Map an OSM `highway=` tag value. `None` = a highway type mahere doesn't draw (construction, proposed, bus_stop, ...).
@@ -174,6 +178,17 @@ impl Road {
         match self.class {
             RoadClass::Waterway => (120.0 + 135.0 * self.weight) as u8,
             _ => 255,
+        }
+    }
+
+    /// The texel class id (0 = empty): road classes 1..=11 as `RoadClass + 1`; waterways 12..=19 by weight bin, the BIGGEST river at 12 so that "most major wins" in the pyramid keeps the Columbia over a ditch, and a theme can map each bin to its own brightness and width.
+    pub fn class_id(&self) -> u8 {
+        match self.class {
+            RoadClass::Waterway => {
+                let bin = (self.weight * (WATERWAY_BINS - 1) as f32).round() as u8;
+                WATERWAY_CLASS0 + (WATERWAY_BINS - 1 - bin)
+            }
+            c => c as u8 + 1,
         }
     }
 }

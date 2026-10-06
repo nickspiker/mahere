@@ -316,14 +316,22 @@ pub struct ImgCell {
     pub red: Vec<u8>,
     pub nir: Vec<u8>,
     pub i1064: Vec<u8>,
+    /// Canopy height, metres (first-return top minus ground), 0 = none; a fourth band from the same point cloud.
+    pub canopy: Vec<u8>,
 }
 
 impl ImgCell {
     pub fn new() -> ImgCell {
-        ImgCell { red: vec![0; TRI], nir: vec![0; TRI], i1064: vec![0; TRI] }
+        ImgCell { red: vec![0; TRI], nir: vec![0; TRI], i1064: vec![0; TRI], canopy: vec![0; TRI] }
     }
     pub fn is_empty(&self) -> bool {
-        self.red.iter().all(|&v| v == 0) && self.nir.iter().all(|&v| v == 0) && self.i1064.iter().all(|&v| v == 0)
+        self.red.iter().all(|&v| v == 0) && self.nir.iter().all(|&v| v == 0) && self.i1064.iter().all(|&v| v == 0) && self.canopy.iter().all(|&v| v == 0)
+    }
+    fn bands(&self) -> [&Vec<u8>; 4] {
+        [&self.red, &self.nir, &self.i1064, &self.canopy]
+    }
+    fn bands_mut(&mut self) -> [&mut Vec<u8>; 4] {
+        [&mut self.red, &mut self.nir, &mut self.i1064, &mut self.canopy]
     }
 }
 
@@ -355,7 +363,7 @@ pub fn bake_lines(feats: &[Road], base_depth: u8, min_depth: u8) -> HashMap<Cell
     let mut cross_diamond = 0usize;
     let tm = texel_m(base_depth);
     for road in feats {
-        let class = road.class as u8 + 1;
+        let class = road.class_id();
         let r = (road.width_m() as f64 / 2.0 / tm).max(0.5);
         let cov_max = road.cov_max();
         let mut prev: Option<(u8, f64, f64)> = None;
@@ -743,6 +751,9 @@ pub fn bake_img(naip: Option<&mahere_dem::ImgStore>, intensity: Option<&mahere_d
                         if let Some(v) = intensity.and_then(|s| s.sample(lat, lon)) {
                             cell.i1064[i] = v;
                         }
+                        if let Some(v) = intensity.and_then(|s| s.canopy(lat, lon)) {
+                            cell.canopy[i] = v;
+                        }
                     }
                 }
             }
@@ -777,11 +788,11 @@ pub fn img_pyramid(base: &[(CellKey, ImgCell)], min_depth: u8) -> Vec<(CellKey, 
                 for ty in 0..TEX {
                     for tx in 0..TEX {
                         for half in 0..2 {
-                            let mut acc = [0u32; 3];
-                            let mut n = [0u32; 3];
+                            let mut acc = [0u32; 4];
+                            let mut n = [0u32; 4];
                             for (q, i) in child_cell_texels(tx, ty, half) {
                                 let Some(child) = kids[q as usize] else { continue };
-                                for (b, plane) in [&child.red, &child.nir, &child.i1064].into_iter().enumerate() {
+                                for (b, plane) in child.bands().into_iter().enumerate() {
                                     if plane[i] != 0 {
                                         acc[b] += plane[i] as u32;
                                         n[b] += 1;
@@ -789,14 +800,10 @@ pub fn img_pyramid(base: &[(CellKey, ImgCell)], min_depth: u8) -> Vec<(CellKey, 
                                 }
                             }
                             let i = tri_idx(tx, ty, half);
-                            if n[0] > 0 {
-                                cell.red[i] = (acc[0] / n[0]) as u8;
-                            }
-                            if n[1] > 0 {
-                                cell.nir[i] = (acc[1] / n[1]) as u8;
-                            }
-                            if n[2] > 0 {
-                                cell.i1064[i] = (acc[2] / n[2]) as u8;
+                            for (b, plane) in cell.bands_mut().into_iter().enumerate() {
+                                if n[b] > 0 {
+                                    plane[i] = (acc[b] / n[b]) as u8;
+                                }
                             }
                         }
                     }
@@ -1105,7 +1112,7 @@ impl CellPlanes {
         let (mut old_line, mut old_land, mut old_water) = (old_line, old_land, old_water);
         match (&mut out.img, old_img) {
             (Some(n), Some(o)) => {
-                for (np, op) in [(&mut n.red, &o.red), (&mut n.nir, &o.nir), (&mut n.i1064, &o.i1064)] {
+                for (np, op) in n.bands_mut().into_iter().zip(o.bands()) {
                     for i in 0..TRI {
                         if np[i] == 0 {
                             np[i] = op[i];
@@ -1216,6 +1223,7 @@ impl CellPlanes {
                     ("red".to_string(), VsfType::t_u3(Tensor::new(vec![2, TEX * TEX], mem_to_disk(&im.red)))),
                     ("nir".to_string(), VsfType::t_u3(Tensor::new(vec![2, TEX * TEX], mem_to_disk(&im.nir)))),
                     ("i1064".to_string(), VsfType::t_u3(Tensor::new(vec![2, TEX * TEX], mem_to_disk(&im.i1064)))),
+                    ("canopy".to_string(), VsfType::t_u3(Tensor::new(vec![2, TEX * TEX], mem_to_disk(&im.canopy)))),
                 ],
             );
         }
@@ -1296,7 +1304,8 @@ pub fn decode_cell(data: &[u8]) -> Result<CellPlanes, String> {
                     fields.get("nir").and_then(plane_u8_mem),
                     fields.get("i1064").and_then(plane_u8_mem),
                 ) {
-                    out.img = Some(ImgCell { red, nir, i1064 });
+                    let canopy = fields.get("canopy").and_then(plane_u8_mem).unwrap_or_else(|| vec![0; TRI]);
+                    out.img = Some(ImgCell { red, nir, i1064, canopy });
                 }
             }
             _ => {}

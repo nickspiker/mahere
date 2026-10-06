@@ -393,6 +393,8 @@ pub struct IntensityStore {
     width: usize,
     height: usize,
     data: Vec<u8>,
+    /// Canopy height per cell, metres (first-return top minus ground), 0 = none or no ground return.
+    canopy: Vec<u8>,
 }
 
 impl IntensityStore {
@@ -416,38 +418,73 @@ impl IntensityStore {
         let height = (y1.ceil() - y0) as usize + 1;
         eprintln!("intensity grid {width}x{height} m from {} tiles", paths.len());
         // Pass 2: per-tile accumulation into the shared grid (tiles don't overlap, so disjoint writes; merged by addition).
-        let partial: Vec<(Vec<u32>, Vec<u16>)> = paths
+        // Per tile: intensity sum/count of first returns, the highest first return (canopy top) and the lowest ground-classified return per cell. Tiles don't overlap, so the merge is add / max / min.
+        let partial: Vec<(Vec<u32>, Vec<u16>, Vec<f32>, Vec<f32>)> = paths
             .par_iter()
             .map(|p| {
                 let mut sum = vec![0u32; width * height];
                 let mut cnt = vec![0u16; width * height];
+                let mut top = vec![f32::MIN; width * height];
+                let mut ground = vec![f32::MAX; width * height];
                 if let Ok(data) = las::Reader::from_path(p).and_then(|mut r| r.read_all()) {
                     // Column accessors skip the full-record decode.
-                    for (((x, y), inten), rn) in data.x().zip(data.y()).zip(data.intensity()).zip(data.return_number()) {
-                        if rn != 1 {
-                            continue;
-                        }
+                    for (((((x, y), z), inten), rn), cls) in
+                        data.x().zip(data.y()).zip(data.z()).zip(data.intensity()).zip(data.return_number()).zip(data.classification())
+                    {
                         let gx = (x - x0) as isize;
                         let gy = (y1.ceil() - y) as isize;
                         if gx < 0 || gy < 0 || gx as usize >= width || gy as usize >= height {
                             continue;
                         }
                         let i = gy as usize * width + gx as usize;
+                        if cls == 2 {
+                            ground[i] = ground[i].min(z as f32);
+                        }
+                        if rn != 1 {
+                            continue;
+                        }
                         sum[i] = sum[i].saturating_add(inten as u32);
                         cnt[i] = cnt[i].saturating_add(1);
+                        top[i] = top[i].max(z as f32);
                     }
                 }
-                (sum, cnt)
+                (sum, cnt, top, ground)
             })
             .collect();
         let mut sum = vec![0u32; width * height];
         let mut cnt = vec![0u16; width * height];
-        for (s, c) in partial {
+        let mut top = vec![f32::MIN; width * height];
+        let mut ground = vec![f32::MAX; width * height];
+        for (s, c, t, g) in partial {
             for i in 0..sum.len() {
                 sum[i] = sum[i].saturating_add(s[i]);
                 cnt[i] = cnt[i].saturating_add(c[i]);
+                top[i] = top[i].max(t[i]);
+                ground[i] = ground[i].min(g[i]);
             }
         }
+        // Canopy: top minus the lowest ground return within a 3x3 m neighbourhood (ground returns are sparse under dense canopy), metres, clamped to 255.
+        let canopy: Vec<u8> = (0..sum.len())
+            .map(|i| {
+                if top[i] == f32::MIN {
+                    return 0;
+                }
+                let (cx, cy) = ((i % width) as isize, (i / width) as isize);
+                let mut g = f32::MAX;
+                for dy in -1..=1isize {
+                    for dx in -1..=1isize {
+                        let (x, y) = (cx + dx, cy + dy);
+                        if x >= 0 && y >= 0 && (x as usize) < width && (y as usize) < height {
+                            g = g.min(ground[y as usize * width + x as usize]);
+                        }
+                    }
+                }
+                if g == f32::MAX {
+                    return 0;
+                }
+                (top[i] - g).clamp(0.0, 255.0) as u8
+            })
+            .collect();
         // Percentile stretch over cells with returns.
         let mut means: Vec<u32> = (0..sum.len()).filter(|&i| cnt[i] > 0).map(|i| sum[i] / cnt[i] as u32).collect();
         if means.is_empty() {
@@ -467,7 +504,18 @@ impl IntensityStore {
             })
             .collect();
         eprintln!("intensity stretch {lo}..{hi}, {} of {} cells lit", means.len(), data.len());
-        Ok(IntensityStore { zone, x0, y0: y1.ceil(), width, height, data })
+        Ok(IntensityStore { zone, x0, y0: y1.ceil(), width, height, data, canopy })
+    }
+
+    /// Canopy height in metres at (lat, lon); None outside the grid or without returns.
+    pub fn canopy(&self, lat: f64, lon: f64) -> Option<u8> {
+        let (x, y) = utm_forward(lat, lon, self.zone);
+        let gx = x - self.x0;
+        let gy = self.y0 - y;
+        if gx < 0.0 || gy < 0.0 || gx >= self.width as f64 || gy >= self.height as f64 {
+            return None;
+        }
+        Some(self.canopy[gy as usize * self.width + gx as usize])
     }
 
     /// Nearest 1 m cell at (lat, lon); None outside the grid or with no returns.

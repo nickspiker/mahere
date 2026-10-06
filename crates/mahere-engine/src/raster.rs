@@ -42,11 +42,15 @@ pub struct LayerMask {
     pub imagery: bool,
     /// Contours, drawn from elevation and slope at draw time (no data behind them): a constant-width anti-aliased line wherever the elevation crosses a multiple of the interval, the interval auto-fit to the previous frame's elevation range.
     pub contours: bool,
+    /// Slope-angle bands over the terrain (25/30/35/45°), from the normal at draw time.
+    pub slope: bool,
+    /// Canopy height tint over the terrain (needs the img section's canopy band).
+    pub canopy: bool,
 }
 
 impl Default for LayerMask {
     fn default() -> Self {
-        LayerMask { dem: true, land: true, water: true, line: true, debug: false, imagery: false, contours: true }
+        LayerMask { dem: true, land: true, water: true, line: true, debug: false, imagery: false, contours: true, slope: false, canopy: false }
     }
 }
 
@@ -124,8 +128,8 @@ pub const WATER_RGB: [u8; 3] = [26, 58, 82];
 /// Terrain tint when the dem layer is off or absent: a neutral ground.
 const FLAT_RGB: [u8; 3] = [96, 100, 96];
 
-/// Line class id (1-based, 0 = empty) -> visible RGB. Index 12 = Waterway.
-pub const CLASS_LUT: [[u8; 3]; 13] = [
+/// Line class id (1-based, 0 = empty) -> visible RGB. 1..=11 road classes; 12..=19 waterways from the biggest river (12, bright) to a trickle (19, dim) — a log brightness ramp over the weight bins, so water is never uniform.
+pub const CLASS_LUT: [[u8; 3]; 20] = [
     [0, 0, 0],
     [245, 150, 60],
     [238, 175, 62],
@@ -138,8 +142,19 @@ pub const CLASS_LUT: [[u8; 3]; 13] = [
     [80, 230, 120],
     [125, 122, 128],
     [148, 136, 160],
-    [84, 150, 210],
+    [120, 190, 255],
+    [104, 174, 238],
+    [90, 158, 220],
+    [78, 142, 202],
+    [66, 126, 184],
+    [56, 110, 164],
+    [46, 94, 144],
+    [38, 80, 124],
 ];
+pub const CLASS_MAX: usize = 19;
+
+/// Slope-angle bands (degrees) and their overlay colours: the avalanche / rideability layer, from the normal at draw time.
+const SLOPE_BANDS: [(f32, [u8; 3]); 4] = [(25.0, [250, 220, 60]), (30.0, [250, 150, 40]), (35.0, [230, 50, 40]), (45.0, [150, 40, 200])];
 
 /// Land cover class id (1-based = AreaClass + 1) -> tint. Order follows mahere_osm::AreaClass: Grass, Farmland, Orchard, Scrub, Forest, Wetland, Sand, Rock, Glacier, Quarry, Industrial, Urban, Water.
 pub const LAND_LUT: [[u8; 3]; 14] = [
@@ -418,6 +433,7 @@ fn compose_rgb(dem: &DemRef, vec: &VecRef, pool: &Pool, diamond: u8, uq: i64, vq
     let mut diffuse = 1.0f32;
     let mut have_ground = false;
     let mut contour = (0.0f32, false);
+    let mut slope_band: Option<[u8; 3]> = None;
     if mask.dem {
         if let Some(t) = dem_texel(dem, pool, diamond, uq, vq) {
             let eq = (t & 0xFFFF) as u16;
@@ -430,10 +446,19 @@ fn compose_rgb(dem: &DemRef, vec: &VecRef, pool: &Pool, diamond: u8, uq: i64, vq
                 let c = luts.hypso[(eq >> 4) as usize];
                 tint = [c[0] as f32, c[1] as f32, c[2] as f32];
                 have_ground = true;
+                let nzn = (nz / 32767.0).max(1e-4);
+                let slope = (1.0 - nzn * nzn).max(0.0).sqrt() / nzn;
                 if mask.contours {
-                    let nzn = (nz / 32767.0).max(1e-4);
-                    let slope = (1.0 - nzn * nzn).max(0.0).sqrt() / nzn;
                     contour = contour_cov(eq as f32 * 0.25 - 500.0, slope, &luts.contours);
+                }
+                if mask.slope {
+                    let deg = slope.atan().to_degrees();
+                    for (lo, col) in SLOPE_BANDS.iter().rev() {
+                        if deg >= *lo {
+                            slope_band = Some(*col);
+                            break;
+                        }
+                    }
                 }
             }
         } else {
@@ -454,7 +479,7 @@ fn compose_rgb(dem: &DemRef, vec: &VecRef, pool: &Pool, diamond: u8, uq: i64, vq
                 if let Some(line) = line {
                     let cov = line.cov[i];
                     if cov != 0 {
-                        rgb = lerp3(rgb, CLASS_LUT[(line.class[i] as usize).min(12)], cov as f32 / 255.0);
+                        rgb = lerp3(rgb, CLASS_LUT[(line.class[i] as usize).min(CLASS_MAX)], cov as f32 / 255.0);
                     }
                 }
             }
@@ -468,8 +493,21 @@ fn compose_rgb(dem: &DemRef, vec: &VecRef, pool: &Pool, diamond: u8, uq: i64, vq
                 }
             }
         }
+        if mask.canopy {
+            if let Some(im) = img {
+                let c = im.canopy[i];
+                if c != 0 {
+                    // 0..60 m -> pale to deep green.
+                    let t = (c as f32 / 60.0).min(1.0);
+                    rgb = lerp3(rgb, [((1.0 - t) * 190.0 + t * 20.0) as u8, ((1.0 - t) * 230.0 + t * 110.0) as u8, ((1.0 - t) * 150.0 + t * 40.0) as u8], 0.8);
+                }
+            }
+        }
         let shade = if have_ground { 0.30 + 0.70 * diffuse } else { 1.0 };
         rgb = [rgb[0] * shade, rgb[1] * shade, rgb[2] * shade];
+        if let Some(col) = slope_band {
+            rgb = lerp3(rgb, col, 0.45);
+        }
         if mask.water {
             if let Some(water) = water {
                 let wc = water.cov[i];
@@ -488,13 +526,16 @@ fn compose_rgb(dem: &DemRef, vec: &VecRef, pool: &Pool, diamond: u8, uq: i64, vq
             if let Some(line) = line {
                 let cov = line.cov[i];
                 if cov != 0 {
-                    rgb = lerp3(rgb, CLASS_LUT[(line.class[i] as usize).min(12)], cov as f32 / 255.0);
+                    rgb = lerp3(rgb, CLASS_LUT[(line.class[i] as usize).min(CLASS_MAX)], cov as f32 / 255.0);
                 }
             }
         }
     } else {
         let shade = if have_ground { 0.30 + 0.70 * diffuse } else { 1.0 };
         rgb = [rgb[0] * shade, rgb[1] * shade, rgb[2] * shade];
+        if let Some(col) = slope_band {
+            rgb = lerp3(rgb, col, 0.45);
+        }
         if contour.0 > 0.0 {
             rgb = lerp3(rgb, if contour.1 { CONTOUR_INDEX_RGB } else { CONTOUR_RGB }, contour.0 * 0.85);
         }
