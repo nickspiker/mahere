@@ -27,6 +27,8 @@ pub struct Readouts {
     pub m_per_px: f64,
     pub frame_ms: f32,
     pub resident: usize,
+    /// The phone's true heading from its orientation sensor, degrees clockwise from north, when it has one.
+    pub phone_heading: Option<f32>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -244,6 +246,7 @@ impl Panel {
             ("world", world_lines),
             ("elevation", vec![r.elev.map_or("—".into(), |e| format!("{} m", e.round() as i64))]),
             ("heading", vec![format!("{:+}°", r.heading_deg.round() as i64)]),
+            ("phone", vec![r.phone_heading.map_or("—".into(), |h| format!("{}°", h.round() as i64))]),
             ("scale", vec![format!("{:.2} m/px", r.m_per_px)]),
             ("frame", vec![format!("{:.1} ms  ·  {} cells", r.frame_ms, r.resident)]),
         ];

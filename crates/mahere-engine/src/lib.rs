@@ -100,6 +100,8 @@ pub struct MapCore {
     pub follow_heading: bool,
     /// Magnetic declination at the position, degrees, east positive: true heading = the sensor's magnetic heading + this.
     pub declination_deg: f32,
+    /// Whether an orientation sensor has ever reported.
+    pub have_rotation: bool,
     /// The last plan and what it was for.
     plan_cache: Option<(PlanKey, Arc<plan::FramePlan>)>,
 }
@@ -141,6 +143,7 @@ impl MapCore {
             real_sun: false,
             follow_heading: false,
             declination_deg: 0.0,
+            have_rotation: false,
             plan_cache: None,
         }
     }
@@ -267,6 +270,7 @@ impl MapCore {
     pub fn set_device_rotation(&mut self, r: [f32; 9]) {
         let changed = self.device_rot.iter().zip(&r).any(|(a, b)| (a - b).abs() > 0.002);
         self.device_rot = r;
+        self.have_rotation = true;
         // Nothing on screen depends on the orientation unless a mode uses it: no frame for a phone merely being held.
         if !self.real_sun && !self.follow_heading {
             return;
@@ -432,7 +436,7 @@ impl MapCore {
                 let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0.0, |d| d.as_secs_f64());
                 let (az, alt) = sh::sun_position(lat, lon, now);
                 // The frames, in order. The almanac gives a true azimuth; the sensor's world frame has magnetic north on its Y axis, so the sun is first expressed against magnetic north (azimuth less the declination, east positive). Rᵀ then takes it into the device frame: x right, y up the screen, z out of it — the lighting frame, since the Activity is locked to portrait. Last, when the map's up is not where the phone points, the device-frame sun is turned by (bearing − true heading): a device turned clockwise sees a fixed world vector turn counterclockwise, so this is the lighting the phone would show turned to match the map, tilt kept. With follow heading on the two agree and nothing turns; without a sensor (R identity, heading = declination) it collapses to the map-locked rotation by the bearing.
-                let frames = Frames { declination_deg: self.declination_deg, rot: self.device_rot, bearing_deg: self.cam.bearing.to_degrees() as f32, heading_mag_deg: self.device_heading };
+                let frames = Frames { declination_deg: self.declination_deg, map_locked: !self.have_rotation, rot: self.device_rot, bearing_deg: self.cam.bearing.to_degrees() as f32, heading_mag_deg: self.device_heading };
                 let strength = (alt as f32 / 5.0).clamp(0.0, 1.0);
                 self.env = sh::Sh9::environment(frames.to_screen(az as f32, alt as f32), strength, frames.up());
             } else if self.luts_sun.0 != self.sun_az || self.luts_sun.1 != self.sun_alt || self.device_heading != 0.0 {
@@ -678,6 +682,8 @@ mod tests {
 #[derive(Clone, Copy)]
 pub struct Frames {
     pub declination_deg: f32,
+    /// True when there is no orientation sensor: the device-frame sun is turned by (bearing − heading) so the lighting is the map's, as if the phone were turned to match it. With a sensor the terrain is a relief model held in the hand and the real sun lights it however the phone is turned (Nick 2026-10-06).
+    pub map_locked: bool,
     /// Row-major, world (east, magnetic north, up) = rot · device (x right, y up the screen, z out).
     pub rot: [f32; 9],
     pub bearing_deg: f32,
@@ -688,6 +694,9 @@ impl Frames {
     fn device(&self, v: [f32; 3]) -> [f32; 3] {
         let r = self.rot;
         let d = [r[0] * v[0] + r[3] * v[1] + r[6] * v[2], r[1] * v[0] + r[4] * v[1] + r[7] * v[2], r[2] * v[0] + r[5] * v[1] + r[8] * v[2]];
+        if !self.map_locked {
+            return d;
+        }
         let (sd, cd) = (self.bearing_deg - (self.heading_mag_deg + self.declination_deg)).to_radians().sin_cos();
         [d[0] * cd - d[1] * sd, d[0] * sd + d[1] * cd, d[2]]
     }
@@ -719,20 +728,23 @@ mod frame_tests {
     #[test]
     fn a_south_sun_lights_from_the_bottom_of_a_north_up_map() {
         // No sensor: the sun's screen position is the map's.
-        let f = Frames { declination_deg: 0.0, rot: IDENTITY, bearing_deg: 0.0, heading_mag_deg: 0.0 };
+        let f = Frames { declination_deg: 0.0, map_locked: true, rot: IDENTITY, bearing_deg: 0.0, heading_mag_deg: 0.0 };
         assert!(close(f.to_screen(180.0, 0.0), [0.0, -1.0, 0.0]));
         // The phone points east with the map still north-up: the same answer, the lighting is the map's.
-        let f = Frames { declination_deg: 0.0, rot: POINTING_EAST, bearing_deg: 0.0, heading_mag_deg: 90.0 };
+        let f = Frames { declination_deg: 0.0, map_locked: true, rot: POINTING_EAST, bearing_deg: 0.0, heading_mag_deg: 90.0 };
         assert!(close(f.to_screen(180.0, 0.0), [0.0, -1.0, 0.0]));
         // Follow heading: the map turns with the phone and the south sun is to the right, as it physically is.
-        let f = Frames { declination_deg: 0.0, rot: POINTING_EAST, bearing_deg: 90.0, heading_mag_deg: 90.0 };
+        let f = Frames { declination_deg: 0.0, map_locked: true, rot: POINTING_EAST, bearing_deg: 90.0, heading_mag_deg: 90.0 };
         assert!(close(f.to_screen(180.0, 0.0), [1.0, 0.0, 0.0]));
         // Declination 15° east with no sensor collapses to the map-locked answer exactly.
-        let f = Frames { declination_deg: 15.0, rot: IDENTITY, bearing_deg: 0.0, heading_mag_deg: 0.0 };
+        let f = Frames { declination_deg: 15.0, map_locked: true, rot: IDENTITY, bearing_deg: 0.0, heading_mag_deg: 0.0 };
         assert!(close(f.to_screen(180.0, 0.0), [0.0, -1.0, 0.0]));
         assert!(close(f.up(), [0.0, 0.0, 1.0]));
         // A map turned 90° clockwise (screen-up east) shows the south sun on the right.
-        let f = Frames { declination_deg: 0.0, rot: IDENTITY, bearing_deg: 90.0, heading_mag_deg: 0.0 };
+        let f = Frames { declination_deg: 0.0, map_locked: true, rot: IDENTITY, bearing_deg: 90.0, heading_mag_deg: 0.0 };
+        assert!(close(f.to_screen(180.0, 0.0), [1.0, 0.0, 0.0]));
+        // With a sensor the terrain is held in the hand: the phone pointing east sees the south sun on its right whatever the map's bearing.
+        let f = Frames { declination_deg: 0.0, map_locked: false, rot: POINTING_EAST, bearing_deg: 0.0, heading_mag_deg: 90.0 };
         assert!(close(f.to_screen(180.0, 0.0), [1.0, 0.0, 0.0]));
     }
 
@@ -741,7 +753,7 @@ mod frame_tests {
         // Phone on its back with its top edge lifted 60°: the top of the screen points north and up, device y = (0, cos60, sin60) in world, and the screen faces south and up, device z = (0, −sin60, cos60).
         let (s, c) = 60f32.to_radians().sin_cos();
         let rot = [1.0, 0.0, 0.0, 0.0, c, -s, 0.0, s, c];
-        let f = Frames { declination_deg: 0.0, rot, bearing_deg: 0.0, heading_mag_deg: 0.0 };
+        let f = Frames { declination_deg: 0.0, map_locked: true, rot, bearing_deg: 0.0, heading_mag_deg: 0.0 };
         // A north sun 30° up is behind the screen: negative z. A south one is in front.
         let north = f.to_screen(0.0, 30.0);
         assert!(north[2] < 0.0, "{north:?}");

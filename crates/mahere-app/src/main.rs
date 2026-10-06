@@ -331,7 +331,7 @@ impl FluorApp for MahereApp {
         if heading > 180.0 {
             heading -= 360.0;
         }
-        let readouts = Readouts { lat: c.lat, lon: c.lon, elev: self.map.elevation_at(c.lat, c.lon), heading_deg: heading, m_per_px: 111_320.0 / c.ppd, frame_ms: self.map.last_frame_ms, resident: self.map.pool().map.len() };
+        let readouts = Readouts { lat: c.lat, lon: c.lon, elev: self.map.elevation_at(c.lat, c.lon), heading_deg: heading, m_per_px: 111_320.0 / c.ppd, frame_ms: self.map.last_frame_ms, resident: self.map.pool().map.len(), phone_heading: None };
         self.panel.paint(w, h, self.map.layers(), Controls { real_sun: self.map.real_sun, follow_heading: self.map.follow_heading }, &readouts);
         let mut map = self.map.canvas.clone();
         self.panel.composite_rgb(&mut map, w, h);
