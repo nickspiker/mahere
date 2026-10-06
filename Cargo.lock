@@ -1472,9 +1472,11 @@ version = "0.1.0"
 dependencies = [
  "fluor",
  "jni 0.21.1",
+ "libc",
  "mahere-engine",
  "mahere-store",
  "ndk",
+ "ndk-sys",
 ]
 
 [[package]]

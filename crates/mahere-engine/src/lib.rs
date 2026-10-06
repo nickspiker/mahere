@@ -411,8 +411,8 @@ mod tests {
 
     struct Empty;
     impl CellStore for Empty {
-        fn get(&self, _key: mahere_tiles::CellKey) -> Option<Vec<u8>> {
-            None
+        fn get(&self, _key: mahere_tiles::CellKey) -> residency::Fetch {
+            residency::Fetch::Absent
         }
     }
 

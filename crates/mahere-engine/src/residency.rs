@@ -10,16 +10,27 @@ use mahere_tiles::{CellKey, ClassCell, CovCell, decode_cell};
 use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
 
+/// What a store found for a cell: bytes, a definite absence (never baked), or a failure to find out (offline, timeout, a bad read) — which must not be remembered as absence.
+pub enum Fetch {
+    Bytes(Vec<u8>),
+    Absent,
+    Failed(String),
+}
+
 /// Where cell bytes come from, addressed by cell — a string path exists only where a filesystem or URL demands one.
 pub trait CellStore: Send + Sync + 'static {
-    fn get(&self, key: CellKey) -> Option<Vec<u8>>;
+    fn get(&self, key: CellKey) -> Fetch;
 }
 
 pub struct DirStore(pub PathBuf);
 
 impl CellStore for DirStore {
-    fn get(&self, key: CellKey) -> Option<Vec<u8>> {
-        std::fs::read(self.0.join(key.path())).ok()
+    fn get(&self, key: CellKey) -> Fetch {
+        match std::fs::read(self.0.join(key.path())) {
+            Ok(b) => Fetch::Bytes(b),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Fetch::Absent,
+            Err(e) => Fetch::Failed(e.to_string()),
+        }
     }
 }
 
@@ -49,7 +60,8 @@ impl Entry {
 
 pub struct Loaded {
     pub key: CellKey,
-    pub entry: Entry,
+    /// `None` = the fetch failed; the cell is not resident and will be asked for again after a short backoff.
+    pub entry: Option<Entry>,
 }
 
 struct WantList {
@@ -68,9 +80,13 @@ pub struct Residency {
     done_rx: Receiver<Loaded>,
     pub pool: Pool,
     pending: FxHashSet<CellKey>,
+    /// Cells whose last fetch failed, with when: not re-requested until RETRY_AFTER has passed, so an offline phone doesn't hammer timeouts every frame.
+    failed: FxHashMap<CellKey, std::time::Instant>,
     pub desired: FxHashSet<CellKey>,
     pub frame: u64,
 }
+
+const RETRY_AFTER: std::time::Duration = std::time::Duration::from_secs(3);
 
 impl Residency {
     pub fn new(store: Arc<dyn CellStore>) -> Residency {
@@ -82,6 +98,7 @@ impl Residency {
             done_rx,
             pool: Pool::default(),
             pending: FxHashSet::default(),
+            failed: FxHashMap::default(),
             desired: FxHashSet::default(),
             frame: 0,
         }
@@ -92,8 +109,15 @@ impl Residency {
         let mut n = 0;
         while let Ok(l) = self.done_rx.try_recv() {
             self.pending.remove(&l.key);
-            self.pool.map.insert(l.key, l.entry);
-            n += 1;
+            match l.entry {
+                Some(e) => {
+                    self.pool.map.insert(l.key, e);
+                    n += 1;
+                }
+                None => {
+                    self.failed.insert(l.key, std::time::Instant::now());
+                }
+            }
         }
         n
     }
@@ -104,7 +128,9 @@ impl Residency {
         let desired = &self.desired;
         self.pool.map.retain(|k, _| desired.contains(k));
         self.pending.retain(|k| desired.contains(k));
-        list.retain(|k| !self.pending.contains(k) && !self.pool.map.contains_key(k));
+        let now = std::time::Instant::now();
+        self.failed.retain(|k, t| desired.contains(k) && now.duration_since(*t) < RETRY_AFTER);
+        list.retain(|k| !self.pending.contains(k) && !self.pool.map.contains_key(k) && !self.failed.contains_key(k));
         if list.is_empty() {
             return;
         }
@@ -161,14 +187,27 @@ fn loader_thread(store: Arc<dyn CellStore>, want_rx: Receiver<WantList>, done_tx
 }
 
 fn load_cell(store: &dyn CellStore, key: CellKey) -> Loaded {
-    let Some(bytes) = store.get(key) else {
-        return Loaded { key, entry: Entry::default() };
+    let bytes = match store.get(key) {
+        Fetch::Bytes(b) => b,
+        Fetch::Absent => return Loaded { key, entry: Some(Entry::default()) },
+        Fetch::Failed(e) => {
+            eprintln!("cell {} fetch failed: {e}", key.path());
+            return Loaded { key, entry: None };
+        }
     };
-    let Ok(planes) = decode_cell(&bytes) else {
-        return Loaded { key, entry: Entry::default() };
+    let planes = match decode_cell(&bytes) {
+        Ok(p) => p,
+        Err(e) => {
+            // A corrupt object: treat as a failure so it's retried (the vault may have a bad copy) rather than remembered as absent.
+            eprintln!("cell {} decode failed ({} bytes): {e}", key.path(), bytes.len());
+            return Loaded { key, entry: None };
+        }
     };
     let dem = planes.dem.map(|d| DemPacked { texel: d.pack_texels(key).into_boxed_slice() });
-    Loaded { key, entry: Entry { dem, line: planes.line, land: planes.land, water: planes.water } }
+    if std::env::var_os("MAHERE_TRACE").is_some() || cfg!(target_os = "android") {
+        eprintln!("cell {} d{} loaded: dem={} line={} land={} water={} ({} bytes)", key.name(), key.depth, dem.is_some(), planes.line.is_some(), planes.land.is_some(), planes.water.is_some(), bytes.len());
+    }
+    Loaded { key, entry: Some(Entry { dem, line: planes.line, land: planes.land, water: planes.water }) }
 }
 
 // ==================== TIERED STORE: VAULT CACHE OVER THE BUCKET ====================
@@ -176,14 +215,17 @@ fn load_cell(store: &dyn CellStore, key: CellKey) -> Loaded {
 /// Where the baked cells live publicly. The path under it is exactly a cell's `CellKey::path`, so the bake directory and the bucket are the same thing.
 pub const DEFAULT_CELLS_URL: &str = "https://brobdingnagian.holdmyoscilloscope.com/mahere/cells";
 
+/// Cell format epoch: bumped whenever the encoding changes incompatibly. It rides on the fetch URL as a query (so the CDN edge, which caches a key for hours, sees a new key) and in the vault key (so a cached cell of an older format is never read back as this one). Old clients keep fetching the old objects they understand.
+pub const CELL_EPOCH: u32 = 2;
+
 /// A store that can also keep what it's given (the vault).
 pub trait CellCache: CellStore {
     fn put(&self, key: CellKey, bytes: &[u8]);
 }
 
-/// The far tier. `Ok(None)` is a definite absence (the cell was never baked); `Err` is a failure to find out (offline, timeout), which must not be remembered as absence.
+/// The far tier: the same outcomes as a store, over the network.
 pub trait RemoteStore: Send + Sync + 'static {
-    fn fetch(&self, key: CellKey) -> Result<Option<Vec<u8>>, String>;
+    fn fetch(&self, key: CellKey) -> Fetch;
 }
 
 /// Cache first, then the bucket, writing hits through. Definite misses are remembered for the process (most of the world isn't baked yet); failures are not, so a cell that couldn't be fetched is tried again the next time the view wants it.
@@ -200,26 +242,25 @@ impl TieredStore {
 }
 
 impl CellStore for TieredStore {
-    fn get(&self, key: CellKey) -> Option<Vec<u8>> {
-        if let Some(b) = self.cache.get(key) {
-            return Some(b);
+    fn get(&self, key: CellKey) -> Fetch {
+        match self.cache.get(key) {
+            Fetch::Bytes(b) => return Fetch::Bytes(b),
+            Fetch::Failed(e) => eprintln!("vault read {} failed: {e}", key.path()),
+            Fetch::Absent => {}
         }
         if self.missing.lock().unwrap().contains(&key) {
-            return None;
+            return Fetch::Absent;
         }
         match self.remote.fetch(key) {
-            Ok(Some(b)) => {
+            Fetch::Bytes(b) => {
                 self.cache.put(key, &b);
-                Some(b)
+                Fetch::Bytes(b)
             }
-            Ok(None) => {
+            Fetch::Absent => {
                 self.missing.lock().unwrap().insert(key);
-                None
+                Fetch::Absent
             }
-            Err(e) => {
-                eprintln!("cell fetch {}: {e}", key.path());
-                None
-            }
+            Fetch::Failed(e) => Fetch::Failed(e),
         }
     }
 }
@@ -241,24 +282,32 @@ impl HttpStore {
 }
 
 impl RemoteStore for HttpStore {
-    fn fetch(&self, key: CellKey) -> Result<Option<Vec<u8>>, String> {
-        let url = format!("{}/{}", self.base, key.path());
+    fn fetch(&self, key: CellKey) -> Fetch {
+        let url = format!("{}/{}?e={}", self.base, key.path(), CELL_EPOCH);
         match self.agent.get(&url).call() {
             Ok(resp) => {
+                let expect: Option<usize> = resp.header("Content-Length").and_then(|v| v.parse().ok());
                 let mut buf = Vec::new();
-                std::io::Read::read_to_end(&mut resp.into_reader(), &mut buf).map_err(|e| e.to_string())?;
-                Ok(Some(buf))
+                if let Err(e) = std::io::Read::read_to_end(&mut resp.into_reader(), &mut buf) {
+                    return Fetch::Failed(e.to_string());
+                }
+                if let Some(n) = expect {
+                    if n != buf.len() {
+                        return Fetch::Failed(format!("short body: {} of {n} bytes", buf.len()));
+                    }
+                }
+                Fetch::Bytes(buf)
             }
-            Err(ureq::Error::Status(404, _)) => Ok(None),
-            Err(e) => Err(e.to_string()),
+            Err(ureq::Error::Status(404, _)) => Fetch::Absent,
+            Err(e) => Fetch::Failed(e.to_string()),
         }
     }
 }
 
 /// The bucket with no cache at all (a desktop without a vault).
 impl CellStore for HttpStore {
-    fn get(&self, key: CellKey) -> Option<Vec<u8>> {
-        self.fetch(key).ok().flatten()
+    fn get(&self, key: CellKey) -> Fetch {
+        self.fetch(key)
     }
 }
 
@@ -269,8 +318,8 @@ mod tests {
     /// A store with nothing in it: every request resolves to absent, which is enough to exercise the residency policy end to end.
     struct Empty;
     impl CellStore for Empty {
-        fn get(&self, _key: CellKey) -> Option<Vec<u8>> {
-            None
+        fn get(&self, _key: CellKey) -> Fetch {
+            Fetch::Absent
         }
     }
 

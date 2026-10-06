@@ -202,6 +202,40 @@ fn shell<'a>(ptr: jlong) -> &'a mut Shell {
 const ACTION_MOVE: jint = 2;
 const ACTION_POINTER_UP: jint = 6;
 
+/// Android has no stderr: everything the engine prints with eprintln (fetch failures, decode failures) vanished. Dup a pipe over fd 2 and relay each line to logcat under the `mahere` tag, once per process.
+fn bridge_stderr_to_logcat() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| unsafe {
+        let mut fds = [0i32; 2];
+        if libc::pipe(fds.as_mut_ptr()) != 0 {
+            return;
+        }
+        libc::dup2(fds[1], 2);
+        libc::close(fds[1]);
+        let rd = fds[0];
+        std::thread::spawn(move || {
+            let tag = b"mahere\0";
+            let mut buf = [0u8; 4096];
+            let mut line: Vec<u8> = Vec::new();
+            loop {
+                let n = libc::read(rd, buf.as_mut_ptr() as *mut libc::c_void, buf.len());
+                if n <= 0 {
+                    break;
+                }
+                for &b in &buf[..n as usize] {
+                    if b == b'\n' {
+                        line.push(0);
+                        ndk_sys::__android_log_write(ndk_sys::android_LogPriority::ANDROID_LOG_INFO.0 as i32, tag.as_ptr() as *const _, line.as_ptr() as *const _);
+                        line.clear();
+                    } else {
+                        line.push(b);
+                    }
+                }
+            }
+        });
+    });
+}
+
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_nz_mahere_app_MahereActivity_nativeInit(
     mut env: JNIEnv,
@@ -214,6 +248,8 @@ pub extern "system" fn Java_nz_mahere_app_MahereActivity_nativeInit(
         Ok(s) => s.into(),
         Err(_) => return 0,
     };
+    bridge_stderr_to_logcat();
+    eprintln!("mahere native init: {dir}");
     // The vault: session, tracks, and the on-device cell cache (kete).
     let store = mahere_store::open(Some(&dir)).ok();
     // Cells stream from the bucket through the vault; `cells-local` (pushed by hand) overrides for offline development.

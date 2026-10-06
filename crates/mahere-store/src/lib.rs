@@ -259,14 +259,20 @@ pub struct VaultCells(pub Arc<FlatStorage>);
 fn cell_key(key: mahere_tiles::CellKey) -> String {
     vault_key(&[
         name("cell"),
+        VsfType::u(mahere_engine::residency::CELL_EPOCH as usize, false),
         VsfType::u(key.depth as usize, false),
         VsfType::wm(vsf::types::WorldCell::from_raw(key.raw())),
     ])
 }
 
 impl mahere_engine::residency::CellStore for VaultCells {
-    fn get(&self, key: mahere_tiles::CellKey) -> Option<Vec<u8>> {
-        self.0.read_device(&cell_key(key)).ok().flatten()
+    fn get(&self, key: mahere_tiles::CellKey) -> mahere_engine::residency::Fetch {
+        use mahere_engine::residency::Fetch;
+        match self.0.read_device(&cell_key(key)) {
+            Ok(Some(b)) => Fetch::Bytes(b),
+            Ok(None) => Fetch::Absent,
+            Err(e) => Fetch::Failed(format!("{e:?}")),
+        }
     }
 }
 

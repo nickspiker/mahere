@@ -1,5 +1,5 @@
 // Headless streaming check: cells come from the bucket through the vault, exactly as the phone does it. Run twice — the second run should be served from the vault (no fetches). Pass a vault dir to keep it out of the real one.
-use mahere_engine::residency::{DEFAULT_CELLS_URL, HttpStore, RemoteStore, TieredStore};
+use mahere_engine::residency::{DEFAULT_CELLS_URL, Fetch, HttpStore, RemoteStore, TieredStore};
 use mahere_tiles::CellKey;
 use mahere_engine::{Camera, MapCore};
 use std::sync::Arc;
@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 struct Counting(HttpStore, AtomicUsize);
 impl RemoteStore for Counting {
-    fn fetch(&self, key: CellKey) -> Result<Option<Vec<u8>>, String> {
+    fn fetch(&self, key: CellKey) -> Fetch {
         self.1.fetch_add(1, Ordering::Relaxed);
         self.0.fetch(key)
     }
