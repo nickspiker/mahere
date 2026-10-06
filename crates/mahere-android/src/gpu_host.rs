@@ -19,6 +19,9 @@ pub struct GpuHost {
     configured: (u32, u32),
     overlay_stamp: Option<OverlayStamp>,
     overlay_at: std::time::Instant,
+    last_cam: Option<(u64, u64, u64, u64)>,
+    /// The last frame was drawn still, at the still factor: nothing more to draw until something changes.
+    settled: bool,
     frames: u64,
     frame_ms: f32,
     work_ms: f32,
@@ -26,6 +29,10 @@ pub struct GpuHost {
     sync_ms: f32,
     report: std::time::Instant,
 }
+
+/// Supersampling while the camera moves and once it has stopped.
+const MOVING_SCALE: u32 = 2;
+const STILL_SCALE: u32 = 3;
 
 type OverlayStamp = (u64, u64, u64, u64, Option<(u64, u64, u32)>, u32, u32, bool, u32);
 
@@ -67,6 +74,8 @@ impl GpuHost {
             configured: (0, 0),
             overlay_stamp: None,
             overlay_at: std::time::Instant::now(),
+            last_cam: None,
+            settled: false,
             frames: 0,
             frame_ms: 0.0,
             work_ms: 0.0,
@@ -124,10 +133,17 @@ impl GpuHost {
         }
         // Nothing changed and nothing arrived: the surface keeps its last image, and the CPU keeps its budget. The poll still runs so finished uploads release their staging memory.
         let fresh = self.configured != (w, h) || self.frames == 0;
-        if !map.tick(w as usize, h as usize) && !fresh && !panel.take_dirty() {
+        if !map.tick(w as usize, h as usize) && !fresh && !panel.take_dirty() && self.settled {
             self.device.poll(wgpu::PollType::Poll).ok();
             return !map.converged();
         }
+        // Moving: 2× keeps the phone at its refresh rate; the first still frame after a move is drawn once more at 3× and the result stays on screen.
+        let c0 = map.cam;
+        let cam_key = (c0.lat.to_bits(), c0.lon.to_bits(), c0.ppd.to_bits(), c0.bearing.to_bits());
+        let moving = self.last_cam != Some(cam_key);
+        self.last_cam = Some(cam_key);
+        self.map.scale = if moving { MOVING_SCALE } else { STILL_SCALE };
+        self.settled = !moving;
         if self.frames == 0 {
             map.set_gpu_only();
         }

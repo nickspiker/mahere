@@ -218,9 +218,10 @@ pub struct GpuMap {
     /// Each resident dem plane.s quantisation (base, step), set when it is uploaded.
     dem_scale: FxHashMap<CellKey, (f32, f32)>,
     map_bind: Option<wgpu::BindGroup>,
-    offscreen: Option<(wgpu::Texture, wgpu::TextureView, u32, u32, u32)>,
+    /// One supersampled target per factor in use (a host draws at 2× while moving and 3× when still), each with its present bind group.
+    offscreen: Vec<(u32, wgpu::Texture, wgpu::TextureView, u32, u32)>,
+    present_binds: FxHashMap<u32, wgpu::BindGroup>,
     overlay: Option<(wgpu::Texture, wgpu::TextureView, u32, u32)>,
-    present_bind: Option<wgpu::BindGroup>,
     pub uploads: usize,
     /// Supersampling factor in use; a change takes effect at the next frame.
     pub scale: u32,
@@ -318,9 +319,9 @@ impl GpuMap {
             img,
             dem_scale: FxHashMap::default(),
             map_bind: None,
-            offscreen: None,
+            offscreen: Vec::new(),
+            present_binds: FxHashMap::default(),
             overlay: None,
-            present_bind: None,
             uploads: 0,
             scale: SCALE,
             sample_offset: [0.0, 0.0],
@@ -471,13 +472,17 @@ impl GpuMap {
             });
             let v = t.create_view(&Default::default());
             self.overlay = Some((t, v, w, h));
-            self.present_bind = None;
+            self.present_binds.clear();
         }
     }
 
     fn ensure_targets(&mut self, device: &wgpu::Device, w: u32, h: u32) {
         let scale = self.scale.max(1);
-        if self.offscreen.as_ref().is_none_or(|(_, _, ow, oh, os)| (*ow, *oh, *os) != (w, h, scale)) {
+        if self.offscreen.iter().any(|(_, _, _, ow, oh)| (*ow, *oh) != (w, h)) {
+            self.offscreen.clear();
+            self.present_binds.clear();
+        }
+        if !self.offscreen.iter().any(|(s, ..)| *s == scale) {
             let t = device.create_texture(&wgpu::TextureDescriptor {
                 label: Some("map supersampled"),
                 size: wgpu::Extent3d { width: w * scale, height: h * scale, depth_or_array_layers: 1 },
@@ -489,8 +494,7 @@ impl GpuMap {
                 view_formats: &[],
             });
             let v = t.create_view(&Default::default());
-            self.offscreen = Some((t, v, w, h, scale));
-            self.present_bind = None;
+            self.offscreen.push((scale, t, v, w, h));
         }
         if self.overlay.as_ref().is_none_or(|(_, _, ow, oh)| (*ow, *oh) != (w, h)) {
             // A blank (zero-initialised) overlay until the host paints one; set_overlay replaces it.
@@ -506,19 +510,20 @@ impl GpuMap {
             });
             let v = t.create_view(&Default::default());
             self.overlay = Some((t, v, w, h));
-            self.present_bind = None;
+            self.present_binds.clear();
         }
-        if self.present_bind.is_none() {
-            let (_, mv, _, _, _) = self.offscreen.as_ref().unwrap();
+        if !self.present_binds.contains_key(&scale) {
+            let (_, _, mv, _, _) = self.offscreen.iter().find(|(s, ..)| *s == scale).unwrap();
             let (_, ov, _, _) = self.overlay.as_ref().unwrap();
-            self.present_bind = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
+            let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("present"),
                 layout: &self.present_layout,
                 entries: &[
                     wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(mv) },
                     wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(ov) },
                 ],
-            }));
+            });
+            self.present_binds.insert(scale, bind);
         }
     }
 
@@ -610,7 +615,8 @@ impl GpuMap {
         };
         queue.write_buffer(&self.uniforms, 0, bytemuck::bytes_of(&u));
 
-        let (_, map_view, _, _, _) = self.offscreen.as_ref().unwrap();
+        let scale = self.scale.max(1);
+        let (_, _, map_view, _, _) = self.offscreen.iter().find(|(s, ..)| *s == scale).unwrap();
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("map"),
@@ -645,7 +651,7 @@ impl GpuMap {
             });
             pass.set_pipeline(&self.present_pipeline);
             pass.set_bind_group(0, self.map_bind.as_ref().unwrap(), &[]);
-            pass.set_bind_group(1, self.present_bind.as_ref().unwrap(), &[]);
+            pass.set_bind_group(1, &self.present_binds[&scale], &[]);
             pass.draw(0..3, 0..1);
         }
     }
