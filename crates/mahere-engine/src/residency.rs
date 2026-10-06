@@ -88,8 +88,16 @@ impl DemQ {
 }
 
 /// A resident cell: whichever layers it carried. All `None` = the loader confirmed the object does not exist (absent), which still ends probing.
+pub const PRESENT_DEM: u8 = 1;
+pub const PRESENT_LINE: u8 = 2;
+pub const PRESENT_LAND: u8 = 4;
+pub const PRESENT_WATER: u8 = 8;
+pub const PRESENT_IMG: u8 = 16;
+
 #[derive(Default)]
 pub struct Entry {
+    /// Which planes the cell carried when it loaded (PRESENT_ bits): the truth about the cell even after a GPU host has released a plane's CPU copy.
+    pub present: u8,
     pub dem: Option<DemPacked>,
     /// The same elevation as `dem`, in the layout a GPU uploads; kept beside the packed texels so either renderer can run.
     pub dem_q: Option<DemQ>,
@@ -111,7 +119,7 @@ impl Entry {
         Some(if q == 0xFFFF { mahere_tiles::ELEV_NODATA } else { mahere_tiles::quantize_elev(d.base + q as f32 * d.step) })
     }
     pub fn has_dem(&self) -> bool {
-        self.dem.is_some() || self.dem_q.is_some()
+        self.present & PRESENT_DEM != 0
     }
     pub fn is_absent(&self) -> bool {
         self.dem.is_none() && self.line.is_none() && self.land.is_none() && self.water.is_none() && self.img.is_none()
@@ -149,6 +157,8 @@ pub struct Residency {
     failed: FxHashMap<CellKey, std::time::Instant>,
     pub desired: FxHashSet<CellKey>,
     pub frame: u64,
+    /// Bumped whenever the pool's membership changes, so a planner can reuse its last plan while nothing moved.
+    pub pool_version: u64,
     /// The last missing list sent to the loader, so an unchanged one is not sent again.
     last_sent: Vec<CellKey>,
     last_send_at: std::time::Instant,
@@ -175,6 +185,7 @@ impl Residency {
             failed: FxHashMap::default(),
             desired: FxHashSet::default(),
             frame: 0,
+            pool_version: 0,
             last_sent: Vec::new(),
             last_send_at: std::time::Instant::now(),
         }
@@ -193,6 +204,7 @@ impl Residency {
             match l.entry {
                 Some(e) => {
                     self.pool.map.insert(l.key, e);
+                    self.pool_version += 1;
                     n += 1;
                 }
                 None => {
@@ -208,7 +220,11 @@ impl Residency {
         self.desired = list.iter().copied().collect();
         let desired = &self.desired;
         // The coarse levels stay resident wherever the view goes: a zoom out always has a frame to show while finer cells arrive, and they are few and small.
+        let before = self.pool.map.len();
         self.pool.map.retain(|k, _| desired.contains(k) || k.depth <= PIN_DEPTH);
+        if self.pool.map.len() != before {
+            self.pool_version += 1;
+        }
         self.pending.retain(|k| desired.contains(k));
         let now = std::time::Instant::now();
         self.failed.retain(|k, t| desired.contains(k) && now.duration_since(*t) < RETRY_AFTER);
@@ -310,7 +326,12 @@ fn load_cell(store: &dyn CellStore, key: CellKey, pack_cpu: bool) -> Loaded {
     if std::env::var_os("MAHERE_TRACE").is_some() || cfg!(target_os = "android") {
         eprintln!("cell {} d{} loaded: dem={} line={} land={} water={} ({} bytes)", key.name(), key.depth, dem.is_some(), planes.line.is_some(), planes.land.is_some(), planes.water.is_some(), bytes.len());
     }
-    Loaded { key, entry: Some(Entry { dem, dem_q, line: planes.line, land: planes.land, water: planes.water, img: planes.img }) }
+    let present = (dem_q.is_some() as u8) * PRESENT_DEM
+        | (planes.line.is_some() as u8) * PRESENT_LINE
+        | (planes.land.is_some() as u8) * PRESENT_LAND
+        | (planes.water.is_some() as u8) * PRESENT_WATER
+        | (planes.img.is_some() as u8) * PRESENT_IMG;
+    Loaded { key, entry: Some(Entry { present, dem, dem_q, line: planes.line, land: planes.land, water: planes.water, img: planes.img }) }
 }
 
 // ==================== TIERED STORE: VAULT CACHE OVER THE BUCKET ====================

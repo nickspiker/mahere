@@ -98,7 +98,11 @@ pub struct MapCore {
     pub real_sun: bool,
     /// Turn the map with the device so screen-up is the way the phone points.
     pub follow_heading: bool,
+    /// The last plan and what it was for.
+    plan_cache: Option<(PlanKey, Arc<plan::FramePlan>)>,
 }
+
+type PlanKey = (u64, u64, u64, u64, usize, usize, u64, u8, u8);
 
 impl MapCore {
     pub fn new(store: Arc<dyn CellStore>, home: Camera) -> MapCore {
@@ -134,6 +138,7 @@ impl MapCore {
             device_rot: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
             real_sun: false,
             follow_heading: false,
+            plan_cache: None,
         }
     }
 
@@ -259,6 +264,10 @@ impl MapCore {
     pub fn set_device_rotation(&mut self, r: [f32; 9]) {
         let changed = self.device_rot.iter().zip(&r).any(|(a, b)| (a - b).abs() > 0.002);
         self.device_rot = r;
+        // Nothing on screen depends on the orientation unless a mode uses it: no frame for a phone merely being held.
+        if !self.real_sun && !self.follow_heading {
+            return;
+        }
         let heading = r[1].atan2(r[4]).to_degrees().rem_euclid(360.0);
         self.set_device_heading(heading);
         if changed {
@@ -321,17 +330,36 @@ impl MapCore {
     }
 
     /// Plan a frame for a GPU: the same preparation as `render`, then the lattice, references and page table instead of pixels. Residency is driven from the plan's desired set; the contour interval is fit to the lattice's elevation range.
-    pub fn plan(&mut self, w: usize, h: usize) -> plan::FramePlan {
+    pub fn plan(&mut self, w: usize, h: usize) -> Arc<plan::FramePlan> {
         let t0 = Instant::now();
         self.prepare(w, h);
-        let p = plan::plan_frame(w, h, &self.cam, &self.res.pool, self.dem_depth, self.vec_depth);
+        // The same view over the same cells is the same plan: a frame the sensor or the GPS made dirty costs nothing here.
+        let key = (self.cam.lat.to_bits(), self.cam.lon.to_bits(), self.cam.ppd.to_bits(), self.cam.bearing.to_bits(), w, h, self.res.pool_version, self.dem_depth, self.vec_depth);
+        if let Some((k, p)) = &self.plan_cache {
+            if *k == key {
+                let p = p.clone();
+                // Residency still hears the want: it re-sends an unchanged missing list once a second.
+                let center = Coord::from_lat_lon(self.cam.lat, self.cam.lon);
+                let (cu, cv) = center.uv();
+                self.res.want(p.want.clone(), (cu, cv));
+                self.last_frame_ms = t0.elapsed().as_secs_f32() * 1000.0;
+                return p;
+            }
+        }
+        let p = Arc::new(plan::plan_frame(w, h, &self.cam, &self.res.pool, self.dem_depth, self.vec_depth));
         self.last_straddle_blocks = p.straddle_blocks;
         self.last_range = p.elev;
         let center = Coord::from_lat_lon(self.cam.lat, self.cam.lon);
         let (cu, cv) = center.uv();
         self.res.want(p.want.clone(), (cu, cv));
+        self.plan_cache = Some((key, p.clone()));
         self.last_frame_ms = t0.elapsed().as_secs_f32() * 1000.0;
         p
+    }
+
+    /// The resident cells, for a renderer that mirrors them and may release what it has copied.
+    pub fn pool_mut(&mut self) -> &mut residency::Pool {
+        &mut self.res.pool
     }
 
     /// The screen-space marks (GPS pin, compass) on a cleared canvas, for a renderer that composites them itself. 0xRRGGBB over black; the ink's brightness is its coverage. `with_pin` false leaves the pin out for a renderer that draws it itself (the GPU, where the pin would otherwise force a full overlay upload on every pan).

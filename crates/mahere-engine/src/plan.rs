@@ -237,20 +237,22 @@ pub fn plan_frame(w: usize, h: usize, cam: &Camera, pool: &Pool, dem_depth: u8, 
     keys.sort();
     for key in keys {
         let e = &pool.map[key];
+        // From the presence bits, not the planes: a GPU host may have released the CPU copies.
+        let p = e.present;
         let mut flags = 0;
-        if e.dem_q.is_some() {
+        if p & crate::residency::PRESENT_DEM != 0 {
             flags |= FLAG_DEM;
         }
-        if e.line.is_some() {
+        if p & crate::residency::PRESENT_LINE != 0 {
             flags |= FLAG_LINE;
         }
-        if e.land.is_some() {
+        if p & crate::residency::PRESENT_LAND != 0 {
             flags |= FLAG_LAND;
         }
-        if e.water.is_some() {
+        if p & crate::residency::PRESENT_WATER != 0 {
             flags |= FLAG_WATER;
         }
-        if e.img.is_some() {
+        if p & crate::residency::PRESENT_IMG != 0 {
             flags |= FLAG_IMG;
         }
         if flags == 0 {
@@ -283,7 +285,7 @@ mod tests {
         let c = Coord::from_lat_lon(46.2, -122.19);
         for depth in MIN_DEPTH..=12 {
             let key = CellKey { depth, prefix: c.raw() >> (60 - 2 * depth as u32) };
-            pool.map.insert(key, crate::residency::Entry { water: Some(mahere_tiles::CovCell::new()), ..Default::default() });
+            pool.map.insert(key, crate::residency::Entry { present: crate::residency::PRESENT_WATER, water: Some(mahere_tiles::CovCell::new()), ..Default::default() });
         }
         let cam = Camera { lat: 46.2, lon: -122.19, ppd: 6000.0, bearing: 0.3 };
         let plan = plan_frame(256, 128, &cam, &pool, 12, 12);

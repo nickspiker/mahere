@@ -45,6 +45,8 @@ pub struct AndroidApp {
     suppress_move: bool,
     centered_once: bool,
     store: Option<std::sync::Arc<mahere_store::FlatStorage>>,
+    /// The dated cell cache, flushed at the pause moment.
+    cells_cache: Option<std::sync::Arc<mahere_store::VaultCells>>,
     recorder: Option<mahere_store::TrackRecorder>,
     fixes_since_save: u32,
     /// The GPU path, created on the first draw; None after a failure means the CPU present is in use.
@@ -276,15 +278,17 @@ pub extern "system" fn Java_nz_mahere_app_MahereActivity_nativeInit(
     let store = mahere_store::open(Some(&dir)).ok();
     // Cells stream from the bucket through the vault; `cells-local` (pushed by hand) overrides for offline development.
     let local = std::path::PathBuf::from(format!("{dir}/cells-local"));
+    let mut cells_cache: Option<std::sync::Arc<mahere_store::VaultCells>> = None;
     let cell_store: std::sync::Arc<dyn CellStore> = if local.is_dir() {
         std::sync::Arc::new(DirStore(local))
     } else {
         let remote = std::sync::Arc::new(HttpStore::new(DEFAULT_CELLS_URL));
         match &store {
-            Some(v) => std::sync::Arc::new(TieredStore::new(
-                std::sync::Arc::new(mahere_store::VaultCells(v.clone())),
-                remote,
-            )),
+            Some(v) => {
+                let cache = std::sync::Arc::new(mahere_store::VaultCells::new(v.clone()));
+                cells_cache = Some(cache.clone());
+                std::sync::Arc::new(TieredStore::new(cache, remote))
+            }
             None => remote,
         }
     };
@@ -311,6 +315,7 @@ pub extern "system" fn Java_nz_mahere_app_MahereActivity_nativeInit(
         // A restored session IS the view; don't let the first fix yank it.
         centered_once: session.is_some(),
         store,
+        cells_cache,
         recorder,
         fixes_since_save: 0,
         gpu: None,
@@ -454,6 +459,9 @@ pub extern "system" fn Java_nz_mahere_app_MahereActivity_nativeOnPause(
         app.save_session();
         if let Some(rec) = &mut app.recorder {
             rec.flush();
+        }
+        if let Some(c) = &app.cells_cache {
+            c.flush();
         }
     }
 }

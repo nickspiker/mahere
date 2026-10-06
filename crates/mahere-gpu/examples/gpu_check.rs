@@ -97,7 +97,7 @@ fn main() {
     });
     let view = target.create_view(&Default::default());
     let t = std::time::Instant::now();
-    gpu.sync(&device, &queue, map.pool());
+    gpu.sync(&device, &queue, map.pool_mut(), false);
     let sync_ms = t.elapsed().as_secs_f32() * 1000.0;
     let overlay = map.overlay(w, h, true).to_vec();
     // MAHERE_PANEL=1 lays the open control panel over the GPU frame (the CPU frame has none, so the diff below is then meaningless).

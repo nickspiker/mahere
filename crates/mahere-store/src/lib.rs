@@ -6,6 +6,7 @@
 use std::sync::Arc;
 
 pub use kete::{FlatStorage, StorageError};
+use vsf::VsfBuilder;
 use rand::RngCore;
 use vsf::types::{EtType, Tensor};
 use vsf::VsfType;
@@ -254,7 +255,147 @@ mod tests {
 // ==================== CELL CACHE ====================
 
 /// The vault as the on-device cell tier: every cell fetched from the bucket is written through here and served from here afterwards (offline included). Keyed by the VSF values (`d` cell, `u` depth, `wm` cell) through [`vault_key`], so cells, session and tracks share the vault with the type system as the namespace.
-pub struct VaultCells(pub Arc<FlatStorage>);
+///
+/// Every cached cell is dated: an index document (`d` cells, `d` index) records each cell's last use as Eagle Time and its size, so the cache can be purged oldest-first to a byte budget ([`VaultCells::purge_to`]). The index is rewritten after every so many new cells and on demand ([`VaultCells::flush`], the pause moment).
+pub struct VaultCells {
+    store: Arc<FlatStorage>,
+    index: std::sync::Mutex<CellIndex>,
+}
+
+#[derive(Default)]
+struct CellIndex {
+    /// (depth, raw cell) → (last use, Eagle Time; bytes).
+    entries: std::collections::HashMap<(u8, u64), (i64, u32)>,
+    /// New cells since the last flush.
+    unsaved: u32,
+}
+
+fn cells_index_key() -> String {
+    vault_key(&[name("cells"), name("index")])
+}
+
+impl VaultCells {
+    pub fn new(store: Arc<FlatStorage>) -> VaultCells {
+        let mut index = CellIndex::default();
+        if let Ok(Some(bytes)) = store.read_device(&cells_index_key()) {
+            index.entries = decode_cell_index(&bytes);
+        }
+        VaultCells { store, index: std::sync::Mutex::new(index) }
+    }
+
+    fn touch(&self, key: mahere_tiles::CellKey, bytes: usize) {
+        let mut ix = self.index.lock().unwrap();
+        let fresh = ix.entries.insert((key.depth, key.raw()), (et_now(), bytes as u32)).is_none();
+        if fresh {
+            ix.unsaved += 1;
+        }
+        if ix.unsaved >= 64 {
+            drop(ix);
+            self.flush();
+        }
+    }
+
+    /// Write the index document.
+    pub fn flush(&self) {
+        let (bytes, n) = {
+            let mut ix = self.index.lock().unwrap();
+            ix.unsaved = 0;
+            (encode_cell_index(&ix.entries), ix.entries.len())
+        };
+        if let Some(b) = bytes {
+            let _ = self.store.write_device(&cells_index_key(), &b);
+        }
+        let _ = n;
+    }
+
+    /// Bytes of cells the index knows about.
+    pub fn cached_bytes(&self) -> u64 {
+        self.index.lock().unwrap().entries.values().map(|&(_, b)| b as u64).sum()
+    }
+
+    /// Delete the least recently used cells until the cache fits `budget` bytes; returns how many went.
+    pub fn purge_to(&self, budget: u64) -> usize {
+        let victims: Vec<(u8, u64)> = {
+            let ix = self.index.lock().unwrap();
+            let mut total: u64 = ix.entries.values().map(|&(_, b)| b as u64).sum();
+            let mut by_age: Vec<(&(u8, u64), &(i64, u32))> = ix.entries.iter().collect();
+            by_age.sort_by_key(|(_, v)| v.0);
+            let mut out = Vec::new();
+            for (k, &(_, b)) in by_age {
+                if total <= budget {
+                    break;
+                }
+                total -= b as u64;
+                out.push(*k);
+            }
+            out
+        };
+        for &(depth, raw) in &victims {
+            let key = mahere_tiles::CellKey { depth, prefix: raw >> (60 - 2 * depth as u32) };
+            let _ = self.store.delete_device(&cell_key(key));
+            self.index.lock().unwrap().entries.remove(&(depth, raw));
+        }
+        if !victims.is_empty() {
+            self.flush();
+        }
+        victims.len()
+    }
+}
+
+fn encode_cell_index(entries: &std::collections::HashMap<(u8, u64), (i64, u32)>) -> Option<Vec<u8>> {
+    let mut depth = Vec::with_capacity(entries.len());
+    let mut cell = Vec::with_capacity(entries.len());
+    let mut seen = Vec::with_capacity(entries.len());
+    let mut bytes = Vec::with_capacity(entries.len());
+    for (&(d, raw), &(t, b)) in entries {
+        depth.push(d);
+        cell.push(raw);
+        seen.push(t);
+        bytes.push(b);
+    }
+    let n = entries.len();
+    VsfBuilder::new()
+        .add_section(
+            "cells",
+            vec![
+                ("depth".to_string(), VsfType::t_u3(Tensor::new(vec![n], depth))),
+                ("cell".to_string(), VsfType::t_u6(Tensor::new(vec![n], cell))),
+                ("seen".to_string(), VsfType::t_i6(Tensor::new(vec![n], seen))),
+                ("bytes".to_string(), VsfType::t_u5(Tensor::new(vec![n], bytes))),
+            ],
+        )
+        .build()
+        .ok()
+}
+
+fn decode_cell_index(data: &[u8]) -> std::collections::HashMap<(u8, u64), (i64, u32)> {
+    let mut out = std::collections::HashMap::new();
+    let Ok((header, end)) = vsf::VsfHeader::decode(data) else { return out };
+    let Ok(sections) = header.sections(data, end) else { return out };
+    for s in sections {
+        if s.name != "cells" {
+            continue;
+        }
+        let mut depth: Vec<u8> = Vec::new();
+        let mut cell: Vec<u64> = Vec::new();
+        let mut seen: Vec<i64> = Vec::new();
+        let mut bytes: Vec<u32> = Vec::new();
+        for f in s.fields {
+            match (f.name.as_str(), f.values.into_iter().next()) {
+                ("depth", Some(VsfType::t_u3(t))) => depth = t.data,
+                ("cell", Some(VsfType::t_u6(t))) => cell = t.data,
+                ("seen", Some(VsfType::t_i6(t))) => seen = t.data,
+                ("bytes", Some(VsfType::t_u5(t))) => bytes = t.data,
+                _ => {}
+            }
+        }
+        let n = depth.len().min(cell.len()).min(seen.len()).min(bytes.len());
+        for i in 0..n {
+            out.insert((depth[i], cell[i]), (seen[i], bytes[i]));
+        }
+    }
+    out
+}
 
 fn cell_key(key: mahere_tiles::CellKey) -> String {
     vault_key(&[
@@ -268,8 +409,11 @@ fn cell_key(key: mahere_tiles::CellKey) -> String {
 impl mahere_engine::residency::CellStore for VaultCells {
     fn get(&self, key: mahere_tiles::CellKey) -> mahere_engine::residency::Fetch {
         use mahere_engine::residency::Fetch;
-        match self.0.read_device(&cell_key(key)) {
-            Ok(Some(b)) => Fetch::Bytes(b),
+        match self.store.read_device(&cell_key(key)) {
+            Ok(Some(b)) => {
+                self.touch(key, b.len());
+                Fetch::Bytes(b)
+            }
             Ok(None) => Fetch::Absent,
             Err(e) => Fetch::Failed(format!("{e:?}")),
         }
@@ -278,6 +422,22 @@ impl mahere_engine::residency::CellStore for VaultCells {
 
 impl mahere_engine::residency::CellCache for VaultCells {
     fn put(&self, key: mahere_tiles::CellKey, bytes: &[u8]) {
-        let _ = self.0.write_device(&cell_key(key), bytes);
+        if self.store.write_device(&cell_key(key), bytes).is_ok() {
+            self.touch(key, bytes.len());
+        }
+    }
+}
+
+#[cfg(test)]
+mod index_tests {
+    use super::*;
+
+    #[test]
+    fn cell_index_round_trips() {
+        let mut entries = std::collections::HashMap::new();
+        entries.insert((13u8, 0x3_0000_0000_0000_0000u64), (et_now(), 48_123u32));
+        entries.insert((9u8, 0x7_0000_0000_0000_0000u64), (et_now() - 5, 1_024u32));
+        let bytes = encode_cell_index(&entries).unwrap();
+        assert_eq!(decode_cell_index(&bytes), entries);
     }
 }

@@ -133,7 +133,7 @@ impl GpuHost {
         }
         let plan = map.plan(w as usize, h as usize);
         let t_plan = t0.elapsed().as_secs_f32() * 1000.0;
-        self.map.sync(&self.device, &self.queue, map.pool());
+        self.map.sync(&self.device, &self.queue, map.pool_mut(), true);
         let t_sync = t0.elapsed().as_secs_f32() * 1000.0 - t_plan;
         self.plan_ms += t_plan;
         self.sync_ms += t_sync;

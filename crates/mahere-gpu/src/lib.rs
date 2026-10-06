@@ -78,12 +78,14 @@ struct Plane {
     max: u32,
     map: FxHashMap<CellKey, u32>,
     free: Vec<u32>,
+    /// Since when the array has been mostly empty, if it is.
+    sparse_since: Option<std::time::Instant>,
 }
 
 impl Plane {
     fn new(device: &wgpu::Device, label: &'static str, w: u32, h: u32, format: wgpu::TextureFormat, max: u32) -> Plane {
         let cap = INITIAL_LAYERS.min(max);
-        Plane { label, w, h, format, tex: plane_texture(device, label, w, h, cap, format), cap, max, map: FxHashMap::default(), free: (0..cap).rev().collect() }
+        Plane { label, w, h, format, tex: plane_texture(device, label, w, h, cap, format), cap, max, map: FxHashMap::default(), free: (0..cap).rev().collect(), sparse_since: None }
     }
 
     /// The cell's slot, allocating one if it has none and growing the array when it is full: `Some((slot, fresh))`, or None at the device's limit. True when the array was reallocated (bind groups must be rebuilt).
@@ -126,6 +128,42 @@ impl Plane {
             self.map.remove(&k);
             self.free.push(s);
         }
+    }
+
+    /// When the slots in use have sat at a quarter of the array or less for two seconds, rebuild it smaller: the live layers are copied into the first slots on the GPU and the map rewritten. Memory follows the resident set down as well as up. True when the array changed.
+    fn shrink_if_sparse(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) -> bool {
+        let used = self.map.len() as u32;
+        if self.cap <= INITIAL_LAYERS || used * 4 > self.cap {
+            self.sparse_since = None;
+            return false;
+        }
+        match self.sparse_since {
+            None => {
+                self.sparse_since = Some(std::time::Instant::now());
+                return false;
+            }
+            Some(t) if t.elapsed() < std::time::Duration::from_secs(2) => return false,
+            _ => {}
+        }
+        let new_cap = (used * 2).max(INITIAL_LAYERS).next_power_of_two().min(self.cap / 2);
+        let new_tex = plane_texture(device, self.label, self.w, self.h, new_cap, self.format);
+        let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("shrink plane") });
+        let mut new_map = FxHashMap::default();
+        for (i, (k, old_slot)) in self.map.iter().enumerate() {
+            enc.copy_texture_to_texture(
+                wgpu::TexelCopyTextureInfo { texture: &self.tex, mip_level: 0, origin: wgpu::Origin3d { x: 0, y: 0, z: *old_slot }, aspect: wgpu::TextureAspect::All },
+                wgpu::TexelCopyTextureInfo { texture: &new_tex, mip_level: 0, origin: wgpu::Origin3d { x: 0, y: 0, z: i as u32 }, aspect: wgpu::TextureAspect::All },
+                wgpu::Extent3d { width: self.w, height: self.h, depth_or_array_layers: 1 },
+            );
+            new_map.insert(*k, i as u32);
+        }
+        queue.submit([enc.finish()]);
+        self.tex = new_tex;
+        self.cap = new_cap;
+        self.map = new_map;
+        self.free = (used..new_cap).rev().collect();
+        self.sparse_since = None;
+        true
     }
 
     fn view(&self) -> wgpu::TextureView {
@@ -308,15 +346,19 @@ impl GpuMap {
     }
 
     /// Mirror the pool: a slot per resident plane, uploaded on first sight, freed when the cell leaves the pool.
-    pub fn sync(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, pool: &Pool) {
+    /// Mirror the pool: a slot per resident plane, uploaded on first sight, freed when the cell leaves the pool, the arrays shrunk when the resident set does. With `release`, a plane's CPU copy is dropped once it is on the GPU (a host that never draws on the CPU): the entry keeps its presence bits and its elevation plane for readouts.
+    pub fn sync(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, pool: &mut Pool, release: bool) {
+        let mut grew = false;
         for s in [&mut self.dem, &mut self.line, &mut self.lw, &mut self.img] {
             s.evict_absent(pool);
+            if !grew {
+                grew |= s.shrink_if_sparse(device, queue);
+            }
         }
         self.dem_scale.retain(|k, _| pool.map.contains_key(k));
         let (w, h) = (2 * TEX as u32, TEX as u32);
         let mut scratch = vec![0u8; TRI * 4];
-        let mut grew = false;
-        for (key, e) in &pool.map {
+        for (key, e) in pool.map.iter_mut() {
             if let Some(d) = &e.dem_q {
                 let (slot, g) = self.dem.alloc(device, queue, *key);
                 grew |= g;
@@ -338,6 +380,9 @@ impl GpuMap {
                     }
                     write_layer(queue, &self.line.tex, slot, w, h, 4, &scratch);
                     self.uploads += 1;
+                    if release {
+                        e.line = None;
+                    }
                 }
             }
             if e.land.is_some() || e.water.is_some() {
@@ -353,6 +398,10 @@ impl GpuMap {
                     }
                     write_layer(queue, &self.lw.tex, slot, w, h, 4, &scratch);
                     self.uploads += 1;
+                    if release {
+                        e.land = None;
+                        e.water = None;
+                    }
                 }
             }
             if let Some(im) = &e.img {
@@ -367,6 +416,9 @@ impl GpuMap {
                     }
                     write_layer(queue, &self.img.tex, slot, w, h, 4, &scratch);
                     self.uploads += 1;
+                    if release {
+                        e.img = None;
+                    }
                 }
             }
         }

@@ -375,7 +375,7 @@ fn main() {
         let remote = std::sync::Arc::new(HttpStore::new(DEFAULT_CELLS_URL));
         match &vault {
             Some(v) => std::sync::Arc::new(TieredStore::new(
-                std::sync::Arc::new(mahere_store::VaultCells(v.clone())),
+                std::sync::Arc::new(mahere_store::VaultCells::new(v.clone())),
                 remote,
             )),
             None => remote,
