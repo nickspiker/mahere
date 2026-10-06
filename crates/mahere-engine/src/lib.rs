@@ -96,7 +96,7 @@ impl MapCore {
         MapCore {
             cam: home,
             res: Residency::new(store),
-            luts: FrameLuts { hypso: build_hypso_lut(), sun: [0.0, 0.0, 1.0], mask: LayerMask::default() },
+            luts: FrameLuts { hypso: build_hypso_lut(), sun: [0.0, 0.0, 1.0], mask: LayerMask::default(), dem_depth: DEM_BASE_DEPTH },
             luts_sun: (f32::NAN, f32::NAN, f64::NAN),
             sun_az: 315.0,
             sun_alt: 40.0,
@@ -267,6 +267,7 @@ impl MapCore {
         }
         self.vec_depth = select_depth(self.cam.ppd, self.vec_depth, VEC_BASE_DEPTH);
         self.dem_depth = select_depth(self.cam.ppd, self.dem_depth, DEM_BASE_DEPTH);
+        self.luts.dem_depth = self.dem_depth;
 
         let (stats, want) = raster::render_frame(
             &mut self.canvas,

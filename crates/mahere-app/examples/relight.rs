@@ -36,6 +36,17 @@ fn main() {
     let store = std::sync::Arc::new(DirStore("data/cells".into()));
     let mut map = MapCore::new(store, cam);
     let (w, h) = (1024usize, 768usize);
+    if std::env::var("MAHERE_DEBUG").is_ok() {
+        // Residency debug: a cold frame mid-stream, then the settled one.
+        let mut m = map.layers();
+        m.debug = true;
+        map.set_layers(m);
+        map.render(w, h);
+        std::thread::sleep(std::time::Duration::from_millis(60));
+        map.tick(w, h);
+        map.render(w, h);
+        save("/tmp/claude-1000/residency_cold.png", &map.canvas, w, h);
+    }
     settle(&mut map, w, h);
     map.render(w, h);
     eprintln!("frame: {:.2} ms ({} straddle blocks)", map.last_frame_ms, map.last_straddle_blocks);

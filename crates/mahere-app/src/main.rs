@@ -216,14 +216,16 @@ impl FluorApp for MahereApp {
                         self.map.go_home(w, h);
                         true
                     }
-                    // The layer filter: 1 terrain, 2 land cover, 3 water, 4 lines.
-                    Some(k @ ("1" | "2" | "3" | "4")) => {
+                    // The layer filter: 1 terrain, 2 land cover, 3 water, 4 lines;
+                    // 0 shows residency (fallback tint).
+                    Some(k @ ("1" | "2" | "3" | "4" | "0")) => {
                         let mut m = self.map.layers();
                         match k {
                             "1" => m.dem = !m.dem,
                             "2" => m.land = !m.land,
                             "3" => m.water = !m.water,
-                            _ => m.line = !m.line,
+                            "4" => m.line = !m.line,
+                            _ => m.debug = !m.debug,
                         }
                         self.map.set_layers(m);
                         true

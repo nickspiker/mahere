@@ -45,11 +45,15 @@ pub struct LayerMask {
     pub land: bool,
     pub water: bool,
     pub line: bool,
+    /// Residency debug: tint pixels whose dem came from a parent of the
+    /// wanted depth (one level amber, two or more red) and blocks with no
+    /// dem at all magenta — so streaming and eviction are visible.
+    pub debug: bool,
 }
 
 impl Default for LayerMask {
     fn default() -> Self {
-        LayerMask { dem: true, land: true, water: true, line: true }
+        LayerMask { dem: true, land: true, water: true, line: true, debug: false }
     }
 }
 
@@ -176,6 +180,8 @@ pub struct FrameLuts {
     pub hypso: Box<[[u8; 3]; 4096]>,
     pub sun: [f32; 3],
     pub mask: LayerMask,
+    /// The depth the frame asked the dem for (debug tint reference).
+    pub dem_depth: u8,
 }
 
 /// Corner lattice entry: diamond + Q30.16 UV (i64).
@@ -351,6 +357,28 @@ fn dem_texel(dem: &DemRef, pool: &Pool, diamond: u8, uq: i64, vq: i64) -> Option
 
 #[inline(always)]
 fn compose(dem: &DemRef, vec: &VecRef, pool: &Pool, diamond: u8, uq: i64, vq: i64, luts: &FrameLuts) -> u32 {
+    let rgb = compose_rgb(dem, vec, pool, diamond, uq, vq, luts);
+    if !luts.mask.debug {
+        return rgb;
+    }
+    // Debug tint by fallback distance of the dem ref.
+    let tint: Option<[u32; 3]> = match dem_ref_depth(dem) {
+        None => Some([255, 0, 255]),
+        Some(d) if d + 2 <= luts.dem_depth => Some([255, 40, 40]),
+        Some(d) if d + 1 == luts.dem_depth => Some([255, 170, 0]),
+        _ => None,
+    };
+    match tint {
+        None => rgb,
+        Some(t) => {
+            let (r, g, b) = ((rgb >> 16) & 255, (rgb >> 8) & 255, rgb & 255);
+            (((r + t[0]) / 2) << 16) | (((g + t[1]) / 2) << 8) | ((b + t[2]) / 2)
+        }
+    }
+}
+
+#[inline(always)]
+fn compose_rgb(dem: &DemRef, vec: &VecRef, pool: &Pool, diamond: u8, uq: i64, vq: i64, luts: &FrameLuts) -> u32 {
     let mask = luts.mask;
     // Terrain: tint from elevation, shade from the normal.
     let mut tint = [FLAT_RGB[0] as f32, FLAT_RGB[1] as f32, FLAT_RGB[2] as f32];
@@ -605,7 +633,7 @@ mod tests {
             },
         );
 
-        let luts = FrameLuts { hypso: build_hypso_lut(), sun: [0.0, 0.0, 1.0], mask: LayerMask::default() };
+        let luts = FrameLuts { hypso: build_hypso_lut(), sun: [0.0, 0.0, 1.0], mask: LayerMask::default(), dem_depth: 12 };
         let (w, h) = (64usize, 64usize);
         let mut canvas = vec![0u32; w * h];
         let (stats, _want) = render_frame(&mut canvas, w, h, &cam, &pool, &luts, 12, 13);
