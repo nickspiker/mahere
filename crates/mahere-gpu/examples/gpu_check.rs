@@ -119,12 +119,15 @@ fn main() {
     for i in 0..2 {
         let t = std::time::Instant::now();
         let mut enc = device.create_command_encoder(&Default::default());
-        gpu.render(&device, &queue, &mut enc, &view, &plan, luts, w as u32, h as u32);
+        gpu.render(&device, &queue, &mut enc, &view, &plan, luts, w as u32, h as u32, mahere_gpu::RenderMode::Full);
         queue.submit([enc.finish()]);
         device.poll(wgpu::PollType::wait_indefinitely()).ok();
         if i == 1 {
             frame_ms = t.elapsed().as_secs_f32() * 1000.0;
         }
+    }
+    if std::env::var("MAHERE_RELIGHT").as_deref() == Ok("1") {
+        relight_check(&device, &queue, &mut gpu, &target, &view, &plan, luts, w, h);
     }
     // Read back.
     let bpr = ((w as u32 * 4) + 255) / 256 * 256;
@@ -167,4 +170,55 @@ fn main() {
     write_png(&format!("{out}_cpu.png"), w, h, |i| [(cpu[i] >> 16) as u8, (cpu[i] >> 8) as u8, cpu[i] as u8]);
     write_png(&format!("{out}_gpu.png"), w, h, |i| [(gpu_px[i] >> 16) as u8, (gpu_px[i] >> 8) as u8, gpu_px[i] as u8]);
     println!("wrote {out}_cpu.png and {out}_gpu.png");
+}
+
+/// MAHERE_RELIGHT=1: draw the frame with the G-buffer at 1×, relight from it, and report how far the two images are apart — the receipt that the deferred path shades the same pixels.
+#[allow(dead_code)]
+fn relight_check(device: &wgpu::Device, queue: &wgpu::Queue, gpu: &mut GpuMap, target: &wgpu::Texture, view: &wgpu::TextureView, plan: &mahere_engine::plan::FramePlan, luts: &mahere_engine::raster::FrameLuts, w: usize, h: usize) {
+    let read = |device: &wgpu::Device, queue: &wgpu::Queue| -> Vec<u32> {
+        let bpr = ((w as u32 * 4) + 255) / 256 * 256;
+        let buf = device.create_buffer(&wgpu::BufferDescriptor { label: Some("readback"), size: (bpr * h as u32) as u64, usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ, mapped_at_creation: false });
+        let mut enc = device.create_command_encoder(&Default::default());
+        enc.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo { texture: target, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+            wgpu::TexelCopyBufferInfo { buffer: &buf, layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(bpr), rows_per_image: Some(h as u32) } },
+            wgpu::Extent3d { width: w as u32, height: h as u32, depth_or_array_layers: 1 },
+        );
+        queue.submit([enc.finish()]);
+        let slice = buf.slice(..);
+        slice.map_async(wgpu::MapMode::Read, |_| {});
+        device.poll(wgpu::PollType::wait_indefinitely()).ok();
+        let data = slice.get_mapped_range();
+        let mut px = vec![0u32; w * h];
+        for y in 0..h {
+            for x in 0..w {
+                let p = &data[y * bpr as usize + x * 4..][..4];
+                px[y * w + x] = ((p[0] as u32) << 16) | ((p[1] as u32) << 8) | p[2] as u32;
+            }
+        }
+        px
+    };
+    let mut frame = |mode: mahere_gpu::RenderMode| {
+        let mut enc = device.create_command_encoder(&Default::default());
+        gpu.render(device, queue, &mut enc, view, plan, luts, w as u32, h as u32, mode);
+        queue.submit([enc.finish()]);
+        device.poll(wgpu::PollType::wait_indefinitely()).ok();
+    };
+    frame(mahere_gpu::RenderMode::FullWithG);
+    let full = read(device, queue);
+    let t = std::time::Instant::now();
+    frame(mahere_gpu::RenderMode::Relight);
+    let relight_ms = t.elapsed().as_secs_f32() * 1000.0;
+    let relit = read(device, queue);
+    let (mut worst, mut n) = (0u32, 0usize);
+    for i in 0..w * h {
+        let (a, b) = (full[i], relit[i]);
+        let d = [((a >> 16) & 255).abs_diff((b >> 16) & 255), ((a >> 8) & 255).abs_diff((b >> 8) & 255), (a & 255).abs_diff(b & 255)];
+        let m = d[0].max(d[1]).max(d[2]);
+        worst = worst.max(m);
+        if m > 2 {
+            n += 1;
+        }
+    }
+    println!("relight: {:.2}% of pixels beyond 2 levels of the full frame, worst {worst}; relight frame {relight_ms:.2} ms submit to idle", n as f64 * 100.0 / (w * h) as f64);
 }

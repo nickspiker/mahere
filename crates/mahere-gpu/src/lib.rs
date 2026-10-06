@@ -10,6 +10,27 @@ use rustc_hash::FxHashMap;
 /// Default supersampling factor: the map pass renders this many pixels per screen pixel on each axis, binned once.
 pub const SCALE: u32 = 3;
 
+/// The G-buffer: base + ground, normal (half-offset unorm) + water, post-light folds one and two. Four targets: five would pass the 32 bytes a sample may carry, so the colour comes from the relight pass instead.
+const G_FORMATS: [wgpu::TextureFormat; 4] = [wgpu::TextureFormat::Rgba8Unorm; 4];
+
+/// How a frame is drawn.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RenderMode {
+    /// The map pass at the current factor.
+    Full,
+    /// The map pass at 1×, also writing the G-buffer.
+    FullWithG,
+    /// Only the light changed: shade the last G-buffer, at 1×.
+    Relight,
+}
+
+struct GBuffer {
+    w: u32,
+    h: u32,
+    views: Vec<wgpu::TextureView>,
+    bind: wgpu::BindGroup,
+}
+
 /// Layers a plane's texture array starts with; it doubles whenever the resident set outgrows it, up to the device's limit, so memory tracks what is on screen.
 pub const INITIAL_LAYERS: u32 = 32;
 
@@ -196,7 +217,13 @@ pub struct GpuMap {
     map_layout: wgpu::BindGroupLayout,
     present_layout: wgpu::BindGroupLayout,
     map_pipeline: wgpu::RenderPipeline,
+    map_g_pipeline: wgpu::RenderPipeline,
     present_pipeline: wgpu::RenderPipeline,
+    relight_pipeline: wgpu::RenderPipeline,
+    relight_layout: wgpu::BindGroupLayout,
+    empty_bind: wgpu::BindGroup,
+    /// The G-buffer the last 1× map pass wrote, if any: what a sample was before the light, so a frame where only the light changed relights from it.
+    gbuf: Option<GBuffer>,
     uniforms: wgpu::Buffer,
     blocks: wgpu::Buffer,
     blocks_cap: usize,
@@ -252,7 +279,12 @@ impl GpuMap {
                 wgpu::BindGroupLayoutEntry { binding: 1, visibility: wgpu::ShaderStages::FRAGMENT, ty: float_tex, count: None },
             ],
         });
-        let pipeline = |label: &str, layouts: &[&wgpu::BindGroupLayout], vs: &str, fs: &str, format: wgpu::TextureFormat| -> wgpu::RenderPipeline {
+        let relight_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("relight"),
+            entries: &(0..4u32).map(|i| wgpu::BindGroupLayoutEntry { binding: i, visibility: wgpu::ShaderStages::FRAGMENT, ty: float_tex, count: None }).collect::<Vec<_>>(),
+        });
+        let pipeline = |label: &str, layouts: &[&wgpu::BindGroupLayout], vs: &str, fs: &str, formats: &[wgpu::TextureFormat]| -> wgpu::RenderPipeline {
+            let targets: Vec<Option<wgpu::ColorTargetState>> = formats.iter().map(|&format| Some(wgpu::ColorTargetState { format, blend: None, write_mask: wgpu::ColorWrites::ALL })).collect();
             let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some(label), bind_group_layouts: layouts, immediate_size: 0 });
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some(label),
@@ -261,13 +293,18 @@ impl GpuMap {
                 primitive: wgpu::PrimitiveState { topology: wgpu::PrimitiveTopology::TriangleList, cull_mode: None, ..Default::default() },
                 depth_stencil: None,
                 multisample: wgpu::MultisampleState::default(),
-                fragment: Some(wgpu::FragmentState { module: &shader, entry_point: Some(fs), compilation_options: Default::default(), targets: &[Some(wgpu::ColorTargetState { format, blend: None, write_mask: wgpu::ColorWrites::ALL })] }),
+                fragment: Some(wgpu::FragmentState { module: &shader, entry_point: Some(fs), compilation_options: Default::default(), targets: &targets }),
                 multiview_mask: None,
                 cache: None,
             })
         };
-        let map_pipeline = pipeline("map", &[&map_layout], "vs_map", "fs_map", wgpu::TextureFormat::Rgba8Unorm);
-        let present_pipeline = pipeline("present", &[&map_layout, &present_layout], "vs_present", "fs_present", present_format);
+        let map_pipeline = pipeline("map", &[&map_layout], "vs_map", "fs_map", &[wgpu::TextureFormat::Rgba8Unorm]);
+        let map_g_pipeline = pipeline("map with g-buffer", &[&map_layout], "vs_map", "fs_map_g", &G_FORMATS);
+        let present_pipeline = pipeline("present", &[&map_layout, &present_layout], "vs_present", "fs_present", &[present_format]);
+        // The relight pass reads the G-buffer at group 2 and must not bind the present group (it renders into that group's map texture), so group 1 is empty for it.
+        let empty_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some("empty"), entries: &[] });
+        let empty_bind = device.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("empty"), layout: &empty_layout, entries: &[] });
+        let relight_pipeline = pipeline("relight", &[&map_layout, &empty_layout, &relight_layout], "vs_present", "fs_relight", &[wgpu::TextureFormat::Rgba8Unorm]);
 
         let uniforms = device.create_buffer(&wgpu::BufferDescriptor { label: Some("uniforms"), size: std::mem::size_of::<Uniforms>() as u64, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
         let blocks_cap = 4096;
@@ -300,7 +337,12 @@ impl GpuMap {
             map_layout,
             present_layout,
             map_pipeline,
+            map_g_pipeline,
             present_pipeline,
+            relight_pipeline,
+            relight_layout,
+            empty_bind,
+            gbuf: None,
             uniforms,
             blocks,
             blocks_cap,
@@ -524,11 +566,50 @@ impl GpuMap {
     }
 
     /// Draw a planned frame to `target` (`w × h`, the present format): upload the plan, the map pass at 2×, the present pass.
-    pub fn render(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, encoder: &mut wgpu::CommandEncoder, target: &wgpu::TextureView, plan: &FramePlan, luts: &FrameLuts, w: u32, h: u32) {
+    /// Whether a G-buffer for a `w × h` screen exists to relight from.
+    pub fn g_valid(&self, w: u32, h: u32) -> bool {
+        self.gbuf.as_ref().is_some_and(|g| (g.w, g.h) == (w, h))
+    }
+
+    fn ensure_gbuffer(&mut self, device: &wgpu::Device, w: u32, h: u32) {
+        if self.g_valid(w, h) {
+            return;
+        }
+        let textures: Vec<wgpu::Texture> = G_FORMATS
+            .iter()
+            .map(|&format| {
+                device.create_texture(&wgpu::TextureDescriptor {
+                    label: Some("g-buffer"),
+                    size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format,
+                    usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::RENDER_ATTACHMENT,
+                    view_formats: &[],
+                })
+            })
+            .collect();
+        let views: Vec<wgpu::TextureView> = textures.iter().map(|t| t.create_view(&Default::default())).collect();
+        let entries: Vec<wgpu::BindGroupEntry> = views.iter().enumerate().map(|(i, v)| wgpu::BindGroupEntry { binding: i as u32, resource: wgpu::BindingResource::TextureView(v) }).collect();
+        let bind = device.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("relight"), layout: &self.relight_layout, entries: &entries });
+        self.gbuf = Some(GBuffer { w, h, views, bind });
+    }
+
+    pub fn render(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, encoder: &mut wgpu::CommandEncoder, target: &wgpu::TextureView, plan: &FramePlan, luts: &FrameLuts, w: u32, h: u32, mode: RenderMode) {
         if w == 0 || h == 0 {
             return;
         }
+        if mode != RenderMode::Full {
+            self.scale = 1;
+        }
+        if mode == RenderMode::Relight && !self.g_valid(w, h) {
+            return self.render(device, queue, encoder, target, plan, luts, w, h, RenderMode::FullWithG);
+        }
         self.ensure_targets(device, w, h);
+        if mode == RenderMode::FullWithG {
+            self.ensure_gbuffer(device, w, h);
+        }
         // References: the plan's cells with the slots they hold here; a plane without a slot (array full) is dropped from the flags so the shader falls through to a parent.
         let refs: Vec<GpuRef> = plan
             .refs
@@ -617,15 +698,41 @@ impl GpuMap {
 
         let scale = self.scale.max(1);
         let (_, _, map_view, _, _) = self.offscreen.iter().find(|(s, ..)| *s == scale).unwrap();
-        {
+        let clear = wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color { r: 18.0 / 255.0, g: 20.0 / 255.0, b: 26.0 / 255.0, a: 1.0 }), store: wgpu::StoreOp::Store };
+        if mode == RenderMode::FullWithG {
+            let g = self.gbuf.as_ref().unwrap();
+            let attachments: Vec<Option<wgpu::RenderPassColorAttachment>> = g.views.iter().map(|v| Some(wgpu::RenderPassColorAttachment { view: v, depth_slice: None, resolve_target: None, ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT), store: wgpu::StoreOp::Store } })).collect();
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("map g-buffer"),
+                color_attachments: &attachments,
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_pipeline(&self.map_g_pipeline);
+            pass.set_bind_group(0, self.map_bind.as_ref().unwrap(), &[]);
+            pass.draw(0..6, 0..blocks.len() as u32);
+        }
+        if mode != RenderMode::Full {
+            let g = self.gbuf.as_ref().unwrap();
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("relight"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment { view: map_view, depth_slice: None, resolve_target: None, ops: clear })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_pipeline(&self.relight_pipeline);
+            pass.set_bind_group(0, self.map_bind.as_ref().unwrap(), &[]);
+            pass.set_bind_group(1, &self.empty_bind, &[]);
+            pass.set_bind_group(2, &g.bind, &[]);
+            pass.draw(0..3, 0..1);
+        } else {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("map"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: map_view,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color { r: 18.0 / 255.0, g: 20.0 / 255.0, b: 26.0 / 255.0, a: 1.0 }), store: wgpu::StoreOp::Store },
-                })],
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment { view: map_view, depth_slice: None, resolve_target: None, ops: clear })],
                 depth_stencil_attachment: None,
                 timestamp_writes: None,
                 occlusion_query_set: None,

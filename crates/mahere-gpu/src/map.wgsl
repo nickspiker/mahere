@@ -300,12 +300,36 @@ fn lerp3(a: vec3<f32>, b: vec3<f32>, t: f32) -> vec3<f32> {
     return a + (b - a) * t;
 }
 
-fn compose(d: u32, u: u32, v: u32) -> vec3<f32> {
+// What a sample is before the light touches it, and how what comes after folds: the final colour is `(base × light) × k + c`, every post-light layer (slope band, contour, lines, the debug tint) being an affine step that composes into one `k` and one `c`. Water sits between, with its own alpha, because its shade follows the sun. A G-buffer of these relights a frame without touching the page table.
+struct Composed {
+    base: vec3<f32>,
+    ground: bool,
+    n: vec3<f32>,
+    k1: f32,
+    c1: vec3<f32>,
+    water: f32,
+    k2: f32,
+    c2: vec3<f32>,
+};
+
+// A lerp toward `col` by `a` after the light, folded into (k, c).
+struct Fold { k: f32, c: vec3<f32> };
+
+fn fold(f: Fold, col: vec3<f32>, a: f32) -> Fold {
+    return Fold(f.k * (1.0 - a), f.c * (1.0 - a) + col * a);
+}
+
+fn compose(d: u32, u: u32, v: u32) -> Composed {
     let mask = U.mask;
-    var tint = vec3<f32>(96.0, 100.0, 96.0);
-    var diffuse = 1.0;
-    var light = vec3<f32>(1.0);
-    var have_ground = false;
+    var out: Composed;
+    out.base = vec3<f32>(96.0, 100.0, 96.0);
+    out.ground = false;
+    out.n = vec3<f32>(0.0, 0.0, 1.0);
+    out.k1 = 1.0;
+    out.c1 = vec3<f32>(0.0);
+    out.water = 0.0;
+    out.k2 = 1.0;
+    out.c2 = vec3<f32>(0.0);
     var contour_cov = 0.0;
     var contour_index = false;
     var band = vec3<f32>(0.0);
@@ -319,14 +343,13 @@ fn compose(d: u32, u: u32, v: u32) -> vec3<f32> {
             found_depth = s.depth;
             let eq = u32(clamp((s.elev + 500.0) * 4.0, 0.0, 65534.0));
             if ((mask & M_DEM) != 0u) {
-                diffuse = max(dot(s.n, U.sun.xyz), 0.0);
-                light = clamp(light_eval(s.n), vec3<f32>(0.0), vec3<f32>(1.3));
+                out.n = s.n;
                 if ((mask & M_HYPSO) != 0u) {
-                    tint = unpack_rgb(lut[eq >> 4u]);
+                    out.base = unpack_rgb(lut[eq >> 4u]);
                 } else {
-                    tint = vec3<f32>(232.0, 232.0, 230.0);
+                    out.base = vec3<f32>(232.0, 232.0, 230.0);
                 }
-                have_ground = true;
+                out.ground = true;
             }
             let nzn = max(s.n.z, 1e-4);
             let slope = sqrt(max(1.0 - nzn * nzn, 0.0)) / nzn;
@@ -363,10 +386,9 @@ fn compose(d: u32, u: u32, v: u32) -> vec3<f32> {
                 }
             }
         } else if ((mask & M_DEM) != 0u) {
-            tint = vec3<f32>(18.0, 20.0, 26.0);
+            out.base = vec3<f32>(18.0, 20.0, 26.0);
         }
     }
-    var rgb = tint;
     let vi = find(d, U.depths.y, u, v, FLAG_VEC);
     if (vi != NONE) {
         let r = refs[vi];
@@ -385,54 +407,48 @@ fn compose(d: u32, u: u32, v: u32) -> vec3<f32> {
         if ((flags & FLAG_IMG) != 0u) {
             im = textureLoad(img_tex, xy, i32(r.b.w), 0);
         }
+        let draw_line = (mask & M_LINE) != 0u && line.y != 0u && (line.x < BOUNDARY_FIRST || (mask & M_BOUND) != 0u);
         if ((mask & M_IMAGERY) != 0u) {
+            // Imagery stands in for the ground: nothing lights it.
+            out.ground = false;
             if (im.x != 0u || im.y != 0u || im.z != 0u) {
-                rgb = vec3<f32>(f32(im.z), f32(im.y), f32(im.x));
+                out.base = vec3<f32>(f32(im.z), f32(im.y), f32(im.x));
             }
-            if ((mask & M_LINE) != 0u && line.y != 0u && (line.x < BOUNDARY_FIRST || (mask & M_BOUND) != 0u)) {
-                rgb = lerp3(rgb, line_colour(line.x, line.z), line_alpha(line.x, line.y, line.z));
+            if (draw_line) {
+                { let f = fold(Fold(out.k2, out.c2), line_colour(line.x, line.z), line_alpha(line.x, line.y, line.z)); out.k2 = f.k; out.c2 = f.c; }
             }
-            return floor(rgb);
+            return out;
         }
         if ((mask & M_LAND) != 0u && lw.y != 0u) {
-            rgb = lerp3(rgb, unpack_rgb(lut[LAND_BASE + min(lw.x, 13u)]), f32(lw.y) / 255.0 * 0.85);
+            out.base = lerp3(out.base, unpack_rgb(lut[LAND_BASE + min(lw.x, 13u)]), f32(lw.y) / 255.0 * 0.85);
         }
         if ((mask & M_CANOPY) != 0u && im.w != 0u) {
             let c = min(f32(im.w) / 60.0, 1.0);
             let green = floor(vec3<f32>((1.0 - c) * 190.0 + c * 20.0, (1.0 - c) * 230.0 + c * 110.0, (1.0 - c) * 150.0 + c * 40.0));
-            rgb = lerp3(rgb, green, 0.8);
-        }
-        if (have_ground) {
-            rgb = rgb * light;
+            out.base = lerp3(out.base, green, 0.8);
         }
         if (have_band) {
-            rgb = lerp3(rgb, band, 0.45);
+            { let f = fold(Fold(out.k1, out.c1), band, 0.45); out.k1 = f.k; out.c1 = f.c; }
         }
         if ((mask & M_WATER) != 0u && lw.z != 0u) {
-            let s = 0.85 + 0.15 * diffuse;
-            let wr = vec3<f32>(26.0, 58.0, 82.0) * s;
-            rgb = lerp3(rgb, wr, f32(lw.z) / 255.0);
+            out.water = f32(lw.z) / 255.0;
         }
         if (contour_cov > 0.0) {
             let ink = select(vec3<f32>(92.0, 62.0, 34.0), vec3<f32>(64.0, 40.0, 18.0), contour_index);
-            rgb = lerp3(rgb, ink, contour_cov * 0.85);
+            { let f = fold(Fold(out.k2, out.c2), ink, contour_cov * 0.85); out.k2 = f.k; out.c2 = f.c; }
         }
-        if ((mask & M_LINE) != 0u && line.y != 0u && (line.x < BOUNDARY_FIRST || (mask & M_BOUND) != 0u)) {
-            rgb = lerp3(rgb, line_colour(line.x, line.z), line_alpha(line.x, line.y, line.z));
+        if (draw_line) {
+            { let f = fold(Fold(out.k2, out.c2), line_colour(line.x, line.z), line_alpha(line.x, line.y, line.z)); out.k2 = f.k; out.c2 = f.c; }
         }
     } else {
-        if (have_ground) {
-            rgb = rgb * light;
-        }
         if (have_band) {
-            rgb = lerp3(rgb, band, 0.45);
+            { let f = fold(Fold(out.k1, out.c1), band, 0.45); out.k1 = f.k; out.c1 = f.c; }
         }
         if (contour_cov > 0.0) {
             let ink = select(vec3<f32>(92.0, 62.0, 34.0), vec3<f32>(64.0, 40.0, 18.0), contour_index);
-            rgb = lerp3(rgb, ink, contour_cov * 0.85);
+            { let f = fold(Fold(out.k2, out.c2), ink, contour_cov * 0.85); out.k2 = f.k; out.c2 = f.c; }
         }
     }
-    rgb = floor(rgb);
     if ((mask & M_DEBUG) != 0u) {
         var tintd = vec3<f32>(-1.0);
         if (found_depth == NONE) {
@@ -443,22 +459,79 @@ fn compose(d: u32, u: u32, v: u32) -> vec3<f32> {
             tintd = vec3<f32>(255.0, 170.0, 0.0);
         }
         if (tintd.x >= 0.0) {
-            rgb = floor((rgb + tintd) * 0.5);
+            { let f = fold(Fold(out.k2, out.c2), tintd, 0.5); out.k2 = f.k; out.c2 = f.c; }
         }
     }
-    return rgb;
+    return out;
 }
 
-@fragment
-fn fs_map(in: VOut) -> @location(0) vec4<f32> {
+// The light applied: the same arithmetic whether the pieces come from the page table or from the G-buffer.
+fn shade(base: vec3<f32>, ground: bool, n: vec3<f32>, k1: f32, c1: vec3<f32>, water: f32, k2: f32, c2: vec3<f32>) -> vec3<f32> {
+    var rgb = base;
+    var diffuse = 1.0;
+    if (ground) {
+        diffuse = max(dot(n, U.sun.xyz), 0.0);
+        rgb = rgb * clamp(light_eval(n), vec3<f32>(0.0), vec3<f32>(1.3));
+    }
+    rgb = rgb * k1 + c1;
+    if (water > 0.0) {
+        let wr = vec3<f32>(26.0, 58.0, 82.0) * (0.85 + 0.15 * diffuse);
+        rgb = lerp3(rgb, wr, water);
+    }
+    return floor(rgb * k2 + c2);
+}
+
+fn sample_uv(in: VOut) -> vec3<u32> {
     let b = blocks[in.block];
     let fx = in.local.x + U.offset.x;
     let fy = in.local.y + U.offset.y;
     let ou = b.c.x * fx + b.c.z * fy + b.d.x * fx * fy;
     let ov = b.c.y * fx + b.c.w * fy + b.d.y * fx * fy;
-    let u = u32(i32(b.b.x) + i32(round(ou)));
-    let v = u32(i32(b.b.y) + i32(round(ov)));
-    let rgb = compose(b.a.w, u, v);
+    return vec3<u32>(b.a.w, u32(i32(b.b.x) + i32(round(ou))), u32(i32(b.b.y) + i32(round(ov))));
+}
+
+@fragment
+fn fs_map(in: VOut) -> @location(0) vec4<f32> {
+    let s = sample_uv(in);
+    let p = compose(s.x, s.y, s.z);
+    return vec4<f32>(shade(p.base, p.ground, p.n, p.k1, p.c1, p.water, p.k2, p.c2) / 255.0, 1.0);
+}
+
+// The map pass that writes the G-buffer instead of a colour: base + ground, normal + water, c1 + k1, c2 + k2. The relight pass then shades it.
+struct GOut {
+    @location(0) base: vec4<f32>,
+    @location(1) normal: vec4<f32>,
+    @location(2) post1: vec4<f32>,
+    @location(3) post2: vec4<f32>,
+};
+
+@fragment
+fn fs_map_g(in: VOut) -> GOut {
+    let s = sample_uv(in);
+    let p = compose(s.x, s.y, s.z);
+    var g: GOut;
+    g.base = vec4<f32>(p.base / 255.0, select(0.0, 1.0, p.ground));
+    g.normal = vec4<f32>(p.n * 0.5 + 0.5, p.water);
+    g.post1 = vec4<f32>(p.c1 / 255.0, p.k1);
+    g.post2 = vec4<f32>(p.c2 / 255.0, p.k2);
+    return g;
+}
+
+// ==================== RELIGHT: the light alone, from the G-buffer ====================
+
+@group(2) @binding(0) var g_base: texture_2d<f32>;
+@group(2) @binding(1) var g_normal: texture_2d<f32>;
+@group(2) @binding(2) var g_post1: texture_2d<f32>;
+@group(2) @binding(3) var g_post2: texture_2d<f32>;
+
+@fragment
+fn fs_relight(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
+    let xy = vec2<i32>(pos.xy);
+    let b = textureLoad(g_base, xy, 0);
+    let nw = textureLoad(g_normal, xy, 0);
+    let p1 = textureLoad(g_post1, xy, 0);
+    let p2 = textureLoad(g_post2, xy, 0);
+    let rgb = shade(b.rgb * 255.0, b.a > 0.5, normalize(nw.xyz * 2.0 - 1.0), p1.a, p1.rgb * 255.0, nw.w, p2.a, p2.rgb * 255.0);
     return vec4<f32>(rgb / 255.0, 1.0);
 }
 

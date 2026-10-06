@@ -1,7 +1,7 @@
 //! The GPU host on Android: a wgpu (Vulkan) surface over the Activity's ANativeWindow, driven from `nativeDraw` in place of fluor's CPU present. fluor still owns input; the engine still owns residency and the frame plan; this is the glue that gets a planned frame onto the screen.
 
 use mahere_engine::MapCore;
-use mahere_gpu::GpuMap;
+use mahere_gpu::{GpuMap, RenderMode};
 use mahere_panel::{Controls, Panel, Readouts};
 use ndk::native_window::NativeWindow;
 use raw_window_handle::{AndroidDisplayHandle, AndroidNdkWindowHandle, RawDisplayHandle, RawWindowHandle};
@@ -20,6 +20,10 @@ pub struct GpuHost {
     overlay_stamp: Option<OverlayStamp>,
     overlay_at: std::time::Instant,
     last_cam: Option<(u64, u64, u64, u64)>,
+    /// The view and cells the G-buffer was written for.
+    g_key: Option<((u64, u64, u64, u64), u64, u32, u32)>,
+    last_change: std::time::Instant,
+    relights: u64,
     /// The last frame was drawn still, at the still factor: nothing more to draw until something changes.
     settled: bool,
     frames: u64,
@@ -75,6 +79,9 @@ impl GpuHost {
             overlay_stamp: None,
             overlay_at: std::time::Instant::now(),
             last_cam: None,
+            g_key: None,
+            last_change: std::time::Instant::now(),
+            relights: 0,
             settled: false,
             frames: 0,
             frame_ms: 0.0,
@@ -131,23 +138,21 @@ impl GpuHost {
             );
             self.configured = (w, h);
         }
-        // Nothing changed and nothing arrived: the surface keeps its last image, and the CPU keeps its budget. The poll still runs so finished uploads release their staging memory.
+        // Nothing changed and nothing arrived: the surface keeps its last image, and the CPU keeps its budget. The poll still runs so finished uploads release their staging memory. Once a quarter second has passed since the last change, one more frame is drawn at the still factor and stays on screen.
         let fresh = self.configured != (w, h) || self.frames == 0;
         let panel_dirty = panel.take_dirty();
         if panel_dirty {
             self.overlay_stamp = None;
         }
-        if !map.tick(w as usize, h as usize) && !fresh && !panel_dirty && self.settled {
-            self.device.poll(wgpu::PollType::Poll).ok();
-            return !map.converged();
+        let changed = map.tick(w as usize, h as usize) || fresh || panel_dirty;
+        let mut settle_frame = false;
+        if !changed {
+            if self.settled || self.last_change.elapsed() < std::time::Duration::from_millis(250) {
+                self.device.poll(wgpu::PollType::Poll).ok();
+                return !map.converged();
+            }
+            settle_frame = true;
         }
-        // Moving: 2× keeps the phone at its refresh rate; the first still frame after a move is drawn once more at 3× and the result stays on screen.
-        let c0 = map.cam;
-        let cam_key = (c0.lat.to_bits(), c0.lon.to_bits(), c0.ppd.to_bits(), c0.bearing.to_bits());
-        let moving = self.last_cam != Some(cam_key);
-        self.last_cam = Some(cam_key);
-        self.map.scale = if moving { MOVING_SCALE } else { STILL_SCALE };
-        self.settled = !moving;
         if self.frames == 0 {
             map.set_gpu_only();
         }
@@ -157,6 +162,29 @@ impl GpuHost {
         let t_sync = t0.elapsed().as_secs_f32() * 1000.0 - t_plan;
         self.plan_ms += t_plan;
         self.sync_ms += t_sync;
+        // What kind of frame: anything moving or arriving draws the map at 1× and writes the G-buffer; a change that touched only the light relights that G-buffer at 1×; the settle frame draws the map once at the still factor.
+        let c0 = map.cam;
+        let cam_key = (c0.lat.to_bits(), c0.lon.to_bits(), c0.ppd.to_bits(), c0.bearing.to_bits());
+        let moving = self.last_cam != Some(cam_key);
+        self.last_cam = Some(cam_key);
+        let g_key = (cam_key, map.pool_version(), w, h);
+        let light_only = !moving && !settle_frame && map.plan_cached() && !panel_dirty && self.g_key == Some(g_key) && self.map.g_valid(w, h);
+        let mode = if settle_frame {
+            RenderMode::Full
+        } else if light_only {
+            RenderMode::Relight
+        } else {
+            RenderMode::FullWithG
+        };
+        self.map.scale = if settle_frame { STILL_SCALE } else { MOVING_SCALE };
+        if mode == RenderMode::FullWithG {
+            self.g_key = Some(g_key);
+        }
+        if !settle_frame {
+            self.last_change = std::time::Instant::now();
+        }
+        self.settled = settle_frame;
+        self.relights += (mode == RenderMode::Relight) as u64;
         let c = map.cam;
         let mask = map.layers();
         let mask_bits = mahere_gpu::mask_bits(mask);
@@ -197,7 +225,7 @@ impl GpuHost {
         };
         let view = frame.texture.create_view(&Default::default());
         let mut enc = self.device.create_command_encoder(&Default::default());
-        self.map.render(&self.device, &self.queue, &mut enc, &view, &plan, map.luts(), w, h);
+        self.map.render(&self.device, &self.queue, &mut enc, &view, &plan, map.luts(), w, h, mode);
         self.queue.submit([enc.finish()]);
         frame.present();
         // Reclaim what finished: staging buffers behind every upload and the arrays replaced by growth are only freed when the device is polled.
@@ -206,8 +234,9 @@ impl GpuHost {
         self.frame_ms += t0.elapsed().as_secs_f32() * 1000.0;
         if self.report.elapsed().as_secs() >= 10 {
             let n = self.frames.max(1) as f32;
-            eprintln!("gpu: {} frames, per frame {:.2} ms plan + {:.2} ms sync + {:.2} ms overlay and encode + {:.2} ms waiting for the swapchain, {} resident, {} pending, {} uploads, layers {:?}", self.frames, self.plan_ms / n, self.sync_ms / n, (self.work_ms - self.plan_ms - self.sync_ms) / n, (self.frame_ms - self.work_ms) / n, map.pool().map.len(), map.pending_cells(), self.map.uploads, self.map.layers());
+            eprintln!("gpu: {} frames ({} relit), per frame {:.2} ms plan + {:.2} ms sync + {:.2} ms overlay and encode + {:.2} ms waiting for the swapchain, {} resident, {} pending, {} uploads, layers {:?}", self.frames, self.relights, self.plan_ms / n, self.sync_ms / n, (self.work_ms - self.plan_ms - self.sync_ms) / n, (self.frame_ms - self.work_ms) / n, map.pool().map.len(), map.pending_cells(), self.map.uploads, self.map.layers());
             self.frames = 0;
+            self.relights = 0;
             self.frame_ms = 0.0;
             self.work_ms = 0.0;
             self.plan_ms = 0.0;

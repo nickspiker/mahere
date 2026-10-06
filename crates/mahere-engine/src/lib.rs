@@ -110,6 +110,8 @@ pub struct MapCore {
     plan_cache: Option<(PlanKey, Arc<plan::FramePlan>)>,
     /// The current measurement, if a point was tapped.
     measure: Option<Measure>,
+    /// The last plan came from the cache: the view and the cells were as before.
+    plan_cached: bool,
     /// Measure from the fix rather than the screen centre, until the camera moves.
     pub lock_to_fix: bool,
 }
@@ -156,6 +158,7 @@ impl MapCore {
             last_pin: None,
             plan_cache: None,
             measure: None,
+            plan_cached: false,
             lock_to_fix: false,
         }
     }
@@ -390,8 +393,10 @@ impl MapCore {
         self.prepare(w, h);
         // The same view over the same cells is the same plan: a frame the sensor or the GPS made dirty costs nothing here.
         let key = (self.cam.lat.to_bits(), self.cam.lon.to_bits(), self.cam.ppd.to_bits(), self.cam.bearing.to_bits(), w, h, self.res.pool_version, self.dem_depth, self.vec_depth);
+        self.plan_cached = false;
         if let Some((k, p)) = &self.plan_cache {
             if *k == key {
+                self.plan_cached = true;
                 let p = p.clone();
                 // Residency still hears the want: it re-sends an unchanged missing list once a second.
                 let center = Coord::from_lat_lon(self.cam.lat, self.cam.lon);
@@ -410,6 +415,14 @@ impl MapCore {
         self.plan_cache = Some((key, p.clone()));
         self.last_frame_ms = t0.elapsed().as_secs_f32() * 1000.0;
         p
+    }
+
+    pub fn plan_cached(&self) -> bool {
+        self.plan_cached
+    }
+
+    pub fn pool_version(&self) -> u64 {
+        self.res.pool_version
     }
 
     /// The resident cells, for a renderer that mirrors them and may release what it has copied.
