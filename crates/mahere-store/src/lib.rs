@@ -381,11 +381,16 @@ fn decode_cell_index(data: &[u8]) -> std::collections::HashMap<(u8, u64), (i64, 
         let mut seen: Vec<i64> = Vec::new();
         let mut bytes: Vec<u32> = Vec::new();
         for f in s.fields {
+            // A one-dimensional tensor comes back as a vector; both spellings are the same data.
             match (f.name.as_str(), f.values.into_iter().next()) {
                 ("depth", Some(VsfType::t_u3(t))) => depth = t.data,
+                ("depth", Some(VsfType::v_u3(t))) => depth = t.data,
                 ("cell", Some(VsfType::t_u6(t))) => cell = t.data,
+                ("cell", Some(VsfType::v_u6(t))) => cell = t.data,
                 ("seen", Some(VsfType::t_i6(t))) => seen = t.data,
+                ("seen", Some(VsfType::v_i6(t))) => seen = t.data,
                 ("bytes", Some(VsfType::t_u5(t))) => bytes = t.data,
+                ("bytes", Some(VsfType::v_u5(t))) => bytes = t.data,
                 _ => {}
             }
         }
