@@ -1,23 +1,20 @@
-//! The cell pipeline: bake source data into dymaxion-cell rasters — the
-//! #pagetable renderer's entire diet.
+//! The cell pipeline: bake source data into dymaxion-cell rasters — the #pagetable renderer's entire diet.
 //!
 //! **One object per cell, every layer inside it.** A cell is one rhombus of the diamond-Morton grid at `depth`; its file carries a VSF section per layer present at that depth, and the client decides what to decode, draw and style:
 //!
-//! - **dem**: elevation (u16, 0.25 m steps from -500 m) + unit normal
-//!   (snorm16 ×3), sampled at triangle centroids from the source DEM at
-//!   the base depth, then a pyramid of means.
-//! - **line**: every road, trail, rail, power line and waterway stamped at
-//!   its physical width as (class, coverage) texels; waterways carry their
-//!   upstream-network weight as width and coverage.
+//! - **dem**: elevation sampled at triangle centroids from the source DEM at the base depth, then a pyramid of means; stored through the pyramid codec ([`pyr`]) at an adaptive step of at least 5 cm, normals derived on load from a one-texel apron of the neighbours.
+//! - **line**: every road, trail, rail, power line and waterway stamped at its physical width as (class, coverage, magnitude, use) texels; waterways carry their upstream-network weight as width and coverage.
 //! - **land**: land cover (class, coverage) from OSM polygons.
 //! - **water**: lakes, ponds, reservoirs, riverbanks as coverage.
+//! - **img**: NAIP red and near-infrared, lidar 1064 nm intensity and canopy height, 8-bit, through the pyramid codec, never finer than depth 14.
 //!
 //! **Texels are triangles.** A cell's 256×256 UV squares are each split along `u+v = k` into a lower and an upper equilateral triangle. The triangular tiling has 6-fold symmetry and a line always crosses it edge-to-edge, so linework is isotropic. Each triangle subdivides into four — three corners and the inverted center — and that is the pyramid's box filter: coverage up the pyramid IS area, so minor features fade and dense ones glow with no styling.
 //!
-//! In memory a cell's planes are indexed `((ty << 8 | tx) << 1) | half`
-//! (the renderer's stepping order). On disk they are in triangle-path order — the triangle code's digits — so a parent texel's four children are contiguous. [`disk_to_mem`] / [`mem_to_disk`] convert.
+//! In memory a cell's planes are indexed `((ty << 8 | tx) << 1) | half` (the renderer's stepping order). On disk they are in triangle-path order — the triangle code's digits — so a parent texel's four children are contiguous. [`disk_to_mem`] / [`mem_to_disk`] convert.
 //!
 //! Files are zstd'd VSF at `{name}.vsf.zst` where the name is the cell's flattened VSF value (`u` depth, `wm` cell) in base64url: no delimiters, no numerals — a directory layout that is byte-for-byte the bucket.
+
+pub mod pyr;
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -968,32 +965,35 @@ impl DemCell {
     }
 }
 
-/// On-disk dem coding: per-cell `base` + `step` (adaptive, >= 5 cm, so the cell's range fits i16 residuals), then LOCO-I MED prediction from the left / up / up-left texels of the same half-plane in row-major order, residuals as i16. No-data texels take the predictor (residual 0) and are marked in a `valid` plane, written only when any is missing.
+/// On-disk dem coding: per-cell `base` + `step` (adaptive, >= 5 cm, so the cell's range fits 16 bits), the quantised elevations through the pyramid codec (`pyr`, disk order, holes filled), a bit mask of the texels that had data when any were missing, and the apron as u16.
 const MIN_STEP: f32 = 0.05;
 
-fn med(a: i32, b: i32, c: i32) -> i32 {
-    if c >= a.max(b) { a.min(b) } else if c <= a.min(b) { a.max(b) } else { a + b - c }
+/// How much a bake may throw away. Zero everywhere is lossless at the base quantisation (5 cm, 1 level of 255).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Loss {
+    /// Finest-level quantiser for elevation diffs, metres.
+    pub dem_m: f32,
+    /// Finest-level quantiser for imagery diffs, in 8-bit levels.
+    pub img: u32,
 }
 
-#[inline(always)]
-fn predict(q: &[i32], tx: usize, ty: usize, half: usize) -> i32 {
-    match (tx, ty) {
-        (0, 0) => 0,
-        (0, _) => q[tri_idx(0, ty - 1, half)],
-        (_, 0) => q[tri_idx(tx - 1, 0, half)],
-        _ => med(q[tri_idx(tx - 1, ty, half)], q[tri_idx(tx, ty - 1, half)], q[tri_idx(tx - 1, ty - 1, half)]),
+impl Loss {
+    pub const LOSSLESS: Loss = Loss { dem_m: 0.0, img: 0 };
+}
+
+/// Quantise a plane of f32 (NaN = no data) to integers at `base` + k·`step`, memory order, holes filled; returns the plane and, when any texel was missing, its mask.
+fn quantise_plane(mem: &[f32], base: f32, step: f32) -> (Vec<i32>, Option<Vec<bool>>) {
+    let q: Vec<i32> = mem.iter().map(|&e| if e.is_nan() { 0 } else { ((e - base) / step).round() as i32 }).collect();
+    let valid: Vec<bool> = mem.iter().map(|e| !e.is_nan()).collect();
+    if valid.iter().all(|&v| v) {
+        return (q, None);
     }
+    let mut disk = mem_to_disk(&q);
+    pyr::fill_holes(&mut disk, &mem_to_disk(&valid));
+    (disk_to_mem(&disk), Some(valid))
 }
 
-struct DemCoded {
-    base: f32,
-    step: f32,
-    residual: Vec<i16>,
-    valid: Option<Vec<u8>>,
-    apron: Vec<u16>,
-}
-
-fn encode_dem(d: &DemPlanes) -> DemCoded {
+fn dem_section(d: &DemPlanes, loss: &Loss) -> vsf::VsfSection {
     let (mut lo, mut hi) = (f32::MAX, f32::MIN);
     for &e in d.elev.iter().chain(d.apron.iter()) {
         if !e.is_nan() {
@@ -1006,51 +1006,133 @@ fn encode_dem(d: &DemPlanes) -> DemCoded {
         hi = 0.0;
     }
     let step = ((hi - lo) / 32000.0).max(MIN_STEP);
-    let quant = |e: f32| -> Option<i32> { (!e.is_nan()).then(|| ((e - lo) / step).round() as i32) };
-    let mut q = vec![0i32; TRI];
-    let mut residual = vec![0i16; TRI];
-    let mut valid = vec![1u8; TRI];
-    let mut any_missing = false;
-    for half in 0..2 {
-        for ty in 0..TEX {
-            for tx in 0..TEX {
-                let i = tri_idx(tx, ty, half);
-                let pred = predict(&q, tx, ty, half);
-                match quant(d.elev[i]) {
-                    Some(v) => {
-                        q[i] = v;
-                        residual[i] = (v - pred).clamp(i16::MIN as i32, i16::MAX as i32) as i16;
-                    }
-                    None => {
-                        q[i] = pred;
-                        valid[i] = 0;
-                        any_missing = true;
-                    }
-                }
+    let steps = pyr::Steps::tapered((loss.dem_m / step).round() as u32);
+    let (plane, mask) = quantise_plane(&d.elev, lo, step);
+    let apron: Vec<u16> = d.apron.iter().map(|&e| if e.is_nan() { u16::MAX } else { (((e - lo) / step).round() as i32).clamp(0, 65534) as u16 }).collect();
+    let mut s = vsf::VsfSection::new("dem");
+    s.add_field("base", VsfType::f5(lo));
+    s.add_field("step", VsfType::f5(step));
+    s.add_field("loss", pyr::steps_vsf(&steps));
+    s.add_field_multi("elev", pyr::encode(&plane, &steps));
+    if let Some(m) = mask {
+        s.add_field("mask", pyr::mask_vsf(&m));
+    }
+    s.add_field("apron", VsfType::t_u4(Tensor::new(vec![4, 2, TEX], apron)));
+    s
+}
+
+fn decode_dem(fields: &HashMap<String, Vec<VsfType>>) -> Option<DemPlanes> {
+    let base = fields.get("base").and_then(|v| v.first()).and_then(scalar_f32)?;
+    let step = fields.get("step").and_then(|v| v.first()).and_then(scalar_f32)?;
+    if let Some(residual) = fields.get("residual").and_then(|v| v.first()).and_then(raw_i16) {
+        return decode_dem_legacy(fields, base, step, residual);
+    }
+    let steps = pyr::steps_from_vsf(fields.get("loss").and_then(|v| v.first()));
+    let plane = pyr::decode(fields.get("elev")?, &steps)?;
+    let mask = match fields.get("mask").and_then(|v| v.first()) {
+        Some(m) => Some(pyr::mask_from_vsf(m)?),
+        None => None,
+    };
+    let apron = fields.get("apron").and_then(|v| v.first()).and_then(raw_u16)?;
+    if apron.len() != APRON {
+        return None;
+    }
+    let mut elev: Vec<f32> = plane.iter().map(|&v| base + v as f32 * step).collect();
+    if let Some(m) = mask {
+        for i in 0..TRI {
+            if !m[i] {
+                elev[i] = f32::NAN;
             }
         }
     }
-    let apron = d.apron.iter().map(|&e| quant(e).map_or(u16::MAX, |v| v.clamp(0, 65534) as u16)).collect();
-    DemCoded { base: lo, step, residual, valid: any_missing.then_some(valid), apron }
+    let apron = apron.iter().map(|&v| if v == u16::MAX { f32::NAN } else { base + v as f32 * step }).collect();
+    Some(DemPlanes { elev, apron })
 }
 
-fn decode_dem(c: &DemCoded) -> DemPlanes {
+/// The epoch-3 dem coding, read-only so old bakes can be transcoded: LOCO-I MED prediction over the half-plane in row-major order, i16 residuals, a u8 `valid` plane when any texel was missing.
+fn decode_dem_legacy(fields: &HashMap<String, Vec<VsfType>>, base: f32, step: f32, residual: Vec<i16>) -> Option<DemPlanes> {
+    fn med(a: i32, b: i32, c: i32) -> i32 {
+        if c >= a.max(b) { a.min(b) } else if c <= a.min(b) { a.max(b) } else { a + b - c }
+    }
+    let valid: Option<Vec<u8>> = match fields.get("valid").and_then(|v| v.first()) {
+        Some(VsfType::t_u3(t)) => Some(t.data.clone()),
+        _ => None,
+    };
+    let apron = fields.get("apron").and_then(|v| v.first()).and_then(raw_u16)?;
+    if residual.len() != TRI || apron.len() != APRON || valid.as_ref().is_some_and(|v| v.len() != TRI) {
+        return None;
+    }
     let mut q = vec![0i32; TRI];
     let mut elev = vec![f32::NAN; TRI];
     for half in 0..2 {
         for ty in 0..TEX {
             for tx in 0..TEX {
                 let i = tri_idx(tx, ty, half);
-                let v = predict(&q, tx, ty, half) + c.residual[i] as i32;
+                let pred = match (tx, ty) {
+                    (0, 0) => 0,
+                    (0, _) => q[tri_idx(0, ty - 1, half)],
+                    (_, 0) => q[tri_idx(tx - 1, 0, half)],
+                    _ => med(q[tri_idx(tx - 1, ty, half)], q[tri_idx(tx, ty - 1, half)], q[tri_idx(tx - 1, ty - 1, half)]),
+                };
+                let v = pred + residual[i] as i32;
                 q[i] = v;
-                if c.valid.as_ref().is_none_or(|m| m[i] != 0) {
-                    elev[i] = c.base + v as f32 * c.step;
+                if valid.as_ref().is_none_or(|m| m[i] != 0) {
+                    elev[i] = base + v as f32 * step;
                 }
             }
         }
     }
-    let apron = c.apron.iter().map(|&v| if v == u16::MAX { f32::NAN } else { c.base + v as f32 * c.step }).collect();
-    DemPlanes { elev, apron }
+    let apron = apron.iter().map(|&v| if v == u16::MAX { f32::NAN } else { base + v as f32 * step }).collect();
+    Some(DemPlanes { elev, apron })
+}
+
+/// Imagery bands through the pyramid codec: 0 is no data for the passive and active bands (masked, filled), a value for canopy.
+const IMG_BANDS: [&str; 4] = ["red", "nir", "intensity", "canopy"];
+
+fn img_section(im: &ImgCell, loss: &Loss) -> vsf::VsfSection {
+    let steps = pyr::Steps::tapered(loss.img);
+    let mut s = vsf::VsfSection::new("img");
+    s.add_field("loss", pyr::steps_vsf(&steps));
+    for (name, band) in IMG_BANDS.iter().zip(im.bands()) {
+        let masked = *name != "canopy";
+        let mem: Vec<f32> = band.iter().map(|&v| if masked && v == 0 { f32::NAN } else { v as f32 }).collect();
+        let (plane, mask) = quantise_plane(&mem, 0.0, 1.0);
+        s.add_field_multi(*name, pyr::encode(&plane, &steps));
+        if let Some(m) = mask {
+            s.add_field(format!("{name}mask"), pyr::mask_vsf(&m));
+        }
+    }
+    s
+}
+
+fn decode_img(fields: &HashMap<String, Vec<VsfType>>) -> Option<ImgCell> {
+    let steps = pyr::steps_from_vsf(fields.get("loss").and_then(|v| v.first()));
+    let mut im = ImgCell::new();
+    let mut any = false;
+    for (name, out) in IMG_BANDS.iter().zip(im.bands_mut()) {
+        let Some(values) = fields.get(*name) else { continue };
+        let plane = pyr::decode(values, &steps)?;
+        let mask = match fields.get(&format!("{name}mask")).and_then(|v| v.first()) {
+            Some(m) => Some(pyr::mask_from_vsf(m)?),
+            None => None,
+        };
+        let masked = *name != "canopy";
+        *out = plane
+            .iter()
+            .enumerate()
+            .map(|(i, &v)| {
+                if mask.as_ref().is_some_and(|m| !m[i]) {
+                    0
+                } else if masked {
+                    v.clamp(1, 255) as u8
+                } else {
+                    v.clamp(0, 255) as u8
+                }
+            })
+            .collect();
+        any = true;
+    }
+    any.then_some(im)
 }
 
 impl DemPlanes {
@@ -1217,21 +1299,10 @@ impl CellPlanes {
         out
     }
 
-    pub fn encode(&self) -> Result<Vec<u8>, String> {
+    pub fn encode(&self, loss: &Loss) -> Result<Vec<u8>, String> {
         let mut b = VsfBuilder::new();
         if let Some(d) = &self.dem {
-            let c = encode_dem(d);
-            let mut fields = vec![
-                ("base".to_string(), VsfType::f5(c.base)),
-                ("step".to_string(), VsfType::f5(c.step)),
-                // Residuals stay in memory (row-major) order: the predictor runs over spatial neighbours, not the triangle path.
-                ("residual".to_string(), VsfType::t_i4(Tensor::new(vec![TEX, TEX, 2], c.residual))),
-                ("apron".to_string(), VsfType::t_u4(Tensor::new(vec![4, 2, TEX], c.apron))),
-            ];
-            if let Some(v) = c.valid {
-                fields.push(("valid".to_string(), VsfType::t_u3(Tensor::new(vec![TEX, TEX, 2], v))));
-            }
-            b = b.add_section("dem", fields);
+            b = b.add_section_direct(dem_section(d, loss));
         }
         for (name, planes) in [("line", &self.line), ("land", &self.land)] {
             if let Some(p) = planes {
@@ -1255,22 +1326,14 @@ impl CellPlanes {
             );
         }
         if let Some(im) = &self.img {
-            b = b.add_section(
-                "img",
-                vec![
-                    ("red".to_string(), VsfType::t_u3(Tensor::new(vec![2, TEX * TEX], mem_to_disk(&im.red)))),
-                    ("nir".to_string(), VsfType::t_u3(Tensor::new(vec![2, TEX * TEX], mem_to_disk(&im.nir)))),
-                    ("i1064".to_string(), VsfType::t_u3(Tensor::new(vec![2, TEX * TEX], mem_to_disk(&im.i1064)))),
-                    ("canopy".to_string(), VsfType::t_u3(Tensor::new(vec![2, TEX * TEX], mem_to_disk(&im.canopy)))),
-                ],
-            );
+            b = b.add_section_direct(img_section(im, loss));
         }
         b.build().map_err(|e| format!("cell build: {e:?}"))
     }
 }
 
 /// Write a cell, merged over whatever is already on disk under that key — so regional bakes compose instead of clobbering each other.
-pub fn write_cell(out: &Path, key: CellKey, cell: &Cell) -> Result<(), String> {
+pub fn write_cell(out: &Path, key: CellKey, cell: &Cell, loss: &Loss) -> Result<(), String> {
     let path = out.join(key.path());
     let mut planes = cell.quantize();
     if let Ok(existing) = std::fs::read(&path) {
@@ -1278,7 +1341,7 @@ pub fn write_cell(out: &Path, key: CellKey, cell: &Cell) -> Result<(), String> {
             planes = planes.merge_over(old);
         }
     }
-    let bytes = planes.encode()?;
+    let bytes = planes.encode(loss)?;
     write_file(&path, &bytes)
 }
 
@@ -1304,27 +1367,14 @@ pub fn decode_cell(data: &[u8]) -> Result<CellPlanes, String> {
     let sections = header.sections(data, end).map_err(|e| e.to_string())?;
     let mut out = CellPlanes::default();
     for s in sections {
-        let fields: HashMap<String, VsfType> =
-            s.fields.into_iter().filter_map(|f| f.values.into_iter().next().map(|v| (f.name, v))).collect();
+        let fields: HashMap<String, Vec<VsfType>> = s.fields.into_iter().map(|f| (f.name, f.values)).collect();
+        let first = |name: &str| fields.get(name).and_then(|v| v.first());
         match s.name.as_str() {
-            "dem" => {
-                let base = fields.get("base").and_then(scalar_f32);
-                let step = fields.get("step").and_then(scalar_f32);
-                let residual = fields.get("residual").and_then(raw_i16);
-                let apron = fields.get("apron").and_then(raw_u16);
-                let valid = fields.get("valid").and_then(raw_u8);
-                if let (Some(base), Some(step), Some(residual), Some(apron)) = (base, step, residual, apron) {
-                    if residual.len() == TRI && apron.len() == APRON && valid.as_ref().is_none_or(|v| v.len() == TRI) {
-                        out.dem = Some(decode_dem(&DemCoded { base, step, residual, valid, apron }));
-                    }
-                }
-            }
+            "dem" => out.dem = decode_dem(&fields),
             "line" | "land" => {
-                if let (Some(class), Some(cov)) =
-                    (fields.get("class").and_then(plane_u8_mem), fields.get("cov").and_then(plane_u8_mem))
-                {
-                    let mag = fields.get("mag").and_then(plane_u8_mem).unwrap_or_default();
-                    let uses = fields.get("use").and_then(plane_u8_mem).unwrap_or_default();
+                if let (Some(class), Some(cov)) = (first("class").and_then(plane_u8_mem), first("cov").and_then(plane_u8_mem)) {
+                    let mag = first("mag").and_then(plane_u8_mem).unwrap_or_default();
+                    let uses = first("use").and_then(plane_u8_mem).unwrap_or_default();
                     let planes = Some(ClassCell { class, cov, mag, uses });
                     if s.name == "line" {
                         out.line = planes;
@@ -1334,19 +1384,19 @@ pub fn decode_cell(data: &[u8]) -> Result<CellPlanes, String> {
                 }
             }
             "water" => {
-                if let Some(cov) = fields.get("cov").and_then(plane_u8_mem) {
+                if let Some(cov) = first("cov").and_then(plane_u8_mem) {
                     out.water = Some(CovCell { cov });
                 }
             }
             "img" => {
-                if let (Some(red), Some(nir), Some(i1064)) = (
-                    fields.get("red").and_then(plane_u8_mem),
-                    fields.get("nir").and_then(plane_u8_mem),
-                    fields.get("i1064").and_then(plane_u8_mem),
-                ) {
-                    let canopy = fields.get("canopy").and_then(plane_u8_mem).unwrap_or_else(|| vec![0; TRI]);
-                    out.img = Some(ImgCell { red, nir, i1064, canopy });
-                }
+                out.img = decode_img(&fields).or_else(|| {
+                    // Epoch 3: plain u8 planes in disk order, the lidar band under its wavelength.
+                    let red = first("red").and_then(plane_u8_mem)?;
+                    let nir = first("nir").and_then(plane_u8_mem)?;
+                    let i1064 = first("i1064").and_then(plane_u8_mem)?;
+                    let canopy = first("canopy").and_then(plane_u8_mem).unwrap_or_else(|| vec![0; TRI]);
+                    Some(ImgCell { red, nir, i1064, canopy })
+                })
             }
             _ => {}
         }
@@ -1362,11 +1412,10 @@ fn scalar_f32(v: &VsfType) -> Option<f32> {
     }
 }
 
-fn raw_u8(v: &VsfType) -> Option<Vec<u8>> {
+fn raw_i16(v: &VsfType) -> Option<Vec<i16>> {
     match v {
-        VsfType::t_u3(t) => Some(t.data.clone()),
-        VsfType::v_u3(t) => Some(t.data.clone()),
-        VsfType::t_u0(t) => Some(t.data.iter().map(|&b| b as u8).collect()),
+        VsfType::t_i4(t) => Some(t.data.clone()),
+        VsfType::v_i4(t) => Some(t.data.clone()),
         _ => None,
     }
 }
@@ -1377,16 +1426,6 @@ fn raw_u16(v: &VsfType) -> Option<Vec<u16>> {
         VsfType::v_u4(t) => Some(t.data.clone()),
         VsfType::t_u3(t) => Some(t.data.iter().map(|&x| x as u16).collect()),
         VsfType::v_u3(t) => Some(t.data.iter().map(|&x| x as u16).collect()),
-        _ => None,
-    }
-}
-
-fn raw_i16(v: &VsfType) -> Option<Vec<i16>> {
-    match v {
-        VsfType::t_i4(t) => Some(t.data.clone()),
-        VsfType::v_i4(t) => Some(t.data.clone()),
-        VsfType::t_i3(t) => Some(t.data.iter().map(|&x| x as i16).collect()),
-        VsfType::v_i3(t) => Some(t.data.iter().map(|&x| x as i16).collect()),
         _ => None,
     }
 }
@@ -1553,7 +1592,7 @@ mod tests {
         line.mag[5] = 77;
         line.uses[5] = 0b101;
         let cell = Cell { dem: Some(dem.clone()), line: Some(line), land: Some(ClassCell::new()), water: None, img: None };
-        let bytes = cell.quantize().encode().unwrap();
+        let bytes = cell.quantize().encode(&Loss::LOSSLESS).unwrap();
         let back = decode_cell(&bytes).unwrap();
         let d = back.dem.as_ref().unwrap();
         // Exact to the adaptive step (range ~80 m -> 5 cm floor).

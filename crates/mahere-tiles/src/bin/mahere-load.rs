@@ -1,6 +1,6 @@
 //! The loader: bake a region's cells into a directory whose layout is the bucket. Cells already in the directory are merged over, so regions can be baked one at a time (and a 1 m region over a 10 m one). Usage:
 //!   mahere-load --pbf <file> --dem <tif>... --out <dir> \
-//!     --bbox lat0,lon0,lat1,lon1 [--vec-base 13] [--dem-base 11] [--min 6]
+//!     --bbox lat0,lon0,lat1,lon1 [--vec-base 13] [--dem-base 11] [--min 6] [--dem-loss m] [--img-loss levels]
 use std::path::Path;
 
 fn arg(args: &[String], name: &str) -> Option<String> {
@@ -18,6 +18,11 @@ fn main() {
     let vec_base: u8 = arg(&args, "--vec-base").map(|v| v.parse().unwrap()).unwrap_or(13);
     let dem_base: u8 = arg(&args, "--dem-base").map(|v| v.parse().unwrap()).unwrap_or(11);
     let min_depth: u8 = arg(&args, "--min").map(|v| v.parse().unwrap()).unwrap_or(6);
+    // Lossy dials for the pyramid codec: --dem-loss metres, --img-loss 8-bit levels, both at the finest level (coarser levels taper to lossless). Defaults 0.2 m and 16: under the lidar noise and invisible in the composite; pass 0 for lossless.
+    let loss = mahere_tiles::Loss {
+        dem_m: arg(&args, "--dem-loss").map(|v| v.parse().unwrap()).unwrap_or(0.2),
+        img: arg(&args, "--img-loss").map(|v| v.parse().unwrap()).unwrap_or(16),
+    };
     let list = |flag: &str| -> Vec<String> {
         match args.iter().position(|a| a == flag) {
             Some(i) => args[i + 1..].iter().take_while(|a| !a.starts_with("--")).cloned().collect(),
@@ -85,7 +90,7 @@ fn main() {
     let n = cells.len();
     use rayon::prelude::*;
     cells.par_iter().for_each(|(key, cell)| {
-        mahere_tiles::write_cell(out, *key, cell).expect("write cell");
+        mahere_tiles::write_cell(out, *key, cell, &loss).expect("write cell");
     });
     eprintln!("{n} cells written (merged over existing), {:.1}s", t.elapsed().as_secs_f32());
 

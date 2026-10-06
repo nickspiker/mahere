@@ -9,7 +9,7 @@ use fluor::host::chrome::{self, HIT_NONE, ResizeEdge};
 use fluor::host::chrome_widget::DefaultChrome;
 use fluor::paint::{Clip, HitId, pack_argb};
 use mahere_engine::residency::{CellStore, DirStore, HttpStore, TieredStore, DEFAULT_CELLS_URL};
-use mahere_engine::{Camera, MapCore, PPD_REF};
+use mahere_engine::{Camera, MapCore};
 use std::time::Instant;
 
 struct MahereApp {

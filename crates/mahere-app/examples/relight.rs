@@ -31,7 +31,7 @@ fn main() {
     let num = |i: usize, d: f64| args.get(i).and_then(|s| s.parse().ok()).unwrap_or(d);
     let cam = Camera { lat: num(1, 46.2000), lon: num(2, -122.1900), ppd: num(3, 12_000.0), bearing: 0.0 };
     let out = args.get(4).cloned().unwrap_or_else(|| "/tmp/claude-1000/adams_nw.png".into());
-    let store = std::sync::Arc::new(DirStore("data/cells".into()));
+    let store = std::sync::Arc::new(DirStore(std::env::var("MAHERE_CELLS").unwrap_or_else(|_| "data/cells".into()).into()));
     let mut map = MapCore::new(store, cam);
     let (w, h) = (1024usize, 768usize);
     // MAHERE_LAYERS=imagery,nocontours,nolines ... adjusts the mask for the render.
