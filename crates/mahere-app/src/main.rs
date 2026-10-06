@@ -338,7 +338,7 @@ fn main() {
     let session = vault.as_ref().and_then(|s| mahere_store::load_session(s));
     let cam = match session {
         Some(s) => Camera { lat: s.lat, lon: s.lon, ppd: s.ppd, bearing: s.bearing },
-        None => Camera { lat: 46.2024, lon: -121.4909, ppd: PPD_REF, bearing: 0.0 },
+        None => Camera { lat: 46.2000, lon: -122.1900, ppd: 12_000.0, bearing: 0.0 },
     };
     let mut map = MapCore::new(store, cam);
     if let Some(s) = session {

@@ -249,8 +249,8 @@ pub extern "system" fn Java_nz_mahere_app_MahereActivity_nativeInit(
     let session = store.as_ref().and_then(|s| mahere_store::load_session(s));
     let cam = match session {
         Some(s) => Camera { lat: s.lat, lon: s.lon, ppd: s.ppd, bearing: s.bearing },
-        // Mt Adams until the first GPS fix recenters us.
-        None => Camera { lat: 46.2024, lon: -121.4909, ppd: 12_000.0, bearing: 0.0 },
+        // Mt St Helens until the first GPS fix recenters us.
+        None => Camera { lat: 46.2000, lon: -122.1900, ppd: 12_000.0, bearing: 0.0 },
     };
     let mut map = MapCore::new(cell_store, cam);
     if let Some(s) = session {
