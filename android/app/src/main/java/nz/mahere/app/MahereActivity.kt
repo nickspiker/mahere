@@ -60,17 +60,10 @@ class MahereActivity : Activity(), SurfaceHolder.Callback, Choreographer.FrameCa
         setContentView(surfaceView)
         hideSystemBars()
 
-        // Stage bundled DEM tiles into filesDir once (the tiff reader wants
-        // real file paths; assets are zip entries).
+        // Cells stream from the bucket into the vault now; nothing ships in
+        // the APK. Drop the staged copy earlier builds left behind.
         thread {
-            // A changed bake stamp means every staged cell is stale: wipe
-            // and restage (per-file existence checks can't see new content).
-            val stamp = runCatching { assets.open("cells/bake-stamp").bufferedReader().readText() }.getOrNull()
-            val staged = java.io.File(filesDir, "cells/bake-stamp")
-            if (stamp != null && (!staged.exists() || staged.readText() != stamp)) {
-                java.io.File(filesDir, "cells").deleteRecursively()
-            }
-            stageAssetDir("cells")
+            java.io.File(filesDir, "cells").deleteRecursively()
             runOnUiThread {
                 assetsStaged = true
                 maybeInit()
@@ -87,23 +80,6 @@ class MahereActivity : Activity(), SurfaceHolder.Callback, Choreographer.FrameCa
         } else {
             startLocation()
         }
-    }
-
-    /// Recursively copy an asset directory into filesDir (skip already-staged
-    /// files by size). The cells dir is {layer}/{depth}/{prefix}.vsf.zst.
-    private fun stageAssetDir(rel: String) {
-        val children = assets.list(rel).orEmpty()
-        if (children.isEmpty()) {
-            val out = java.io.File(filesDir, rel)
-            if (!out.exists() || out.length() == 0L) {
-                out.parentFile?.mkdirs()
-                assets.open(rel).use { input ->
-                    out.outputStream().use { input.copyTo(it) }
-                }
-            }
-            return
-        }
-        for (c in children) stageAssetDir("$rel/$c")
     }
 
     private fun hideSystemBars() {

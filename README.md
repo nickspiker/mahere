@@ -100,9 +100,15 @@ cargo run --release -p mahere-tiles --bin mahere-load -- \
   --bbox 46.0,-121.75,46.35,-121.30 --line-base 13 --line-min 6 \
   --dem-depths 11,6 --dem data/USGS_13_n47w122.tif
 
-cargo run --release -p mahere-app   # Linux/macOS; reads data/cells
+cargo run --release -p mahere-app   # Linux/macOS; reads data/cells if present
 cargo test                          # coordinates, tiles, engine, store
 ```
+
+Without a local `data/cells`, both frontends stream cells from the public
+bucket (`https://brobdingnagian.holdmyoscilloscope.com/mahere/cells/…`,
+the same `{layer}/{depth}/{prefix}.vsf.zst` layout) into the kete vault on
+the device, and serve them from there afterwards — the Android APK carries
+no map data. `scripts/publish-cells.sh` syncs a bake to the bucket.
 
 ## License
 

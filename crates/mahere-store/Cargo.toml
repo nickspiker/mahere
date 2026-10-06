@@ -8,5 +8,6 @@ description = "mahere's on-device database: session, tracks (and soon tiles) on 
 
 [dependencies]
 kete = { git = "https://github.com/nickspiker/kete", rev = "47b43716cc9342d7b00dd03dd9edf011185b532e" }
+mahere-engine = { path = "../mahere-engine" }
 vsf = { git = "https://github.com/nickspiker/vsf", rev = "5f2bb06c8d96ee417a2571944882ef36d6c9ca8f" }
 rand = "0.8"

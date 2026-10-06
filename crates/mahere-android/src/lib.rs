@@ -21,6 +21,7 @@ use fluor::paint::pack_argb;
 use jni::JNIEnv;
 use jni::objects::{JClass, JObject, JString};
 use jni::sys::{jboolean, jdouble, jfloat, jint, jlong};
+use mahere_engine::residency::{CellStore, DirStore, HttpStore, TieredStore, DEFAULT_CELLS_URL};
 use mahere_engine::{Camera, GpsFix, MapCore};
 use ndk::native_window::NativeWindow;
 use std::time::Instant;
@@ -228,11 +229,23 @@ pub extern "system" fn Java_nz_mahere_app_MahereActivity_nativeInit(
         Ok(s) => s.into(),
         Err(_) => return 0,
     };
-    // The #pagetable pipeline: the only map data is the baked cells dir.
-    let cell_store =
-        std::sync::Arc::new(mahere_engine::residency::DirStore(format!("{dir}/cells").into()));
-    // The vault: session restore + track recording (kete/manifestus).
+    // The vault: session, tracks, and the on-device cell cache (kete).
     let store = mahere_store::open(Some(&dir)).ok();
+    // Cells stream from the bucket through the vault; `cells-local` (pushed
+    // by hand) overrides for offline development.
+    let local = std::path::PathBuf::from(format!("{dir}/cells-local"));
+    let cell_store: std::sync::Arc<dyn CellStore> = if local.is_dir() {
+        std::sync::Arc::new(DirStore(local))
+    } else {
+        let remote = std::sync::Arc::new(HttpStore::new(DEFAULT_CELLS_URL));
+        match &store {
+            Some(v) => std::sync::Arc::new(TieredStore::new(
+                std::sync::Arc::new(mahere_store::VaultCells(v.clone())),
+                remote,
+            )),
+            None => remote,
+        }
+    };
     let session = store.as_ref().and_then(|s| mahere_store::load_session(s));
     let cam = match session {
         Some(s) => Camera { lat: s.lat, lon: s.lon, ppd: s.ppd, bearing: s.bearing },

@@ -8,6 +8,7 @@ description = "mahere's host-independent map core: camera, terrain reservoir eng
 
 [dependencies]
 mahere-coord = { path = "../mahere-coord" }
+ureq = "2"
 mahere-tiles = { path = "../mahere-tiles" }
 rayon = "1"
 rustc-hash = "2"

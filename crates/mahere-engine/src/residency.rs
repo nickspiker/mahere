@@ -343,3 +343,101 @@ mod tests {
         assert!(r.converged());
     }
 }
+
+// ==================== TIERED STORE: VAULT CACHE OVER THE BUCKET ====================
+
+/// Where the baked cells live publicly. The path under it is exactly a
+/// cell's `CellKey::path`, so the bake directory and the bucket are the
+/// same thing.
+pub const DEFAULT_CELLS_URL: &str = "https://brobdingnagian.holdmyoscilloscope.com/mahere/cells";
+
+/// A store that can also keep what it's given (the vault).
+pub trait CellCache: CellStore {
+    fn put(&self, rel: &str, bytes: &[u8]);
+}
+
+/// The far tier. `Ok(None)` is a definite absence (the cell was never
+/// baked); `Err` is a failure to find out (offline, timeout), which must
+/// not be remembered as absence.
+pub trait RemoteStore: Send + Sync + 'static {
+    fn fetch(&self, rel: &str) -> Result<Option<Vec<u8>>, String>;
+}
+
+/// Cache first, then the bucket, writing hits through. Definite misses
+/// are remembered for the process (most of the world isn't baked yet);
+/// failures are not, so a cell that couldn't be fetched is tried again
+/// the next time the view wants it.
+pub struct TieredStore {
+    cache: Arc<dyn CellCache>,
+    remote: Arc<dyn RemoteStore>,
+    missing: std::sync::Mutex<FxHashSet<String>>,
+}
+
+impl TieredStore {
+    pub fn new(cache: Arc<dyn CellCache>, remote: Arc<dyn RemoteStore>) -> TieredStore {
+        TieredStore { cache, remote, missing: std::sync::Mutex::new(FxHashSet::default()) }
+    }
+}
+
+impl CellStore for TieredStore {
+    fn get(&self, rel: &str) -> Option<Vec<u8>> {
+        if let Some(b) = self.cache.get(rel) {
+            return Some(b);
+        }
+        if self.missing.lock().unwrap().contains(rel) {
+            return None;
+        }
+        match self.remote.fetch(rel) {
+            Ok(Some(b)) => {
+                self.cache.put(rel, &b);
+                Some(b)
+            }
+            Ok(None) => {
+                self.missing.lock().unwrap().insert(rel.to_string());
+                None
+            }
+            Err(e) => {
+                eprintln!("cell fetch {rel}: {e}");
+                None
+            }
+        }
+    }
+}
+
+/// The bucket over HTTPS. 404 is absence; anything else is a failure.
+pub struct HttpStore {
+    base: String,
+    agent: ureq::Agent,
+}
+
+impl HttpStore {
+    pub fn new(base: &str) -> HttpStore {
+        let agent = ureq::AgentBuilder::new()
+            .timeout_connect(std::time::Duration::from_secs(10))
+            .timeout_read(std::time::Duration::from_secs(30))
+            .build();
+        HttpStore { base: base.trim_end_matches('/').to_string(), agent }
+    }
+}
+
+impl RemoteStore for HttpStore {
+    fn fetch(&self, rel: &str) -> Result<Option<Vec<u8>>, String> {
+        let url = format!("{}/{}", self.base, rel);
+        match self.agent.get(&url).call() {
+            Ok(resp) => {
+                let mut buf = Vec::new();
+                std::io::Read::read_to_end(&mut resp.into_reader(), &mut buf).map_err(|e| e.to_string())?;
+                Ok(Some(buf))
+            }
+            Err(ureq::Error::Status(404, _)) => Ok(None),
+            Err(e) => Err(e.to_string()),
+        }
+    }
+}
+
+/// The bucket with no cache at all (a desktop without a vault).
+impl CellStore for HttpStore {
+    fn get(&self, rel: &str) -> Option<Vec<u8>> {
+        self.fetch(rel).ok().flatten()
+    }
+}

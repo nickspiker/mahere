@@ -230,3 +230,24 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
+
+// ==================== CELL CACHE ====================
+
+/// The vault as the on-device cell tier: every cell fetched from the bucket
+/// is written through here and served from here afterwards (offline
+/// included). Keys are `cell|{layer}/{dd}/{prefix}.vsf.zst` — the bucket
+/// key with a namespace, so session and track records share the vault
+/// without collisions.
+pub struct VaultCells(pub Arc<FlatStorage>);
+
+impl mahere_engine::residency::CellStore for VaultCells {
+    fn get(&self, rel: &str) -> Option<Vec<u8>> {
+        self.0.read_device(&format!("cell|{rel}")).ok().flatten()
+    }
+}
+
+impl mahere_engine::residency::CellCache for VaultCells {
+    fn put(&self, rel: &str, bytes: &[u8]) {
+        let _ = self.0.write_device(&format!("cell|{rel}"), bytes);
+    }
+}

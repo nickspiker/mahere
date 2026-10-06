@@ -9,6 +9,7 @@ use fluor::host::app::{Context, EventResponse, FluorApp, run_app};
 use fluor::host::chrome::{self, HIT_NONE, ResizeEdge};
 use fluor::host::chrome_widget::DefaultChrome;
 use fluor::paint::{Clip, HitId, pack_argb};
+use mahere_engine::residency::{CellStore, DirStore, HttpStore, TieredStore, DEFAULT_CELLS_URL};
 use mahere_engine::{Camera, MapCore, PPD_REF};
 use std::time::Instant;
 
@@ -302,11 +303,24 @@ impl FluorApp for MahereApp {
 }
 
 fn main() {
-    let cells = std::env::args().nth(1).unwrap_or_else(|| "data/cells".into());
-    eprintln!("cells: {cells}");
-    let store = std::sync::Arc::new(mahere_engine::residency::DirStore(cells.into()));
-
     let vault = mahere_store::open(None).ok();
+    // A local bake (argv[1], or data/cells) serves directly; otherwise cells
+    // come from the bucket through the vault, like the phone.
+    let local = std::env::args().nth(1).map(std::path::PathBuf::from).unwrap_or_else(|| "data/cells".into());
+    let store: std::sync::Arc<dyn CellStore> = if local.is_dir() {
+        eprintln!("cells: {}", local.display());
+        std::sync::Arc::new(DirStore(local))
+    } else {
+        eprintln!("cells: {} (vault-cached: {})", DEFAULT_CELLS_URL, vault.is_some());
+        let remote = std::sync::Arc::new(HttpStore::new(DEFAULT_CELLS_URL));
+        match &vault {
+            Some(v) => std::sync::Arc::new(TieredStore::new(
+                std::sync::Arc::new(mahere_store::VaultCells(v.clone())),
+                remote,
+            )),
+            None => remote,
+        }
+    };
     let session = vault.as_ref().and_then(|s| mahere_store::load_session(s));
     let cam = match session {
         Some(s) => Camera { lat: s.lat, lon: s.lon, ppd: s.ppd, bearing: s.bearing },
