@@ -53,11 +53,13 @@ pub struct LayerMask {
     pub canopy: bool,
     /// The hypsometric gradient under the light; off leaves a flat white landscape lit by the sun alone.
     pub hypso: bool,
+    /// Boundaries: parks, wilderness, national forests, other protected land, state and county lines.
+    pub boundaries: bool,
 }
 
 impl Default for LayerMask {
     fn default() -> Self {
-        LayerMask { dem: true, land: true, water: true, line: true, debug: false, imagery: false, contours: true, slope: false, canopy: false, hypso: true }
+        LayerMask { dem: true, land: true, water: true, line: true, debug: false, imagery: false, contours: true, slope: false, canopy: false, hypso: true, boundaries: true }
     }
 }
 
@@ -65,7 +67,26 @@ impl LayerMask {
     /// Which rows a dominating layer makes inert: imagery replaces everything but lines, land cover and a terrain that is off make the elevation tint moot. The panel greys these; the renderer treats them as off through [`LayerMask::effective`].
     pub fn inert(self) -> LayerMask {
         let im = self.imagery;
-        LayerMask { dem: im, land: im, water: im, line: false, debug: false, imagery: false, contours: im, slope: im, canopy: im, hypso: im || self.land || !self.dem }
+        LayerMask { dem: im, land: im, water: im, line: false, debug: false, imagery: false, contours: im, slope: im, canopy: im, hypso: im || self.land || !self.dem, boundaries: !self.line }
+    }
+
+    /// The mask as bits, one per field in declaration order, for a shader or a settings document.
+    pub fn bits(self) -> u32 {
+        (self.dem as u32)
+            | (self.land as u32) << 1
+            | (self.water as u32) << 2
+            | (self.line as u32) << 3
+            | (self.debug as u32) << 4
+            | (self.imagery as u32) << 5
+            | (self.contours as u32) << 6
+            | (self.slope as u32) << 7
+            | (self.canopy as u32) << 8
+            | (self.hypso as u32) << 9
+            | (self.boundaries as u32) << 10
+    }
+
+    pub fn from_bits(b: u32) -> LayerMask {
+        LayerMask { dem: b & 1 != 0, land: b & 2 != 0, water: b & 4 != 0, line: b & 8 != 0, debug: b & 16 != 0, imagery: b & 32 != 0, contours: b & 64 != 0, slope: b & 128 != 0, canopy: b & 256 != 0, hypso: b & 512 != 0, boundaries: b & 1024 != 0 }
     }
 
     /// The mask as drawn: every inert row off.
@@ -82,6 +103,7 @@ impl LayerMask {
             slope: self.slope && !i.slope,
             canopy: self.canopy && !i.canopy,
             hypso: self.hypso && !i.hypso,
+            boundaries: self.boundaries && !i.boundaries,
         }
     }
 }
@@ -163,7 +185,7 @@ const FLAT_RGB: [u8; 3] = [96, 100, 96];
 const FLAT_WHITE: [u8; 3] = [232, 232, 230];
 
 /// Line class id (1-based, 0 = empty) -> visible RGB. Index 12 = Waterway, whose brightness is scaled by the texel's log magnitude at draw time so water is never uniform.
-pub const CLASS_LUT: [[u8; 3]; 13] = [
+pub const CLASS_LUT: [[u8; 3]; 18] = [
     [0, 0, 0],
     [245, 150, 60],
     [238, 175, 62],
@@ -177,9 +199,16 @@ pub const CLASS_LUT: [[u8; 3]; 13] = [
     [125, 122, 128],
     [148, 136, 160],
     [120, 190, 255],
+    [96, 200, 96],
+    [150, 210, 120],
+    [140, 160, 80],
+    [110, 190, 150],
+    [190, 150, 210],
 ];
-pub const CLASS_MAX: usize = 12;
+pub const CLASS_MAX: usize = 17;
 pub const WATERWAY_CLASS: usize = 12;
+/// Classes from here up are boundaries (national park, wilderness, national forest, other protected land, state and county lines), gated by the boundaries layer.
+pub const BOUNDARY_FIRST: usize = 13;
 
 /// Slope-angle bands (degrees) and their overlay colours: the avalanche / rideability layer, from the normal at draw time.
 const SLOPE_BANDS: [(f32, [u8; 3]); 4] = [(25.0, [250, 220, 60]), (30.0, [250, 150, 40]), (35.0, [230, 50, 40]), (45.0, [150, 40, 200])];
@@ -533,7 +562,7 @@ fn compose_rgb(dem: &DemRef, vec: &VecRef, pool: &Pool, diamond: u8, uq: i64, vq
             if mask.line {
                 if let Some(line) = line {
                     let cov = line.cov[i];
-                    if cov != 0 {
+                    if cov != 0 && (mask.boundaries || (line.class[i] as usize) < BOUNDARY_FIRST) {
                         rgb = lerp3(rgb, line_colour(line, i), cov as f32 / 255.0);
                     }
                 }
@@ -581,7 +610,7 @@ fn compose_rgb(dem: &DemRef, vec: &VecRef, pool: &Pool, diamond: u8, uq: i64, vq
         if mask.line {
             if let Some(line) = line {
                 let cov = line.cov[i];
-                if cov != 0 {
+                if cov != 0 && (mask.boundaries || (line.class[i] as usize) < BOUNDARY_FIRST) {
                     rgb = lerp3(rgb, line_colour(line, i), cov as f32 / 255.0);
                 }
             }
@@ -781,7 +810,7 @@ mod tests {
             key,
             Entry {
                 present: crate::residency::PRESENT_DEM | crate::residency::PRESENT_LINE | crate::residency::PRESENT_LAND | crate::residency::PRESENT_WATER,
-                line_mag_max: [0; 16],
+                line_mag_max: [0; 32],
                 elev_lo: 6000,
                 elev_hi: 6000,
                 dem: Some(DemPacked { texel: texel.into_boxed_slice() }),

@@ -23,8 +23,10 @@ struct MahereApp {
     rotating: bool,
     last_cursor: (f64, f64),
     store: Option<std::sync::Arc<mahere_store::FlatStorage>>,
+    cells: Option<std::sync::Arc<mahere_store::VaultCells>>,
     last_save: Instant,
     panel: Panel,
+    cache_budget: u64,
 }
 
 impl MahereApp {
@@ -45,8 +47,10 @@ impl MahereApp {
             rotating: false,
             last_cursor: (0., 0.),
             store: None,
+            cells: None,
             last_save: Instant::now(),
             panel: Panel::new(),
+            cache_budget: 2 << 30,
         }
     }
 
@@ -139,8 +143,9 @@ impl FluorApp for MahereApp {
                     return EventResponse::StartWindowDrag;
                 }
                 let mut mask = self.map.layers();
-                let mut ctl = Controls { real_sun: self.map.real_sun, follow_heading: self.map.follow_heading, lock_to_fix: self.map.lock_to_fix };
+                let mut ctl = Controls { real_sun: self.map.real_sun, follow_heading: self.map.follow_heading, lock_to_fix: self.map.lock_to_fix, cache_budget: self.cache_budget };
                 if self.panel.tap(cx as f32, cy as f32, w, h, &mut mask, &mut ctl) {
+                    self.cache_budget = ctl.cache_budget;
                     self.map.set_layers(mask);
                     if ctl.real_sun != self.map.real_sun {
                         self.map.set_real_sun(ctl.real_sun);
@@ -159,6 +164,7 @@ impl FluorApp for MahereApp {
                 EventResponse::Handled
             }
             FEvent::MouseInput { state: ElementState::Released, button: MouseButton::Left } => {
+                self.panel.release();
                 // A click that never travelled is a tap: a new measurement to that point.
                 if self.dragging && self.travel < 6.0 {
                     self.map.tap(ctx.cursor_x as f64, ctx.cursor_y as f64, w, h);
@@ -178,6 +184,13 @@ impl FluorApp for MahereApp {
                     ctx.window.request_redraw();
                 }
                 let (x, y) = (hx as f64, hy as f64);
+                let mut ctl = Controls { real_sun: self.map.real_sun, follow_heading: self.map.follow_heading, lock_to_fix: self.map.lock_to_fix, cache_budget: self.cache_budget };
+                if self.panel.drag(hx, &mut ctl) {
+                    self.cache_budget = ctl.cache_budget;
+                    ctx.window.request_redraw();
+                    self.last_cursor = (x, y);
+                    return EventResponse::Handled;
+                }
                 if self.dragging {
                     let (dx, dy) = (x - self.last_cursor.0, y - self.last_cursor.1);
                     self.travel += dx.abs() + dy.abs();
@@ -344,9 +357,10 @@ impl FluorApp for MahereApp {
         if heading > 180.0 {
             heading -= 360.0;
         }
-        let readouts = Readouts { lat: c.lat, lon: c.lon, elev: self.map.elevation_at(c.lat, c.lon), heading_deg: heading, m_per_px: 111_320.0 / c.ppd, frame_ms: self.map.last_frame_ms, resident: self.map.pool().map.len(), phone_heading: None };
+        let used = self.cells.as_ref().map_or(0, |c| c.cached_bytes());
+        let readouts = Readouts { lat: c.lat, lon: c.lon, elev: self.map.elevation_at(c.lat, c.lon), heading_deg: heading, m_per_px: 111_320.0 / c.ppd, frame_ms: self.map.last_frame_ms, resident: self.map.pool().map.len(), phone_heading: None, cache_used: used, cache_max: used + (8u64 << 30) };
         let measure = self.map.measure_view(w, h, Panel::strip_samples(w));
-        self.panel.paint(w, h, self.map.layers(), Controls { real_sun: self.map.real_sun, follow_heading: self.map.follow_heading, lock_to_fix: self.map.lock_to_fix }, &readouts, measure.as_ref());
+        self.panel.paint(w, h, self.map.layers(), Controls { real_sun: self.map.real_sun, follow_heading: self.map.follow_heading, lock_to_fix: self.map.lock_to_fix, cache_budget: self.cache_budget }, &readouts, measure.as_ref());
         let mut map = self.map.canvas.clone();
         self.panel.composite_rgb(&mut map, w, h);
         self.chrome.rasterize_bg(ctx.damage, |c| {
@@ -381,6 +395,7 @@ fn main() {
     let vault = mahere_store::open(None).ok();
     // A local bake (argv[1], or data/cells) serves directly; otherwise cells come from the bucket through the vault, like the phone.
     let local = std::env::args().nth(1).map(std::path::PathBuf::from).unwrap_or_else(|| "data/cells".into());
+    let mut cells: Option<std::sync::Arc<mahere_store::VaultCells>> = None;
     let store: std::sync::Arc<dyn CellStore> = if local.is_dir() {
         eprintln!("cells: {}", local.display());
         std::sync::Arc::new(DirStore(local))
@@ -388,10 +403,11 @@ fn main() {
         eprintln!("cells: {} (vault-cached: {})", DEFAULT_CELLS_URL, vault.is_some());
         let remote = std::sync::Arc::new(HttpStore::new(DEFAULT_CELLS_URL));
         match &vault {
-            Some(v) => std::sync::Arc::new(TieredStore::new(
-                std::sync::Arc::new(mahere_store::VaultCells::new(v.clone())),
-                remote,
-            )),
+            Some(v) => {
+                let cache = std::sync::Arc::new(mahere_store::VaultCells::new(v.clone()));
+                cells = Some(cache.clone());
+                std::sync::Arc::new(TieredStore::new(cache, remote))
+            }
             None => remote,
         }
     };
@@ -407,5 +423,6 @@ fn main() {
     }
     let mut app = MahereApp::new(map);
     app.store = vault;
+    app.cells = cells;
     run_app(app).expect("fluor event loop failed");
 }

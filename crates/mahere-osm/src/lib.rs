@@ -26,9 +26,15 @@ pub enum RoadClass {
     Power,
     /// Rivers, streams, canals, irrigation ditches — drawn under everything.
     Waterway,
+    /// Boundaries, stamped as lines from the relation rings: national parks, wilderness, national forests, other protected land, state and county lines.
+    NationalPark,
+    Wilderness,
+    NationalForest,
+    Protected,
+    Admin,
 }
 
-pub const CLASS_COUNT: usize = 12;
+pub const CLASS_COUNT: usize = 17;
 
 /// Line `use` bits: what a way is for, from its tags. A theme draws a path differently when bikes or horses are allowed, hides motor roads on a ski map, and so on.
 pub mod use_bits {
@@ -99,6 +105,47 @@ impl RoadClass {
             Rail => 4.0,
             Power => 2.0,
             Waterway => 2.0,
+            NationalPark | Wilderness | NationalForest => 6.0,
+            Protected => 5.0,
+            Admin => 8.0,
+        }
+    }
+
+    /// A boundary relation's class from its tags, if it is one worth a line.
+    fn from_boundary<'a>(tags: impl Iterator<Item = (&'a str, &'a str)>) -> Option<RoadClass> {
+        let (mut boundary, mut protect, mut operator, mut admin, mut reserve) = (None, None, String::new(), None, false);
+        for (k, v) in tags {
+            match k {
+                "boundary" => boundary = Some(v.to_string()),
+                "protect_class" => protect = Some(v.to_string()),
+                "operator" => operator = v.to_lowercase(),
+                "admin_level" => admin = v.parse::<u8>().ok(),
+                "leisure" if v == "nature_reserve" => reserve = true,
+                _ => {}
+            }
+        }
+        match boundary.as_deref() {
+            Some("national_park") => Some(RoadClass::NationalPark),
+            Some("protected_area") => Some(match protect.as_deref() {
+                Some("1") | Some("1a") | Some("1b") => RoadClass::Wilderness,
+                Some("2") => RoadClass::NationalPark,
+                Some("6") => RoadClass::NationalForest,
+                _ if operator.contains("forest service") => RoadClass::NationalForest,
+                _ => RoadClass::Protected,
+            }),
+            Some("administrative") => matches!(admin, Some(4) | Some(6)).then_some(RoadClass::Admin),
+            _ => reserve.then_some(RoadClass::Protected),
+        }
+    }
+
+    /// How a boundary weighs against the others of its kind: the line's magnitude.
+    fn boundary_weight(self) -> f32 {
+        match self {
+            RoadClass::Admin => 1.0,
+            RoadClass::NationalPark => 0.9,
+            RoadClass::Wilderness => 0.8,
+            RoadClass::NationalForest => 0.7,
+            _ => 0.5,
         }
     }
 }
@@ -182,7 +229,7 @@ fn uses_and_magnitude<'a>(class: RoadClass, tags: impl Iterator<Item = (&'a str,
         Trunk | Primary | Secondary | Tertiary | Residential | Service => MOTOR | BIKE | FOOT,
         Track => MOTOR | BIKE | FOOT | HORSE | UNPAVED,
         Path => FOOT | BIKE,
-        Rail | Power | Waterway => 0,
+        Rail | Power | Waterway | NationalPark | Wilderness | NationalForest | Protected | Admin => 0,
     };
     let mut mag: Option<f32> = None;
     let mut lanes: Option<f32> = None;
@@ -243,6 +290,7 @@ fn uses_and_magnitude<'a>(class: RoadClass, tags: impl Iterator<Item = (&'a str,
         Path => 0.15,
         Rail => 0.5,
         Power => 0.3,
+        NationalPark | Wilderness | NationalForest | Protected | Admin => class.boundary_weight(),
         Waterway => 0.0,
     });
     // Lanes refine a road's magnitude until traffic counts exist: log over 1..8 lanes, blended with the class default.
@@ -301,22 +349,22 @@ enum WayRec {
 
 /// Load every drawable line and area from a .osm.pbf extract.
 pub fn load_features(path: &str) -> Result<Features, osmpbf::Error> {
-    // Pass 1: multipolygon relations with a drawable class.
-    let relations: Vec<(AreaClass, Vec<i64>)> = ElementReader::from_path(path)?.par_map_reduce(
+    // Pass 1: relations — multipolygons with a drawable area class, and boundaries, which become rings of line.
+    let rels: Vec<(Option<AreaClass>, Option<RoadClass>, Vec<i64>)> = ElementReader::from_path(path)?.par_map_reduce(
         |element| match element {
             Element::Relation(r) => {
                 let is_mp = r.tags().any(|(k, v)| k == "type" && v == "multipolygon");
-                match (is_mp, AreaClass::from_tags(r.tags())) {
-                    (true, Some(class)) => {
-                        let members: Vec<i64> = r
-                            .members()
-                            .filter(|m| m.member_type == osmpbf::RelMemberType::Way)
-                            .map(|m| m.member_id)
-                            .collect();
-                        vec![(class, members)]
-                    }
-                    _ => Vec::new(),
+                let area = if is_mp { AreaClass::from_tags(r.tags()) } else { None };
+                let bound = RoadClass::from_boundary(r.tags());
+                if area.is_none() && bound.is_none() {
+                    return Vec::new();
                 }
+                let members: Vec<i64> = r
+                    .members()
+                    .filter(|m| m.member_type == osmpbf::RelMemberType::Way)
+                    .map(|m| m.member_id)
+                    .collect();
+                vec![(area, bound, members)]
             }
             _ => Vec::new(),
         },
@@ -326,7 +374,9 @@ pub fn load_features(path: &str) -> Result<Features, osmpbf::Error> {
             a
         },
     )?;
-    let mut member_ids: Vec<i64> = relations.iter().flat_map(|(_, m)| m.iter().copied()).collect();
+    let relations: Vec<(AreaClass, Vec<i64>)> = rels.iter().filter_map(|(a, _, m)| a.map(|a| (a, m.clone()))).collect();
+    let bounds: Vec<(RoadClass, Vec<i64>)> = rels.iter().filter_map(|(_, b, m)| b.map(|b| (b, m.clone()))).collect();
+    let mut member_ids: Vec<i64> = rels.iter().flat_map(|(_, _, m)| m.iter().copied()).collect();
     member_ids.sort_unstable();
     member_ids.dedup();
 
@@ -436,6 +486,17 @@ pub fn load_features(path: &str) -> Result<Features, osmpbf::Error> {
             let (uses, mag) = line_attrs[i];
             let weight = if class == RoadClass::Waterway { weights[i] } else { mag };
             roads.push(Road { class, pts, weight, uses });
+        }
+    }
+
+    // Boundaries: each closed ring of a relation is a line of its class.
+    for (class, member_ids) in bounds {
+        let parts: Vec<&Vec<i64>> = member_ids.iter().filter_map(|id| members.get(id)).collect();
+        for ring in assemble_rings(&parts) {
+            let pts = locate_all(&ring);
+            if pts.len() >= 2 {
+                roads.push(Road { class, pts, weight: class.boundary_weight(), uses: 0 });
+            }
         }
     }
 

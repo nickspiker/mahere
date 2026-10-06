@@ -99,7 +99,7 @@ pub struct Entry {
     /// Which planes the cell carried when it loaded (PRESENT_ bits): the truth about the cell even after a GPU host has released a plane's CPU copy.
     pub present: u8,
     /// The largest magnitude per line class in the cell's line plane (index = class id), so a view can scale every line against what it shows.
-    pub line_mag_max: [u8; 16],
+    pub line_mag_max: [u8; 32],
     /// The cell's elevation span, quantised (ELEV_NODATA, 0 when it has none): the contour interval is fit to the union over the view.
     pub elev_lo: u16,
     pub elev_hi: u16,
@@ -345,11 +345,11 @@ fn load_cell(store: &dyn CellStore, key: CellKey, pack_cpu: bool) -> Loaded {
         | (planes.land.is_some() as u8) * PRESENT_LAND
         | (planes.water.is_some() as u8) * PRESENT_WATER
         | (planes.img.is_some() as u8) * PRESENT_IMG;
-    let mut line_mag_max = [0u8; 16];
+    let mut line_mag_max = [0u8; 32];
     if let Some(l) = &planes.line {
         for i in 0..mahere_tiles::TRI {
             if l.cov[i] != 0 {
-                let c = (l.class[i] as usize).min(15);
+                let c = (l.class[i] as usize).min(31);
                 line_mag_max[c] = line_mag_max[c].max(l.mag_at(i));
             }
         }
@@ -363,7 +363,7 @@ fn load_cell(store: &dyn CellStore, key: CellKey, pack_cpu: bool) -> Loaded {
 pub const DEFAULT_CELLS_URL: &str = "https://brobdingnagian.holdmyoscilloscope.com/mahere/cells";
 
 /// Cell format epoch: bumped whenever the encoding changes incompatibly. It rides on the fetch URL as a query (so the CDN edge, which caches a key for hours, sees a new key) and in the vault key (so a cached cell of an older format is never read back as this one). Old clients keep fetching the old objects they understand.
-pub const CELL_EPOCH: u32 = 4;
+pub const CELL_EPOCH: u32 = 5;
 
 /// A store that can also keep what it's given (the vault).
 pub trait CellCache: CellStore {

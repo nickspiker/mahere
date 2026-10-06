@@ -119,6 +119,40 @@ pub fn load_session(store: &FlatStorage) -> Option<Session> {
     Some(Session { lat: d[0], lon: d[1], ppd: d[2], bearing: d[3], sun_az: d[4], sun_alt: d[5] })
 }
 
+/// The app's settings: the cache budget in bytes, the layer mask as bits, and the mode flags, as one tensor of integers in the vault under `d` settings.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Settings {
+    pub cache_budget: u64,
+    pub layer_bits: u64,
+    pub real_sun: bool,
+    pub follow_heading: bool,
+    pub lock_to_fix: bool,
+}
+
+fn settings_key() -> String {
+    vault_key(&[name("settings")])
+}
+
+pub fn save_settings(store: &FlatStorage, s: &Settings) -> Result<(), StorageError> {
+    let flags = (s.real_sun as u64) | (s.follow_heading as u64) << 1 | (s.lock_to_fix as u64) << 2;
+    let t = VsfType::t_u6(Tensor::new(vec![3], vec![s.cache_budget, s.layer_bits, flags]));
+    store.write_device(&settings_key(), &t.flatten())
+}
+
+pub fn load_settings(store: &FlatStorage) -> Option<Settings> {
+    let bytes = store.read_device(&settings_key()).ok()??;
+    let mut ptr = 0usize;
+    let d = match vsf::parse(&bytes, &mut ptr).ok()? {
+        VsfType::t_u6(t) => t.data,
+        VsfType::v_u6(t) => t.data,
+        _ => return None,
+    };
+    if d.len() != 3 {
+        return None;
+    }
+    Some(Settings { cache_budget: d[0], layer_bits: d[1], real_sun: d[2] & 1 != 0, follow_heading: d[2] & 2 != 0, lock_to_fix: d[2] & 4 != 0 })
+}
+
 /// Width-agnostic float-array read, per VSF doctrine.
 fn tensor_f64(v: VsfType) -> Option<Vec<f64>> {
     Some(match v {

@@ -53,22 +53,13 @@ struct Uniforms {
     depths: [u32; 4],
     offset: [f32; 4],
     pin: [f32; 4],
-    line_hi: [[f32; 4]; 4],
+    line_hi: [[f32; 4]; 8],
     measure: [f32; 4],
 }
 
 /// The layer mask as the shader's bits.
 pub fn mask_bits(m: LayerMask) -> u32 {
-    (m.dem as u32)
-        | (m.land as u32) << 1
-        | (m.water as u32) << 2
-        | (m.line as u32) << 3
-        | (m.debug as u32) << 4
-        | (m.imagery as u32) << 5
-        | (m.contours as u32) << 6
-        | (m.slope as u32) << 7
-        | (m.canopy as u32) << 8
-        | (m.hypso as u32) << 9
+    m.bits()
 }
 
 /// One plane's texture array and its slots, keyed by cell. Grows by doubling, copying the old layers on the GPU.
@@ -285,7 +276,7 @@ impl GpuMap {
         let refs = storage_buffer(device, "refs", (refs_cap * std::mem::size_of::<GpuRef>()) as u64);
         let table = storage_buffer(device, "table", (TABLE_N * std::mem::size_of::<GpuSlot>()) as u64);
         // Style tables: 4096 hypsometric rows, then the line classes and the land classes, each 0xRRGGBB.
-        let mut lut_data = vec![0u32; 4096 + 32];
+        let mut lut_data = vec![0u32; 4096 + 64];
         let hypso = mahere_engine::raster::build_hypso_lut();
         for (i, c) in hypso.iter().enumerate() {
             lut_data[i] = ((c[0] as u32) << 16) | ((c[1] as u32) << 8) | c[2] as u32;
@@ -294,7 +285,7 @@ impl GpuMap {
             lut_data[4096 + i] = ((c[0] as u32) << 16) | ((c[1] as u32) << 8) | c[2] as u32;
         }
         for (i, c) in LAND_LUT.iter().enumerate() {
-            lut_data[4112 + i] = ((c[0] as u32) << 16) | ((c[1] as u32) << 8) | c[2] as u32;
+            lut_data[4128 + i] = ((c[0] as u32) << 16) | ((c[1] as u32) << 8) | c[2] as u32;
         }
         let lut = storage_buffer(device, "lut", (lut_data.len() * 4) as u64);
         queue.write_buffer(&lut, 0, bytemuck::cast_slice(&lut_data));

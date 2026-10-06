@@ -55,9 +55,59 @@ pub struct AndroidApp {
     gpu: Option<GpuHost>,
     gpu_failed: bool,
     panel: Panel,
+    /// Bytes the cell cache may hold; purged to it at the pause moment.
+    cache_budget: u64,
+    data_dir: Option<String>,
+}
+
+/// A gigabyte of cells until the slider says otherwise.
+const DEFAULT_CACHE_BUDGET: u64 = 1 << 30;
+
+/// Free bytes on the volume holding `dir`, or none if it cannot be asked.
+fn free_bytes(dir: &str) -> Option<u64> {
+    let c = std::ffi::CString::new(dir).ok()?;
+    let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statvfs(c.as_ptr(), &mut st) } != 0 {
+        return None;
+    }
+    Some(st.f_bavail as u64 * st.f_frsize as u64)
 }
 
 impl AndroidApp {
+    fn controls(&self) -> Controls {
+        Controls { real_sun: self.map.real_sun, follow_heading: self.map.follow_heading, lock_to_fix: self.map.lock_to_fix, cache_budget: self.cache_budget }
+    }
+
+    /// Apply what the panel changed and keep it.
+    fn apply_controls(&mut self, ctl: Controls, mask: mahere_engine::LayerMask) {
+        self.map.set_layers(mask);
+        if ctl.real_sun != self.map.real_sun {
+            self.map.set_real_sun(ctl.real_sun);
+        }
+        if ctl.follow_heading != self.map.follow_heading {
+            self.map.set_follow_heading(ctl.follow_heading);
+        }
+        if ctl.lock_to_fix != self.map.lock_to_fix {
+            self.map.set_lock_to_fix(ctl.lock_to_fix);
+        }
+        self.cache_budget = ctl.cache_budget;
+        self.save_settings();
+    }
+
+    fn save_settings(&self) {
+        if let Some(store) = &self.store {
+            let s = mahere_store::Settings { cache_budget: self.cache_budget, layer_bits: self.map.layers().bits() as u64, real_sun: self.map.real_sun, follow_heading: self.map.follow_heading, lock_to_fix: self.map.lock_to_fix };
+            let _ = mahere_store::save_settings(store, &s);
+        }
+    }
+
+    /// What the cache holds and the most the slider may allow: what is held plus the free space.
+    fn cache_stats(&self) -> (u64, u64) {
+        let used = self.cells_cache.as_ref().map_or(0, |c| c.cached_bytes());
+        let free = self.data_dir.as_deref().and_then(free_bytes).unwrap_or(0);
+        (used, used + free)
+    }
+
     fn two_begin(&mut self, x0: f64, y0: f64, x1: f64, y1: f64) {
         let geo_a = self.map.cam.screen_to_geo(x0, y0, self.w, self.h);
         let geo_b = self.map.cam.screen_to_geo(x1, y1, self.w, self.h);
@@ -152,18 +202,9 @@ impl FluorApp for AndroidApp {
             FEvent::MouseInput { state: ElementState::Pressed, button: MouseButton::Left } => {
                 // The panel first: the gear and its rows take the tap; the map gets the rest.
                 let mut mask = self.map.layers();
-                let mut ctl = Controls { real_sun: self.map.real_sun, follow_heading: self.map.follow_heading, lock_to_fix: self.map.lock_to_fix };
+                let mut ctl = self.controls();
                 if self.panel.tap(ctx.cursor_x as f32, ctx.cursor_y as f32, self.w, self.h, &mut mask, &mut ctl) {
-                    self.map.set_layers(mask);
-                    if ctl.real_sun != self.map.real_sun {
-                        self.map.set_real_sun(ctl.real_sun);
-                    }
-                    if ctl.follow_heading != self.map.follow_heading {
-                        self.map.set_follow_heading(ctl.follow_heading);
-                    }
-                    if ctl.lock_to_fix != self.map.lock_to_fix {
-                        self.map.set_lock_to_fix(ctl.lock_to_fix);
-                    }
+                    self.apply_controls(ctl, mask);
                     self.dragging = false;
                     return EventResponse::Handled;
                 }
@@ -175,6 +216,7 @@ impl FluorApp for AndroidApp {
                 EventResponse::Handled
             }
             FEvent::MouseInput { state: ElementState::Released, button: MouseButton::Left } => {
+                self.panel.release();
                 // A press and release that never travelled is a tap: a new measurement to that point.
                 if self.dragging && self.two.is_none() && self.travel < 12.0 {
                     self.map.tap(ctx.cursor_x as f64, ctx.cursor_y as f64, self.w, self.h);
@@ -184,6 +226,13 @@ impl FluorApp for AndroidApp {
             }
             FEvent::CursorMoved { .. } => {
                 let (x, y) = (ctx.cursor_x as f64, ctx.cursor_y as f64);
+                let mut ctl = self.controls();
+                if self.panel.drag(x as f32, &mut ctl) {
+                    let mask = self.map.layers();
+                    self.apply_controls(ctl, mask);
+                    self.last_cursor = (x, y);
+                    return EventResponse::Handled;
+                }
                 if self.suppress_move {
                     self.suppress_move = false;
                 } else if self.dragging && self.two.is_none() {
@@ -306,6 +355,7 @@ pub extern "system" fn Java_nz_mahere_app_MahereActivity_nativeInit(
         }
     };
     let session = store.as_ref().and_then(|s| mahere_store::load_session(s));
+    let settings = store.as_ref().and_then(|s| mahere_store::load_settings(s));
     let cam = match session {
         Some(s) => Camera { lat: s.lat, lon: s.lon, ppd: s.ppd, bearing: s.bearing },
         // Mt St Helens until the first GPS fix recenters us.
@@ -315,6 +365,12 @@ pub extern "system" fn Java_nz_mahere_app_MahereActivity_nativeInit(
     if let Some(s) = session {
         map.sun_az = s.sun_az as f32;
         map.sun_alt = s.sun_alt as f32;
+    }
+    if let Some(s) = settings {
+        map.set_layers(mahere_engine::LayerMask::from_bits(s.layer_bits as u32));
+        map.set_real_sun(s.real_sun);
+        map.set_follow_heading(s.follow_heading);
+        map.set_lock_to_fix(s.lock_to_fix);
     }
     let recorder = store.clone().map(mahere_store::TrackRecorder::new);
     let app = AndroidApp {
@@ -335,6 +391,8 @@ pub extern "system" fn Java_nz_mahere_app_MahereActivity_nativeInit(
         gpu: None,
         gpu_failed: false,
         panel: Panel::new(),
+        cache_budget: settings.map_or(DEFAULT_CACHE_BUDGET, |s| if s.cache_budget == 0 { DEFAULT_CACHE_BUDGET } else { s.cache_budget }),
+        data_dir: Some(dir.clone()),
     };
     Box::into_raw(Box::new(AndroidShell::new(app, width as u32, height as u32))) as jlong
 }
@@ -383,11 +441,13 @@ pub extern "system" fn Java_nz_mahere_app_MahereActivity_nativeDraw(
                 }
             }
         }
+        let stats = app.cache_stats();
+        let ctl = app.controls();
         let AndroidApp { gpu: Some(g), map, panel, w, h, .. } = app else {
             return shell(ptr).draw(&window) as jboolean;
         };
         if g.ensure_window(&window) {
-            return g.draw(map, panel, *w as u32, *h as u32) as jboolean;
+            return g.draw(map, panel, ctl, stats, *w as u32, *h as u32) as jboolean;
         }
     }
     shell(ptr).draw(&window) as jboolean
@@ -488,8 +548,10 @@ pub extern "system" fn Java_nz_mahere_app_MahereActivity_nativeOnPause(
             rec.flush();
         }
         if let Some(c) = &app.cells_cache {
+            c.purge_to(app.cache_budget);
             c.flush();
         }
+        app.save_settings();
     }
 }
 

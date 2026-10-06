@@ -22,11 +22,13 @@ const M_CONTOURS: u32 = 64u;
 const M_SLOPE: u32 = 128u;
 const M_CANOPY: u32 = 256u;
 const M_HYPSO: u32 = 512u;
+const M_BOUND: u32 = 1024u;
 
 // Where the style tables sit in the LUT buffer after the 4096 hypsometric rows.
 const CLASS_BASE: u32 = 4096u;
-const LAND_BASE: u32 = 4112u;
-const CLASS_MAX: u32 = 12u;
+const LAND_BASE: u32 = 4128u;
+const CLASS_MAX: u32 = 17u;
+const BOUNDARY_FIRST: u32 = 13u;
 const WATERWAY_CLASS: u32 = 12u;
 
 struct Uniforms {
@@ -39,7 +41,7 @@ struct Uniforms {
     depths: vec4<u32>,
     offset: vec4<f32>,
     pin: vec4<f32>,
-    line_hi: array<vec4<f32>, 4>,
+    line_hi: array<vec4<f32>, 8>,
     measure: vec4<f32>,
 };
 
@@ -387,7 +389,7 @@ fn compose(d: u32, u: u32, v: u32) -> vec3<f32> {
             if (im.x != 0u || im.y != 0u || im.z != 0u) {
                 rgb = vec3<f32>(f32(im.z), f32(im.y), f32(im.x));
             }
-            if ((mask & M_LINE) != 0u && line.y != 0u) {
+            if ((mask & M_LINE) != 0u && line.y != 0u && (line.x < BOUNDARY_FIRST || (mask & M_BOUND) != 0u)) {
                 rgb = lerp3(rgb, line_colour(line.x, line.z), line_alpha(line.x, line.y, line.z));
             }
             return floor(rgb);
@@ -415,7 +417,7 @@ fn compose(d: u32, u: u32, v: u32) -> vec3<f32> {
             let ink = select(vec3<f32>(92.0, 62.0, 34.0), vec3<f32>(64.0, 40.0, 18.0), contour_index);
             rgb = lerp3(rgb, ink, contour_cov * 0.85);
         }
-        if ((mask & M_LINE) != 0u && line.y != 0u) {
+        if ((mask & M_LINE) != 0u && line.y != 0u && (line.x < BOUNDARY_FIRST || (mask & M_BOUND) != 0u)) {
             rgb = lerp3(rgb, line_colour(line.x, line.z), line_alpha(line.x, line.y, line.z));
         }
     } else {

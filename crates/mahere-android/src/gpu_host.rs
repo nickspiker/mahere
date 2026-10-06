@@ -110,7 +110,7 @@ impl GpuHost {
     }
 
     /// One frame: tick, plan, mirror the pool, marks when they changed, draw, present. Returns whether more frames are wanted (cells still arriving).
-    pub fn draw(&mut self, map: &mut MapCore, panel: &mut Panel, w: u32, h: u32) -> bool {
+    pub fn draw(&mut self, map: &mut MapCore, panel: &mut Panel, ctl: Controls, cache: (u64, u64), w: u32, h: u32) -> bool {
         if w == 0 || h == 0 {
             return false;
         }
@@ -133,7 +133,11 @@ impl GpuHost {
         }
         // Nothing changed and nothing arrived: the surface keeps its last image, and the CPU keeps its budget. The poll still runs so finished uploads release their staging memory.
         let fresh = self.configured != (w, h) || self.frames == 0;
-        if !map.tick(w as usize, h as usize) && !fresh && !panel.take_dirty() && self.settled {
+        let panel_dirty = panel.take_dirty();
+        if panel_dirty {
+            self.overlay_stamp = None;
+        }
+        if !map.tick(w as usize, h as usize) && !fresh && !panel_dirty && self.settled {
             self.device.poll(wgpu::PollType::Poll).ok();
             return !map.converged();
         }
@@ -171,9 +175,9 @@ impl GpuHost {
             if heading > 180.0 {
                 heading -= 360.0;
             }
-            let readouts = Readouts { lat: c.lat, lon: c.lon, elev: map.elevation_at(c.lat, c.lon), heading_deg: heading, m_per_px: 111_320.0 / c.ppd, frame_ms: map.last_frame_ms, resident: map.pool().map.len(), phone_heading: map.have_rotation.then(|| map.true_heading()) };
+            let readouts = Readouts { lat: c.lat, lon: c.lon, elev: map.elevation_at(c.lat, c.lon), heading_deg: heading, m_per_px: 111_320.0 / c.ppd, frame_ms: map.last_frame_ms, resident: map.pool().map.len(), phone_heading: map.have_rotation.then(|| map.true_heading()), cache_used: cache.0, cache_max: cache.1 };
             let measure = map.measure_view(w as usize, h as usize, Panel::strip_samples(w as usize));
-            panel.paint(w as usize, h as usize, mask, Controls { real_sun: map.real_sun, follow_heading: map.follow_heading, lock_to_fix: map.lock_to_fix }, &readouts, measure.as_ref());
+            panel.paint(w as usize, h as usize, mask, ctl, &readouts, measure.as_ref());
             let marks = map.overlay(w as usize, h as usize, false).to_vec();
             let rgba = panel.overlay_rgba(&marks, w as usize, h as usize);
             self.map.set_overlay_rgba(&self.device, &self.queue, w, h, &rgba);

@@ -16,6 +16,8 @@ pub struct Controls {
     pub follow_heading: bool,
     /// Measure from the fix rather than the screen centre.
     pub lock_to_fix: bool,
+    /// Bytes the cell cache may hold; the slider sets it.
+    pub cache_budget: u64,
 }
 
 /// What the readouts show.
@@ -31,6 +33,9 @@ pub struct Readouts {
     pub resident: usize,
     /// The phone's true heading from its orientation sensor, degrees clockwise from north, when it has one.
     pub phone_heading: Option<f32>,
+    /// Bytes the cell cache holds now, and the most the slider may allow (what is cached plus the free space).
+    pub cache_used: u64,
+    pub cache_max: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -40,6 +45,7 @@ enum Layer {
     LockToFix,
     Dem,
     Hypso,
+    Boundaries,
     Land,
     Water,
     Line,
@@ -50,12 +56,13 @@ enum Layer {
     Debug,
 }
 
-const LAYERS: [(Layer, &str); 13] = [
+const LAYERS: [(Layer, &str); 14] = [
     (Layer::Dem, "Terrain"),
     (Layer::Hypso, "Elevation tint"),
     (Layer::Land, "Land cover"),
     (Layer::Water, "Water"),
     (Layer::Line, "Lines"),
+    (Layer::Boundaries, "Boundaries"),
     (Layer::Contours, "Contours"),
     (Layer::Slope, "Slope bands"),
     (Layer::Canopy, "Canopy"),
@@ -76,6 +83,7 @@ fn get(mask: &LayerMask, ctl: &Controls, l: Layer) -> bool {
         Layer::Land => mask.land,
         Layer::Water => mask.water,
         Layer::Line => mask.line,
+        Layer::Boundaries => mask.boundaries,
         Layer::Contours => mask.contours,
         Layer::Slope => mask.slope,
         Layer::Canopy => mask.canopy,
@@ -94,6 +102,7 @@ fn set(mask: &mut LayerMask, ctl: &mut Controls, l: Layer, v: bool) {
         Layer::Land => mask.land = v,
         Layer::Water => mask.water = v,
         Layer::Line => mask.line = v,
+        Layer::Boundaries => mask.boundaries = v,
         Layer::Contours => mask.contours = v,
         Layer::Slope => mask.slope = v,
         Layer::Canopy => mask.canopy = v,
@@ -111,6 +120,10 @@ const PANEL_BG: u32 = ink(0x0E_12_1A, 222);
 const GEAR_BG: u32 = ink(0x14_18_22, 230);
 const PANEL_DIM: u32 = ink(0x0E_12_1A, 170);
 const STRIP_FILL: u32 = ink(0x3A_5A_7A, 200);
+const SLIDER_TRACK: u32 = ink(0x2A_30_3C, 255);
+const SLIDER_FILL: u32 = ink(0x1A_22_4E, 255);
+const SLIDER_USED: u32 = ink(0x40_9C_FF, 255);
+const SLIDER_KNOB: u32 = ink(0xE0_E0_DC, 255);
 const STRIP_EDGE: u32 = ink(0xFF_C4_40, 255);
 const READOUT: u32 = ink(0xC8_CC_D4, 255);
 const READOUT_DIM: u32 = ink(0x80_86_92, 255);
@@ -127,6 +140,10 @@ pub struct Panel {
     font: f32,
     gear: (f32, f32, f32),
     panel_w: f32,
+    /// The cache slider's track on screen (x0, y, width), and whether a press is riding it.
+    slider: (f32, f32, f32),
+    slider_held: bool,
+    cache_max: u64,
 }
 
 impl Default for Panel {
@@ -139,7 +156,7 @@ impl Panel {
     pub fn new() -> Panel {
         let mut hits: HitId = HIT_NONE;
         let checks = LAYERS.iter().map(|&(l, label)| (l, Checkbox::new(&mut hits, label, 0.0, 0.0, 10.0, 10.0, 10.0, false))).collect();
-        Panel { open: false, dirty: true, hits, checks, text: TextRenderer::new(), buf: Vec::new(), w: 0, h: 0, font: 16.0, gear: (0.0, 0.0, 0.0), panel_w: 0.0 }
+        Panel { open: false, dirty: true, hits, checks, text: TextRenderer::new(), buf: Vec::new(), w: 0, h: 0, font: 16.0, gear: (0.0, 0.0, 0.0), panel_w: 0.0, slider: (0.0, 0.0, 0.0), slider_held: false, cache_max: CACHE_MIN + 1 }
     }
 
     pub fn is_open(&self) -> bool {
@@ -168,13 +185,17 @@ impl Panel {
         let row = self.font * 1.7;
         let x0 = self.font * 0.8;
         let top = self.gear.1 + r + self.font * 0.9;
+        let mut last = top;
         for (i, (l, cb)) in self.checks.iter_mut().enumerate() {
-            // The two modes sit a little apart from the layers.
+            // The modes sit a little apart from the layers.
             let gap = if matches!(l, Layer::RealSun | Layer::FollowHeading | Layer::LockToFix) { row * 0.5 } else { 0.0 };
             let cy = top + row * (i as f32 + 0.5) + gap;
             cb.set_font_size(self.font);
             cb.set_rect(x0 + (self.panel_w - x0 * 1.5) * 0.5, cy, self.panel_w - x0 * 1.5, row);
+            last = cy + row * 0.5;
         }
+        // The cache slider below the modes: a track the width of the column.
+        self.slider = (x0, last + row * 1.3, self.panel_w - x0 * 2.0);
     }
 
     /// A tap at screen (x, y): true if the panel took it. The gear toggles the panel; a row flips its layer in `mask`.
@@ -202,6 +223,9 @@ impl Panel {
                 self.dirty = true;
                 return true;
             }
+        }
+        if self.slider_press(x, y, ctl) {
+            return true;
         }
         // Anywhere else on the column is the panel's, not the map's.
         x < self.panel_w
@@ -248,11 +272,12 @@ impl Panel {
             }
             cb.render_content_into(&mut canvas, &mut self.text, None, None);
         }
-        // Readouts below the rows, one line each, dim labels.
-        let last = self.checks.last().map(|(_, cb)| cb.bbox().bottom()).unwrap_or(0.0);
+        self.cache_max = r.cache_max;
+        Self::paint_slider(&mut canvas, &mut self.text, font, self.slider, &ctl, r);
+        // Readouts below the slider, one line each, dim labels.
         let x = font * 0.9;
         let step = font * 1.35;
-        let mut y = last + font * 1.2;
+        let mut y = self.slider.1 + font * 1.6;
         let small = TextStyle::new(font * 0.9, READOUT);
         let dim = TextStyle::new(font * 0.75, READOUT_DIM);
         // The world code is seven words: wrapped to the column so none is cut.
@@ -393,5 +418,61 @@ impl Panel {
             paint::fill_rect(canvas, x as isize, y as isize - 1, 1, 2, STRIP_EDGE, None, None);
         }
         paint::fill_rect(canvas, 0, top as isize, w as isize, band as isize, PANEL_BG, None, None);
+    }
+}
+
+/// Least the cache slider allows.
+pub const CACHE_MIN: u64 = 64 << 20;
+
+fn bytes_text(b: u64) -> String {
+    if b >= 1 << 30 { format!("{:.1} GB", b as f64 / (1u64 << 30) as f64) } else { format!("{} MB", b >> 20) }
+}
+
+impl Panel {
+    /// A press on the slider track sets the budget and arms a drag; true if the press was on it.
+    fn slider_press(&mut self, x: f32, y: f32, ctl: &mut Controls) -> bool {
+        let (sx, sy, sw) = self.slider;
+        if !self.open || (y - sy).abs() > self.font * 1.1 || x < sx - self.font || x > sx + sw + self.font {
+            return false;
+        }
+        self.slider_held = true;
+        self.slider_set(x, ctl);
+        true
+    }
+
+    fn slider_set(&mut self, x: f32, ctl: &mut Controls) {
+        let (sx, _, sw) = self.slider;
+        let t = ((x - sx) / sw.max(1.0)).clamp(0.0, 1.0);
+        let max = self.cache_max.max(CACHE_MIN + 1);
+        ctl.cache_budget = CACHE_MIN + ((max - CACHE_MIN) as f64 * t as f64) as u64;
+        self.dirty = true;
+    }
+
+    /// A move while the slider is held: the budget follows the finger. True while it does.
+    pub fn drag(&mut self, x: f32, ctl: &mut Controls) -> bool {
+        if !self.slider_held {
+            return false;
+        }
+        self.slider_set(x, ctl);
+        true
+    }
+
+    pub fn release(&mut self) {
+        self.slider_held = false;
+    }
+
+    fn paint_slider(canvas: &mut Canvas, text: &mut TextRenderer, font: f32, slider: (f32, f32, f32), ctl: &Controls, r: &Readouts) {
+        let (sx, sy, sw) = slider;
+        let max = r.cache_max.max(CACHE_MIN + 1);
+        let t = ((ctl.cache_budget.saturating_sub(CACHE_MIN)) as f64 / (max - CACHE_MIN) as f64).clamp(0.0, 1.0) as f32;
+        let used = (r.cache_used as f64 / max as f64).clamp(0.0, 1.0) as f32;
+        let label = format!("cache  {} of {}  ·  holding {}", bytes_text(ctl.cache_budget), bytes_text(max), bytes_text(r.cache_used));
+        text.draw_text_left(canvas, &label, sx, sy - font * 1.0, &TextStyle::new(font * 0.75, READOUT_DIM), None, None);
+        // Knob, then the budget's fill, then what is held, then the track under all of them.
+        let th = (font * 0.28).max(3.0);
+        paint::circle_filled(canvas, (sx + sw * t) as isize, sy as isize, (font * 0.45) as isize, SLIDER_KNOB, None, None);
+        paint::fill_rect(canvas, sx as isize, (sy - th * 0.5) as isize, (sw * t) as isize, th as isize, SLIDER_FILL, None, None);
+        paint::fill_rect(canvas, sx as isize, (sy - th * 0.5) as isize, (sw * used) as isize, th as isize, SLIDER_USED, None, None);
+        paint::fill_rect(canvas, sx as isize, (sy - th * 0.5) as isize, sw as isize, th as isize, SLIDER_TRACK, None, None);
     }
 }

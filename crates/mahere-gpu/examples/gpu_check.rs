@@ -106,7 +106,7 @@ fn main() {
         let mut panel = mahere_panel::Panel::new();
         panel.set_open(true);
         let c = map.cam;
-        let readouts = mahere_panel::Readouts { lat: c.lat, lon: c.lon, elev: map.elevation_at(c.lat, c.lon), heading_deg: c.bearing.to_degrees(), m_per_px: 111_320.0 / c.ppd, frame_ms: cpu_ms, resident: map.pool().map.len(), phone_heading: None };
+        let readouts = mahere_panel::Readouts { lat: c.lat, lon: c.lon, elev: map.elevation_at(c.lat, c.lon), heading_deg: c.bearing.to_degrees(), m_per_px: 111_320.0 / c.ppd, frame_ms: cpu_ms, resident: map.pool().map.len(), phone_heading: None, cache_used: 0, cache_max: 1 << 30 };
         panel.paint(w, h, map.layers(), mahere_panel::Controls::default(), &readouts, None);
         let rgba = panel.overlay_rgba(&overlay, w, h);
         gpu.set_overlay_rgba(&device, &queue, w as u32, h as u32, &rgba);
