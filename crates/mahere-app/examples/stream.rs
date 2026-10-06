@@ -18,7 +18,7 @@ fn main() {
     let vault = mahere_store::open(Some(&vault_dir)).expect("vault");
     let remote = Arc::new(Counting(HttpStore::new(DEFAULT_CELLS_URL), AtomicUsize::new(0)));
     let store = Arc::new(TieredStore::new(
-        Arc::new(mahere_store::VaultCells(vault.clone())),
+        Arc::new(mahere_store::VaultCells::new(vault.clone())),
         remote.clone(),
     ));
     let mut map = MapCore::new(store, Camera { lat: 46.20, lon: -122.19, ppd: 12000.0, bearing: 0.0 });

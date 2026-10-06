@@ -435,8 +435,8 @@ mod index_tests {
     #[test]
     fn cell_index_round_trips() {
         let mut entries = std::collections::HashMap::new();
-        entries.insert((13u8, 0x3_0000_0000_0000_0000u64), (et_now(), 48_123u32));
-        entries.insert((9u8, 0x7_0000_0000_0000_0000u64), (et_now() - 5, 1_024u32));
+        entries.insert((13u8, 0x3000_0000_0000_0000u64), (et_now(), 48_123u32));
+        entries.insert((9u8, 0x7000_0000_0000_0000u64), (et_now() - 5, 1_024u32));
         let bytes = encode_cell_index(&entries).unwrap();
         assert_eq!(decode_cell_index(&bytes), entries);
     }
