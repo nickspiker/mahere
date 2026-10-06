@@ -605,7 +605,7 @@ impl GpuMap {
             mask: mask_bits(luts.mask),
             light,
             sun: [luts.sun[0], luts.sun[1], luts.sun[2], 0.0],
-            contour: [luts.contours.interval, luts.contours.index_every as f32, luts.contours.m_per_px, 0.0],
+            contour: [luts.contours.interval, luts.contours.index_every as f32, luts.contours.m_per_px, plan.water_mag_hi.max(1) as f32],
             depths: [plan.dem_depth as u32, plan.vec_depth as u32, plan.magnified as u32, 0],
             offset: [self.sample_offset[0], self.sample_offset[1], 0.0, 0.0],
             pin: match self.pin {

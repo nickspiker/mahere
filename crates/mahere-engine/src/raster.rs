@@ -179,7 +179,7 @@ pub const CLASS_LUT: [[u8; 3]; 13] = [
     [120, 190, 255],
 ];
 pub const CLASS_MAX: usize = 12;
-const WATERWAY_CLASS: usize = 12;
+pub const WATERWAY_CLASS: usize = 12;
 
 /// Slope-angle bands (degrees) and their overlay colours: the avalanche / rideability layer, from the normal at draw time.
 const SLOPE_BANDS: [(f32, [u8; 3]); 4] = [(25.0, [250, 220, 60]), (30.0, [250, 150, 40]), (35.0, [230, 50, 40]), (45.0, [150, 40, 200])];
@@ -781,6 +781,7 @@ mod tests {
             key,
             Entry {
                 present: crate::residency::PRESENT_DEM | crate::residency::PRESENT_LINE | crate::residency::PRESENT_LAND | crate::residency::PRESENT_WATER,
+                water_mag_max: 0,
                 dem: Some(DemPacked { texel: texel.into_boxed_slice() }),
                 dem_q: None,
                 line: Some(ClassCell::new_line()),

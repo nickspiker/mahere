@@ -272,7 +272,8 @@ fn line_colour(cls_id: u32, mag: u32) -> vec3<f32> {
     let cls = min(cls_id, CLASS_MAX);
     let c = unpack_rgb(lut[CLASS_BASE + cls]);
     if (cls == WATERWAY_CLASS) {
-        return floor(c * (0.4 + 0.6 * f32(mag) / 255.0));
+        // Water on a linear scale up to the largest magnitude in view: the biggest river on screen is full, a trickle a third.
+        return floor(c * (0.35 + 0.65 * clamp(f32(mag) / U.contour.w, 0.0, 1.0)));
     }
     return c;
 }
