@@ -52,16 +52,13 @@ class MahereActivity : Activity(), SurfaceHolder.Callback, Choreographer.FrameCa
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         surfaceView = SurfaceView(this)
-        // fluor writes 32-bit pixels into the locked buffer; without this the
-        // Surface can default to a 16-bit format and every frame writes past
-        // the allocation (SEGV_ACCERR in nativeDraw).
+        // fluor writes 32-bit pixels into the locked buffer; without this the Surface can default to a 16-bit format and every frame writes past the allocation (SEGV_ACCERR in nativeDraw).
         surfaceView.holder.setFormat(PixelFormat.RGBA_8888)
         surfaceView.holder.addCallback(this)
         setContentView(surfaceView)
         hideSystemBars()
 
-        // Cells stream from the bucket into the vault now; nothing ships in
-        // the APK. Drop the staged copy earlier builds left behind.
+        // Cells stream from the bucket into the vault now; nothing ships in the APK. Drop the staged copy earlier builds left behind.
         thread {
             for (legacy in listOf("cells", "dem", "featpack.vsf")) {
                 java.io.File(filesDir, legacy).deleteRecursively()
@@ -96,9 +93,7 @@ class MahereActivity : Activity(), SurfaceHolder.Callback, Choreographer.FrameCa
             )
     }
 
-    /// Idempotent frame-loop (re)start — the resume/surfaceChanged ordering
-    /// varies by path (screen-off vs app-switch), so every reentry point
-    /// calls this instead of guessing which event comes last.
+    /// Idempotent frame-loop (re)start — the resume/surfaceChanged ordering / varies by path (screen-off vs app-switch), so every reentry point / calls this instead of guessing which event comes last.
     private fun startFrames() {
         Choreographer.getInstance().removeFrameCallback(this)
         if (nativePtr != 0L && surfaceReady) {
@@ -112,8 +107,7 @@ class MahereActivity : Activity(), SurfaceHolder.Callback, Choreographer.FrameCa
         if (nativePtr == 0L) {
             if (initInFlight) return
             initInFlight = true
-            // The first init decodes ~500 MB of GeoTIFF — off the UI thread,
-            // or the app black-screens (and ANRs on touch) for ~30 s.
+            // The first init decodes ~500 MB of GeoTIFF — off the UI thread, or the app black-screens (and ANRs on touch) for ~30 s.
             thread {
                 val ptr = nativeInit(w, h, filesDir.absolutePath)
                 runOnUiThread {

@@ -1,13 +1,7 @@
-//! Raster elevation boundary. GeoTIFF dies here: USGS 3DEP tiles are decoded
-//! once at load and everything downstream sees `elevation(lat, lon)` and
-//! `elev_and_gradient(lat, lon)` queries in plain WGS84/NAD83 degrees
-//! (the two datums differ by under a meter — ignored, like every consumer
-//! of this data).
+//! Raster elevation boundary. GeoTIFF dies here: USGS 3DEP tiles are decoded once at load and everything downstream sees `elevation(lat, lon)` and `elev_and_gradient(lat, lon)` queries in plain WGS84/NAD83 degrees (the two datums differ by under a meter — ignored, like every consumer of this data).
 //!
-//! Two grid kinds: geographic (the 1/3 and 1 arc-second products, degrees
-//! per pixel) and projected UTM (the 1 m lidar products, meters per pixel).
-//! A UTM tile is queried by projecting the lat/lon forward onto its zone;
-//! the grid convergence (< 2° within a zone) is ignored for the gradient.
+//! Two grid kinds: geographic (the 1/3 and 1 arc-second products, degrees per pixel) and projected UTM (the 1 m lidar products, meters per pixel).
+//! A UTM tile is queried by projecting the lat/lon forward onto its zone; the grid convergence (< 2° within a zone) is ignored for the gradient.
 
 use std::fs::File;
 use std::io::BufReader;
@@ -37,8 +31,7 @@ pub struct DemTile {
     data: Vec<f32>,
 }
 
-/// A set of tiles answering point queries; tiles are searched in order, so
-/// overlapping collars resolve to the first tile loaded.
+/// A set of tiles answering point queries; tiles are searched in order, so overlapping collars resolve to the first tile loaded.
 pub struct DemStore {
     tiles: Vec<DemTile>,
 }
@@ -68,8 +61,7 @@ impl DemTile {
             Err(e) => return Err(format!("{path}: GeoKeyDirectory: {e}")),
         };
         eprintln!("dem tile {path}: {w}x{h} {grid:?}");
-        // Tiepoint maps raster (i, j) -> world (x, y); USGS ties pixel (0, 0)
-        // to the top-left corner.
+        // Tiepoint maps raster (i, j) -> world (x, y); USGS ties pixel (0, 0) to the top-left corner.
         let origin = (tie[3] - tie[0] * scale[0], tie[4] + tie[1] * scale[1]);
         let data = match dec.read_image().map_err(|e| format!("{path}: {e}"))? {
             DecodingResult::F32(v) => v,
@@ -83,8 +75,7 @@ impl DemTile {
         Ok(DemTile { width: w as usize, height: h as usize, grid, origin, step: (scale[0], scale[1]), data })
     }
 
-    /// Fractional pixel coordinates of (lat, lon), if inside this tile
-    /// (with half a pixel of slack for the bilinear footprint).
+    /// Fractional pixel coordinates of (lat, lon), if inside this tile (with half a pixel of slack for the bilinear footprint).
     fn pixel_at(&self, lat: f64, lon: f64) -> Option<(f64, f64)> {
         let (x, y) = match self.grid {
             Grid::Geographic => (lon, lat),
@@ -126,9 +117,7 @@ impl DemTile {
     }
 }
 
-/// Decode the GeoKeyDirectory (u16 quads: key, tag location, count, value)
-/// into a grid kind. Geographic models and northern UTM zones (WGS84
-/// 326xx, NAD83 269xx, NAD83(2011) 6329-6348) are supported.
+/// Decode the GeoKeyDirectory (u16 quads: key, tag location, count, value) into a grid kind. Geographic models and northern UTM zones (WGS84 326xx, NAD83 269xx, NAD83(2011) 6329-6348) are supported.
 fn grid_of(keys: &[u32]) -> Option<Grid> {
     let mut model = None;
     let mut pcs = None;
@@ -157,8 +146,7 @@ fn grid_of(keys: &[u32]) -> Option<Grid> {
     }
 }
 
-/// Transverse Mercator forward projection (WGS84/GRS80 ellipsoid — identical
-/// to sub-millimeter), UTM parameters: k0 = 0.9996, false easting 500 km.
+/// Transverse Mercator forward projection (WGS84/GRS80 ellipsoid — identical to sub-millimeter), UTM parameters: k0 = 0.9996, false easting 500 km.
 pub fn utm_forward(lat: f64, lon: f64, zone: u8) -> (f64, f64) {
     const A: f64 = 6_378_137.0;
     const F: f64 = 1.0 / 298.257_223_563;
@@ -243,8 +231,7 @@ impl DemStore {
         None
     }
 
-    /// Elevation plus gradient (east, north) in meters of rise per meter of
-    /// ground, from central differences on the source grid.
+    /// Elevation plus gradient (east, north) in meters of rise per meter of ground, from central differences on the source grid.
     pub fn elev_and_gradient(&self, lat: f64, lon: f64) -> Option<(f32, (f32, f32))> {
         for t in &self.tiles {
             if let Some((px, py)) = t.pixel_at(lat, lon) {

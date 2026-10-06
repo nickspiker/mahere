@@ -1,5 +1,4 @@
-// probe_cells <lat> <lon>: for every depth, what the cell on disk holds at
-// that point — dem present / nodata, vector planes present, coverage.
+// probe_cells <lat> <lon>: for every depth, what the cell on disk holds at that point — dem present / nodata, vector planes present, coverage.
 use mahere_coord::Coord;
 use mahere_engine::raster::tri_index;
 use mahere_tiles::{CellKey, decode_cell};

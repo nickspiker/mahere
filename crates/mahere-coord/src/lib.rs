@@ -1,35 +1,16 @@
 //! mahere-coord: the canonical coordinate system for mahere.
 //!
-//! A position on Earth is one `u64` ([`Coord`]): 4 bits of diamond ID plus
-//! 2×30 bits of Morton-interleaved face-local UV on an icosahedron whose 20
-//! triangles are paired into 10 rhombic diamonds. Resolution at full depth is
-//! ~6.6 mm of ground. Truncating the low bits yields the enclosing quadtree
-//! cell ([`Cell`]); a tile address is a coordinate prefix.
+//! A position on Earth is one `u64` ([`Coord`]): 4 bits of diamond ID plus 2×30 bits of Morton-interleaved face-local UV on an icosahedron whose 20 triangles are paired into 10 rhombic diamonds. Resolution at full depth is ~6.6 mm of ground. Truncating the low bits yields the enclosing quadtree cell ([`Cell`]); a tile address is a coordinate prefix.
 //!
-//! Datum rule (locked — changing it re-tiles the world): WGS84 *geodetic*
-//! latitude/longitude is treated as spherical. The sphere point is
-//! `(cos φ cos λ, cos φ sin λ, sin φ)` with geodetic φ — explicitly NOT
-//! ECEF-normalized (that would be geocentric latitude, a different mapping,
-//! up to ~21 km of ground away). This bijection lives here and only here.
+//! Datum rule (locked — changing it re-tiles the world): WGS84 *geodetic* latitude/longitude is treated as spherical. The sphere point is `(cos φ cos λ, cos φ sin λ, sin φ)` with geodetic φ — explicitly NOT ECEF-normalized (that would be geocentric latitude, a different mapping, up to ~21 km of ground away). This bijection lives here and only here.
 //!
-//! Anchoring: a [`Cell`] identifies an area and is corner-anchored (prefix +
-//! zeros = minimum UV corner). To degrade a *point*, use [`Cell::center`],
-//! which re-centers instead of biasing toward the corner.
+//! Anchoring: a [`Cell`] identifies an area and is corner-anchored (prefix + zeros = minimum UV corner). To degrade a *point*, use [`Cell::center`], which re-centers instead of biasing toward the corner.
 //!
 //! Elevation never enters this codec; it is a separately sampled DEM value.
 //!
-//! Projection geometry is ported from Nick's `icosahedron` codec
-//! (face-finding via closest centroid, gnomonic projection, barycentric UV),
-//! re-laid-out from face × BASE² packing to diamond-Morton prefix coding.
+//! Projection geometry is ported from Nick's `icosahedron` codec (face-finding via closest centroid, gnomonic projection, barycentric UV), re-laid-out from face × BASE² packing to diamond-Morton prefix coding.
 
-/// Pole-vertex icosahedron, unit vertices (locked orientation): vertex 0 is
-/// the north pole, 1–5 the upper ring at lat atan(1/2) ≈ 26.565° (lons 0°,
-/// 72°, …), 6–10 the lower ring at −atan(1/2) (lons 36°, 108°, …), 11 the
-/// south pole. Chosen 2026-10-03 on symmetry grounds: the polar axis is a
-/// 5-fold axis, so lat/lon's rotational symmetry shares its largest cyclic
-/// subgroup with the solid, and the coordinate system's polar degeneracy
-/// coincides with the grid's two degree-5 points. Ring components are
-/// cos/sin of 72° multiples scaled by 2/√5, z = ±1/√5.
+/// Pole-vertex icosahedron, unit vertices (locked orientation): vertex 0 is the north pole, 1–5 the upper ring at lat atan(1/2) ≈ 26.565° (lons 0°, 72°, …), 6–10 the lower ring at −atan(1/2) (lons 36°, 108°, …), 11 the south pole. Chosen 2026-10-03 on symmetry grounds: the polar axis is a 5-fold axis, so lat/lon's rotational symmetry shares its largest cyclic subgroup with the solid, and the coordinate system's polar degeneracy coincides with the grid's two degree-5 points. Ring components are cos/sin of 72° multiples scaled by 2/√5, z = ±1/√5.
 const VERTICES: [[f64; 3]; 12] = [
     [0., 0., 1.0],
     [0.8944271909999159, 0., 0.4472135954999579],
@@ -45,10 +26,7 @@ const VERTICES: [[f64; 3]; 12] = [
     [0., 0., -1.0],
 ];
 
-/// The 10 diamonds as vertex indices `[a0, q, r, b0]`: lower triangle
-/// (a0, q, r) and upper triangle (b0, q, r) share the edge q–r (the diamond's
-/// diagonal). UV basis: origin a0, u along a0→q, v along a0→r; b0 sits at
-/// (1, 1). Pairing covers all 20 icosahedron faces exactly once.
+/// The 10 diamonds as vertex indices `[a0, q, r, b0]`: lower triangle (a0, q, r) and upper triangle (b0, q, r) share the edge q–r (the diamond's diagonal). UV basis: origin a0, u along a0→q, v along a0→r; b0 sits at (1, 1). Pairing covers all 20 icosahedron faces exactly once.
 const DIAMONDS: [[usize; 4]; 10] = [
     [0, 1, 2, 6],
     [0, 2, 3, 7],
@@ -62,8 +40,7 @@ const DIAMONDS: [[usize; 4]; 10] = [
     [11, 6, 10, 1],
 ];
 
-/// Each diamond's two triangles as `(vertex indices, diamond, is_upper)` —
-/// the face table the encoder searches. Derived from [`DIAMONDS`].
+/// Each diamond's two triangles as `(vertex indices, diamond, is_upper)` — the face table the encoder searches. Derived from [`DIAMONDS`].
 const FACES: [([usize; 3], u8, bool); 20] = {
     let mut faces = [([0usize; 3], 0u8, false); 20];
     let mut d = 0;
@@ -82,30 +59,25 @@ const UV_BITS: u32 = 30;
 const UV_STEPS: u64 = 1 << UV_BITS; // 2^30 per axis
 const MORTON_BITS: u32 = 60;
 
-/// Mean Earth radius in meters (spherical datum, consistent with the rule
-/// that geodetic lat/lon is treated as spherical).
+/// Mean Earth radius in meters (spherical datum, consistent with the rule that geodetic lat/lon is treated as spherical).
 pub const EARTH_RADIUS_M: f64 = 6_371_000.0;
 
 /// Arc length of an icosahedron edge on the unit sphere: atan(2).
 const EDGE_ARC_RAD: f64 = 1.107148717794090503;
 
 /// Approximate ground length of a cell edge at `depth`, in meters.
-/// Depth 0 is a whole diamond (~7,054 km); each depth halves it; depth 30 is
-/// ~6.6 mm. Gnomonic distortion varies this by a few percent across a face.
+/// Depth 0 is a whole diamond (~7,054 km); each depth halves it; depth 30 is ~6.6 mm. Gnomonic distortion varies this by a few percent across a face.
 pub fn cell_edge_m(depth: u8) -> f64 {
     EDGE_ARC_RAD * EARTH_RADIUS_M / (1u64 << depth) as f64
 }
 
 /// A point on Earth at full (~6.6 mm) resolution.
 ///
-/// Bit layout, MSB first: `[4 bits diamond 0–9][60 bits Morton(u, v)]`, where
-/// the Morton field interleaves u and v from their MSBs down, u in the
-/// higher bit of each pair.
+/// Bit layout, MSB first: `[4 bits diamond 0–9][60 bits Morton(u, v)]`, where the Morton field interleaves u and v from their MSBs down, u in the higher bit of each pair.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct Coord(u64);
 
-/// A quadtree cell: the first `4 + 2·depth` bits of a [`Coord`], low bits
-/// zero. Depth 0 is a whole diamond; depth `d` cells are the 4^d children.
+/// A quadtree cell: the first `4 + 2·depth` bits of a [`Coord`], low bits zero. Depth 0 is a whole diamond; depth `d` cells are the 4^d children.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct Cell {
     bits: u64,
@@ -113,16 +85,13 @@ pub struct Cell {
 }
 
 impl Coord {
-    /// Encode WGS84 geodetic latitude/longitude (degrees), treated as
-    /// spherical per the datum rule.
+    /// Encode WGS84 geodetic latitude/longitude (degrees), treated as spherical per the datum rule.
     pub fn from_lat_lon(lat_deg: f64, lon_deg: f64) -> Coord {
         let (phi, lam) = (lat_deg.to_radians(), lon_deg.to_radians());
         Coord::from_xyz([phi.cos() * lam.cos(), phi.cos() * lam.sin(), phi.sin()])
     }
 
-    /// Encode searching only the given diamonds (both halves of each) —
-    /// the renderer's diamond-straddle fast path: a screen block knows its
-    /// corner diamonds, so the 20-face search shrinks to <= 8.
+    /// Encode searching only the given diamonds (both halves of each) — the renderer's diamond-straddle fast path: a screen block knows its corner diamonds, so the 20-face search shrinks to <= 8.
     pub fn from_lat_lon_in_diamonds(lat_deg: f64, lon_deg: f64, diamonds: &[u8]) -> Coord {
         let (phi, lam) = (lat_deg.to_radians(), lon_deg.to_radians());
         let p = [phi.cos() * lam.cos(), phi.cos() * lam.sin(), phi.sin()];
@@ -153,9 +122,7 @@ impl Coord {
 
     /// Encode a direction from the sphere's center (need not be unit length).
     pub fn from_xyz(p: [f64; 3]) -> Coord {
-        // Containing face = face whose centroid direction is nearest: for a
-        // regular icosahedron the spherical Voronoi of face centroids is
-        // exactly the radial projection of the faces.
+        // Containing face = face whose centroid direction is nearest: for a regular icosahedron the spherical Voronoi of face centroids is exactly the radial projection of the faces.
         let mut best = 0;
         let mut best_dot = f64::NEG_INFINITY;
         for (i, (verts, _, _)) in FACES.iter().enumerate() {
@@ -244,8 +211,7 @@ impl Cell {
         }
     }
 
-    /// The cell's center as a full-resolution coordinate (next bit of each
-    /// axis set — the re-centering rule for degraded points).
+    /// The cell's center as a full-resolution coordinate (next bit of each axis set — the re-centering rule for degraded points).
     pub fn center(self) -> Coord {
         if self.depth == MAX_DEPTH {
             return Coord(self.bits);
@@ -263,9 +229,7 @@ impl Cell {
     }
 }
 
-/// Geographic position of a continuous diamond-UV point (texel centers in
-/// the cell pipeline). Inverse of the encode path's projection, exposed for
-/// bakers that walk cell grids.
+/// Geographic position of a continuous diamond-UV point (texel centers in the cell pipeline). Inverse of the encode path's projection, exposed for bakers that walk cell grids.
 pub fn uv_to_lat_lon(diamond: u8, u: f64, v: f64) -> (f64, f64) {
     let [a0, q, r, b0] = DIAMONDS[diamond as usize];
     let fp = if u + v <= 1. {
@@ -277,8 +241,7 @@ pub fn uv_to_lat_lon(diamond: u8, u: f64, v: f64) -> (f64, f64) {
     (z.asin().to_degrees(), y.atan2(x).to_degrees())
 }
 
-/// Public Morton helpers for cell-grid math (30-bit axes, u in the higher
-/// bit of each pair — the same layout as [`Coord`]).
+/// Public Morton helpers for cell-grid math (30-bit axes, u in the higher bit of each pair — the same layout as [`Coord`]).
 pub fn morton_spread(x: u64) -> u64 {
     spread(x)
 }
@@ -291,23 +254,14 @@ pub fn morton_compact(x: u64) -> u64 {
 pub const TRI_LEVELS: u32 = 29;
 
 impl Coord {
-    /// The triangle code of this position — the icosahedron's own
-    /// hierarchy: `[4 bits diamond][1 bit face: upper][2 bits × 29 levels]`,
-    /// each digit naming the sub-triangle (0 apex, 1 toward r, 2 toward q,
-    /// 3 the inverted center), so truncating the code gives the containing
-    /// triangle at that depth. Every depth-k triangle is one half of a
-    /// depth-k Morton rhombus — which half is whether the fractional parts
-    /// of u and v sum past 1, i.e. the carry of `u + v` at that bit. So the
-    /// code is a bit-parallel function of the Morton form and the two are
-    /// the same hierarchy: no base-20 arithmetic anywhere.
+    /// The triangle code of this position — the icosahedron's own hierarchy: `[4 bits diamond][1 bit face: upper][2 bits × 29 levels]`, each digit naming the sub-triangle (0 apex, 1 toward r, 2 toward q, 3 the inverted center), so truncating the code gives the containing triangle at that depth. Every depth-k triangle is one half of a depth-k Morton rhombus — which half is whether the fractional parts of u and v sum past 1, i.e. the carry of `u + v` at that bit. So the code is a bit-parallel function of the Morton form and the two are the same hierarchy: no base-20 arithmetic anywhere.
     pub fn tri_code(self) -> u64 {
         let (iu, iv) = self.uv();
         let m30 = (1u64 << 30) - 1;
         // Bit p of `carries` = carry into bit p of u + v.
         let carries = (iu + iv) ^ iu ^ iv;
         let face = (carries >> 30) & 1;
-        // Level j's half flips relative to level j-1 exactly where the
-        // point descended into a center child.
+        // Level j's half flips relative to level j-1 exactly where the point descended into a center child.
         let flip = (carries ^ (carries >> 1)) & m30;
         let eq = !(iu ^ iv) & m30;
         let morton = (spread(iu) << 1) | spread(iv);
@@ -316,8 +270,7 @@ impl Coord {
         ((self.diamond() as u64) << 59) | (face << 58) | (digits >> 2)
     }
 
-    /// Inverse of [`tri_code`](Self::tri_code): a Coord inside the coded
-    /// depth-29 triangle (its apex-most Morton position at depth 30).
+    /// Inverse of [`tri_code`](Self::tri_code): a Coord inside the coded depth-29 triangle (its apex-most Morton position at depth 30).
     pub fn from_tri_code(code: u64) -> Coord {
         let diamond = (code >> 59) as u64;
         let mut half = (code >> 58) & 1;
@@ -383,15 +336,13 @@ fn centroid(verts: &[usize; 3]) -> [f64; 3] {
     [a[0] + b[0] + c[0], a[1] + b[1] + c[1], a[2] + b[2] + c[2]]
 }
 
-/// Gnomonic projection of direction `p` onto the plane of triangle `verts`,
-/// returned as barycentric (s, t): fp = A + s·(B−A) + t·(C−A).
+/// Gnomonic projection of direction `p` onto the plane of triangle `verts`, returned as barycentric (s, t): fp = A + s·(B−A) + t·(C−A).
 fn gnomonic_barycentric(p: [f64; 3], verts: [usize; 3]) -> (f64, f64) {
     let (a, b, c) = (VERTICES[verts[0]], VERTICES[verts[1]], VERTICES[verts[2]]);
     let v0 = sub(b, a);
     let v1 = sub(c, a);
     let n = cross(v0, v1);
-    // Ray origin→p meets the plane n·x = n·a at t = (n·a)/(n·p); the face
-    // always subtends the ray for points chosen by closest-centroid.
+    // Ray origin→p meets the plane n·x = n·a at t = (n·a)/(n·p); the face always subtends the ray for points chosen by closest-centroid.
     let scale = dot(n, a) / dot(n, p);
     let fp = [p[0] * scale, p[1] * scale, p[2] * scale];
     let v2 = sub(fp, a);
@@ -441,8 +392,7 @@ mod tests {
         let (phi, lam) = (lat.to_radians(), lon.to_radians());
         let p = [phi.cos() * lam.cos(), phi.cos() * lam.sin(), phi.sin()];
         let q = coord.to_xyz();
-        // Chord distance, not acos(dot): acos has a ~1.5e-8 rad (~10 cm)
-        // precision floor near zero angle, far above the codec's resolution.
+        // Chord distance, not acos(dot): acos has a ~1.5e-8 rad (~10 cm) precision floor near zero angle, far above the codec's resolution.
         let d = sub(p, q);
         dot(d, d).sqrt() * EARTH_RADIUS_M
     }
@@ -471,8 +421,7 @@ mod tests {
             }
             lat += 2.9;
         }
-        // Max error is half a cell diagonal plus gnomonic stretch; 2 cm is
-        // comfortably above that and far below any data source's precision.
+        // Max error is half a cell diagonal plus gnomonic stretch; 2 cm is comfortably above that and far below any data source's precision.
         assert!(worst < 0.02, "worst round-trip error {worst} m");
     }
 
@@ -556,10 +505,7 @@ mod tests {
 
     #[test]
     fn nearby_points_get_distinct_fine_cells() {
-        // Two trailheads ~150 m apart in the Issaquah Alps. They may straddle
-        // a boundary at any depth (boundaries are nested), so sharing a coarse
-        // cell is never guaranteed — but 150 m exceeds a depth-18 cell's
-        // diagonal (~40 m), so distinctness at depth 18 is.
+        // Two trailheads ~150 m apart in the Issaquah Alps. They may straddle a boundary at any depth (boundaries are nested), so sharing a coarse cell is never guaranteed — but 150 m exceeds a depth-18 cell's diagonal (~40 m), so distinctness at depth 18 is.
         let a = Coord::from_lat_lon(47.5290, -121.9960);
         let b = Coord::from_lat_lon(47.5300, -121.9945);
         assert_ne!(a.cell(18), b.cell(18));
@@ -577,9 +523,7 @@ mod tests {
 mod tri_tests {
     use super::*;
 
-    /// Reference: descend the triangle tree in floating point, one level at
-    /// a time, with the barycentric rule (apex if that corner's weight
-    /// exceeds 1/2, else center).
+    /// Reference: descend the triangle tree in floating point, one level at a time, with the barycentric rule (apex if that corner's weight exceeds 1/2, else center).
     fn float_tri_code(c: Coord) -> u64 {
         let (iu, iv) = c.uv();
         let (mut u, mut v) = (iu as f64 / 2f64.powi(30), iv as f64 / 2f64.powi(30));
@@ -641,8 +585,7 @@ mod tri_tests {
         let code = c.tri_code();
         let back = Coord::from_tri_code(code);
         assert_eq!(back.tri_code(), code);
-        // Prefix = containing triangle: the point and its reconstruction
-        // share every ancestor, and so does a nearby point at coarse depth.
+        // Prefix = containing triangle: the point and its reconstruction share every ancestor, and so does a nearby point at coarse depth.
         let near = Coord::from_lat_lon(46.2025, -121.4910).tri_code();
         for depth in 1..=10 {
             let sh = 58 - 2 * depth;

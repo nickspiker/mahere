@@ -1,6 +1,4 @@
-//! The loader: bake a region's cells into a directory whose layout is the
-//! bucket. Cells already in the directory are merged over, so regions can
-//! be baked one at a time (and a 1 m region over a 10 m one). Usage:
+//! The loader: bake a region's cells into a directory whose layout is the bucket. Cells already in the directory are merged over, so regions can be baked one at a time (and a 1 m region over a 10 m one). Usage:
 //!   mahere-load --pbf <file> --dem <tif>... --out <dir> \
 //!     --bbox lat0,lon0,lat1,lon1 [--vec-base 13] [--dem-base 11] [--min 6]
 use std::path::Path;

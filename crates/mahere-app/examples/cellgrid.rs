@@ -1,6 +1,4 @@
-// Diagnostic: the Adams view with the dymaxion triangle grid drawn over it —
-// depth-10 triangles (cell rhombi split along u+v) in yellow, depth-8 in
-// cyan — so the actual tile footprints are visible.
+// Diagnostic: the Adams view with the dymaxion triangle grid drawn over it — depth-10 triangles (cell rhombi split along u+v) in yellow, depth-8 in cyan — so the actual tile footprints are visible.
 use mahere_coord::Coord;
 use mahere_engine::{Camera, MapCore, residency::DirStore};
 

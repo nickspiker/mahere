@@ -1,11 +1,6 @@
-//! Clipmap residency: which cells are decoded and resident, and the loader
-//! thread that feeds them. Zero locks anywhere near the pixel loop — the
-//! main thread sends want-lists, the loader reads / decompresses / decodes /
-//! repacks off-thread, and the main thread drains a channel of finished
-//! planes at frame start.
+//! Clipmap residency: which cells are decoded and resident, and the loader thread that feeds them. Zero locks anywhere near the pixel loop — the main thread sends want-lists, the loader reads / decompresses / decodes / repacks off-thread, and the main thread drains a channel of finished planes at frame start.
 //!
-//! One object per cell carries every layer, so residency is one pool keyed
-//! by cell; an entry holds whichever planes the cell had at its depth.
+//! One object per cell carries every layer, so residency is one pool keyed by cell; an entry holds whichever planes the cell had at its depth.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -15,8 +10,7 @@ use mahere_tiles::{CellKey, ClassCell, CovCell, decode_cell};
 use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
 
-/// Where cell bytes come from, addressed by cell — a string path exists
-/// only where a filesystem or URL demands one.
+/// Where cell bytes come from, addressed by cell — a string path exists only where a filesystem or URL demands one.
 pub trait CellStore: Send + Sync + 'static {
     fn get(&self, key: CellKey) -> Option<Vec<u8>>;
 }
@@ -29,16 +23,13 @@ impl CellStore for DirStore {
     }
 }
 
-/// Decoded dem planes packed one u64 per triangle texel for the hot loop
-/// (memory order `((ty << 8 | tx) << 1) | half`):
-/// `[elev_q u16 | nx i16 | ny i16 | nz i16]`, elev_q = (elev + 500) * 4
-/// (0.25 m steps), 0xFFFF = no data.
+/// Decoded dem planes packed one u64 per triangle texel for the hot loop (memory order `((ty << 8 | tx) << 1) | half`):
+/// `[elev_q u16 | nx i16 | ny i16 | nz i16]`, elev_q = (elev + 500) * 4 (0.25 m steps), 0xFFFF = no data.
 pub struct DemPacked {
     pub texel: Box<[u64]>,
 }
 
-/// A resident cell: whichever layers it carried. All `None` = the loader
-/// confirmed the object does not exist (absent), which still ends probing.
+/// A resident cell: whichever layers it carried. All `None` = the loader confirmed the object does not exist (absent), which still ends probing.
 #[derive(Default)]
 pub struct Entry {
     pub dem: Option<DemPacked>,
@@ -66,8 +57,7 @@ struct WantList {
     list: Vec<CellKey>,
 }
 
-/// Resident cells: page table over decoded planes. Plain map — a few
-/// hundred entries, probed per BLOCK (not per pixel) during render.
+/// Resident cells: page table over decoded planes. Plain map — a few hundred entries, probed per BLOCK (not per pixel) during render.
 #[derive(Default)]
 pub struct Pool {
     pub map: FxHashMap<CellKey, Entry>,
@@ -108,11 +98,7 @@ impl Residency {
         n
     }
 
-    /// Declare the frame's desired set — the cells this view needs at its
-    /// depths plus the parents it falls back through. Everything else is
-    /// dropped now (out of view or zoom mismatch: gone, re-fetched if it
-    /// comes back), in-flight requests outside it are forgotten, and only
-    /// what's missing is requested, nearest-first.
+    /// Declare the frame's desired set — the cells this view needs at its depths plus the parents it falls back through. Everything else is dropped now (out of view or zoom mismatch: gone, re-fetched if it comes back), in-flight requests outside it are forgotten, and only what's missing is requested, nearest-first.
     pub fn want(&mut self, mut list: Vec<CellKey>, center: (u64, u64)) {
         self.desired = list.iter().copied().collect();
         let desired = &self.desired;
@@ -124,8 +110,7 @@ impl Residency {
         }
         list.sort_by_key(|k| {
             let (cu, cv) = k.grid();
-            // Chebyshev distance in this depth's grid, normalized by shifting
-            // the center (given at depth 30-ish precision) down.
+            // Chebyshev distance in this depth's grid, normalized by shifting the center (given at depth 30-ish precision) down.
             let sh = 30 - k.depth as u32;
             let (ku, kv) = (center.0 >> sh, center.1 >> sh);
             (cu.abs_diff(ku)).max(cv.abs_diff(kv))
@@ -141,11 +126,8 @@ impl Residency {
     }
 }
 
-/// The newest want-list is the only one that matters: an older list's
-/// leftovers are cells the view no longer needs (the main side forgets
-/// them as pending too, so they're re-requested if they come back).
-/// Cells decode in parallel a small chunk at a time so the nearest-first
-/// order still holds and a newer list preempts within a few cells.
+/// The newest want-list is the only one that matters: an older list's leftovers are cells the view no longer needs (the main side forgets them as pending too, so they're re-requested if they come back).
+/// Cells decode in parallel a small chunk at a time so the nearest-first order still holds and a newer list preempts within a few cells.
 fn loader_thread(store: Arc<dyn CellStore>, want_rx: Receiver<WantList>, done_tx: Sender<Loaded>) {
     let chunk = rayon::current_num_threads().clamp(2, 8);
     let mut current: Option<WantList> = None;
@@ -191,9 +173,7 @@ fn load_cell(store: &dyn CellStore, key: CellKey) -> Loaded {
 
 // ==================== TIERED STORE: VAULT CACHE OVER THE BUCKET ====================
 
-/// Where the baked cells live publicly. The path under it is exactly a
-/// cell's `CellKey::path`, so the bake directory and the bucket are the
-/// same thing.
+/// Where the baked cells live publicly. The path under it is exactly a cell's `CellKey::path`, so the bake directory and the bucket are the same thing.
 pub const DEFAULT_CELLS_URL: &str = "https://brobdingnagian.holdmyoscilloscope.com/mahere/cells";
 
 /// A store that can also keep what it's given (the vault).
@@ -201,17 +181,12 @@ pub trait CellCache: CellStore {
     fn put(&self, key: CellKey, bytes: &[u8]);
 }
 
-/// The far tier. `Ok(None)` is a definite absence (the cell was never
-/// baked); `Err` is a failure to find out (offline, timeout), which must
-/// not be remembered as absence.
+/// The far tier. `Ok(None)` is a definite absence (the cell was never baked); `Err` is a failure to find out (offline, timeout), which must not be remembered as absence.
 pub trait RemoteStore: Send + Sync + 'static {
     fn fetch(&self, key: CellKey) -> Result<Option<Vec<u8>>, String>;
 }
 
-/// Cache first, then the bucket, writing hits through. Definite misses
-/// are remembered for the process (most of the world isn't baked yet);
-/// failures are not, so a cell that couldn't be fetched is tried again
-/// the next time the view wants it.
+/// Cache first, then the bucket, writing hits through. Definite misses are remembered for the process (most of the world isn't baked yet); failures are not, so a cell that couldn't be fetched is tried again the next time the view wants it.
 pub struct TieredStore {
     cache: Arc<dyn CellCache>,
     remote: Arc<dyn RemoteStore>,
@@ -291,8 +266,7 @@ impl CellStore for HttpStore {
 mod tests {
     use super::*;
 
-    /// A store with nothing in it: every request resolves to absent, which
-    /// is enough to exercise the residency policy end to end.
+    /// A store with nothing in it: every request resolves to absent, which is enough to exercise the residency policy end to end.
     struct Empty;
     impl CellStore for Empty {
         fn get(&self, _key: CellKey) -> Option<Vec<u8>> {
@@ -319,8 +293,7 @@ mod tests {
         r.want(vec![a], (0, 0));
         settle(&mut r);
         assert!(r.pool.map.contains_key(&a));
-        // A new view that no longer needs `a`: it's dropped at once, `b` is
-        // requested, and nothing stays pending for the old view.
+        // A new view that no longer needs `a`: it's dropped at once, `b` is requested, and nothing stays pending for the old view.
         r.want(vec![b], (0, 0));
         assert!(!r.pool.map.contains_key(&a));
         assert!(r.pending.contains(&b));

@@ -1,12 +1,6 @@
-//! mahere's database: the kete/manifestus stack photon rides — a crash-proof
-//! keyed object store (copy-on-write HAMT over mirrored VSF-sealed rings)
-//! with per-key encryption. Three verbs: write, read, delete; a kill at any
-//! byte leaves every entry committed-or-absent.
+//! mahere's database: the kete/manifestus stack photon rides — a crash-proof keyed object store (copy-on-write HAMT over mirrored VSF-sealed rings) with per-key encryption. Three verbs: write, read, delete; a kill at any byte leaves every entry committed-or-absent.
 //!
-//! mahere uses the device scope only (no identity layer): the vault opens
-//! from a device secret minted on first run. Today it holds the session
-//! (camera + sun, restored on launch) and recorded GPS tracks in chunked
-//! entries; the dymaxion tile repack lands here next — `demcell|{prefix}`
+//! mahere uses the device scope only (no identity layer): the vault opens from a device secret minted on first run. Today it holds the session (camera + sun, restored on launch) and recorded GPS tracks in chunked entries; the dymaxion tile repack lands here next — `demcell|{prefix}`
 //! and `featcell|{prefix}` keys are the planned tile store.
 
 use std::sync::Arc;
@@ -18,9 +12,7 @@ use vsf::VsfType;
 
 pub const APP: kete::App<'static> = kete::App { id: "mahere", dir: "mahere" };
 
-/// Open THE mahere vault (shared registry underneath — concurrent opens
-/// receive the same engine). `base`: Android passes filesDir; desktop passes
-/// None (XDG config/data dirs).
+/// Open THE mahere vault (shared registry underneath — concurrent opens receive the same engine). `base`: Android passes filesDir; desktop passes None (XDG config/data dirs).
 pub fn open(base: Option<&str>) -> Result<Arc<FlatStorage>, String> {
     let secret_path = match base {
         Some(b) => {
@@ -44,9 +36,7 @@ fn dirs_config() -> Option<String> {
         .map(|c| format!("{c}/mahere"))
 }
 
-/// The vault's value here is crash-proofness, not secrecy — but kete wants a
-/// device secret, so mint 32 random bytes once and keep them beside the
-/// rings.
+/// The vault's value here is crash-proofness, not secrecy — but kete wants a device secret, so mint 32 random bytes once and keep them beside the rings.
 fn load_or_mint_secret(path: &str) -> Result<[u8; 32], String> {
     if let Ok(bytes) = std::fs::read(path) {
         if bytes.len() == 32 {
@@ -78,11 +68,7 @@ pub struct Session {
 
 // ==================== KEYS ====================
 
-/// kete addresses an entry by hashing a logical key. Ours are VSF values —
-/// the type tags are the domain separation (`d` names a domain, `u` a
-/// depth or index, `wm` a world cell, `e` an instant) — flattened, hashed,
-/// and spelled base64url for kete's string parameter. No delimiter and no
-/// numeral ever appears in a key.
+/// kete addresses an entry by hashing a logical key. Ours are VSF values — the type tags are the domain separation (`d` names a domain, `u` a depth or index, `wm` a world cell, `e` an instant) — flattened, hashed, and spelled base64url for kete's string parameter. No delimiter and no numeral ever appears in a key.
 pub fn vault_key(parts: &[VsfType]) -> String {
     let mut bytes = Vec::new();
     for p in parts {
@@ -145,9 +131,7 @@ fn tensor_f64(v: VsfType) -> Option<Vec<f64>> {
 
 // ==================== TRACKS ====================
 
-/// Chunked GPS track recorder: (lat, lon, elevation m, unix seconds) per
-/// fix, flushed every CHUNK fixes so a crash costs at most one chunk and a
-/// day's hike never rewrites more than a small object per flush.
+/// Chunked GPS track recorder: (lat, lon, elevation m, unix seconds) per fix, flushed every CHUNK fixes so a crash costs at most one chunk and a day's hike never rewrites more than a small object per flush.
 pub struct TrackRecorder {
     store: Arc<FlatStorage>,
     /// Eagle Time of the first fix's session — the track's identity.
@@ -221,8 +205,7 @@ pub fn track_chunks(store: &FlatStorage, start: i64) -> Option<u32> {
 mod tests {
     use super::*;
 
-    /// One serial test: set_vault_dirs_override is process-global, so
-    /// parallel vault tests would race each other's directories.
+    /// One serial test: set_vault_dirs_override is process-global, so parallel vault tests would race each other's directories.
     #[test]
     fn vault_round_trips_and_persists() {
         let nanos = std::time::SystemTime::now()
@@ -245,9 +228,7 @@ mod tests {
         save_session(&store, &s).unwrap();
         assert_eq!(load_session(&store), Some(s));
 
-        // Recorder pattern: big chunk blobs interleaved with rapid counter
-        // overwrites — the exact shape that looked flaky before the test
-        // harness itself was fixed (stale reused dirs + global override).
+        // Recorder pattern: big chunk blobs interleaved with rapid counter overwrites — the exact shape that looked flaky before the test harness itself was fixed (stale reused dirs + global override).
         let mut rec = TrackRecorder::new(store.clone());
         let key = rec.start();
         for i in 0..200 {
@@ -260,8 +241,7 @@ mod tests {
             assert!(track_chunk(&store, key, c).is_some(), "chunk {c} missing");
         }
 
-        // Persistence across a real reopen: drop every handle, open again,
-        // read everything back.
+        // Persistence across a real reopen: drop every handle, open again, read everything back.
         drop(rec);
         drop(store);
         let store2 = open(Some(&base)).expect("reopen");
@@ -273,10 +253,7 @@ mod tests {
 
 // ==================== CELL CACHE ====================
 
-/// The vault as the on-device cell tier: every cell fetched from the bucket
-/// is written through here and served from here afterwards (offline
-/// included). Keyed by the VSF values (`d` cell, `u` depth, `wm` cell) through [`vault_key`], so cells, session and tracks share the
-/// vault with the type system as the namespace.
+/// The vault as the on-device cell tier: every cell fetched from the bucket is written through here and served from here afterwards (offline included). Keyed by the VSF values (`d` cell, `u` depth, `wm` cell) through [`vault_key`], so cells, session and tracks share the vault with the type system as the namespace.
 pub struct VaultCells(pub Arc<FlatStorage>);
 
 fn cell_key(key: mahere_tiles::CellKey) -> String {

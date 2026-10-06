@@ -1,6 +1,5 @@
 //! mahere desktop app — a thin fluor frontend over mahere-engine's MapCore.
-//! Chrome, desktop input mapping, and the bg-layer blit live here; all map
-//! state and rendering live in the engine (shared with the Android shell).
+//! Chrome, desktop input mapping, and the bg-layer blit live here; all map state and rendering live in the engine (shared with the Android shell).
 
 use fluor::coord::Coord as Px;
 use fluor::event::{CursorIcon, ElementState, Event as FEvent, MouseButton, MouseScrollDelta};
@@ -156,8 +155,7 @@ impl FluorApp for MahereApp {
                     self.map.pan(dx, dy, w, h);
                     ctx.window.request_redraw();
                 } else if self.rotating {
-                    // Angle swept by the cursor around the screen centre, so the
-                    // map turns with the hand instead of at a fixed rate.
+                    // Angle swept by the cursor around the screen centre, so the map turns with the hand instead of at a fixed rate.
                     let (cx, cy) = (w as f64 * 0.5, h as f64 * 0.5);
                     let a0 = (self.last_cursor.1 - cy).atan2(self.last_cursor.0 - cx);
                     let a1 = (y - cy).atan2(x - cx);
@@ -240,8 +238,7 @@ impl FluorApp for MahereApp {
                         self.map.go_home(w, h);
                         true
                     }
-                    // The layer filter: 1 terrain, 2 land cover, 3 water, 4 lines;
-                    // 0 shows residency (fallback tint).
+                    // The layer filter: 1 terrain, 2 land cover, 3 water, 4 lines; 0 shows residency (fallback tint).
                     Some(k @ ("1" | "2" | "3" | "4" | "0")) => {
                         let mut m = self.map.layers();
                         match k {
@@ -277,8 +274,7 @@ impl FluorApp for MahereApp {
 
     fn tick(&mut self, ctx: &mut Context) -> bool {
         let (w, h) = Self::dims(ctx);
-        // Session persistence rides the refinement ticks: at most one vault
-        // write per few seconds, only while the view is actually changing.
+        // Session persistence rides the refinement ticks: at most one vault write per few seconds, only while the view is actually changing.
         if self.last_save.elapsed().as_secs() >= 1 {
             self.last_save = Instant::now();
             self.chrome.set_status_text(Some(format!(
@@ -309,8 +305,7 @@ impl FluorApp for MahereApp {
             self.map.render(w, h);
             self.chrome.invalidate_bg();
         }
-        // fluor composites front-to-back: the map is the chrome group's
-        // BACKGROUND layer, never painted straight over `target`.
+        // fluor composites front-to-back: the map is the chrome group's BACKGROUND layer, never painted straight over `target`.
         let map = &self.map.canvas;
         self.chrome.rasterize_bg(ctx.damage, |c| {
             let n = c.pixels.len().min(map.len());
@@ -342,8 +337,7 @@ impl FluorApp for MahereApp {
 
 fn main() {
     let vault = mahere_store::open(None).ok();
-    // A local bake (argv[1], or data/cells) serves directly; otherwise cells
-    // come from the bucket through the vault, like the phone.
+    // A local bake (argv[1], or data/cells) serves directly; otherwise cells come from the bucket through the vault, like the phone.
     let local = std::env::args().nth(1).map(std::path::PathBuf::from).unwrap_or_else(|| "data/cells".into());
     let store: std::sync::Arc<dyn CellStore> = if local.is_dir() {
         eprintln!("cells: {}", local.display());

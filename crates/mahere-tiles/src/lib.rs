@@ -1,10 +1,7 @@
 //! The cell pipeline: bake source data into dymaxion-cell rasters — the
 //! #pagetable renderer's entire diet.
 //!
-//! **One object per cell, every layer inside it.** A cell is one rhombus of
-//! the diamond-Morton grid at `depth`; its file carries a VSF section per
-//! layer present at that depth, and the client decides what to decode,
-//! draw and style:
+//! **One object per cell, every layer inside it.** A cell is one rhombus of the diamond-Morton grid at `depth`; its file carries a VSF section per layer present at that depth, and the client decides what to decode, draw and style:
 //!
 //! - **dem**: elevation (u16, 0.25 m steps from -500 m) + unit normal
 //!   (snorm16 ×3), sampled at triangle centroids from the source DEM at
@@ -15,22 +12,12 @@
 //! - **land**: land cover (class, coverage) from OSM polygons.
 //! - **water**: lakes, ponds, reservoirs, riverbanks as coverage.
 //!
-//! **Texels are triangles.** A cell's 256×256 UV squares are each split
-//! along `u+v = k` into a lower and an upper equilateral triangle. The
-//! triangular tiling has 6-fold symmetry and a line always crosses it
-//! edge-to-edge, so linework is isotropic. Each triangle subdivides into
-//! four — three corners and the inverted center — and that is the
-//! pyramid's box filter: coverage up the pyramid IS area, so minor
-//! features fade and dense ones glow with no styling.
+//! **Texels are triangles.** A cell's 256×256 UV squares are each split along `u+v = k` into a lower and an upper equilateral triangle. The triangular tiling has 6-fold symmetry and a line always crosses it edge-to-edge, so linework is isotropic. Each triangle subdivides into four — three corners and the inverted center — and that is the pyramid's box filter: coverage up the pyramid IS area, so minor features fade and dense ones glow with no styling.
 //!
 //! In memory a cell's planes are indexed `((ty << 8 | tx) << 1) | half`
-//! (the renderer's stepping order). On disk they are in triangle-path
-//! order — the triangle code's digits — so a parent texel's four children
-//! are contiguous. [`disk_to_mem`] / [`mem_to_disk`] convert.
+//! (the renderer's stepping order). On disk they are in triangle-path order — the triangle code's digits — so a parent texel's four children are contiguous. [`disk_to_mem`] / [`mem_to_disk`] convert.
 //!
-//! Files are zstd'd VSF at `{name}.vsf.zst` where the name is the cell's
-//! flattened VSF value (`u` depth, `wm` cell) in base64url: no delimiters,
-//! no numerals — a directory layout that is byte-for-byte the bucket.
+//! Files are zstd'd VSF at `{name}.vsf.zst` where the name is the cell's flattened VSF value (`u` depth, `wm` cell) in base64url: no delimiters, no numerals — a directory layout that is byte-for-byte the bucket.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -43,8 +30,7 @@ use rayon::prelude::*;
 use vsf::types::{Tensor, WorldCell};
 use vsf::{VsfBuilder, VsfType};
 
-/// base64url without padding — how bytes are spelled when they must be a
-/// name (the same alphabet tohu uses for vault file names).
+/// base64url without padding — how bytes are spelled when they must be a name (the same alphabet tohu uses for vault file names).
 pub fn base64url(bytes: &[u8]) -> String {
     const A: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
     let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
@@ -72,8 +58,7 @@ pub fn dequantize_elev(q: u16) -> f32 {
     q as f32 / 4.0 - 500.0
 }
 
-/// A cell address: dymaxion Morton prefix (diamond in the top 4 bits of the
-/// full-resolution coordinate, right-aligned here) at `depth`.
+/// A cell address: dymaxion Morton prefix (diamond in the top 4 bits of the full-resolution coordinate, right-aligned here) at `depth`.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, PartialOrd, Ord)]
 pub struct CellKey {
     pub depth: u8,
@@ -81,8 +66,7 @@ pub struct CellKey {
 }
 
 impl CellKey {
-    /// The cell containing `c` at `depth`: diamond + 2*depth Morton bits,
-    /// right-aligned (so prefixes sort and shift like integers).
+    /// The cell containing `c` at `depth`: diamond + 2*depth Morton bits, right-aligned (so prefixes sort and shift like integers).
     pub fn containing(c: Coord, depth: u8) -> CellKey {
         CellKey { depth, prefix: c.raw() >> (60 - 2 * depth as u32) }
     }
@@ -127,9 +111,7 @@ impl CellKey {
         self.prefix << (60 - 2 * self.depth as u32)
     }
 
-    /// The cell as VSF values, flattened: its depth (`u`) and the world
-    /// cell (`wm`). This is the cell's identity everywhere a key is needed —
-    /// no delimiters, no numerals, the type tags are the structure.
+    /// The cell as VSF values, flattened: its depth (`u`) and the world cell (`wm`). This is the cell's identity everywhere a key is needed — no delimiters, no numerals, the type tags are the structure.
     pub fn vsf_bytes(self) -> Vec<u8> {
         let mut b = VsfType::u(self.depth as usize, false).flatten();
         b.extend(VsfType::wm(WorldCell::from_raw(self.raw())).flatten());
@@ -171,8 +153,7 @@ pub fn tri_idx(tx: usize, ty: usize, half: usize) -> usize {
     (((ty << TEX_BITS) | tx) << 1) | half
 }
 
-/// Triangle texel containing a point given in texel units within the cell
-/// (or any grid): the UV square plus which side of `u+v = k` it lies on.
+/// Triangle texel containing a point given in texel units within the cell (or any grid): the UV square plus which side of `u+v = k` it lies on.
 #[inline(always)]
 pub fn tri_at(gx: f64, gy: f64) -> (usize, usize, usize) {
     let (tx, ty) = (gx.floor(), gy.floor());
@@ -193,11 +174,7 @@ pub fn tri_centroid(tx: usize, ty: usize, half: usize) -> (f64, f64) {
     (tx as f64 + off, ty as f64 + off)
 }
 
-/// The four children of triangle (tx, ty, half) on the next-finer grid, in
-/// code-digit order: 0 apex, 1 toward r (+v), 2 toward q (+u), 3 the
-/// inverted center — which lives in the apex's UV square with the opposite
-/// orientation. A lower triangle's apex is its square's (0,0) corner, an
-/// upper's is (1,1).
+/// The four children of triangle (tx, ty, half) on the next-finer grid, in code-digit order: 0 apex, 1 toward r (+v), 2 toward q (+u), 3 the inverted center — which lives in the apex's UV square with the opposite orientation. A lower triangle's apex is its square's (0,0) corner, an upper's is (1,1).
 #[inline]
 pub fn tri_children(tx: usize, ty: usize, half: usize) -> [(usize, usize, usize); 4] {
     let (x, y) = (2 * tx, 2 * ty);
@@ -208,8 +185,7 @@ pub fn tri_children(tx: usize, ty: usize, half: usize) -> [(usize, usize, usize)
     }
 }
 
-/// Parent-cell texel -> its four children as (child cell Morton digit,
-/// memory index in that child cell).
+/// Parent-cell texel -> its four children as (child cell Morton digit, memory index in that child cell).
 #[inline]
 fn child_cell_texels(tx: usize, ty: usize, half: usize) -> [(u64, usize); 4] {
     tri_children(tx, ty, half).map(|(cx, cy, ch)| {
@@ -218,8 +194,7 @@ fn child_cell_texels(tx: usize, ty: usize, half: usize) -> [(u64, usize); 4] {
     })
 }
 
-/// Squared ground distance (in rhombus-edge units) of a UV offset: the UV
-/// axes meet at 60°, so |du e_u + dv e_v|² = du² + dv² + du·dv.
+/// Squared ground distance (in rhombus-edge units) of a UV offset: the UV axes meet at 60°, so |du e_u + dv e_v|² = du² + dv² + du·dv.
 #[inline(always)]
 fn uv_dist2(du: f64, dv: f64) -> f64 {
     du * du + dv * dv + du * dv
@@ -260,8 +235,7 @@ pub fn disk_to_mem<T: Copy + Default>(disk: &[T]) -> Vec<T> {
     mem
 }
 
-/// Global texel coordinates of a Coord at a given base depth: the texel grid
-/// is the cell grid times TEX.
+/// Global texel coordinates of a Coord at a given base depth: the texel grid is the cell grid times TEX.
 fn texel_of(c: Coord, depth: u8) -> (u8, f64, f64) {
     let (iu, iv) = c.uv();
     let shift = 30 - depth as u32 - TEX_BITS as u32;
@@ -314,15 +288,11 @@ impl Default for CovCell {
     }
 }
 
-/// Baker-side dem planes: elevation only (f32 so the pyramid averages at
-/// full precision), plus a one-texel apron copied from neighbour cells so
-/// the loader can derive exact normals at the cell edge. Normals are never
-/// stored — they're six of the eight bytes a texel used to cost.
+/// Baker-side dem planes: elevation only (f32 so the pyramid averages at full precision), plus a one-texel apron copied from neighbour cells so the loader can derive exact normals at the cell edge. Normals are never stored — they're six of the eight bytes a texel used to cost.
 #[derive(Clone)]
 pub struct DemCell {
     pub elev: Vec<f32>,
-    /// Neighbour edge texels: `[side][half][index]`, sides west (tx=-1),
-    /// east (tx=256), south (ty=-1), north (ty=256); NaN where unknown.
+    /// Neighbour edge texels: `[side][half][index]`, sides west (tx=-1), east (tx=256), south (ty=-1), north (ty=256); NaN where unknown.
     pub apron: Vec<f32>,
 }
 
@@ -340,9 +310,7 @@ pub fn apron_idx(side: usize, half: usize, i: usize) -> usize {
     (side * 2 + half) * TEX + i
 }
 
-/// Everything a cell can carry. Vector layers at a vector depth are always
-/// all present (empty planes compress to nothing), so a reader finding one
-/// of them knows the cell's vector truth is complete.
+/// Everything a cell can carry. Vector layers at a vector depth are always all present (empty planes compress to nothing), so a reader finding one of them knows the cell's vector truth is complete.
 #[derive(Clone, Default)]
 pub struct Cell {
     pub dem: Option<DemCell>,
@@ -353,11 +321,7 @@ pub struct Cell {
 
 // ==================== LINE LAYER ====================
 
-/// Stamp every feature ONCE, at its physical width, into base-depth cells;
-/// the pyramid does the rest. Lines are measure-zero features, so a parent
-/// texel's coverage is the SUM of its four children (saturating): a road
-/// stays a texel wide at every depth instead of averaging away, and dense
-/// networks saturate into a glow. Major class wins per texel.
+/// Stamp every feature ONCE, at its physical width, into base-depth cells; the pyramid does the rest. Lines are measure-zero features, so a parent texel's coverage is the SUM of its four children (saturating): a road stays a texel wide at every depth instead of averaging away, and dense networks saturate into a glow. Major class wins per texel.
 pub fn bake_lines(feats: &[Road], base_depth: u8, min_depth: u8) -> HashMap<CellKey, ClassCell> {
     assert!(base_depth as u32 + TEX_BITS as u32 <= 30);
     let mut cells: HashMap<CellKey, ClassCell> = HashMap::new();
@@ -387,10 +351,7 @@ pub fn bake_lines(feats: &[Road], base_depth: u8, min_depth: u8) -> HashMap<Cell
     pyramid_class(cells, base_depth, min_depth, ClassMerge::Major)
 }
 
-/// Stamp a segment as a band of radius `r` texels (ground metric): walk the
-/// centreline in half-texel steps and cover every triangle whose centroid
-/// is within the band, coverage feathered over the last texel. Coverage
-/// combines by max; class follows the strongest coverage.
+/// Stamp a segment as a band of radius `r` texels (ground metric): walk the centreline in half-texel steps and cover every triangle whose centroid is within the band, coverage feathered over the last texel. Coverage combines by max; class follows the strongest coverage.
 #[allow(clippy::too_many_arguments)]
 fn stamp_segment(
     cells: &mut HashMap<CellKey, ClassCell>,
@@ -405,8 +366,7 @@ fn stamp_segment(
     let extent = ((1u64 << depth) * TEX as u64) as f64;
     let len = uv_dist2(b.0 - a.0, b.1 - a.1).sqrt();
     let steps = (len * 2.0).ceil().max(1.0) as usize;
-    // Bounding box of a ground disc of radius r in UV units (the 60° basis
-    // stretches it by up to 2/sqrt(3)).
+    // Bounding box of a ground disc of radius r in UV units (the 60° basis stretches it by up to 2/sqrt(3)).
     let reach = (r * 1.16 + 1.0).ceil() as i64;
     for i in 0..=steps {
         let t = i as f64 / steps as f64;
@@ -443,8 +403,7 @@ fn stamp_segment(
 
 // ==================== AREA LAYERS ====================
 
-/// Rasterize land cover and water polygons at base depth (even-odd fill,
-/// sampled at triangle centroids), then pyramid both to `min_depth`.
+/// Rasterize land cover and water polygons at base depth (even-odd fill, sampled at triangle centroids), then pyramid both to `min_depth`.
 pub fn bake_areas(
     areas: &[Area],
     base_depth: u8,
@@ -501,8 +460,7 @@ pub fn bake_areas(
     )
 }
 
-/// Even-odd scanline fill of rings given in global texel coordinates,
-/// visiting every triangle whose centroid is inside.
+/// Even-odd scanline fill of rings given in global texel coordinates, visiting every triangle whose centroid is inside.
 fn fill_rings(rings: &[Vec<(f64, f64)>], depth: u8, mut visit: impl FnMut(usize, usize, usize)) {
     let extent = ((1u64 << depth) * TEX as u64) as f64;
     let (mut v0, mut v1) = (f64::MAX, f64::MIN);
@@ -554,16 +512,13 @@ fn fill_rings(rings: &[Vec<(f64, f64)>], depth: u8, mut visit: impl FnMut(usize,
 
 #[derive(Clone, Copy)]
 pub enum ClassMerge {
-    /// Lines: coverage is the SUM of the children (a line has no area, so
-    /// its amount adds); the most major class present wins.
+    /// Lines: coverage is the SUM of the children (a line has no area, so its amount adds); the most major class present wins.
     Major,
-    /// Land cover: coverage is the MEAN of the children (an area fraction);
-    /// the class with the most coverage wins.
+    /// Land cover: coverage is the MEAN of the children (an area fraction); the class with the most coverage wins.
     Dominant,
 }
 
-/// Parent texel from its four triangle children (missing children are
-/// empty): coverage summed or averaged, class per `merge`.
+/// Parent texel from its four triangle children (missing children are empty): coverage summed or averaged, class per `merge`.
 pub fn pyramid_class(
     mut cells: HashMap<CellKey, ClassCell>,
     base_depth: u8,
@@ -663,8 +618,7 @@ pub fn pyramid_cov(mut cells: HashMap<CellKey, CovCell>, base_depth: u8, min_dep
 
 // ==================== DEM LAYER ====================
 
-/// Bake dem cells covering `keys` from the source store: each triangle
-/// texel's elevation sampled at its centroid.
+/// Bake dem cells covering `keys` from the source store: each triangle texel's elevation sampled at its centroid.
 pub fn bake_dem(dem: &DemStore, keys: &[CellKey]) -> Vec<(CellKey, DemCell)> {
     keys.par_iter()
         .map(|&key| {
@@ -689,10 +643,7 @@ pub fn bake_dem(dem: &DemStore, keys: &[CellKey]) -> Vec<(CellKey, DemCell)> {
         .collect()
 }
 
-/// Every depth from `base.depth - 1` down to `min_depth`, each texel the
-/// mean of its four triangle children (no-data ignored). Building the
-/// pyramid from the base set is what guarantees every ancestor of a baked
-/// cell exists.
+/// Every depth from `base.depth - 1` down to `min_depth`, each texel the mean of its four triangle children (no-data ignored). Building the pyramid from the base set is what guarantees every ancestor of a baked cell exists.
 pub fn dem_pyramid(base: &[(CellKey, DemCell)], min_depth: u8) -> Vec<(CellKey, DemCell)> {
     let mut out: Vec<(CellKey, DemCell)> = Vec::new();
     // Start index of the most recent level inside `out` (None = base).
@@ -742,9 +693,7 @@ pub fn dem_pyramid(base: &[(CellKey, DemCell)], min_depth: u8) -> Vec<(CellKey, 
     out
 }
 
-/// All cells at `depth` that intersect a lat/lon bbox. Scanned at half-cell
-/// resolution, never coarser than an eighth of the box — a slanted rhombus
-/// cell can cut through a box without containing any corner of it.
+/// All cells at `depth` that intersect a lat/lon bbox. Scanned at half-cell resolution, never coarser than an eighth of the box — a slanted rhombus cell can cut through a box without containing any corner of it.
 pub fn cells_covering(lat0: f64, lon0: f64, lat1: f64, lon1: f64, depth: u8) -> Vec<CellKey> {
     let mut keys = std::collections::HashSet::new();
     // Half a cell edge in degrees of latitude, as the scan step.
@@ -768,15 +717,12 @@ pub fn cells_covering(lat0: f64, lon0: f64, lat1: f64, lon1: f64, depth: u8) -> 
 
 // ==================== ASSEMBLY ====================
 
-/// Copy each cell's neighbours' edge texels into its apron (same depth,
-/// same diamond; a missing neighbour leaves NaN and the loader uses a
-/// one-sided gradient there).
+/// Copy each cell's neighbours' edge texels into its apron (same depth, same diamond; a missing neighbour leaves NaN and the loader uses a one-sided gradient there).
 pub fn fill_aprons(mut dem: Vec<(CellKey, DemCell)>) -> Vec<(CellKey, DemCell)> {
     let edges: HashMap<CellKey, [Vec<f32>; 4]> = dem
         .iter()
         .map(|(k, c)| {
-            // What THIS cell offers its neighbours: its own edge texels,
-            // indexed so the neighbour can copy them straight in.
+            // What THIS cell offers its neighbours: its own edge texels, indexed so the neighbour can copy them straight in.
             let mut west = vec![f32::NAN; 2 * TEX]; // this cell's tx=0 column -> east neighbour's... see below
             let mut east = vec![f32::NAN; 2 * TEX];
             let mut south = vec![f32::NAN; 2 * TEX];
@@ -813,9 +759,7 @@ pub fn fill_aprons(mut dem: Vec<(CellKey, DemCell)>) -> Vec<(CellKey, DemCell)> 
     dem
 }
 
-/// Union the layers into cells. Wherever any vector layer exists at a
-/// depth, all three are present (empty planes for the missing ones) so
-/// readers never have to climb for one layer but not another.
+/// Union the layers into cells. Wherever any vector layer exists at a depth, all three are present (empty planes for the missing ones) so readers never have to climb for one layer but not another.
 pub fn assemble(
     dem: Vec<(CellKey, DemCell)>,
     line: HashMap<CellKey, ClassCell>,
@@ -844,8 +788,7 @@ pub fn assemble(
 
 // ==================== VSF I/O ====================
 
-/// Decoded, quantized planes in memory order — what the loader hands the
-/// renderer and what a merge-on-write reads back.
+/// Decoded, quantized planes in memory order — what the loader hands the renderer and what a merge-on-write reads back.
 #[derive(Clone, Default)]
 pub struct CellPlanes {
     pub dem: Option<DemPlanes>,
@@ -867,11 +810,7 @@ impl DemCell {
     }
 }
 
-/// On-disk dem coding: per-cell `base` + `step` (adaptive, >= 5 cm, so the
-/// cell's range fits i16 residuals), then LOCO-I MED prediction from the
-/// left / up / up-left texels of the same half-plane in row-major order,
-/// residuals as i16. No-data texels take the predictor (residual 0) and
-/// are marked in a `valid` plane, written only when any is missing.
+/// On-disk dem coding: per-cell `base` + `step` (adaptive, >= 5 cm, so the cell's range fits i16 residuals), then LOCO-I MED prediction from the left / up / up-left texels of the same half-plane in row-major order, residuals as i16. No-data texels take the predictor (residual 0) and are marked in a `valid` plane, written only when any is missing.
 const MIN_STEP: f32 = 0.05;
 
 fn med(a: i32, b: i32, c: i32) -> i32 {
@@ -957,11 +896,7 @@ fn decode_dem(c: &DemCoded) -> DemPlanes {
 }
 
 impl DemPlanes {
-    /// Pack for the renderer: `[elev_q u16 | nx i16 | ny i16 | nz i16]` per
-    /// texel (0.25 m steps from -500 m, 0xFFFF no data). Normals come from
-    /// central differences over the half-plane (apron at the edges, one-
-    /// sided next to no-data) mapped through the cell's UV→east/north
-    /// Jacobian — snorm16, not u8, because u8 bands on gentle slopes.
+    /// Pack for the renderer: `[elev_q u16 | nx i16 | ny i16 | nz i16]` per texel (0.25 m steps from -500 m, 0xFFFF no data). Normals come from central differences over the half-plane (apron at the edges, one- sided next to no-data) mapped through the cell's UV→east/north Jacobian — snorm16, not u8, because u8 bands on gentle slopes.
     pub fn pack_texels(&self, key: CellKey) -> Vec<u64> {
         // Jacobian: metres east/north per texel step in u and in v.
         let (u0, v0, size) = key.uv_rect();
@@ -1040,9 +975,7 @@ impl Cell {
 }
 
 impl CellPlanes {
-    /// Overlay `self` (a new bake) onto `old`. A bake's footprint is where
-    /// it has elevation: inside it the new vector planes win, outside the
-    /// old ones stay; without a dem the new planes replace wholesale.
+    /// Overlay `self` (a new bake) onto `old`. A bake's footprint is where it has elevation: inside it the new vector planes win, outside the old ones stay; without a dem the new planes replace wholesale.
     pub fn merge_over(self, old: CellPlanes) -> CellPlanes {
         let mut out = self;
         let CellPlanes { dem: old_dem, line: old_line, land: old_land, water: old_water } = old;
@@ -1114,8 +1047,7 @@ impl CellPlanes {
             let mut fields = vec![
                 ("base".to_string(), VsfType::f5(c.base)),
                 ("step".to_string(), VsfType::f5(c.step)),
-                // Residuals stay in memory (row-major) order: the predictor
-                // runs over spatial neighbours, not the triangle path.
+                // Residuals stay in memory (row-major) order: the predictor runs over spatial neighbours, not the triangle path.
                 ("residual".to_string(), VsfType::t_i4(Tensor::new(vec![TEX, TEX, 2], c.residual))),
                 ("apron".to_string(), VsfType::t_u4(Tensor::new(vec![4, 2, TEX], c.apron))),
             ];
@@ -1145,8 +1077,7 @@ impl CellPlanes {
     }
 }
 
-/// Write a cell, merged over whatever is already on disk under that key —
-/// so regional bakes compose instead of clobbering each other.
+/// Write a cell, merged over whatever is already on disk under that key — so regional bakes compose instead of clobbering each other.
 pub fn write_cell(out: &Path, key: CellKey, cell: &Cell) -> Result<(), String> {
     let path = out.join(key.path());
     let mut planes = cell.quantize();
@@ -1163,14 +1094,12 @@ fn write_file(path: &Path, bytes: &[u8]) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
-    // Whole-file zstd: VSF internals untouched, the bucket keeps the
-    // .vsf.zst names, and empty planes shrink to nothing.
+    // Whole-file zstd: VSF internals untouched, the bucket keeps the .vsf.zst names, and empty planes shrink to nothing.
     let z = zstd::encode_all(bytes, 3).map_err(|e| e.to_string())?;
     std::fs::write(path, z).map_err(|e| format!("{}: {e}", path.display()))
 }
 
-/// Decode a cell from raw file bytes (zstd or plain VSF) — the loader
-/// thread's entry point; no filesystem coupling. Width-agnostic reads.
+/// Decode a cell from raw file bytes (zstd or plain VSF) — the loader thread's entry point; no filesystem coupling. Width-agnostic reads.
 pub fn decode_cell(data: &[u8]) -> Result<CellPlanes, String> {
     let plain: Vec<u8>;
     let data = if data.starts_with(&[0x28, 0xB5, 0x2F, 0xFD]) {
@@ -1290,8 +1219,7 @@ mod tests {
         }
     }
 
-    /// Children partition the parent: every triangle at the fine grid is
-    /// the child of exactly one triangle at the coarse grid.
+    /// Children partition the parent: every triangle at the fine grid is the child of exactly one triangle at the coarse grid.
     #[test]
     fn triangle_children_partition() {
         let n = 8usize;
@@ -1350,15 +1278,13 @@ mod tests {
             cells.iter().filter(|(k, _)| k.depth == d).map(|(_, c)| *c.cov.iter().max().unwrap()).max().unwrap()
         };
         assert!(lit(12) > 0, "base stamping produced nothing");
-        // Summing children: the path stays fully covered along its length at
-        // every depth (it shrinks in texel count, never in intensity).
+        // Summing children: the path stays fully covered along its length at every depth (it shrinks in texel count, never in intensity).
         assert_eq!(peak(10), 255);
         let r = lit(12) as f64 / lit(10) as f64;
         assert!((2.0..=8.0).contains(&r), "line texel count should shrink several-fold over 2 levels, got {r}");
     }
 
-    /// A motorway covers more ground than a path along the same line, in
-    /// proportion to its width.
+    /// A motorway covers more ground than a path along the same line, in proportion to its width.
     #[test]
     fn width_scales_coverage() {
         let path = bake_lines(&[trail(mahere_osm::RoadClass::Path, 0.0)], 13, 13);
@@ -1370,8 +1296,7 @@ mod tests {
         assert!(r > 8.0 && r < 40.0, "motorway/path coverage ratio {r}");
     }
 
-    /// A square lake fills its interior (and only its interior), and the
-    /// pyramid conserves its area.
+    /// A square lake fills its interior (and only its interior), and the pyramid conserves its area.
     #[test]
     fn polygon_fill_is_area_exact() {
         let (lat0, lon0, lat1, lon1) = (46.20f32, -121.50f32, 46.22f32, -121.47f32);
@@ -1384,9 +1309,7 @@ mod tests {
             water.iter().filter(|(k, _)| k.depth == d).map(|(_, c)| c.cov.iter().map(|&x| x as u64).sum::<u64>()).sum()
         };
         let base = sum(12);
-        // Expected count: the lake's area over the LOCAL triangle area (the
-        // gnomonic face mapping varies texel size across a face, so measure
-        // one texel's parallelogram on the ground at the lake's centre).
+        // Expected count: the lake's area over the LOCAL triangle area (the gnomonic face mapping varies texel size across a face, so measure one texel's parallelogram on the ground at the lake's centre).
         let c = Coord::from_lat_lon(46.21, -121.485);
         let (iu, iv) = c.uv();
         let unit = 1.0 / (1u64 << 30) as f64;

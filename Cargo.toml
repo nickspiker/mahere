@@ -1,8 +1,7 @@
 [workspace]
 resolver = "3"
 members = ["crates/*"]
-# mahere-android only compiles for Android targets (cargo ndk -p mahere-android);
-# host-side `cargo build/test` skips it.
+# mahere-android only compiles for Android targets (cargo ndk -p mahere-android); host-side `cargo build/test` skips it.
 default-members = [
     "crates/mahere-app",
     "crates/mahere-coord",
@@ -18,14 +17,11 @@ edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/nickspiker/mahere"
 
-# fluor's dev tree declares vsf as a sibling path dep (../vsf), which a git
-# checkout of fluor doesn't contain — point it at the pushed vsf repo.
+# fluor's dev tree declares vsf as a sibling path dep (../vsf), which a git checkout of fluor doesn't contain — point it at the pushed vsf repo.
 [patch."https://github.com/nickspiker/fluor"]
 vsf = { git = "https://github.com/nickspiker/vsf", rev = "5f2bb06c8d96ee417a2571944882ef36d6c9ca8f" }
 
-# kete (and its manifestus/tohu deps) declare sibling path deps like fluor
-# does — redirect each git source's path deps to the pushed repos, all vsf
-# references unified on one rev.
+# kete (and its manifestus/tohu deps) declare sibling path deps like fluor does — redirect each git source's path deps to the pushed repos, all vsf references unified on one rev.
 [patch."https://github.com/nickspiker/kete"]
 manifestus = { git = "https://github.com/nickspiker/manifestus", rev = "d4aed47f415e7b56dbd6c1a2ff4efcb4cf8e1239" }
 tohu = { git = "https://github.com/nickspiker/tohu", rev = "a0b6b0af38b8967cc436f618e5cf0edbac968bda" }

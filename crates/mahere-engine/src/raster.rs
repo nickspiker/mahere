@@ -1,13 +1,6 @@
-//! The hot loop: the #pagetable compositor. A frame is fetches — 32 px
-//! block grid with exact corners, fixed-point UV stepping inside, per-BLOCK
-//! cell resolution through the page table, nearest-fetch compose of the
-//! layers through style LUTs. No vectors, no re-rasterization, no
-//! allocation; rayon over row bands.
+//! The hot loop: the #pagetable compositor. A frame is fetches — 32 px block grid with exact corners, fixed-point UV stepping inside, per-BLOCK cell resolution through the page table, nearest-fetch compose of the layers through style LUTs. No vectors, no re-rasterization, no allocation; rayon over row bands.
 //!
-//! Two depth selections: the dem's and the vector layers' (line, land,
-//! water share a base and live in the same cell). Each block resolves one
-//! dem ref and one vector ref; a pixel composes dem → land tint → shade →
-//! water → line, each gated by the client's layer mask.
+//! Two depth selections: the dem's and the vector layers' (line, land, water share a base and live in the same cell). Each block resolves one dem ref and one vector ref; a pixel composes dem → land tint → shade → water → line, each gated by the client's layer mask.
 
 use mahere_coord::Coord;
 use mahere_tiles::{CellKey, ClassCell, CovCell, ELEV_NODATA};
@@ -18,14 +11,12 @@ use crate::Camera;
 use crate::residency::{DemPacked, Entry, Pool};
 
 pub const BLOCK: usize = 32;
-/// Deepest depths any bake produces; regions baked shallower simply fall
-/// back to their parents through the page table.
+/// Deepest depths any bake produces; regions baked shallower simply fall back to their parents through the page table.
 pub const VEC_BASE_DEPTH: u8 = 14;
 pub const DEM_BASE_DEPTH: u8 = 14;
 pub const MIN_DEPTH: u8 = 6;
 
-/// texel/pixel ratio constant: diamond edge 7054 km, 111320 m/deg, 256
-/// texels/cell. ratio r(d) = ppd * K / 2^d; pick d so r ∈ (0.5, 1].
+/// texel/pixel ratio constant: diamond edge 7054 km, 111320 m/deg, 256 texels/cell. ratio r(d) = ppd * K / 2^d; pick d so r ∈ (0.5, 1].
 const K: f64 = 7_054_000.0 / (111_320.0 * 256.0);
 
 pub fn select_depth(ppd: f64, last: u8, base: u8) -> u8 {
@@ -45,9 +36,7 @@ pub struct LayerMask {
     pub land: bool,
     pub water: bool,
     pub line: bool,
-    /// Residency debug: tint pixels whose dem came from a parent of the
-    /// wanted depth (one level amber, two or more red) and blocks with no
-    /// dem at all magenta — so streaming and eviction are visible.
+    /// Residency debug: tint pixels whose dem came from a parent of the wanted depth (one level amber, two or more red) and blocks with no dem at all magenta — so streaming and eviction are visible.
     pub debug: bool,
 }
 
@@ -57,8 +46,7 @@ impl Default for LayerMask {
     }
 }
 
-/// Hypsometric tint LUT indexed by elev_q >> 4 (4 m buckets). Water and
-/// no-data are LUT rows, keeping the pixel loop branch-free on terrain type.
+/// Hypsometric tint LUT indexed by elev_q >> 4 (4 m buckets). Water and no-data are LUT rows, keeping the pixel loop branch-free on terrain type.
 pub fn build_hypso_lut() -> Box<[[u8; 3]; 4096]> {
     const STOPS: [(f32, [f32; 3]); 5] = [
         (0.0, [72.0, 96.0, 60.0]),
@@ -116,9 +104,7 @@ pub const CLASS_LUT: [[u8; 3]; 13] = [
     [84, 150, 210],
 ];
 
-/// Land cover class id (1-based = AreaClass + 1) -> tint. Order follows
-/// mahere_osm::AreaClass: Grass, Farmland, Orchard, Scrub, Forest,
-/// Wetland, Sand, Rock, Glacier, Quarry, Industrial, Urban, Water.
+/// Land cover class id (1-based = AreaClass + 1) -> tint. Order follows mahere_osm::AreaClass: Grass, Farmland, Orchard, Scrub, Forest, Wetland, Sand, Rock, Glacier, Quarry, Industrial, Urban, Water.
 pub const LAND_LUT: [[u8; 3]; 14] = [
     [0, 0, 0],
     [122, 162, 90],
@@ -136,9 +122,7 @@ pub const LAND_LUT: [[u8; 3]; 14] = [
     [26, 58, 82],
 ];
 
-/// One resolved layer reference for a block: planes plus the shift that maps
-/// Q30.16 UV to this entry's texel grid (depends on the entry's ACTUAL
-/// depth — a parent fallback is just a different shift).
+/// One resolved layer reference for a block: planes plus the shift that maps Q30.16 UV to this entry's texel grid (depends on the entry's ACTUAL depth — a parent fallback is just a different shift).
 #[derive(Clone, Copy)]
 enum DemRef<'a> {
     Cell { planes: &'a DemPacked, shift: u32, prefix_shift: u32, prefix: u64 },
@@ -158,9 +142,7 @@ enum VecRef<'a> {
     None,
 }
 
-/// Probe the pool at `depth`, climbing parents to MIN_DEPTH until an entry
-/// satisfies `has`. Absent cells climb too (for dem a parent is coarser
-/// truth; for vector layers the parent IS the box-filtered truth).
+/// Probe the pool at `depth`, climbing parents to MIN_DEPTH until an entry satisfies `has`. Absent cells climb too (for dem a parent is coarser truth; for vector layers the parent IS the box-filtered truth).
 fn probe<'a>(pool: &'a Pool, mut depth: u8, mut prefix: u64, has: impl Fn(&Entry) -> bool) -> Option<(&'a Entry, u8, u64)> {
     loop {
         if let Some(e) = pool.map.get(&CellKey { depth, prefix }) {
@@ -204,8 +186,7 @@ pub struct FrameStats {
     pub straddle_blocks: usize,
 }
 
-/// Render one frame into `canvas` (0xRRGGBB). Returns per-frame stats and
-/// the desired cell set (for residency) derived from the corner lattice.
+/// Render one frame into `canvas` (0xRRGGBB). Returns per-frame stats and the desired cell set (for residency) derived from the corner lattice.
 #[allow(clippy::too_many_arguments)]
 pub fn render_frame(
     canvas: &mut [u32],
@@ -228,11 +209,7 @@ pub fn render_frame(
         })
         .collect();
 
-    // Desired set from the lattice: the active depths and the whole parent
-    // chain down to the base — a region may be baked several depths
-    // shallower than the view wants, and the fallback must find it rather
-    // than skip to the base. Parents are shared by many corners, so the
-    // chain adds only a handful of small cells.
+    // Desired set from the lattice: the active depths and the whole parent chain down to the base — a region may be baked several depths shallower than the view wants, and the fallback must find it rather than skip to the base. Parents are shared by many corners, so the chain adds only a handful of small cells.
     let mut desired: FxHashSet<CellKey> = FxHashSet::default();
     for c in &corners {
         let raw = raw_of(c.diamond, c.u, c.v);
@@ -268,8 +245,7 @@ pub fn render_frame(
     (FrameStats { blocks: bw * bh, straddle_blocks: straddle_count.into_inner() }, want)
 }
 
-/// Resolve a dem ref for a full-res raw prefix base. Shift maps Q30.16 u to
-/// texel at the found depth: tx = (uQ >> (16 + 22 - d)) & 255.
+/// Resolve a dem ref for a full-res raw prefix base. Shift maps Q30.16 u to texel at the found depth: tx = (uQ >> (16 + 22 - d)) & 255.
 fn resolve_dem<'a>(pool: &'a Pool, depth: u8, raw: u64) -> DemRef<'a> {
     let prefix = raw >> (60 - 2 * depth as u32);
     match probe(pool, depth, prefix, |e| e.dem.is_some()) {
@@ -305,8 +281,7 @@ fn raw_of(diamond: u8, uq: i64, vq: i64) -> u64 {
         | mahere_coord::morton_spread((vq >> 16) as u64)
 }
 
-/// Triangle texel index for Q30.16 UV against an entry whose texel grid is
-/// `shift` bits below the UV: the UV square, then which side of `u+v = k`
+/// Triangle texel index for Q30.16 UV against an entry whose texel grid is `shift` bits below the UV: the UV square, then which side of `u+v = k`
 /// — the carry of the two fractional parts.
 #[inline(always)]
 pub fn tri_index(uq: i64, vq: i64, shift: u32) -> usize {
@@ -335,9 +310,7 @@ fn dem_ref_depth(r: &DemRef) -> Option<u8> {
     }
 }
 
-/// The dem texel for a pixel: the block's ref, and on a NODATA texel the
-/// parents below it — a merged cell can carry elevation only inside the
-/// newer bake's footprint while an older, coarser bake covers the rest.
+/// The dem texel for a pixel: the block's ref, and on a NODATA texel the parents below it — a merged cell can carry elevation only inside the newer bake's footprint while an older, coarser bake covers the rest.
 #[inline(always)]
 fn dem_texel(dem: &DemRef, pool: &Pool, diamond: u8, uq: i64, vq: i64) -> Option<u64> {
     let mut r = *dem;
@@ -474,9 +447,7 @@ fn render_block_interp(
             n_vec += 1;
         }
     }
-    // Finest ref first: a parent-fallback ref covers its resident fine
-    // siblings' footprints too, so first-match must try the fine cell before
-    // the parent or the block paints coarse where sharp data is resident.
+    // Finest ref first: a parent-fallback ref covers its resident fine siblings' footprints too, so first-match must try the fine cell before the parent or the block paints coarse where sharp data is resident.
     dem_refs[..n_dem].sort_by_key(|(_, r)| match r {
         DemRef::Cell { prefix_shift, .. } => *prefix_shift,
         DemRef::None => u32::MAX,
@@ -513,8 +484,7 @@ fn render_block_interp(
         } else {
             for px in row.iter_mut() {
                 let raw = raw_of(d, uq, vq);
-                // Match against each ref's RESOLVED (prefix, shift): a ref
-                // that fell back to a parent covers many nominal prefixes.
+                // Match against each ref's RESOLVED (prefix, shift): a ref that fell back to a parent covers many nominal prefixes.
                 let mut dref = DemRef::None;
                 for (_, r) in &dem_refs[..n_dem] {
                     if let DemRef::Cell { prefix, prefix_shift, .. } = r {
@@ -525,9 +495,7 @@ fn render_block_interp(
                     }
                 }
                 if matches!(dref, DemRef::None) {
-                    // Boundary sliver: the pixel's cell wasn't sampled by any
-                    // corner. Rare (sub-texel band along cell edges) — a full
-                    // probe here is cheap and makes coverage exact.
+                    // Boundary sliver: the pixel's cell wasn't sampled by any corner. Rare (sub-texel band along cell edges) — a full probe here is cheap and makes coverage exact.
                     dref = resolve_dem(pool, dem_depth, raw);
                 }
                 let mut vref = VecRef::None;
@@ -550,8 +518,7 @@ fn render_block_interp(
     }
 }
 
-/// Diamond-straddle fallback: exact per-pixel encode restricted to the
-/// corner diamonds. Rare (a few blocks per screen at most, usually zero).
+/// Diamond-straddle fallback: exact per-pixel encode restricted to the corner diamonds. Rare (a few blocks per screen at most, usually zero).
 #[allow(clippy::too_many_arguments)]
 fn render_block_exact(
     band: &mut [u32],
@@ -604,10 +571,7 @@ mod tests {
         assert_eq!(select_depth(100.0, 11, 13), MIN_DEPTH);
     }
 
-    /// One synthetic flat cell at depth 6; a rendered frame must light it
-    /// exactly as the compose math says, through the whole block/page-table
-    /// path (including parent fallback from the nominal depth). With a
-    /// forest over half of it, the land tint shows exactly there.
+    /// One synthetic flat cell at depth 6; a rendered frame must light it exactly as the compose math says, through the whole block/page-table path (including parent fallback from the nominal depth). With a forest over half of it, the land tint shows exactly there.
     #[test]
     fn frame_matches_compose_reference() {
         let mut pool = Pool::default();

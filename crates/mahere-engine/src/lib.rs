@@ -1,8 +1,4 @@
-//! mahere's host-independent map core — the #pagetable edition. A frame is
-//! fetches: 32 px block grid → diamond UV → page table → plane fetch → LUT
-//! composite. No vectors, no reservoir, no source data at runtime: the
-//! renderer's entire diet is baked cells served by a CellStore through the
-//! clipmap residency layer. Frontends feed input and blit `canvas`.
+//! mahere's host-independent map core — the #pagetable edition. A frame is fetches: 32 px block grid → diamond UV → page table → plane fetch → LUT composite. No vectors, no reservoir, no source data at runtime: the renderer's entire diet is baked cells served by a CellStore through the clipmap residency layer. Frontends feed input and blit `canvas`.
 
 pub mod raster;
 pub mod residency;
@@ -19,8 +15,7 @@ use residency::{CellStore, Residency};
 pub const PPD_REF: f64 = 6000.;
 pub const BG_RGB: u32 = 0x12141A;
 
-/// View state in absolute WGS84 degrees; ppd = pixels per degree latitude;
-/// bearing = radians the view is rotated (0 = north-up).
+/// View state in absolute WGS84 degrees; ppd = pixels per degree latitude; bearing = radians the view is rotated (0 = north-up).
 #[derive(Clone, Copy)]
 pub struct Camera {
     pub lat: f64,
@@ -34,8 +29,7 @@ impl Camera {
         self.lat.to_radians().cos()
     }
 
-    /// Screen basis in local east/north: up = (sin B, cos B), right =
-    /// (cos B, −sin B). B = 0 is north-up.
+    /// Screen basis in local east/north: up = (sin B, cos B), right = (cos B, −sin B). B = 0 is north-up.
     pub fn geo_to_screen(&self, lat: f64, lon: f64, w: usize, h: usize) -> (f64, f64) {
         let e = (lon - self.lon) * self.ppd * self.coslat();
         let n = (lat - self.lat) * self.ppd;
@@ -66,9 +60,7 @@ pub struct GpsFix {
     pub accuracy_m: f32,
 }
 
-/// The map: all state and rendering, no host. Frontends call the input
-/// methods, drive `tick` until `converged`, and blit `canvas` (0xRRGGBB,
-/// row-major) after `render`.
+/// The map: all state and rendering, no host. Frontends call the input methods, drive `tick` until `converged`, and blit `canvas` (0xRRGGBB, row-major) after `render`.
 pub struct MapCore {
     pub cam: Camera,
     res: Residency,
@@ -86,8 +78,7 @@ pub struct MapCore {
     /// Measured cost of the last `render` call in milliseconds.
     pub last_frame_ms: f32,
     pub last_straddle_blocks: usize,
-    /// Something changed since the last render (camera, sun, GPS). Reported
-    /// by `tick` so shells that only draw on demand get a frame.
+    /// Something changed since the last render (camera, sun, GPS). Reported by `tick` so shells that only draw on demand get a frame.
     dirty: bool,
 }
 
@@ -225,8 +216,7 @@ impl MapCore {
 
     // ==================== PROGRESS ====================
 
-    /// Integrate async-loaded cells. True if a redraw is due: cells arrived
-    /// or the camera/sun/GPS changed since the last render.
+    /// Integrate async-loaded cells. True if a redraw is due: cells arrived or the camera/sun/GPS changed since the last render.
     pub fn tick(&mut self, _w: usize, _h: usize) -> bool {
         self.res.drain() > 0 || self.dirty
     }
@@ -241,8 +231,7 @@ impl MapCore {
 
     // ==================== RENDER ====================
 
-    /// Render the full frame into `self.canvas` (visible 0xRRGGBB). Cheap by
-    /// construction (fetch + composite), so it runs every host frame.
+    /// Render the full frame into `self.canvas` (visible 0xRRGGBB). Cheap by construction (fetch + composite), so it runs every host frame.
     pub fn render(&mut self, w: usize, h: usize) {
         let t0 = Instant::now();
         self.dirty = false;
@@ -336,8 +325,7 @@ pub fn draw_segment(
     let pad = half_w + 1.0;
     let bx0 = (x0.min(x1) - pad).floor().max(0.) as usize;
     let by0 = (y0.min(y1) - pad).floor().max(0.) as usize;
-    // Clamp through isize and floor at 0: a segment fully off-canvas yields a
-    // negative bound, and a bare `as usize` would wrap it past the guard.
+    // Clamp through isize and floor at 0: a segment fully off-canvas yields a negative bound, and a bare `as usize` would wrap it past the guard.
     let bx1 = ((x0.max(x1) + pad).ceil() as isize).clamp(0, w as isize) as usize;
     let by1 = ((y0.max(y1) + pad).ceil() as isize).clamp(0, h as isize) as usize;
     if bx0 >= bx1 || by0 >= by1 {
@@ -428,8 +416,7 @@ mod tests {
         }
     }
 
-    /// Shells that draw on demand rely on `tick` to report camera changes
-    /// (the Android two-finger path has no redraw request of its own).
+    /// Shells that draw on demand rely on `tick` to report camera changes (the Android two-finger path has no redraw request of its own).
     #[test]
     fn tick_reports_camera_changes() {
         let cam = Camera { lat: 46.2, lon: -121.5, ppd: 2800.0, bearing: 0.0 };

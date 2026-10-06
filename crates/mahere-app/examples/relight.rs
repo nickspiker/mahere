@@ -1,6 +1,4 @@
-// Headless pipeline check: load cells for Mt Adams, settle residency, render
-// at two sun azimuths from the SAME resident cells (zero re-bakes), plus a
-// rotation render. Prints frame times — the perf receipt.
+// Headless pipeline check: load cells for Mt Adams, settle residency, render at two sun azimuths from the SAME resident cells (zero re-bakes), plus a rotation render. Prints frame times — the perf receipt.
 use mahere_engine::{Camera, MapCore, residency::DirStore};
 
 fn save(path: &str, canvas: &[u32], w: usize, h: usize) {

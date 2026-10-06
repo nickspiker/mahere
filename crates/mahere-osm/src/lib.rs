@@ -1,22 +1,13 @@
-//! OSM ingest boundary. This is the one crate where protobuf exists: OSM's
-//! distribution format (.osm.pbf) is read here and nothing protobuf-shaped
-//! leaves. Every coordinate is round-tripped through [`mahere_coord::Coord`]
-//! on the way out, so downstream consumers see codec-quantized positions —
-//! the same positions cells will carry.
+//! OSM ingest boundary. This is the one crate where protobuf exists: OSM's distribution format (.osm.pbf) is read here and nothing protobuf-shaped leaves. Every coordinate is round-tripped through [`mahere_coord::Coord`] on the way out, so downstream consumers see codec-quantized positions — the same positions cells will carry.
 //!
-//! Three parallel passes over the extract: relations (multipolygon areas),
-//! ways (lines, closed-way areas, relation members), then only the
-//! referenced nodes. Waterways get a weight from their upstream network
-//! length — the catchment proxy OSM can give — so a map can draw the
-//! Waikato and a headwater trickle differently without a styling table.
+//! Three parallel passes over the extract: relations (multipolygon areas), ways (lines, closed-way areas, relation members), then only the referenced nodes. Waterways get a weight from their upstream network length — the catchment proxy OSM can give — so a map can draw the Waikato and a headwater trickle differently without a styling table.
 
 use std::collections::HashMap;
 
 use mahere_coord::Coord;
 use osmpbf::{Element, ElementReader};
 
-/// Road / trail classification, ordered major → minor. Ordering is the
-/// default draw priority (minor classes draw first, major on top).
+/// Road / trail classification, ordered major → minor. Ordering is the default draw priority (minor classes draw first, major on top).
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 #[repr(u8)]
 pub enum RoadClass {
@@ -40,8 +31,7 @@ pub enum RoadClass {
 pub const CLASS_COUNT: usize = 12;
 
 impl RoadClass {
-    /// Map an OSM `highway=` tag value. `None` = a highway type mahere
-    /// doesn't draw (construction, proposed, bus_stop, ...).
+    /// Map an OSM `highway=` tag value. `None` = a highway type mahere doesn't draw (construction, proposed, bus_stop, ...).
     fn from_tag(v: &str) -> Option<RoadClass> {
         use RoadClass::*;
         Some(match v {
@@ -100,9 +90,7 @@ impl RoadClass {
     }
 }
 
-/// Land cover and water areas: what's on the ground. Ordered so that a
-/// higher class wins where polygons overlap (water over everything,
-/// built-up over vegetation, vegetation over the generic classes).
+/// Land cover and water areas: what's on the ground. Ordered so that a higher class wins where polygons overlap (water over everything, built-up over vegetation, vegetation over the generic classes).
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 #[repr(u8)]
 pub enum AreaClass {
@@ -164,10 +152,8 @@ impl AreaClass {
     }
 }
 
-/// One drawable way. Points are (lat, lon) degrees, already quantized by a
-/// round trip through the mahere coordinate codec. `weight` is 0..1:
-/// for waterways, log-scaled upstream network length (a catchment proxy);
-/// for everything else it's unused (width comes from the class).
+/// One drawable way. Points are (lat, lon) degrees, already quantized by a round trip through the mahere coordinate codec. `weight` is 0..1:
+/// for waterways, log-scaled upstream network length (a catchment proxy); for everything else it's unused (width comes from the class).
 pub struct Road {
     pub class: RoadClass,
     pub pts: Vec<(f32, f32)>,
@@ -175,10 +161,7 @@ pub struct Road {
 }
 
 impl Road {
-    /// Stamp width in meters: the class width, and for waterways 1.5 m at
-    /// a headwater growing to ~20 m for a major river (big rivers also
-    /// carry riverbank polygons in the water layer, which give the true
-    /// width).
+    /// Stamp width in meters: the class width, and for waterways 1.5 m at a headwater growing to ~20 m for a major river (big rivers also carry riverbank polygons in the water layer, which give the true width).
     pub fn width_m(&self) -> f32 {
         match self.class {
             RoadClass::Waterway => 1.5 + 18.0 * self.weight * self.weight * self.weight,
@@ -186,8 +169,7 @@ impl Road {
         }
     }
 
-    /// Peak coverage at the centreline: the NZ render's log-brightness, on
-    /// the waterway's weight; everything else is opaque.
+    /// Peak coverage at the centreline: the NZ render's log-brightness, on the waterway's weight; everything else is opaque.
     pub fn cov_max(&self) -> u8 {
         match self.class {
             RoadClass::Waterway => (120.0 + 135.0 * self.weight) as u8,
@@ -196,8 +178,7 @@ impl Road {
     }
 }
 
-/// One polygon feature: rings (outer and inner alike — even-odd fill sorts
-/// them out) of codec-quantized (lat, lon) points.
+/// One polygon feature: rings (outer and inner alike — even-odd fill sorts them out) of codec-quantized (lat, lon) points.
 pub struct Area {
     pub class: AreaClass,
     pub rings: Vec<Vec<(f32, f32)>>,
@@ -365,8 +346,7 @@ pub fn load_features(path: &str) -> Result<Features, osmpbf::Error> {
 }
 
 /// Join way fragments end-to-end by shared node ids into closed rings.
-/// Fragments that never close are dropped (a broken relation draws nothing
-/// rather than a wrong fill).
+/// Fragments that never close are dropped (a broken relation draws nothing rather than a wrong fill).
 fn assemble_rings(parts: &[&Vec<i64>]) -> Vec<Vec<i64>> {
     let mut used = vec![false; parts.len()];
     let mut by_end: HashMap<i64, Vec<usize>> = HashMap::new();
@@ -404,11 +384,7 @@ fn assemble_rings(parts: &[&Vec<i64>]) -> Vec<Vec<i64>> {
     rings
 }
 
-/// Waterway weight 0..1 from upstream network length: a way's length plus
-/// everything that flows into it (OSM draws waterways in flow direction,
-/// so a tributary's last node lies on its receiver). Log-scaled: 0.1 km of
-/// headwater is 0, 1000 km of river is 1 — the NZ render's catchment rule
-/// with the data OSM actually has.
+/// Waterway weight 0..1 from upstream network length: a way's length plus everything that flows into it (OSM draws waterways in flow direction, so a tributary's last node lies on its receiver). Log-scaled: 0.1 km of headwater is 0, 1000 km of river is 1 — the NZ render's catchment rule with the data OSM actually has.
 fn waterway_weights(lines: &[(RoadClass, Vec<i64>)], locate: &dyn Fn(i64) -> Option<(f32, f32)>) -> Vec<f32> {
     let n = lines.len();
     let mut weights = vec![0.0f32; n];

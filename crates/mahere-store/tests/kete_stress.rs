@@ -1,6 +1,4 @@
-//! Direct interrogation of kete/manifestus overwrite visibility — written
-//! after a false alarm (a swallowed identity-scope error masqueraded as
-//! "rapid overwrites vanish"), to establish the engine's actual guarantees.
+//! Direct interrogation of kete/manifestus overwrite visibility — written after a false alarm (a swallowed identity-scope error masqueraded as "rapid overwrites vanish"), to establish the engine's actual guarantees.
 //! One test fn: the vault-dir override is process-global.
 
 use std::sync::Arc;
@@ -58,9 +56,7 @@ fn overwrite_visibility_gauntlet() {
         "rewrite after delete must be visible"
     );
 
-    // 4. Concurrent writers: distinct keys from 4 threads, plus all four
-    // hammering one shared key. Shared-key winner is nondeterministic, but
-    // every read must return a COMPLETE value some thread wrote.
+    // 4. Concurrent writers: distinct keys from 4 threads, plus all four hammering one shared key. Shared-key winner is nondeterministic, but every read must return a COMPLETE value some thread wrote.
     let mut handles = Vec::new();
     for t in 0u32..4 {
         let s = store.clone();

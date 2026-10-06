@@ -1,16 +1,9 @@
-//! mahere on Android: fluor's AndroidShell hosting the shared MapCore, plus
-//! the raw two-finger gesture solve and GPS.
+//! mahere on Android: fluor's AndroidShell hosting the shared MapCore, plus the raw two-finger gesture solve and GPS.
 //!
-//! Gesture philosophy (Nick's spec): no gesture recognizers, no slop radius,
-//! no focal-point abstraction. Two fingers are two point correspondences;
-//! with rotation locked the solve is scale = finger-distance ratio and the
-//! geographic midpoint pinned under the screen midpoint — applied per raw
-//! MotionEvent, so the map locks to the fingers from the first event.
+//! Gesture philosophy (Nick's spec): no gesture recognizers, no slop radius, no focal-point abstraction. Two fingers are two point correspondences; with rotation locked the solve is scale = finger-distance ratio and the geographic midpoint pinned under the screen midpoint — applied per raw MotionEvent, so the map locks to the fingers from the first event.
 //! Rotation joins when the camera grows a bearing.
 //!
-//! Single-finger events forward into fluor's AndroidShell (which synthesizes
-//! MouseInput/CursorMoved); the shell's synthetic MouseWheel (meant for
-//! scrolly apps) is swallowed — zoom belongs to the two-finger solve.
+//! Single-finger events forward into fluor's AndroidShell (which synthesizes MouseInput/CursorMoved); the shell's synthetic MouseWheel (meant for scrolly apps) is swallowed — zoom belongs to the two-finger solve.
 
 use fluor::coord::Coord as Px;
 use fluor::event::{CursorIcon, ElementState, Event as FEvent, MouseButton};
@@ -44,8 +37,7 @@ pub struct AndroidApp {
     dragging: bool,
     last_cursor: (f64, f64),
     two: Option<TwoFinger>,
-    /// Re-anchor the next CursorMoved instead of panning (finger handoff
-    /// after a pinch would otherwise jump by the stale delta).
+    /// Re-anchor the next CursorMoved instead of panning (finger handoff after a pinch would otherwise jump by the stale delta).
     suppress_move: bool,
     centered_once: bool,
     store: Option<std::sync::Arc<mahere_store::FlatStorage>>,
@@ -69,11 +61,7 @@ impl AndroidApp {
         self.dragging = false;
     }
 
-    /// Full 4-DOF similarity solve: two finger correspondences exactly
-    /// determine pan+rotate+zoom. Scale from the distance ratio, bearing
-    /// from the finger-vector angle (screen angle of a fixed geo segment is
-    /// -(B + its ENU angle), so B = B0 + (alpha0 - alpha)), then the
-    /// geographic midpoint pinned under the screen midpoint.
+    /// Full 4-DOF similarity solve: two finger correspondences exactly determine pan+rotate+zoom. Scale from the distance ratio, bearing from the finger-vector angle (screen angle of a fixed geo segment is -(B + its ENU angle), so B = B0 + (alpha0 - alpha)), then the geographic midpoint pinned under the screen midpoint.
     fn two_update(&mut self, x0: f64, y0: f64, x1: f64, y1: f64) {
         let Some(t) = &self.two else { return };
         let d = ((x1 - x0).powi(2) + (y1 - y0).powi(2)).sqrt().max(1.0);
@@ -102,8 +90,7 @@ impl AndroidApp {
             self.map.camera_moved(self.w, self.h);
         }
         self.map.set_gps(fix);
-        // Track recording: every fix into the vault (chunk-flushed), the
-        // session (camera + sun) refreshed every tenth fix.
+        // Track recording: every fix into the vault (chunk-flushed), the session (camera + sun) refreshed every tenth fix.
         if let Some(rec) = &mut self.recorder {
             let elev = self.map.gps_elevation().unwrap_or(f32::NAN) as f64;
             rec.on_fix(fix.lat, fix.lon, elev);
@@ -173,8 +160,7 @@ impl FluorApp for AndroidApp {
                 self.last_cursor = (x, y);
                 EventResponse::Handled
             }
-            // The shell synthesizes MouseWheel from touch-drags for scrolly
-            // apps; swallowed — zoom is the two-finger solve's job.
+            // The shell synthesizes MouseWheel from touch-drags for scrolly apps; swallowed — zoom is the two-finger solve's job.
             FEvent::MouseWheel { .. } => EventResponse::Handled,
             _ => EventResponse::Pass,
         }
@@ -194,8 +180,7 @@ impl FluorApp for AndroidApp {
         if self.map.needs_render(w, h) {
             self.map.render(w, h);
         }
-        // ANativeWindow RGBA_8888 lands R in the low byte: swap R/B vs the
-        // desktop path or Puget Sound renders brown and the pin orange.
+        // ANativeWindow RGBA_8888 lands R in the low byte: swap R/B vs the desktop path or Puget Sound renders brown and the pin orange.
         let n = (w * h).min(target.len()).min(self.map.canvas.len());
         for (out, &rgb) in target[..n].iter_mut().zip(&self.map.canvas[..n]) {
             *out = pack_argb(rgb as u8, (rgb >> 8) as u8, (rgb >> 16) as u8, 255);
@@ -231,8 +216,7 @@ pub extern "system" fn Java_nz_mahere_app_MahereActivity_nativeInit(
     };
     // The vault: session, tracks, and the on-device cell cache (kete).
     let store = mahere_store::open(Some(&dir)).ok();
-    // Cells stream from the bucket through the vault; `cells-local` (pushed
-    // by hand) overrides for offline development.
+    // Cells stream from the bucket through the vault; `cells-local` (pushed by hand) overrides for offline development.
     let local = std::path::PathBuf::from(format!("{dir}/cells-local"));
     let cell_store: std::sync::Arc<dyn CellStore> = if local.is_dir() {
         std::sync::Arc::new(DirStore(local))
@@ -286,8 +270,7 @@ pub extern "system" fn Java_nz_mahere_app_MahereActivity_nativeResize(
     if ptr != 0 {
         let s = shell(ptr);
         s.resize(width as u32, height as u32);
-        // A restored surface arrives with undefined buffers; same-size
-        // resizes must still repaint everything.
+        // A restored surface arrives with undefined buffers; same-size resizes must still repaint everything.
         s.app().map.mark_dirty();
     }
 }
