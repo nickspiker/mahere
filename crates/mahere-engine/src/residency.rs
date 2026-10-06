@@ -151,6 +151,7 @@ pub struct Residency {
     pub frame: u64,
     /// The last missing list sent to the loader, so an unchanged one is not sent again.
     last_sent: Vec<CellKey>,
+    last_send_at: std::time::Instant,
 }
 
 const RETRY_AFTER: std::time::Duration = std::time::Duration::from_secs(3);
@@ -175,6 +176,7 @@ impl Residency {
             desired: FxHashSet::default(),
             frame: 0,
             last_sent: Vec::new(),
+            last_send_at: std::time::Instant::now(),
         }
     }
 
@@ -219,9 +221,11 @@ impl Residency {
             let (ku, kv) = (center.0 >> sh, center.1 >> sh);
             (cu.abs_diff(ku)).max(cv.abs_diff(kv))
         });
-        if list == self.last_sent {
+        // An unchanged list is still re-sent once a second: a cell the loader skipped as just-done can otherwise be waited on forever after a quick zoom out and back.
+        if list == self.last_sent && self.last_send_at.elapsed() < std::time::Duration::from_secs(1) {
             return;
         }
+        self.last_send_at = std::time::Instant::now();
         self.pending.clear();
         for &k in &list {
             self.pending.insert(k);
@@ -247,6 +251,8 @@ impl Residency {
 fn loader_thread(store: Arc<dyn CellStore>, want_rx: Receiver<WantList>, done_tx: Sender<Loaded>, pack_cpu: Arc<std::sync::atomic::AtomicBool>) {
     let chunk = rayon::current_num_threads().clamp(2, 8);
     let mut current: Option<WantList> = None;
+    // Cells finished in the last moment: a newer list arrives before the main side has drained them, and would load them twice.
+    let mut done: FxHashMap<CellKey, std::time::Instant> = FxHashMap::default();
     loop {
         if current.is_none() {
             match want_rx.recv() {
@@ -259,12 +265,17 @@ fn loader_thread(store: Arc<dyn CellStore>, want_rx: Receiver<WantList>, done_tx
         }
         let Some(w) = current.take() else { continue };
         let mut list = w.list;
+        let now = std::time::Instant::now();
+        done.retain(|_, t| now.duration_since(*t) < std::time::Duration::from_millis(800));
+        list.retain(|k| !done.contains_key(k));
         while !list.is_empty() {
             let n = list.len().min(chunk);
             let batch: Vec<CellKey> = list.drain(..n).collect();
             let pack = pack_cpu.load(std::sync::atomic::Ordering::Relaxed);
             let loaded: Vec<Loaded> = batch.par_iter().map(|&k| load_cell(&*store, k, pack)).collect();
+            let t = std::time::Instant::now();
             for l in loaded {
+                done.insert(l.key, t);
                 if done_tx.send(l).is_err() {
                     return;
                 }

@@ -386,8 +386,14 @@ impl MapCore {
                 let (az, alt) = sh::sun_position(lat, lon, now);
                 let (azr, altr) = (az.to_radians(), alt.to_radians());
                 let enu = [(azr.sin() * altr.cos()) as f32, (azr.cos() * altr.cos()) as f32, altr.sin() as f32];
+                // Into the device frame, then turned about the screen by the difference between where the phone points and where the map's up points: the lighting the phone would show if it were turned to match the map, tilt kept. With follow heading on the two agree and nothing turns.
                 let r = self.device_rot;
-                let dev = |v: [f32; 3]| [r[0] * v[0] + r[3] * v[1] + r[6] * v[2], r[1] * v[0] + r[4] * v[1] + r[7] * v[2], r[2] * v[0] + r[5] * v[1] + r[8] * v[2]];
+                let (sd, cd) = (self.device_heading as f64 - self.cam.bearing.to_degrees()).to_radians().sin_cos();
+                let (sd, cd) = (sd as f32, cd as f32);
+                let dev = |v: [f32; 3]| {
+                    let d = [r[0] * v[0] + r[3] * v[1] + r[6] * v[2], r[1] * v[0] + r[4] * v[1] + r[7] * v[2], r[2] * v[0] + r[5] * v[1] + r[8] * v[2]];
+                    [d[0] * cd - d[1] * sd, d[0] * sd + d[1] * cd, d[2]]
+                };
                 let strength = (alt as f32 / 5.0).clamp(0.0, 1.0);
                 self.env = sh::Sh9::environment(dev(enu), strength, dev([0.0, 0.0, 1.0]));
             } else if self.luts_sun.0 != self.sun_az || self.luts_sun.1 != self.sun_alt || self.device_heading != 0.0 {
