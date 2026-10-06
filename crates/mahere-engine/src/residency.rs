@@ -138,6 +138,9 @@ pub struct Residency {
 
 const RETRY_AFTER: std::time::Duration = std::time::Duration::from_secs(3);
 
+/// Cells at this depth and above are never evicted.
+pub const PIN_DEPTH: u8 = 8;
+
 impl Residency {
     pub fn new(store: Arc<dyn CellStore>) -> Residency {
         let (want_tx, want_rx) = channel::<WantList>();
@@ -176,7 +179,8 @@ impl Residency {
     pub fn want(&mut self, mut list: Vec<CellKey>, center: (u64, u64)) {
         self.desired = list.iter().copied().collect();
         let desired = &self.desired;
-        self.pool.map.retain(|k, _| desired.contains(k));
+        // The coarse levels stay resident wherever the view goes: a zoom out always has a frame to show while finer cells arrive, and they are few and small.
+        self.pool.map.retain(|k, _| desired.contains(k) || k.depth <= PIN_DEPTH);
         self.pending.retain(|k| desired.contains(k));
         let now = std::time::Instant::now();
         self.failed.retain(|k, t| desired.contains(k) && now.duration_since(*t) < RETRY_AFTER);
@@ -388,8 +392,9 @@ mod tests {
     #[test]
     fn view_only_residency() {
         let mut r = Residency::new(Arc::new(Empty));
-        let a = CellKey { depth: 8, prefix: 0x3_0000 };
-        let b = CellKey { depth: 8, prefix: 0x3_0001 };
+        // Deeper than PIN_DEPTH: the coarse levels are never evicted.
+        let a = CellKey { depth: 12, prefix: 0x3_0000 };
+        let b = CellKey { depth: 12, prefix: 0x3_0001 };
         r.want(vec![a], (0, 0));
         settle(&mut r);
         assert!(r.pool.map.contains_key(&a));

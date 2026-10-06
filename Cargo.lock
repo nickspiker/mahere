@@ -1552,6 +1552,7 @@ dependencies = [
  "libc",
  "mahere-engine",
  "mahere-gpu",
+ "mahere-panel",
  "mahere-store",
  "ndk",
  "ndk-sys",
@@ -1567,6 +1568,7 @@ dependencies = [
  "fluor",
  "mahere-coord",
  "mahere-engine",
+ "mahere-panel",
  "mahere-store",
  "mahere-tiles",
  "png",
@@ -1602,6 +1604,7 @@ version = "0.1.0"
 dependencies = [
  "bytemuck",
  "mahere-engine",
+ "mahere-panel",
  "mahere-tiles",
  "png",
  "pollster",
@@ -1615,6 +1618,15 @@ version = "0.1.0"
 dependencies = [
  "mahere-coord",
  "osmpbf",
+ "vsf",
+]
+
+[[package]]
+name = "mahere-panel"
+version = "0.1.0"
+dependencies = [
+ "fluor",
+ "mahere-engine",
  "vsf",
 ]
 

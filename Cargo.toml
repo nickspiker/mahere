@@ -9,6 +9,7 @@ default-members = [
     "crates/mahere-engine",
     "crates/mahere-gpu",
     "crates/mahere-osm",
+    "crates/mahere-panel",
     "crates/mahere-store",
 ]
 

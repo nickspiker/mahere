@@ -10,6 +10,7 @@ use fluor::host::chrome_widget::DefaultChrome;
 use fluor::paint::{Clip, HitId, pack_argb};
 use mahere_engine::residency::{CellStore, DirStore, HttpStore, TieredStore, DEFAULT_CELLS_URL};
 use mahere_engine::{Camera, MapCore};
+use mahere_panel::{Panel, Readouts};
 use std::time::Instant;
 
 struct MahereApp {
@@ -21,6 +22,7 @@ struct MahereApp {
     last_cursor: (f64, f64),
     store: Option<std::sync::Arc<mahere_store::FlatStorage>>,
     last_save: Instant,
+    panel: Panel,
 }
 
 impl MahereApp {
@@ -41,6 +43,7 @@ impl MahereApp {
             last_cursor: (0., 0.),
             store: None,
             last_save: Instant::now(),
+            panel: Panel::new(),
         }
     }
 
@@ -131,6 +134,12 @@ impl FluorApp for MahereApp {
                 }
                 if cy < chrome::strip_height(ctx.viewport) {
                     return EventResponse::StartWindowDrag;
+                }
+                let mut mask = self.map.layers();
+                if self.panel.tap(cx as f32, cy as f32, w, h, &mut mask) {
+                    self.map.set_layers(mask);
+                    ctx.window.request_redraw();
+                    return EventResponse::Handled;
                 }
                 self.dragging = true;
                 EventResponse::Handled
@@ -309,8 +318,16 @@ impl FluorApp for MahereApp {
             self.map.render(w, h);
             self.chrome.invalidate_bg();
         }
-        // fluor composites front-to-back: the map is the chrome group's BACKGROUND layer, never painted straight over `target`.
-        let map = &self.map.canvas;
+        // The panel over the map, then fluor composites front-to-back: the map is the chrome group's BACKGROUND layer, never painted straight over `target`.
+        let c = self.map.cam;
+        let mut heading = c.bearing.to_degrees().rem_euclid(360.0);
+        if heading > 180.0 {
+            heading -= 360.0;
+        }
+        let readouts = Readouts { lat: c.lat, lon: c.lon, elev: self.map.elevation_at(c.lat, c.lon), heading_deg: heading, m_per_px: 111_320.0 / c.ppd, frame_ms: self.map.last_frame_ms, resident: self.map.pool().map.len() };
+        self.panel.paint(w, h, self.map.layers(), &readouts);
+        let mut map = self.map.canvas.clone();
+        self.panel.composite_rgb(&mut map, w, h);
         self.chrome.rasterize_bg(ctx.damage, |c| {
             let n = c.pixels.len().min(map.len());
             for (out, &rgb) in c.pixels[..n].iter_mut().zip(&map[..n]) {

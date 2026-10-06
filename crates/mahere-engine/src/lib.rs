@@ -276,15 +276,25 @@ impl MapCore {
         p
     }
 
-    /// The screen-space marks (GPS pin, compass) on a cleared canvas, for a renderer that composites them itself. 0xRRGGBB over black; the ink's brightness is its coverage.
-    pub fn overlay(&mut self, w: usize, h: usize) -> &[u32] {
+    /// The screen-space marks (GPS pin, compass) on a cleared canvas, for a renderer that composites them itself. 0xRRGGBB over black; the ink's brightness is its coverage. `with_pin` false leaves the pin out for a renderer that draws it itself (the GPU, where the pin would otherwise force a full overlay upload on every pan).
+    pub fn overlay(&mut self, w: usize, h: usize, with_pin: bool) -> &[u32] {
         let mut scratch = std::mem::take(&mut self.canvas);
         scratch.clear();
         scratch.resize(w * h, 0);
         self.canvas = scratch;
-        self.draw_gps(w, h);
+        if with_pin {
+            self.draw_gps(w, h);
+        }
         self.draw_compass(w, h);
         &self.canvas
+    }
+
+    /// The GPS pin on screen: centre and accuracy radius in pixels, for a renderer that draws it itself.
+    pub fn gps_screen(&self, w: usize, h: usize) -> Option<(f32, f32, f32)> {
+        let g = self.gps?;
+        let (x, y) = self.cam.geo_to_screen(g.lat, g.lon, w, h);
+        let px_per_m = (self.cam.ppd / 111_320.0) as f32;
+        Some((x as f32, y as f32, (g.accuracy_m * px_per_m).clamp(6.0, 4000.0)))
     }
 
     /// Everything a frame needs before any pixel: drain arrivals, lighting for the current sun and bearing, depth selection, the contour interval fit to the previous frame's range.

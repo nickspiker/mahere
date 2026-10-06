@@ -2,6 +2,7 @@
 
 use mahere_engine::MapCore;
 use mahere_gpu::GpuMap;
+use mahere_panel::{Panel, Readouts};
 use ndk::native_window::NativeWindow;
 use raw_window_handle::{AndroidDisplayHandle, AndroidNdkWindowHandle, RawDisplayHandle, RawWindowHandle};
 
@@ -22,7 +23,7 @@ pub struct GpuHost {
     report: std::time::Instant,
 }
 
-type OverlayStamp = (u64, u64, u64, u64, Option<(u64, u64, u32)>, u32, u32);
+type OverlayStamp = (u64, u64, u64, u64, Option<(u64, u64, u32)>, u32, u32, bool, u32);
 
 impl GpuHost {
     pub fn new(window: &NativeWindow) -> Option<GpuHost> {
@@ -92,7 +93,7 @@ impl GpuHost {
     }
 
     /// One frame: tick, plan, mirror the pool, marks when they changed, draw, present. Returns whether more frames are wanted (cells still arriving).
-    pub fn draw(&mut self, map: &mut MapCore, w: u32, h: u32) -> bool {
+    pub fn draw(&mut self, map: &mut MapCore, panel: &mut Panel, w: u32, h: u32) -> bool {
         if w == 0 || h == 0 {
             return false;
         }
@@ -113,14 +114,30 @@ impl GpuHost {
             );
             self.configured = (w, h);
         }
-        map.tick(w as usize, h as usize);
+        // Nothing changed and nothing arrived: the surface keeps its last image, and the CPU keeps its budget.
+        let fresh = self.configured != (w, h) || self.frames == 0;
+        if !map.tick(w as usize, h as usize) && !fresh && !panel.take_dirty() {
+            return !map.converged();
+        }
         let plan = map.plan(w as usize, h as usize);
         self.map.sync(&self.device, &self.queue, map.pool());
         let c = map.cam;
-        let stamp: OverlayStamp = (c.lat.to_bits(), c.lon.to_bits(), c.ppd.to_bits(), c.bearing.to_bits(), map.gps.map(|g| (g.lat.to_bits(), g.lon.to_bits(), g.accuracy_m.to_bits())), w, h);
+        let mask = map.layers();
+        let mask_bits = (mask.dem as u32) | (mask.land as u32) << 1 | (mask.water as u32) << 2 | (mask.line as u32) << 3 | (mask.debug as u32) << 4 | (mask.imagery as u32) << 5 | (mask.contours as u32) << 6 | (mask.slope as u32) << 7 | (mask.canopy as u32) << 8;
+        // The overlay repaints when what it shows changes: the panel (open: its readouts follow the camera), the compass (bearing), the size. The pin is the shader's.
+        let cam_part = if panel.is_open() { (c.lat.to_bits(), c.lon.to_bits(), c.ppd.to_bits()) } else { (0, 0, 0) };
+        let stamp: OverlayStamp = (cam_part.0, cam_part.1, cam_part.2, c.bearing.to_bits(), None, w, h, panel.is_open(), mask_bits);
+        self.map.pin = map.gps_screen(w as usize, h as usize);
         if self.overlay_stamp != Some(stamp) {
-            let px = map.overlay(w as usize, h as usize).to_vec();
-            self.map.set_overlay(&self.device, &self.queue, w, h, &px);
+            let mut heading = c.bearing.to_degrees().rem_euclid(360.0);
+            if heading > 180.0 {
+                heading -= 360.0;
+            }
+            let readouts = Readouts { lat: c.lat, lon: c.lon, elev: map.elevation_at(c.lat, c.lon), heading_deg: heading, m_per_px: 111_320.0 / c.ppd, frame_ms: map.last_frame_ms, resident: map.pool().map.len() };
+            panel.paint(w as usize, h as usize, mask, &readouts);
+            let marks = map.overlay(w as usize, h as usize, false).to_vec();
+            let rgba = panel.overlay_rgba(&marks, w as usize, h as usize);
+            self.map.set_overlay_rgba(&self.device, &self.queue, w, h, &rgba);
             self.overlay_stamp = Some(stamp);
         }
         let frame = match self.surface.get_current_texture() {

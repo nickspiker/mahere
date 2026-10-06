@@ -16,6 +16,7 @@ use jni::objects::{JClass, JObject, JString};
 use jni::sys::{jboolean, jdouble, jfloat, jint, jlong};
 use mahere_engine::residency::{CellStore, DirStore, HttpStore, TieredStore, DEFAULT_CELLS_URL};
 use mahere_engine::{Camera, GpsFix, MapCore};
+use mahere_panel::Panel;
 use ndk::native_window::NativeWindow;
 use std::time::Instant;
 
@@ -49,6 +50,7 @@ pub struct AndroidApp {
     /// The GPU path, created on the first draw; None after a failure means the CPU present is in use.
     gpu: Option<GpuHost>,
     gpu_failed: bool,
+    panel: Panel,
 }
 
 impl AndroidApp {
@@ -144,6 +146,13 @@ impl FluorApp for AndroidApp {
     fn on_event(&mut self, event: &FEvent, ctx: &mut Context) -> EventResponse {
         match event {
             FEvent::MouseInput { state: ElementState::Pressed, button: MouseButton::Left } => {
+                // The panel first: the gear and its rows take the tap; the map gets the rest.
+                let mut mask = self.map.layers();
+                if self.panel.tap(ctx.cursor_x as f32, ctx.cursor_y as f32, self.w, self.h, &mut mask) {
+                    self.map.set_layers(mask);
+                    self.dragging = false;
+                    return EventResponse::Handled;
+                }
                 if self.two.is_none() {
                     self.dragging = true;
                     self.last_cursor = (ctx.cursor_x as f64, ctx.cursor_y as f64);
@@ -299,6 +308,7 @@ pub extern "system" fn Java_nz_mahere_app_MahereActivity_nativeInit(
         fixes_since_save: 0,
         gpu: None,
         gpu_failed: false,
+        panel: Panel::new(),
     };
     Box::into_raw(Box::new(AndroidShell::new(app, width as u32, height as u32))) as jlong
 }
@@ -347,11 +357,11 @@ pub extern "system" fn Java_nz_mahere_app_MahereActivity_nativeDraw(
                 }
             }
         }
-        let AndroidApp { gpu: Some(g), map, w, h, .. } = app else {
+        let AndroidApp { gpu: Some(g), map, panel, w, h, .. } = app else {
             return shell(ptr).draw(&window) as jboolean;
         };
         if g.ensure_window(&window) {
-            return g.draw(map, *w as u32, *h as u32) as jboolean;
+            return g.draw(map, panel, *w as u32, *h as u32) as jboolean;
         }
     }
     shell(ptr).draw(&window) as jboolean

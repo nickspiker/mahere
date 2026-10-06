@@ -1,0 +1,12 @@
+[package]
+name = "mahere-panel"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "mahere's on-map controls: a gear that shows and hides the layer toggles and readouts, painted with fluor's widgets into an overlay either renderer composites"
+
+[dependencies]
+mahere-engine = { path = "../mahere-engine" }
+fluor = { git = "https://github.com/nickspiker/fluor", rev = "d538a0a", default-features = false, features = ["std", "text"] }
+vsf = { git = "https://github.com/nickspiker/vsf", rev = "5f2bb06c8d96ee417a2571944882ef36d6c9ca8f" }

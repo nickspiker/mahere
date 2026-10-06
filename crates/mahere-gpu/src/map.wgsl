@@ -37,6 +37,7 @@ struct Uniforms {
     contour: vec4<f32>,
     depths: vec4<u32>,
     offset: vec4<f32>,
+    pin: vec4<f32>,
 };
 
 // a: diamond, depth, cu, cv. b: dem slot, line slot, land+water slot, img slot. c: flags. d: base, step, eu, nu. e: ev, nv, inv det.
@@ -388,7 +389,17 @@ fn fs_present(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         }
     }
     c = c / f32(s * s);
+    // The overlay is premultiplied: straight over.
     let o = textureLoad(overlay_tex, vec2<i32>(pos.xy), 0);
-    let a = max(max(o.r, o.g), o.b);
-    return vec4<f32>(c.rgb * (1.0 - a) + o.rgb, 1.0);
+    var rgb = c.rgb * (1.0 - o.a) + o.rgb;
+    // The GPS pin: an accuracy ring and a crosshair, feathered over a pixel, in the engine's pin blue.
+    if (U.pin.w > 0.5) {
+        let d = pos.xy - U.pin.xy;
+        let dist = length(d);
+        let ring = clamp(1.0 - abs(dist - U.pin.z) + 0.45, 0.0, 1.0);
+        let cross = select(0.0, clamp(1.6 - min(abs(d.x), abs(d.y)) + 0.5, 0.0, 1.0), max(abs(d.x), abs(d.y)) <= 9.0);
+        let cov = max(ring, cross);
+        rgb = mix(rgb, vec3<f32>(64.0, 156.0, 255.0) / 255.0, cov);
+    }
+    return vec4<f32>(rgb, 1.0);
 }

@@ -52,6 +52,7 @@ struct Uniforms {
     contour: [f32; 4],
     depths: [u32; 4],
     offset: [f32; 4],
+    pin: [f32; 4],
 }
 
 fn mask_bits(m: LayerMask) -> u32 {
@@ -185,6 +186,8 @@ pub struct GpuMap {
     pub scale: u32,
     /// Where inside a screen pixel the shader samples, in pixels; the CPU raster samples the top-left corner, which is (-0.5, -0.5) here, and the default centre is 0.
     pub sample_offset: [f32; 2],
+    /// The GPS pin, drawn by the present pass: screen centre and accuracy radius in pixels.
+    pub pin: Option<(f32, f32, f32)>,
 }
 
 impl GpuMap {
@@ -281,6 +284,7 @@ impl GpuMap {
             uploads: 0,
             scale: SCALE,
             sample_offset: [0.0, 0.0],
+            pin: None,
         }
     }
 
@@ -376,8 +380,30 @@ impl GpuMap {
         [self.dem.cap, self.line.cap, self.lw.cap, self.img.cap]
     }
 
-    /// The screen-space marks: 0xRRGGBB over black, the ink's brightness its coverage, `w × h`.
+    /// The screen overlay as premultiplied RGBA bytes, `w × h`: marks, panel, whatever the host composes over the map.
+    pub fn set_overlay_rgba(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, w: u32, h: u32, rgba: &[u8]) {
+        self.ensure_overlay(device, w, h);
+        let n = (w * h * 4) as usize;
+        if rgba.len() >= n {
+            write_layer(queue, &self.overlay.as_ref().unwrap().0, 0, w, h, 4, &rgba[..n]);
+        }
+    }
+
+    /// The engine's marks alone: 0xRRGGBB over black, the ink's brightness its coverage, `w × h`.
     pub fn set_overlay(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, w: u32, h: u32, pixels: &[u32]) {
+        let n = (w * h) as usize;
+        let mut bytes = vec![0u8; n * 4];
+        for (i, &p) in pixels.iter().take(n).enumerate() {
+            let (r, g, b) = ((p >> 16) as u8, (p >> 8) as u8, p as u8);
+            bytes[4 * i] = r;
+            bytes[4 * i + 1] = g;
+            bytes[4 * i + 2] = b;
+            bytes[4 * i + 3] = r.max(g).max(b);
+        }
+        self.set_overlay_rgba(device, queue, w, h, &bytes);
+    }
+
+    fn ensure_overlay(&mut self, device: &wgpu::Device, w: u32, h: u32) {
         if self.overlay.as_ref().is_none_or(|(_, _, ow, oh)| (*ow, *oh) != (w, h)) {
             let t = device.create_texture(&wgpu::TextureDescriptor {
                 label: Some("overlay"),
@@ -393,15 +419,6 @@ impl GpuMap {
             self.overlay = Some((t, v, w, h));
             self.present_bind = None;
         }
-        let n = (w * h) as usize;
-        let mut bytes = vec![0u8; n * 4];
-        for (i, &p) in pixels.iter().take(n).enumerate() {
-            bytes[4 * i] = (p >> 16) as u8;
-            bytes[4 * i + 1] = (p >> 8) as u8;
-            bytes[4 * i + 2] = p as u8;
-            bytes[4 * i + 3] = 255;
-        }
-        write_layer(queue, &self.overlay.as_ref().unwrap().0, 0, w, h, 4, &bytes);
     }
 
     fn ensure_targets(&mut self, device: &wgpu::Device, w: u32, h: u32) {
@@ -532,6 +549,10 @@ impl GpuMap {
             contour: [luts.contours.interval, luts.contours.index_every as f32, luts.contours.m_per_px, 0.0],
             depths: [plan.dem_depth as u32, plan.vec_depth as u32, 0, 0],
             offset: [self.sample_offset[0], self.sample_offset[1], 0.0, 0.0],
+            pin: match self.pin {
+                Some((x, y, r)) => [x, y, r, 1.0],
+                None => [0.0, 0.0, 0.0, 0.0],
+            },
         };
         queue.write_buffer(&self.uniforms, 0, bytemuck::bytes_of(&u));
 

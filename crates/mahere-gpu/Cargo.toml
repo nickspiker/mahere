@@ -23,3 +23,4 @@ wgpu = { version = "28", default-features = false, features = ["wgsl", "metal"] 
 [dev-dependencies]
 pollster = "0.4"
 png = "0.17"
+mahere-panel = { path = "../mahere-panel" }

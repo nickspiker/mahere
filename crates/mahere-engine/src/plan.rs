@@ -19,6 +19,9 @@ pub const SUB: usize = 4;
 /// Page table slots; a power of two, several times the largest resident set.
 pub const TABLE_N: usize = 4096;
 
+/// Depths at which the view's neighbouring cells are fetched ahead, so a zoom out is already covered.
+pub const PREFETCH_DEPTH: u8 = 10;
+
 pub const FLAG_DEM: u32 = 1;
 pub const FLAG_LINE: u32 = 2;
 pub const FLAG_LAND: u32 = 4;
@@ -128,13 +131,24 @@ pub fn plan_frame(w: usize, h: usize, cam: &Camera, pool: &Pool, dem_depth: u8, 
         })
         .collect();
 
-    // Desired set and the elevation range, from the lattice.
+    // Desired set and the elevation range, from the lattice. At the coarse depths the ring of neighbours comes too: a zoom out then lands on cells already resident instead of a blank screen (Nick 2026-10-06), and they are small.
     let mut desired: rustc_hash::FxHashSet<CellKey> = rustc_hash::FxHashSet::default();
     let mut elev = ElevRange::EMPTY;
     for c in &corners {
         let raw = raw_of(c.diamond, c.u, c.v);
         for d in MIN_DEPTH..=dem_depth.max(vec_depth) {
-            desired.insert(CellKey { depth: d, prefix: raw >> (60 - 2 * d as u32) });
+            let key = CellKey { depth: d, prefix: raw >> (60 - 2 * d as u32) };
+            desired.insert(key);
+            if d <= PREFETCH_DEPTH {
+                let (cu, cv) = key.grid();
+                let n = 1u64 << d;
+                for (du, dv) in [(-1i64, -1i64), (0, -1), (1, -1), (-1, 0), (1, 0), (-1, 1), (0, 1), (1, 1)] {
+                    let (nu, nv) = (cu as i64 + du, cv as i64 + dv);
+                    if nu >= 0 && nv >= 0 && (nu as u64) < n && (nv as u64) < n {
+                        desired.insert(CellKey::from_grid(key.diamond(), d, nu as u64, nv as u64));
+                    }
+                }
+            }
         }
         if let Some(t) = dem_texel(&resolve_dem(pool, dem_depth, raw), pool, c.diamond, c.u, c.v) {
             let eq = (t & 0xFFFF) as u16;

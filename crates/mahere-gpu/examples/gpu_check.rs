@@ -99,8 +99,19 @@ fn main() {
     let t = std::time::Instant::now();
     gpu.sync(&device, &queue, map.pool());
     let sync_ms = t.elapsed().as_secs_f32() * 1000.0;
-    let overlay = map.overlay(w, h).to_vec();
-    gpu.set_overlay(&device, &queue, w as u32, h as u32, &overlay);
+    let overlay = map.overlay(w, h, true).to_vec();
+    // MAHERE_PANEL=1 lays the open control panel over the GPU frame (the CPU frame has none, so the diff below is then meaningless).
+    if std::env::var("MAHERE_PANEL").as_deref() == Ok("1") {
+        let mut panel = mahere_panel::Panel::new();
+        panel.set_open(true);
+        let c = map.cam;
+        let readouts = mahere_panel::Readouts { lat: c.lat, lon: c.lon, elev: map.elevation_at(c.lat, c.lon), heading_deg: c.bearing.to_degrees(), m_per_px: 111_320.0 / c.ppd, frame_ms: cpu_ms, resident: map.pool().map.len() };
+        panel.paint(w, h, map.layers(), &readouts);
+        let rgba = panel.overlay_rgba(&overlay, w, h);
+        gpu.set_overlay_rgba(&device, &queue, w as u32, h as u32, &rgba);
+    } else {
+        gpu.set_overlay(&device, &queue, w as u32, h as u32, &overlay);
+    }
     let luts = map.luts();
     // Time the second frame: the first pays for pipeline warm-up.
     let mut frame_ms = 0.0;
