@@ -48,27 +48,34 @@ Early. Working today:
 - `mahere-tiles` + `mahere-load` — the bake: sources in, dymaxion **cells**
   out. A cell is one diamond-Morton rhombus whose texels are **triangles**:
   the icosahedron's own subdivision, 256×256 UV squares each split into a
-  lower and an upper equilateral triangle (131072 texels), stored as a VSF
-  file (whole-file zstd) at `{layer}/{cell}.vsf.zst` — the cell named by its
-  flattened VSF value in base64url — a layout
-  that is also the future object-store bucket. Triangles matter: the tiling
-  has 6-fold symmetry and a line always crosses it edge-to-edge, so linework
-  is isotropic (a rhombus grid draws +45° and −45° roads differently). The
-  `dem` layer is elevation + gradient sampled at each triangle's centroid at
-  the base depth, then a pyramid down to depth 6 where every texel is the
-  mean of its four children — three corners and the inverted center; the
-  `line` layer is every road, trail and stream stamped into the triangles it
-  crosses at depth 13 as (class, coverage) texels, averaged up the same way —
-  coverage up the pyramid is exact box filtering, so minor ways fade and
-  towns glow with no styling tricks and no aliasing.
+  lower and an upper equilateral triangle (131072 texels). One zstd'd VSF
+  file per cell at `{cell}.vsf.zst` (the cell named by its flattened VSF
+  value in base64url) carries a section per layer — a layout that is also
+  the object-store bucket, and writes merge over what's there so regions
+  bake one at a time. Triangles matter: the tiling has 6-fold symmetry and
+  a line always crosses it edge-to-edge, so linework is isotropic. Layers:
+  - `dem` — elevation (0.25 m steps) and unit normals, sampled at triangle
+    centroids from USGS GeoTIFFs (geographic or UTM — the 1 m lidar tiles
+    bake directly) at the base depth, then a pyramid of means down to 6;
+  - `line` — every road, trail, rail, power line and waterway stamped at
+    its physical width as (class, coverage); waterways weighted by their
+    upstream network length, so a headwater is a thread and a river a band;
+  - `land` — OSM land cover (forest, scrub, grass, farmland, wetland, sand,
+    rock, glacier, built-up…) as (class, coverage);
+  - `water` — lakes, ponds, reservoirs and riverbanks as coverage.
+
+  Each parent texel is the mean of its four children (three corners and
+  the inverted centre), so coverage up the pyramid is exact box filtering:
+  minor ways fade and towns glow with no styling tricks and no aliasing.
 - `mahere-engine` — the `#pagetable` renderer. Pure raster: a frame is
   fetches. A 32 px block grid gets exact screen→diamond-UV corners; inside
   a block UV steps in Q30.16 fixed point; each block resolves its cell(s)
   once through a page table of decoded planes, falling back to resident
   parents while finer cells stream in from a loader thread. Per pixel:
   unpack a dem texel (u16 elevation, snorm16 normal), light it by the sun
-  through a hypsometric LUT, lerp the line class colour by coverage. No
-  vectors, no per-pixel hashing, no locks. Sun lives in screen space, so the
+  through a hypsometric LUT, tint by land cover, lerp in water and the
+  line class colour by coverage — each layer gated by the client's layer
+  mask (desktop keys 1–4). No vectors, no per-pixel hashing, no locks. Sun lives in screen space, so the
   terrain is lit from the top-left at any bearing.
 - `mahere-app` (desktop, fluor) and `mahere-android` (chromeless, JNI) are
   thin frontends over the same `MapCore`: drag/pinch to pan, two-finger
@@ -78,10 +85,9 @@ Early. Working today:
 Measured: a 1024×768 frame of Mount Adams renders in ~1.4 ms on a desktop
 CPU (the previous reservoir/vector engine took ~300 ms).
 
-Next: landcover fills, hydro areas and contours as further layers (each
-is a baker pass plus a compositor stage — the renderer core doesn't
-change), the GUI cache and settings, and a Cloudflare R2 cell fetcher
-behind the same `CellStore` trait.
+Next: contours stamped from elevation at bake, anti-aliasing (render at
+2× with texels at 1–2 px, bin once), the GUI cache and settings, the GPU
+path, imagery.
 
 ## Building
 
@@ -94,12 +100,13 @@ curl -L -o data/washington-latest.osm.pbf \
 curl -L -o data/USGS_13_n47w122.tif \
   "https://prd-tnm.s3.amazonaws.com/StagedProducts/Elevation/13/TIFF/current/n47w122/USGS_13_n47w122.tif"
 
-# Bake cells for a lat/lon box (Mount Adams here): line pyramid 13..6,
-# dem sampled at depth 11 (10 m source) with its pyramid down to 6.
+# Bake cells for a lat/lon box (Mount Adams here): vector layers at depth
+# 13, dem sampled at depth 11 (10 m source), pyramids down to 6. For 1 m
+# lidar tiles use --vec-base 14 --dem-base 14; bakes merge over each other.
 cargo run --release -p mahere-tiles --bin mahere-load -- \
   --pbf data/washington-latest.osm.pbf --out data/cells \
-  --bbox 46.0,-121.75,46.35,-121.30 --line-base 13 --line-min 6 \
-  --dem-depths 11,6 --dem data/USGS_13_n47w122.tif
+  --bbox 46.0,-121.75,46.35,-121.30 --vec-base 13 --dem-base 11 --min 6 \
+  --dem data/USGS_13_n47w122.tif
 
 cargo run --release -p mahere-app   # Linux/macOS; reads data/cells if present
 cargo test                          # coordinates, tiles, engine, store

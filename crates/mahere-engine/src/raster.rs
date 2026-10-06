@@ -222,20 +222,16 @@ pub fn render_frame(
         })
         .collect();
 
-    // Desired set from the lattice: active depths + 2 parent rings + base.
+    // Desired set from the lattice: the active depths and the whole parent
+    // chain down to the base — a region may be baked several depths
+    // shallower than the view wants, and the fallback must find it rather
+    // than skip to the base. Parents are shared by many corners, so the
+    // chain adds only a handful of small cells.
     let mut desired: FxHashSet<CellKey> = FxHashSet::default();
     for c in &corners {
         let raw = raw_of(c.diamond, c.u, c.v);
-        for d0 in [dem_depth, vec_depth] {
-            let mut d = d0;
-            loop {
-                desired.insert(CellKey { depth: d, prefix: raw >> (60 - 2 * d as u32) });
-                if d <= d0.saturating_sub(2) || d == MIN_DEPTH {
-                    break;
-                }
-                d -= 1;
-            }
-            desired.insert(CellKey { depth: MIN_DEPTH, prefix: raw >> (60 - 2 * MIN_DEPTH as u32) });
+        for d in MIN_DEPTH..=dem_depth.max(vec_depth) {
+            desired.insert(CellKey { depth: d, prefix: raw >> (60 - 2 * d as u32) });
         }
     }
     let want: Vec<CellKey> = desired.into_iter().collect();
@@ -324,18 +320,46 @@ fn lerp3(a: [f32; 3], b: [u8; 3], t: f32) -> [f32; 3] {
     ]
 }
 
+/// A dem ref's depth (from its prefix shift).
 #[inline(always)]
-fn compose(dem: &DemRef, vec: &VecRef, uq: i64, vq: i64, luts: &FrameLuts) -> u32 {
+fn dem_ref_depth(r: &DemRef) -> Option<u8> {
+    match r {
+        DemRef::Cell { prefix_shift, .. } => Some(((60 - prefix_shift) / 2) as u8),
+        DemRef::None => None,
+    }
+}
+
+/// The dem texel for a pixel: the block's ref, and on a NODATA texel the
+/// parents below it — a merged cell can carry elevation only inside the
+/// newer bake's footprint while an older, coarser bake covers the rest.
+#[inline(always)]
+fn dem_texel(dem: &DemRef, pool: &Pool, diamond: u8, uq: i64, vq: i64) -> Option<u64> {
+    let mut r = *dem;
+    loop {
+        let DemRef::Cell { planes, shift, .. } = r else { return None };
+        let t = planes.texel[tri_index(uq, vq, shift)];
+        if (t & 0xFFFF) as u16 != ELEV_NODATA {
+            return Some(t);
+        }
+        let d = dem_ref_depth(&r)?;
+        if d <= MIN_DEPTH {
+            return None;
+        }
+        r = resolve_dem(pool, d - 1, raw_of(diamond, uq, vq));
+    }
+}
+
+#[inline(always)]
+fn compose(dem: &DemRef, vec: &VecRef, pool: &Pool, diamond: u8, uq: i64, vq: i64, luts: &FrameLuts) -> u32 {
     let mask = luts.mask;
     // Terrain: tint from elevation, shade from the normal.
     let mut tint = [FLAT_RGB[0] as f32, FLAT_RGB[1] as f32, FLAT_RGB[2] as f32];
     let mut diffuse = 1.0f32;
     let mut have_ground = false;
     if mask.dem {
-        if let DemRef::Cell { planes, shift, .. } = dem {
-            let t = planes.texel[tri_index(uq, vq, *shift)];
+        if let Some(t) = dem_texel(dem, pool, diamond, uq, vq) {
             let eq = (t & 0xFFFF) as u16;
-            if eq != ELEV_NODATA {
+            {
                 let nx = (t >> 16) as u16 as i16 as f32;
                 let ny = (t >> 32) as u16 as i16 as f32;
                 let nz = (t >> 48) as u16 as i16 as f32;
@@ -343,9 +367,6 @@ fn compose(dem: &DemRef, vec: &VecRef, uq: i64, vq: i64, luts: &FrameLuts) -> u3
                 let c = luts.hypso[(eq >> 4) as usize];
                 tint = [c[0] as f32, c[1] as f32, c[2] as f32];
                 have_ground = true;
-            } else {
-                let c = luts.hypso[4095];
-                tint = [c[0] as f32, c[1] as f32, c[2] as f32];
             }
         } else {
             tint = [BG_RGB8[0] as f32, BG_RGB8[1] as f32, BG_RGB8[2] as f32];
@@ -457,7 +478,7 @@ fn render_block_interp(
             let dref = &dem_refs[0].1;
             let vref = &vec_refs[0].1;
             for px in row.iter_mut() {
-                *px = compose(dref, vref, uq, vq, luts);
+                *px = compose(dref, vref, pool, d, uq, vq, luts);
                 uq += dux;
                 vq += dvx;
             }
@@ -493,7 +514,7 @@ fn render_block_interp(
                 if matches!(vref, VecRef::None) {
                     vref = resolve_vec(pool, vec_depth, raw);
                 }
-                *px = compose(&dref, &vref, uq, vq, luts);
+                *px = compose(&dref, &vref, pool, d, uq, vq, luts);
                 uq += dux;
                 vq += dvx;
             }
@@ -533,7 +554,7 @@ fn render_block_exact(
             let raw = c.raw();
             let dref = resolve_dem(pool, dem_depth, raw);
             let vref = resolve_vec(pool, vec_depth, raw);
-            *px = compose(&dref, &vref, uq, vq, luts);
+            *px = compose(&dref, &vref, pool, c.diamond(), uq, vq, luts);
         }
     }
 }

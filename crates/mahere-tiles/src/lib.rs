@@ -840,9 +840,11 @@ impl CellPlanes {
         let mut out = self;
         let CellPlanes { dem: old_dem, line: old_line, land: old_land, water: old_water } = old;
         let (mut old_line, mut old_land, mut old_water) = (old_line, old_land, old_water);
+        // The new bake's footprint, if it has one.
+        let mask: Option<Vec<bool>> = out.dem.as_ref().map(|d| d.elev.iter().map(|&e| e != ELEV_NODATA).collect());
         match (&mut out.dem, old_dem) {
             (Some(new), Some(old_dem)) => {
-                let mask: Vec<bool> = new.elev.iter().map(|&e| e != ELEV_NODATA).collect();
+                let mask = mask.as_ref().unwrap();
                 for i in 0..TRI {
                     if !mask[i] {
                         new.elev[i] = old_dem.elev[i];
@@ -851,26 +853,17 @@ impl CellPlanes {
                         new.nz[i] = old_dem.nz[i];
                     }
                 }
-                fn keep_old_class(new: &mut Option<ClassCell>, old: Option<ClassCell>, mask: &[bool]) {
-                    match (new, old) {
-                        (Some(n), Some(o)) => {
-                            for i in 0..TRI {
-                                if !mask[i] {
-                                    n.class[i] = o.class[i];
-                                    n.cov[i] = o.cov[i];
-                                }
-                            }
-                        }
-                        (n @ None, Some(o)) => *n = Some(o),
-                        _ => {}
-                    }
-                }
-                keep_old_class(&mut out.line, old_line.take(), &mask);
-                keep_old_class(&mut out.land, old_land.take(), &mask);
-                match (&mut out.water, old_water.take()) {
+            }
+            (None, Some(old_dem)) => out.dem = Some(old_dem),
+            _ => {}
+        }
+        if let Some(mask) = &mask {
+            fn keep_old_class(new: &mut Option<ClassCell>, old: Option<ClassCell>, mask: &[bool]) {
+                match (new, old) {
                     (Some(n), Some(o)) => {
                         for i in 0..TRI {
                             if !mask[i] {
+                                n.class[i] = o.class[i];
                                 n.cov[i] = o.cov[i];
                             }
                         }
@@ -879,8 +872,19 @@ impl CellPlanes {
                     _ => {}
                 }
             }
-            (None, Some(old_dem)) => out.dem = Some(old_dem),
-            _ => {}
+            keep_old_class(&mut out.line, old_line.take(), mask);
+            keep_old_class(&mut out.land, old_land.take(), mask);
+            match (&mut out.water, old_water.take()) {
+                (Some(n), Some(o)) => {
+                    for i in 0..TRI {
+                        if !mask[i] {
+                            n.cov[i] = o.cov[i];
+                        }
+                    }
+                }
+                (n @ None, Some(o)) => *n = Some(o),
+                _ => {}
+            }
         }
         if out.line.is_none() {
             out.line = old_line;
