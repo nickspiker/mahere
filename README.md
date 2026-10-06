@@ -49,7 +49,8 @@ Early. Working today:
   out. A cell is one diamond-Morton rhombus whose texels are **triangles**:
   the icosahedron's own subdivision, 256×256 UV squares each split into a
   lower and an upper equilateral triangle (131072 texels), stored as a VSF
-  file (whole-file zstd) at `{layer}/{depth}/{prefix}.vsf.zst` — a layout
+  file (whole-file zstd) at `{layer}/{cell}.vsf.zst` — the cell named by its
+  flattened VSF value in base64url — a layout
   that is also the future object-store bucket. Triangles matter: the tiling
   has 6-fold symmetry and a line always crosses it edge-to-edge, so linework
   is isotropic (a rhombus grid draws +45° and −45° roads differently). The
@@ -106,7 +107,7 @@ cargo test                          # coordinates, tiles, engine, store
 
 Without a local `data/cells`, both frontends stream cells from the public
 bucket (`https://brobdingnagian.holdmyoscilloscope.com/mahere/cells/…`,
-the same `{layer}/{depth}/{prefix}.vsf.zst` layout) into the kete vault on
+the same `{layer}/{cell}.vsf.zst` layout) into the kete vault on
 the device, and serve them from there afterwards — the Android APK carries
 no map data. `scripts/publish-cells.sh` syncs a bake to the bucket.
 

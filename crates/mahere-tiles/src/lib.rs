@@ -37,8 +37,22 @@ use mahere_coord::{Coord, morton_compact, morton_spread, uv_to_lat_lon};
 use mahere_dem::DemStore;
 use mahere_osm::Road;
 use rayon::prelude::*;
-use vsf::types::Tensor;
+use vsf::types::{Tensor, WorldCell};
 use vsf::{VsfBuilder, VsfType};
+
+/// base64url without padding — how bytes are spelled when they must be a
+/// name (the same alphabet tohu uses for vault file names).
+pub fn base64url(bytes: &[u8]) -> String {
+    const A: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let n = chunk.iter().fold(0u32, |acc, &b| (acc << 8) | b as u32) << (8 * (3 - chunk.len()));
+        for i in 0..=chunk.len() {
+            out.push(A[((n >> (18 - 6 * i)) & 63) as usize] as char);
+        }
+    }
+    out
+}
 
 /// Cells are TEX x TEX UV squares; TEX_BITS of Morton depth below the cell.
 pub const TEX: usize = 256;
@@ -90,8 +104,27 @@ impl CellKey {
         )
     }
 
+    /// The full-resolution Morton value this cell is a prefix of.
+    pub fn raw(self) -> u64 {
+        self.prefix << (60 - 2 * self.depth as u32)
+    }
+
+    /// The cell as VSF values, flattened: its depth (`u`) and the world
+    /// cell (`wm`). This is the cell's identity everywhere a key is needed —
+    /// no delimiters, no numerals, the type tags are the structure.
+    pub fn vsf_bytes(self) -> Vec<u8> {
+        let mut b = VsfType::u(self.depth as usize, false).flatten();
+        b.extend(VsfType::wm(WorldCell::from_raw(self.raw())).flatten());
+        b
+    }
+
+    /// File / object name: the VSF bytes spelled base64url.
+    pub fn name(self) -> String {
+        base64url(&self.vsf_bytes())
+    }
+
     pub fn path(self, layer: &str) -> String {
-        format!("{layer}/{:02}/{:016x}.vsf.zst", self.depth, self.prefix)
+        format!("{layer}/{}.vsf.zst", self.name())
     }
 
     /// Diamond-UV rectangle covered by this cell.

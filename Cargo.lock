@@ -1485,6 +1485,7 @@ dependencies = [
  "mahere-coord",
  "mahere-engine",
  "mahere-store",
+ "mahere-tiles",
  "png",
 ]
 
@@ -1523,8 +1524,10 @@ dependencies = [
 name = "mahere-store"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "kete",
  "mahere-engine",
+ "mahere-tiles",
  "rand",
  "vsf",
 ]

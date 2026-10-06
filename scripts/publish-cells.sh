@@ -1,6 +1,7 @@
 #!/bin/sh
 # Publish the baked cell directory to the bucket. The directory layout IS
-# the object layout: {layer}/{dd}/{prefix}.vsf.zst, served publicly at
+# the object layout: {layer}/{cell}.vsf.zst (the cell named by its flattened
+# VSF value, base64url), served publicly at
 # https://brobdingnagian.holdmyoscilloscope.com/mahere/cells/... which is
 # what every client fetches from (mahere_engine::residency::DEFAULT_CELLS_URL).
 # rclone's `r2` remote holds the bucket's S3 credentials (keys dir).

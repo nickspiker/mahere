@@ -13,4 +13,5 @@ fluor = { git = "https://github.com/nickspiker/fluor", rev = "d538a0a", features
 
 [dev-dependencies]
 mahere-coord = { path = "../mahere-coord" }
+mahere-tiles = { path = "../mahere-tiles" }
 png = "0.17"

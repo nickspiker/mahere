@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 pub use kete::{FlatStorage, StorageError};
 use rand::RngCore;
-use vsf::types::Tensor;
+use vsf::types::{EtType, Tensor};
 use vsf::VsfType;
 
 pub const APP: kete::App<'static> = kete::App { id: "mahere", dir: "mahere" };
@@ -76,16 +76,53 @@ pub struct Session {
     pub sun_alt: f64,
 }
 
+// ==================== KEYS ====================
+
+/// kete addresses an entry by hashing a logical key. Ours are VSF values —
+/// the type tags are the domain separation (`d` names a domain, `u` a
+/// depth or index, `wm` a world cell, `e` an instant) — flattened, hashed,
+/// and spelled base64url for kete's string parameter. No delimiter and no
+/// numeral ever appears in a key.
+pub fn vault_key(parts: &[VsfType]) -> String {
+    let mut bytes = Vec::new();
+    for p in parts {
+        bytes.extend(p.flatten());
+    }
+    mahere_tiles::base64url(blake3::hash(&bytes).as_bytes())
+}
+
+fn name(s: &str) -> VsfType {
+    VsfType::d(s.to_string())
+}
+
+fn session_key() -> String {
+    vault_key(&[name("session")])
+}
+
+/// Eagle Time now, as the `e` value tracks are keyed by.
+fn et_now() -> i64 {
+    let d = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
+    vsf::types::eagle_time::from_unix_ns(d.as_secs() as i64, d.subsec_nanos())
+}
+
+fn track_chunk_key(start: i64, chunk: u32) -> String {
+    vault_key(&[name("track"), VsfType::e(EtType::e6(start)), VsfType::u(chunk as usize, false)])
+}
+
+fn track_count_key(start: i64) -> String {
+    vault_key(&[name("track"), VsfType::e(EtType::e6(start)), name("chunks")])
+}
+
 pub fn save_session(store: &FlatStorage, s: &Session) -> Result<(), StorageError> {
     let t = VsfType::t_f6(Tensor::new(
         vec![6],
         vec![s.lat, s.lon, s.ppd, s.bearing, s.sun_az, s.sun_alt],
     ));
-    store.write_device("session", &t.flatten())
+    store.write_device(&session_key(), &t.flatten())
 }
 
 pub fn load_session(store: &FlatStorage) -> Option<Session> {
-    let bytes = store.read_device("session").ok()??;
+    let bytes = store.read_device(&session_key()).ok()??;
     let mut ptr = 0usize;
     let v = vsf::parse(&bytes, &mut ptr).ok()?;
     let d = tensor_f64(v)?;
@@ -113,7 +150,8 @@ fn tensor_f64(v: VsfType) -> Option<Vec<f64>> {
 /// day's hike never rewrites more than a small object per flush.
 pub struct TrackRecorder {
     store: Arc<FlatStorage>,
-    session_key: String,
+    /// Eagle Time of the first fix's session — the track's identity.
+    start: i64,
     buf: Vec<f64>,
     chunk: u32,
 }
@@ -122,11 +160,7 @@ const CHUNK_FIXES: usize = 64;
 
 impl TrackRecorder {
     pub fn new(store: Arc<FlatStorage>) -> TrackRecorder {
-        let start = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        TrackRecorder { store, session_key: format!("track|{start}"), buf: Vec::new(), chunk: 0 }
+        TrackRecorder { store, start: et_now(), buf: Vec::new(), chunk: 0 }
     }
 
     pub fn on_fix(&mut self, lat: f64, lon: f64, elevation_m: f64) {
@@ -144,13 +178,13 @@ impl TrackRecorder {
         if self.buf.is_empty() {
             return;
         }
-        let key = format!("{}|{:05}", self.session_key, self.chunk);
+        let key = track_chunk_key(self.start, self.chunk);
         let t = VsfType::t_f6(Tensor::new(vec![self.buf.len()], std::mem::take(&mut self.buf)));
         if self.store.write_device(&key, &t.flatten()).is_ok() {
             self.chunk += 1;
             // VSF all the way down: the counter is a u, not naked LE bytes.
             let _ = self.store.write_device(
-                &format!("{}|chunks", self.session_key),
+                &track_count_key(self.start),
                 &VsfType::u(self.chunk as usize, false).flatten(),
             );
         }
@@ -160,12 +194,24 @@ impl TrackRecorder {
     pub fn chunks(&self) -> u32 {
         self.chunk
     }
+
+    /// The track's identity: Eagle Time at recording start.
+    pub fn start(&self) -> i64 {
+        self.start
+    }
+}
+
+/// One recorded chunk's fixes (lat, lon, elevation m, unix s) × n.
+pub fn track_chunk(store: &FlatStorage, start: i64, chunk: u32) -> Option<Vec<f64>> {
+    let bytes = store.read_device(&track_chunk_key(start, chunk)).ok()??;
+    let mut ptr = 0usize;
+    tensor_f64(vsf::parse(&bytes, &mut ptr).ok()?)
 }
 
 
 /// Chunk count for a recorded track session (width-agnostic VSF read).
-pub fn track_chunks(store: &FlatStorage, session_key: &str) -> Option<u32> {
-    let bytes = store.read_device(&format!("{session_key}|chunks")).ok()??;
+pub fn track_chunks(store: &FlatStorage, start: i64) -> Option<u32> {
+    let bytes = store.read_device(&track_count_key(start)).ok()??;
     let mut ptr = 0usize;
     let v = vsf::parse(&bytes, &mut ptr).ok()?;
     v.as_u64().and_then(|n| u32::try_from(n).ok())
@@ -203,21 +249,15 @@ mod tests {
         // overwrites — the exact shape that looked flaky before the test
         // harness itself was fixed (stale reused dirs + global override).
         let mut rec = TrackRecorder::new(store.clone());
-        let key = rec.session_key.clone();
+        let key = rec.start();
         for i in 0..200 {
             rec.on_fix(46.2 + i as f64 * 1e-5, -121.49, 2000.0 + i as f64);
         }
         rec.flush();
         assert_eq!(rec.chunks(), 4);
-        assert_eq!(track_chunks(&store, &key), Some(4));
+        assert_eq!(track_chunks(&store, key), Some(4));
         for c in 0..4u32 {
-            assert!(
-                store
-                    .read_device(&format!("{key}|{c:05}"))
-                    .unwrap()
-                    .is_some(),
-                "chunk {c} missing"
-            );
+            assert!(track_chunk(&store, key, c).is_some(), "chunk {c} missing");
         }
 
         // Persistence across a real reopen: drop every handle, open again,
@@ -226,7 +266,7 @@ mod tests {
         drop(store);
         let store2 = open(Some(&base)).expect("reopen");
         assert_eq!(load_session(&store2), Some(s), "session must survive reopen");
-        assert_eq!(track_chunks(&store2, &key), Some(4), "track counter must survive reopen");
+        assert_eq!(track_chunks(&store2, key), Some(4), "track counter must survive reopen");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
@@ -235,19 +275,28 @@ mod tests {
 
 /// The vault as the on-device cell tier: every cell fetched from the bucket
 /// is written through here and served from here afterwards (offline
-/// included). Keys are `cell|{layer}/{dd}/{prefix}.vsf.zst` — the bucket
-/// key with a namespace, so session and track records share the vault
-/// without collisions.
+/// included). Keyed by the VSF values (`d` cell, `d` layer, `u` depth,
+/// `wm` cell) through [`vault_key`], so cells, session and tracks share the
+/// vault with the type system as the namespace.
 pub struct VaultCells(pub Arc<FlatStorage>);
 
+fn cell_key(layer: mahere_engine::residency::Layer, key: mahere_tiles::CellKey) -> String {
+    vault_key(&[
+        name("cell"),
+        name(layer.name()),
+        VsfType::u(key.depth as usize, false),
+        VsfType::wm(vsf::types::WorldCell::from_raw(key.raw())),
+    ])
+}
+
 impl mahere_engine::residency::CellStore for VaultCells {
-    fn get(&self, rel: &str) -> Option<Vec<u8>> {
-        self.0.read_device(&format!("cell|{rel}")).ok().flatten()
+    fn get(&self, layer: mahere_engine::residency::Layer, key: mahere_tiles::CellKey) -> Option<Vec<u8>> {
+        self.0.read_device(&cell_key(layer, key)).ok().flatten()
     }
 }
 
 impl mahere_engine::residency::CellCache for VaultCells {
-    fn put(&self, rel: &str, bytes: &[u8]) {
-        let _ = self.0.write_device(&format!("cell|{rel}"), bytes);
+    fn put(&self, layer: mahere_engine::residency::Layer, key: mahere_tiles::CellKey, bytes: &[u8]) {
+        let _ = self.0.write_device(&cell_key(layer, key), bytes);
     }
 }

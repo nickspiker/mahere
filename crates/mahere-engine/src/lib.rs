@@ -412,7 +412,7 @@ mod tests {
 
     struct Empty;
     impl CellStore for Empty {
-        fn get(&self, _rel: &str) -> Option<Vec<u8>> {
+        fn get(&self, _layer: residency::Layer, _key: mahere_tiles::CellKey) -> Option<Vec<u8>> {
             None
         }
     }

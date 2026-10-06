@@ -1,0 +1,1 @@
+- Client path: `TieredStore(VaultCells(kete vault), HttpStore)` — vault hit, else HTTPS fetch (404 = absent, remembered per process; errors retried), {path}`|{path}`. Android falls back to `files/cells-local` dir if present (dev). APK carries no map data (INTERNET permission added; asset staging removed 2026-10-05).

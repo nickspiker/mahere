@@ -12,16 +12,17 @@ use mahere_tiles::{CellKey, TRI, decode_cell_fields, plane_f32_mem, plane_u8_mem
 use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
 
-/// Where cell bytes come from. DirStore today; vault / R2 fetcher later.
+/// Where cell bytes come from, addressed by (layer, cell) — a string path
+/// exists only where a filesystem or URL demands one.
 pub trait CellStore: Send + Sync + 'static {
-    fn get(&self, rel: &str) -> Option<Vec<u8>>;
+    fn get(&self, layer: Layer, key: CellKey) -> Option<Vec<u8>>;
 }
 
 pub struct DirStore(pub PathBuf);
 
 impl CellStore for DirStore {
-    fn get(&self, rel: &str) -> Option<Vec<u8>> {
-        std::fs::read(self.0.join(rel)).ok()
+    fn get(&self, layer: Layer, key: CellKey) -> Option<Vec<u8>> {
+        std::fs::read(self.0.join(key.path(layer.name()))).ok()
     }
 }
 
@@ -32,7 +33,7 @@ pub enum Layer {
 }
 
 impl Layer {
-    fn name(self) -> &'static str {
+    pub fn name(self) -> &'static str {
         match self {
             Layer::Dem => "dem",
             Layer::Line => "line",
@@ -252,7 +253,7 @@ fn loader_thread(store: Arc<dyn CellStore>, want_rx: Receiver<WantList>, done_tx
 }
 
 fn load_cell(store: &dyn CellStore, layer: Layer, key: CellKey) -> Loaded {
-    let Some(bytes) = store.get(&key.path(layer.name())) else {
+    let Some(bytes) = store.get(layer, key) else {
         return Loaded { layer, key, planes: Planes::Absent };
     };
     let Ok(fields) = decode_cell_fields(&bytes) else {
@@ -307,7 +308,7 @@ mod tests {
     /// is enough to exercise the residency policy end to end.
     struct Empty;
     impl CellStore for Empty {
-        fn get(&self, _rel: &str) -> Option<Vec<u8>> {
+        fn get(&self, _layer: Layer, _key: CellKey) -> Option<Vec<u8>> {
             None
         }
     }
@@ -353,14 +354,14 @@ pub const DEFAULT_CELLS_URL: &str = "https://brobdingnagian.holdmyoscilloscope.c
 
 /// A store that can also keep what it's given (the vault).
 pub trait CellCache: CellStore {
-    fn put(&self, rel: &str, bytes: &[u8]);
+    fn put(&self, layer: Layer, key: CellKey, bytes: &[u8]);
 }
 
 /// The far tier. `Ok(None)` is a definite absence (the cell was never
 /// baked); `Err` is a failure to find out (offline, timeout), which must
 /// not be remembered as absence.
 pub trait RemoteStore: Send + Sync + 'static {
-    fn fetch(&self, rel: &str) -> Result<Option<Vec<u8>>, String>;
+    fn fetch(&self, layer: Layer, key: CellKey) -> Result<Option<Vec<u8>>, String>;
 }
 
 /// Cache first, then the bucket, writing hits through. Definite misses
@@ -370,7 +371,7 @@ pub trait RemoteStore: Send + Sync + 'static {
 pub struct TieredStore {
     cache: Arc<dyn CellCache>,
     remote: Arc<dyn RemoteStore>,
-    missing: std::sync::Mutex<FxHashSet<String>>,
+    missing: std::sync::Mutex<FxHashSet<(Layer, u8, u64)>>,
 }
 
 impl TieredStore {
@@ -380,24 +381,25 @@ impl TieredStore {
 }
 
 impl CellStore for TieredStore {
-    fn get(&self, rel: &str) -> Option<Vec<u8>> {
-        if let Some(b) = self.cache.get(rel) {
+    fn get(&self, layer: Layer, key: CellKey) -> Option<Vec<u8>> {
+        if let Some(b) = self.cache.get(layer, key) {
             return Some(b);
         }
-        if self.missing.lock().unwrap().contains(rel) {
+        let id = (layer, key.depth, key.prefix);
+        if self.missing.lock().unwrap().contains(&id) {
             return None;
         }
-        match self.remote.fetch(rel) {
+        match self.remote.fetch(layer, key) {
             Ok(Some(b)) => {
-                self.cache.put(rel, &b);
+                self.cache.put(layer, key, &b);
                 Some(b)
             }
             Ok(None) => {
-                self.missing.lock().unwrap().insert(rel.to_string());
+                self.missing.lock().unwrap().insert(id);
                 None
             }
             Err(e) => {
-                eprintln!("cell fetch {rel}: {e}");
+                eprintln!("cell fetch {}: {e}", key.path(layer.name()));
                 None
             }
         }
@@ -421,8 +423,8 @@ impl HttpStore {
 }
 
 impl RemoteStore for HttpStore {
-    fn fetch(&self, rel: &str) -> Result<Option<Vec<u8>>, String> {
-        let url = format!("{}/{}", self.base, rel);
+    fn fetch(&self, layer: Layer, key: CellKey) -> Result<Option<Vec<u8>>, String> {
+        let url = format!("{}/{}", self.base, key.path(layer.name()));
         match self.agent.get(&url).call() {
             Ok(resp) => {
                 let mut buf = Vec::new();
@@ -437,7 +439,7 @@ impl RemoteStore for HttpStore {
 
 /// The bucket with no cache at all (a desktop without a vault).
 impl CellStore for HttpStore {
-    fn get(&self, rel: &str) -> Option<Vec<u8>> {
-        self.fetch(rel).ok().flatten()
+    fn get(&self, layer: Layer, key: CellKey) -> Option<Vec<u8>> {
+        self.fetch(layer, key).ok().flatten()
     }
 }
