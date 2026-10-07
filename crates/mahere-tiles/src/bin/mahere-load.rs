@@ -39,7 +39,30 @@ fn main() {
 
     let t = std::time::Instant::now();
     let feats = mahere_osm::load_features(&pbf).expect("pbf");
-    let roads: Vec<_> = feats.roads.into_iter().filter(|r| r.pts.iter().any(|&(la, lo)| in_box(la, lo))).collect();
+    // Lines are clipped to the box with a margin of a cell or so: a county line or a highway leaving the box would otherwise stamp lone-line cells along its whole length, eight objects for every one with terrain.
+    let margin = 0.01;
+    let clip = |la: f32, lo: f32| (la as f64) >= lat0 - margin && (la as f64) <= lat1 + margin && (lo as f64) >= lon0 - margin && (lo as f64) <= lon1 + margin;
+    let mut roads: Vec<mahere_osm::Road> = Vec::new();
+    for r in feats.roads {
+        let mut run: Vec<(f32, f32)> = Vec::new();
+        for (i, &p) in r.pts.iter().enumerate() {
+            // Keep a point inside the margin, plus the one just outside on either end so the line reaches the edge.
+            let inside = clip(p.0, p.1);
+            let prev_in = i > 0 && clip(r.pts[i - 1].0, r.pts[i - 1].1);
+            let next_in = i + 1 < r.pts.len() && clip(r.pts[i + 1].0, r.pts[i + 1].1);
+            if inside || prev_in || next_in {
+                run.push(p);
+            }
+            if !inside && !next_in && run.len() >= 2 {
+                roads.push(mahere_osm::Road { class: r.class, pts: std::mem::take(&mut run), weight: r.weight, uses: r.uses });
+            } else if !inside && !next_in {
+                run.clear();
+            }
+        }
+        if run.len() >= 2 {
+            roads.push(mahere_osm::Road { class: r.class, pts: run, weight: r.weight, uses: r.uses });
+        }
+    }
     let areas: Vec<_> = feats
         .areas
         .into_iter()
