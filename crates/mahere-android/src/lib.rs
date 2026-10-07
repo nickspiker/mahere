@@ -77,7 +77,7 @@ fn free_bytes(dir: &str) -> Option<u64> {
 
 impl AndroidApp {
     fn controls(&self) -> Controls {
-        Controls { real_sun: self.map.real_sun, follow_heading: self.map.follow_heading, lock_to_fix: self.map.lock_to_fix, cache_budget: self.cache_budget }
+        Controls { real_sun: self.map.real_sun, follow_heading: self.map.follow_heading, lock_to_fix: self.map.lock_to_fix, cache_budget: self.cache_budget, theme: self.map.theme }
     }
 
     /// Apply what the panel changed and keep it.
@@ -93,12 +93,15 @@ impl AndroidApp {
             self.map.set_lock_to_fix(ctl.lock_to_fix);
         }
         self.cache_budget = ctl.cache_budget;
+        if ctl.theme != self.map.theme {
+            self.map.set_theme(ctl.theme);
+        }
         self.save_settings();
     }
 
     fn save_settings(&self) {
         if let Some(store) = &self.store {
-            let s = mahere_store::Settings { cache_budget: self.cache_budget, layer_bits: self.map.layers().bits() as u64, real_sun: self.map.real_sun, follow_heading: self.map.follow_heading, lock_to_fix: self.map.lock_to_fix };
+            let s = mahere_store::Settings { cache_budget: self.cache_budget, layer_bits: self.map.layers().bits() as u64, real_sun: self.map.real_sun, follow_heading: self.map.follow_heading, lock_to_fix: self.map.lock_to_fix, theme: self.map.theme as u64 };
             let _ = mahere_store::save_settings(store, &s);
         }
     }
@@ -374,7 +377,12 @@ pub extern "system" fn Java_nz_mahere_app_MahereActivity_nativeInit(
         map.sun_az = s.sun_az as f32;
         map.sun_alt = s.sun_alt as f32;
     }
+    // Themes from the vault (the built-ins written on first launch), then the saved choice, then the saved layers over the theme's defaults.
+    if let Some(v) = &store {
+        map.set_themes(mahere_store::themes::load_all(v));
+    }
     if let Some(s) = settings {
+        map.set_theme(s.theme as usize);
         map.set_layers(mahere_engine::LayerMask::from_bits(s.layer_bits as u32));
         map.set_real_sun(s.real_sun);
         map.set_follow_heading(s.follow_heading);

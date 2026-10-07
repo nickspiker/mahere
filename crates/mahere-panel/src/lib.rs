@@ -7,6 +7,7 @@ use fluor::paint::{self, HitId, HIT_NONE};
 use fluor::text::{TextRenderer, TextStyle};
 use fluor::theme;
 use fluor::widgets::Checkbox;
+use mahere_engine::theme::{CLASS_NAMES, LAND_NAMES, Theme};
 use mahere_engine::{LayerMask, MeasureView};
 
 /// The two modes the panel switches besides the layers.
@@ -18,6 +19,8 @@ pub struct Controls {
     pub lock_to_fix: bool,
     /// Bytes the cell cache may hold; the slider sets it.
     pub cache_budget: u64,
+    /// The theme, an index into the engine's themes.
+    pub theme: usize,
 }
 
 /// What the readouts show.
@@ -128,9 +131,19 @@ const STRIP_EDGE: u32 = ink(0xFF_C4_40, 255);
 const READOUT: u32 = ink(0xC8_CC_D4, 255);
 const READOUT_DIM: u32 = ink(0x80_86_92, 255);
 
+/// Which page the column shows.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Page {
+    Layers,
+    Themes,
+}
+
 pub struct Panel {
     open: bool,
     dirty: bool,
+    page: Page,
+    /// The theme page's rows: the back row, then one per theme, as (centre y, half height) in screen pixels.
+    theme_rows: Vec<(f32, f32)>,
     hits: HitId,
     checks: Vec<(Layer, Checkbox)>,
     text: TextRenderer,
@@ -140,6 +153,8 @@ pub struct Panel {
     font: f32,
     gear: (f32, f32, f32),
     panel_w: f32,
+    /// The theme row above the layers: x0, centre y, half height.
+    theme_row: (f32, f32, f32),
     /// The cache slider's track on screen (x0, y, width), and whether a press is riding it.
     slider: (f32, f32, f32),
     slider_held: bool,
@@ -159,7 +174,7 @@ impl Panel {
     pub fn new() -> Panel {
         let mut hits: HitId = HIT_NONE;
         let checks = LAYERS.iter().map(|&(l, label)| (l, Checkbox::new(&mut hits, label, 0.0, 0.0, 10.0, 10.0, 10.0, false))).collect();
-        Panel { open: false, dirty: true, hits, checks, text: TextRenderer::new(), buf: Vec::new(), w: 0, h: 0, font: 16.0, gear: (0.0, 0.0, 0.0), panel_w: 0.0, slider: (0.0, 0.0, 0.0), slider_held: false, cache_max: CACHE_MIN + 1, strip_close: None, clear_measure: false }
+        Panel { open: false, dirty: true, page: Page::Layers, theme_rows: Vec::new(), hits, checks, text: TextRenderer::new(), buf: Vec::new(), w: 0, h: 0, font: 16.0, gear: (0.0, 0.0, 0.0), panel_w: 0.0, theme_row: (0.0, 0.0, 0.0), slider: (0.0, 0.0, 0.0), slider_held: false, cache_max: CACHE_MIN + 1, strip_close: None, clear_measure: false }
     }
 
     pub fn is_open(&self) -> bool {
@@ -168,6 +183,13 @@ impl Panel {
 
     pub fn set_open(&mut self, open: bool) {
         self.open = open;
+        self.dirty = true;
+    }
+
+    /// Open on the theme page.
+    pub fn show_themes(&mut self) {
+        self.open = true;
+        self.page = Page::Themes;
         self.dirty = true;
     }
 
@@ -187,7 +209,10 @@ impl Panel {
         self.panel_w = (self.font * 13.0).min(w as f32 * 0.7);
         let row = self.font * 1.7;
         let x0 = self.font * 0.8;
-        let top = self.gear.1 + r + self.font * 0.9;
+        // The theme row sits first, then the layers.
+        let theme_y = self.gear.1 + r + self.font * 0.9 + row * 0.5;
+        self.theme_row = (x0, theme_y, row * 0.5);
+        let top = theme_y + row * 0.8;
         let mut last = top;
         for (i, (l, cb)) in self.checks.iter_mut().enumerate() {
             // The modes sit a little apart from the layers.
@@ -220,6 +245,30 @@ impl Panel {
         if !self.open {
             return false;
         }
+        if self.page == Page::Themes {
+            if x >= self.panel_w {
+                return false;
+            }
+            for (i, &(cy, hh)) in self.theme_rows.iter().enumerate() {
+                if (y - cy).abs() <= hh {
+                    if i == 0 {
+                        self.page = Page::Layers;
+                    } else {
+                        ctl.theme = i - 1;
+                    }
+                    self.dirty = true;
+                    return true;
+                }
+            }
+            return true;
+        }
+        // The theme row above the layers opens the theme page.
+        let (tx, ty, tr) = self.theme_row;
+        if (y - ty).abs() <= tr && x >= tx && x < self.panel_w {
+            self.page = Page::Themes;
+            self.dirty = true;
+            return true;
+        }
         let inert = mask.inert();
         for (l, cb) in &mut self.checks {
             if cb.bbox().contains(x, y) {
@@ -242,7 +291,7 @@ impl Panel {
     }
 
     /// Paint for a `w × h` screen: the gear always, the column when open. Returns the buffer in fluor's pixel convention.
-    pub fn paint(&mut self, w: usize, h: usize, mask: LayerMask, ctl: Controls, r: &Readouts, measure: Option<&MeasureView>) -> &[u32] {
+    pub fn paint(&mut self, w: usize, h: usize, mask: LayerMask, ctl: Controls, r: &Readouts, measure: Option<&MeasureView>, themes: &[Theme]) -> &[u32] {
         self.layout(w, h);
         self.buf.clear();
         self.buf.resize(w * h, 0);
@@ -273,6 +322,15 @@ impl Panel {
         if !self.open {
             return &self.buf;
         }
+        if self.page == Page::Themes {
+            self.theme_rows = Self::paint_themes(&mut canvas, &mut self.text, font, self.panel_w, self.gear, h, themes, ctl.theme);
+            paint::fill_rect(&mut canvas, 0, 0, self.panel_w as isize, h as isize, PANEL_BG, None, None);
+            return &self.buf;
+        }
+        // The theme row: the current theme's name and a chevron.
+        let (tx, ty, _) = self.theme_row;
+        let current = themes.get(ctl.theme).map_or("Trail", |t| t.name.as_str());
+        self.text.draw_text_left(&mut canvas, &format!("Theme   {current}  \u{203a}"), tx, ty, &TextStyle::new(font, theme::TEXTBOX_TEXT), None, None);
         let inert = mask.inert();
         for (l, cb) in &mut self.checks {
             cb.set_checked(get(&mask, &ctl, *l));
@@ -497,4 +555,100 @@ impl Panel {
         paint::fill_rect(canvas, sx as isize, (sy - th * 0.5) as isize, (sw * used) as isize, th as isize, SLIDER_USED, None, None);
         paint::fill_rect(canvas, sx as isize, (sy - th * 0.5) as isize, sw as isize, th as isize, SLIDER_TRACK, None, None);
     }
+}
+
+impl Panel {
+    /// The theme page: a back row, one row per theme (the current one ticked), and under them the legend of the chosen theme — the terrain ramp, the land cover swatches, the line classes and the inks. Returns the rows as (centre y, half height), the back row first.
+    #[allow(clippy::too_many_arguments)]
+    fn paint_themes(canvas: &mut Canvas, text: &mut TextRenderer, font: f32, panel_w: f32, gear: (f32, f32, f32), h: usize, themes: &[Theme], current: usize) -> Vec<(f32, f32)> {
+        let x0 = font * 0.9;
+        let row = font * 1.6;
+        let mut y = gear.1 + gear.2 + font * 0.9 + row * 0.5;
+        let mut rows = Vec::new();
+        let title = TextStyle::new(font, theme::TEXTBOX_TEXT);
+        let small = TextStyle::new(font * 0.8, READOUT);
+        let dim = TextStyle::new(font * 0.72, READOUT_DIM);
+        text.draw_text_left(canvas, "\u{2039}  Layers", x0, y, &title, None, None);
+        rows.push((y, row * 0.5));
+        y += row * 1.2;
+        for (i, t) in themes.iter().enumerate() {
+            let mark = if i == current { "\u{25cf}" } else { "\u{25cb}" };
+            text.draw_text_left(canvas, &format!("{mark}  {}", t.name), x0, y, &title, None, None);
+            rows.push((y, row * 0.5));
+            y += row;
+        }
+        let Some(t) = themes.get(current) else { return rows };
+        // Legend: the ramp as a bar from sea to summit.
+        y += font * 0.5;
+        text.draw_text_left(canvas, "terrain", x0, y, &dim, None, None);
+        y += font * 0.9;
+        let lut = t.hypso_lut();
+        let bar_w = panel_w - x0 * 2.0;
+        let bar_h = font * 0.7;
+        let cols = bar_w.max(1.0) as usize;
+        for i in 0..cols {
+            // 0 to 3200 m across the bar.
+            let eq = ((i as f32 / cols as f32) * 3200.0 + 500.0) * 4.0;
+            let c = lut[((eq as usize) >> 4).min(4094)];
+            paint::fill_rect(canvas, (x0 + i as f32) as isize, y as isize, 1, bar_h as isize, swatch(c), None, None);
+        }
+        y += bar_h + font * 0.5;
+        // Land cover: swatch and name, two to a line.
+        text.draw_text_left(canvas, "land cover", x0, y, &dim, None, None);
+        y += font * 0.9;
+        let half = (panel_w - x0 * 2.0) * 0.5;
+        for (name, c) in LAND_NAMES.iter().zip(t.land.iter()).skip(1) {
+            let col = ((name_index(name, &LAND_NAMES) - 1) % 2) as f32;
+            let x = x0 + col * half;
+            paint::fill_rect(canvas, x as isize, (y - font * 0.3) as isize, (font * 0.8) as isize, (font * 0.6) as isize, swatch(*c), None, None);
+            text.draw_text_left(canvas, name, x + font * 1.1, y, &small, None, None);
+            if col == 1.0 {
+                y += font * 0.95;
+            }
+            if y > h as f32 - font * 2.0 {
+                return rows;
+            }
+        }
+        if LAND_NAMES.len() % 2 == 0 {
+            y += font * 0.95;
+        }
+        // Lines: a short stroke and the name, two to a line.
+        y += font * 0.4;
+        text.draw_text_left(canvas, "lines", x0, y, &dim, None, None);
+        y += font * 0.9;
+        for (name, c) in CLASS_NAMES.iter().zip(t.line.iter()).skip(1) {
+            let col = ((name_index(name, &CLASS_NAMES) - 1) % 2) as f32;
+            let x = x0 + col * half;
+            paint::fill_rect(canvas, x as isize, (y - font * 0.08) as isize, (font * 0.8) as isize, (font * 0.16).max(2.0) as isize, swatch(*c), None, None);
+            text.draw_text_left(canvas, name, x + font * 1.1, y, &small, None, None);
+            if col == 1.0 {
+                y += font * 0.95;
+            }
+            if y > h as f32 - font * 2.0 {
+                return rows;
+            }
+        }
+        y += font * 1.3;
+        text.draw_text_left(canvas, "inks", x0, y, &dim, None, None);
+        y += font * 0.9;
+        for (i, (name, c)) in [("water", t.water), ("contour", t.contour), ("index contour", t.contour_index), ("flat ground", t.flat)].iter().enumerate() {
+            let col = (i % 2) as f32;
+            let x = x0 + col * half;
+            paint::fill_rect(canvas, x as isize, (y - font * 0.3) as isize, (font * 0.8) as isize, (font * 0.6) as isize, swatch(*c), None, None);
+            text.draw_text_left(canvas, name, x + font * 1.1, y, &small, None, None);
+            if col == 1.0 {
+                y += font * 0.95;
+            }
+        }
+        rows
+    }
+}
+
+fn name_index(name: &str, names: &[&str]) -> usize {
+    names.iter().position(|n| *n == name).unwrap_or(0)
+}
+
+/// A legend swatch of a display colour, opaque, in fluor's stored form.
+fn swatch(c: [u8; 3]) -> u32 {
+    (theme::dark(theme::fmt(((c[0] as u32) << 16) | ((c[1] as u32) << 8) | c[2] as u32)) & 0x00FF_FFFF) | 0xFF00_0000
 }

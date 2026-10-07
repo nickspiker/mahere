@@ -155,20 +155,25 @@ impl Sh9 {
 
     /// The default environment: a warm sun at (azimuth clockwise from screen-up, altitude) in the device frame plus a cool sky dome, scaled so flat ground under the sun's zenith reads about as bright as today's hillshade (ambient ≈ 0.3, sun ≈ 0.7).
     pub fn sun_and_sky(az_deg: f32, alt_deg: f32) -> Sh9 {
+        Sh9::sun_and_sky_coloured(az_deg, alt_deg, [0.74, 0.70, 0.62], [0.85, 0.95, 1.15])
+    }
+
+    /// The same with a theme's sun and sky colours.
+    pub fn sun_and_sky_coloured(az_deg: f32, alt_deg: f32, sun: [f32; 3], sky: [f32; 3]) -> Sh9 {
         // The direct light fades out over the last five degrees above the horizon and is gone below it; the sky dome stays, so dusk is dim and flat rather than black.
         let strength = (alt_deg / 5.0).clamp(0.0, 1.0);
         let (az, alt) = (az_deg.to_radians(), alt_deg.max(0.0).to_radians());
         // Device frame: x right, y up (screen), z out of the screen; "up" for the sky is +z.
-        Sh9::environment([az.sin() * alt.cos(), az.cos() * alt.cos(), alt.sin()], strength, [0.0, 0.0, 1.0])
+        Sh9::environment([az.sin() * alt.cos(), az.cos() * alt.cos(), alt.sin()], strength, [0.0, 0.0, 1.0], sun, sky)
     }
 
     /// The environment from vectors in the device frame: the sun's direction and strength, and which way the sky is. A phone tilted away from the sun sees neither and goes dark; one facing it is lit flat.
-    pub fn environment(sun_dir: [f32; 3], strength: f32, up: [f32; 3]) -> Sh9 {
+    pub fn environment(sun_dir: [f32; 3], strength: f32, up: [f32; 3], sun: [f32; 3], sky: [f32; 3]) -> Sh9 {
         let mut sh = Sh9::ZERO;
-        sh.add_sun(sun_dir, [0.74 * strength, 0.70 * strength, 0.62 * strength]);
-        // A sky of radiance S gives πS onto an upward normal: πS ≈ 0.3.
+        sh.add_sun(sun_dir, [sun[0] * strength, sun[1] * strength, sun[2] * strength]);
+        // A sky of radiance S gives πS onto an upward normal: πS ≈ 0.3 for a unit tint.
         let s = 0.3 / std::f32::consts::PI;
-        sh.add_sky(up, [s * 0.85, s * 0.95, s * 1.15]);
+        sh.add_sky(up, [s * sky[0], s * sky[1], s * sky[2]]);
         sh
     }
 }

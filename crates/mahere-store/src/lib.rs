@@ -127,6 +127,8 @@ pub struct Settings {
     pub real_sun: bool,
     pub follow_heading: bool,
     pub lock_to_fix: bool,
+    /// Index into the engine's themes.
+    pub theme: u64,
 }
 
 fn settings_key() -> String {
@@ -135,7 +137,7 @@ fn settings_key() -> String {
 
 pub fn save_settings(store: &FlatStorage, s: &Settings) -> Result<(), StorageError> {
     let flags = (s.real_sun as u64) | (s.follow_heading as u64) << 1 | (s.lock_to_fix as u64) << 2;
-    let t = VsfType::t_u6(Tensor::new(vec![3], vec![s.cache_budget, s.layer_bits, flags]));
+    let t = VsfType::t_u6(Tensor::new(vec![4], vec![s.cache_budget, s.layer_bits, flags, s.theme]));
     store.write_device(&settings_key(), &t.flatten())
 }
 
@@ -147,10 +149,10 @@ pub fn load_settings(store: &FlatStorage) -> Option<Settings> {
         VsfType::v_u6(t) => t.data,
         _ => return None,
     };
-    if d.len() != 3 {
+    if d.len() < 3 {
         return None;
     }
-    Some(Settings { cache_budget: d[0], layer_bits: d[1], real_sun: d[2] & 1 != 0, follow_heading: d[2] & 2 != 0, lock_to_fix: d[2] & 4 != 0 })
+    Some(Settings { cache_budget: d[0], layer_bits: d[1], real_sun: d[2] & 1 != 0, follow_heading: d[2] & 2 != 0, lock_to_fix: d[2] & 4 != 0, theme: d.get(3).copied().unwrap_or(0) })
 }
 
 /// Width-agnostic float-array read, per VSF doctrine.
@@ -478,5 +480,236 @@ mod index_tests {
         entries.insert((9u8, 0x7000_0000_0000_0000u64), (et_now() - 5, 1_024u32));
         let bytes = encode_cell_index(&entries).unwrap();
         assert_eq!(decode_cell_index(&bytes), entries);
+    }
+}
+
+// ==================== THEMES ====================
+
+/// Themes on disk: one VSF document per theme in the vault under (`d` theme, `x` name), colours authored in VSF RGB at gamma 2 as Photon authors its palette, and converted to the display when loaded. The built-ins are written on first launch so a user can edit them in place; an index document (`d` theme, `d` index) lists the names.
+pub mod themes {
+    use super::{name, vault_key};
+    use kete::FlatStorage;
+    use mahere_engine::LayerMask;
+    use mahere_engine::theme::Theme;
+    use vsf::types::Tensor;
+    use vsf::{VsfBuilder, VsfType};
+
+    fn theme_key(theme_name: &str) -> String {
+        vault_key(&[name("theme"), VsfType::x(theme_name.to_string())])
+    }
+
+    fn index_key() -> String {
+        vault_key(&[name("theme"), name("index")])
+    }
+
+    fn rgb_t(c: [u8; 3]) -> VsfType {
+        VsfType::t_u3(Tensor::new(vec![3], c.to_vec()))
+    }
+
+    fn table_t<const N: usize>(t: &[[u8; 3]; N]) -> VsfType {
+        VsfType::t_u3(Tensor::new(vec![N, 3], t.iter().flatten().copied().collect()))
+    }
+
+    pub fn encode(t: &Theme) -> Option<Vec<u8>> {
+        let stops: Vec<f32> = t.hypso.iter().map(|(m, _)| *m).collect();
+        let stop_rgb: Vec<u8> = t.hypso.iter().flat_map(|(_, c)| c.to_vec()).collect();
+        VsfBuilder::new()
+            .add_section("theme", vec![("name".to_string(), VsfType::x(t.name.clone())), ("layers".to_string(), VsfType::u(t.layers.bits() as usize, false))])
+            .add_section("hypso", vec![("metres".to_string(), VsfType::t_f5(Tensor::new(vec![stops.len()], stops))), ("rgb".to_string(), VsfType::t_u3(Tensor::new(vec![t.hypso.len(), 3], stop_rgb)))])
+            .add_section("tables", vec![("land".to_string(), table_t(&t.land)), ("line".to_string(), table_t(&t.line))])
+            .add_section(
+                "inks",
+                vec![
+                    ("sea".to_string(), rgb_t(t.sea)),
+                    ("flat".to_string(), rgb_t(t.flat)),
+                    ("background".to_string(), rgb_t(t.bg)),
+                    ("noterrain".to_string(), rgb_t(t.no_dem)),
+                    ("water".to_string(), rgb_t(t.water)),
+                    ("contour".to_string(), rgb_t(t.contour)),
+                    ("index".to_string(), rgb_t(t.contour_index)),
+                ],
+            )
+            .add_section("light", vec![("sun".to_string(), VsfType::t_f5(Tensor::new(vec![3], t.sun.to_vec()))), ("sky".to_string(), VsfType::t_f5(Tensor::new(vec![3], t.sky.to_vec())))])
+            .build()
+            .ok()
+    }
+
+    fn bytes_of(v: &VsfType) -> Option<Vec<u8>> {
+        match v {
+            VsfType::t_u3(t) => Some(t.data.clone()),
+            VsfType::v_u3(t) => Some(t.data.clone()),
+            _ => None,
+        }
+    }
+
+    fn floats_of(v: &VsfType) -> Option<Vec<f32>> {
+        match v {
+            VsfType::t_f5(t) => Some(t.data.clone()),
+            VsfType::v_f5(t) => Some(t.data.clone()),
+            VsfType::t_f6(t) => Some(t.data.iter().map(|&x| x as f32).collect()),
+            VsfType::v_f6(t) => Some(t.data.iter().map(|&x| x as f32).collect()),
+            _ => None,
+        }
+    }
+
+    fn rgb3(v: &VsfType) -> Option<[u8; 3]> {
+        let b = bytes_of(v)?;
+        (b.len() == 3).then(|| [b[0], b[1], b[2]])
+    }
+
+    fn table<const N: usize>(v: &VsfType) -> Option<[[u8; 3]; N]> {
+        let b = bytes_of(v)?;
+        if b.len() != N * 3 {
+            return None;
+        }
+        Some(std::array::from_fn(|i| [b[3 * i], b[3 * i + 1], b[3 * i + 2]]))
+    }
+
+    pub fn decode(data: &[u8]) -> Option<Theme> {
+        let (header, end) = vsf::VsfHeader::decode(data).ok()?;
+        let sections = header.sections(data, end).ok()?;
+        let mut fields: std::collections::HashMap<(String, String), VsfType> = std::collections::HashMap::new();
+        for s in sections {
+            for f in s.fields {
+                if let Some(v) = f.values.into_iter().next() {
+                    fields.insert((s.name.clone(), f.name), v);
+                }
+            }
+        }
+        let get = |s: &str, f: &str| fields.get(&(s.to_string(), f.to_string()));
+        let theme_name = match get("theme", "name")? {
+            VsfType::x(s) | VsfType::a(s) => s.clone(),
+            _ => return None,
+        };
+        let layers = match get("theme", "layers")? {
+            VsfType::u(b, _) => LayerMask::from_bits(*b as u32),
+            VsfType::u3(b) => LayerMask::from_bits(*b as u32),
+            VsfType::u4(b) => LayerMask::from_bits(*b as u32),
+            VsfType::u5(b) => LayerMask::from_bits(*b),
+            VsfType::u6(b) => LayerMask::from_bits(*b as u32),
+            _ => LayerMask::default(),
+        };
+        let metres = floats_of(get("hypso", "metres")?)?;
+        let rgb = bytes_of(get("hypso", "rgb")?)?;
+        if metres.len() != 5 || rgb.len() != 15 {
+            return None;
+        }
+        let hypso: [(f32, [u8; 3]); 5] = std::array::from_fn(|i| (metres[i], [rgb[3 * i], rgb[3 * i + 1], rgb[3 * i + 2]]));
+        let sun = floats_of(get("light", "sun")?)?;
+        let sky = floats_of(get("light", "sky")?)?;
+        if sun.len() != 3 || sky.len() != 3 {
+            return None;
+        }
+        Some(Theme {
+            name: theme_name,
+            hypso,
+            sea: rgb3(get("inks", "sea")?)?,
+            flat: rgb3(get("inks", "flat")?)?,
+            bg: rgb3(get("inks", "background")?)?,
+            no_dem: rgb3(get("inks", "noterrain")?)?,
+            land: table(get("tables", "land")?)?,
+            line: table(get("tables", "line")?)?,
+            water: rgb3(get("inks", "water")?)?,
+            contour: rgb3(get("inks", "contour")?)?,
+            contour_index: rgb3(get("inks", "index")?)?,
+            sun: [sun[0], sun[1], sun[2]],
+            sky: [sky[0], sky[1], sky[2]],
+            layers,
+        })
+    }
+
+    /// VSF RGB (gamma 2) to this display, Photon's rule: Android and Linux surfaces are BT.2020-tagged or assumed so, so the primaries convert and the transfer stays gamma 2; macOS surfaces are tagged VSF RGB and take the authored value as is.
+    pub fn to_display(c: [u8; 3]) -> [u8; 3] {
+        if cfg!(target_os = "macos") {
+            return c;
+        }
+        let lin = [(c[0] as f32 / 255.0).powi(2), (c[1] as f32 / 255.0).powi(2), (c[2] as f32 / 255.0).powi(2)];
+        let out = vsf::colour::convert::apply_matrix_3x3_f32(&vsf::colour::VSF_RGB2REC2020, &lin);
+        let e = |x: f32| (x.clamp(0.0, 1.0).sqrt() * 255.0).round() as u8;
+        [e(out[0]), e(out[1]), e(out[2])]
+    }
+
+    /// A theme with every colour converted to the display.
+    pub fn display(t: &Theme) -> Theme {
+        let mut d = t.clone();
+        for (_, c) in d.hypso.iter_mut() {
+            *c = to_display(*c);
+        }
+        for c in [&mut d.sea, &mut d.flat, &mut d.bg, &mut d.no_dem, &mut d.water, &mut d.contour, &mut d.contour_index] {
+            *c = to_display(*c);
+        }
+        for c in d.land.iter_mut().chain(d.line.iter_mut()) {
+            *c = to_display(*c);
+        }
+        d
+    }
+
+    fn write_index(store: &FlatStorage, names: &[String]) {
+        let joined: Vec<VsfType> = names.iter().map(|n| VsfType::x(n.clone())).collect();
+        let mut section = vsf::VsfSection::new("themes");
+        section.add_field_multi("names", joined);
+        if let Ok(b) = VsfBuilder::new().add_section_direct(section).build() {
+            let _ = store.write_device(&index_key(), &b);
+        }
+    }
+
+    pub fn names(store: &FlatStorage) -> Vec<String> {
+        let Ok(Some(bytes)) = store.read_device(&index_key()) else { return Vec::new() };
+        let Ok((header, end)) = vsf::VsfHeader::decode(&bytes) else { return Vec::new() };
+        let Ok(sections) = header.sections(&bytes, end) else { return Vec::new() };
+        let mut out = Vec::new();
+        for s in sections {
+            for f in s.fields {
+                if f.name == "names" {
+                    for v in f.values {
+                        if let VsfType::x(n) | VsfType::a(n) = v {
+                            out.push(n);
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    pub fn save(store: &FlatStorage, t: &Theme) {
+        if let Some(b) = encode(t) {
+            let _ = store.write_device(&theme_key(&t.name), &b);
+            let mut list = names(store);
+            if !list.iter().any(|n| *n == t.name) {
+                list.push(t.name.clone());
+                write_index(store, &list);
+            }
+        }
+    }
+
+    pub fn load(store: &FlatStorage, theme_name: &str) -> Option<Theme> {
+        let bytes = store.read_device(&theme_key(theme_name)).ok()??;
+        decode(&bytes)
+    }
+
+    /// The built-ins into the vault where they are missing, then every theme the vault holds, converted to the display and in index order.
+    pub fn load_all(store: &FlatStorage) -> Vec<Theme> {
+        for t in mahere_engine::theme::builtin() {
+            if load(store, &t.name).is_none() {
+                save(store, &t);
+            }
+        }
+        names(store).iter().filter_map(|n| load(store, n)).map(|t| display(&t)).collect()
+    }
+}
+
+#[cfg(test)]
+mod theme_tests {
+    #[test]
+    fn a_theme_survives_the_document() {
+        let t = mahere_engine::theme::night();
+        let bytes = super::themes::encode(&t).unwrap();
+        let back = super::themes::decode(&bytes).unwrap();
+        assert_eq!(back.name, "Night");
+        assert_eq!(back.line, t.line);
+        assert_eq!(back.hypso, t.hypso);
+        assert_eq!(back.layers.bits(), t.layers.bits());
+        assert_eq!(back.contour_index, t.contour_index);
     }
 }

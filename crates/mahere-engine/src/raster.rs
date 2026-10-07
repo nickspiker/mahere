@@ -141,8 +141,32 @@ impl ElevRange {
     }
 }
 
-/// Hypsometric tint LUT indexed by elev_q >> 4 (4 m buckets). Water and no-data are LUT rows, keeping the pixel loop branch-free on terrain type.
+/// The colours a frame draws with, from the theme: land and line tables, the water and contour inks, the flat and no-terrain grounds, the background.
+#[derive(Clone, Copy, Debug)]
+pub struct Style {
+    pub land: [[u8; 3]; 14],
+    pub line: [[u8; 3]; 18],
+    pub water: [u8; 3],
+    pub contour: [u8; 3],
+    pub contour_index: [u8; 3],
+    pub flat: [u8; 3],
+    pub bg: [u8; 3],
+    pub no_dem: [u8; 3],
+}
+
+impl Default for Style {
+    fn default() -> Self {
+        crate::theme::trail().style()
+    }
+}
+
+/// Hypsometric tint LUT indexed by elev_q >> 4 (4 m buckets). Water and no-data are LUT rows, keeping the pixel loop branch-free on terrain type. The Trail theme's ramp.
 pub fn build_hypso_lut() -> Box<[[u8; 3]; 4096]> {
+    crate::theme::trail().hypso_lut()
+}
+
+#[allow(dead_code)]
+fn build_hypso_lut_old() -> Box<[[u8; 3]; 4096]> {
     const STOPS: [(f32, [f32; 3]); 5] = [
         (0.0, [72.0, 96.0, 60.0]),
         (500.0, [110.0, 112.0, 70.0]),
@@ -179,10 +203,6 @@ pub fn build_hypso_lut() -> Box<[[u8; 3]; 4096]> {
 
 pub const BG_RGB8: [u8; 3] = [18, 20, 26];
 pub const WATER_RGB: [u8; 3] = [26, 58, 82];
-/// Terrain tint when the dem layer is off or absent: a neutral ground.
-const FLAT_RGB: [u8; 3] = [96, 100, 96];
-/// The barren landscape under the light alone, with the elevation tint off.
-const FLAT_WHITE: [u8; 3] = [232, 232, 230];
 
 /// Line class id (1-based, 0 = empty) -> visible RGB. Index 12 = Waterway, whose brightness is scaled by the texel's log magnitude at draw time so water is never uniform.
 pub const CLASS_LUT: [[u8; 3]; 18] = [
@@ -270,6 +290,7 @@ pub(crate) fn probe<'a>(pool: &'a Pool, mut depth: u8, mut prefix: u64, has: imp
 
 pub struct FrameLuts {
     pub hypso: Box<[[u8; 3]; 4096]>,
+    pub style: Style,
     pub sun: [f32; 3],
     pub mask: LayerMask,
     /// The depth the frame asked the dem for (debug tint reference).
@@ -411,9 +432,9 @@ pub fn tri_index(uq: i64, vq: i64, shift: u32) -> usize {
 
 /// A line texel's colour: the class LUT, with waterways darkened by their log magnitude (a trickle at ~40%, a big river at full).
 #[inline(always)]
-fn line_colour(line: &ClassCell, i: usize) -> [u8; 3] {
+fn line_colour(line: &ClassCell, i: usize, style: &Style) -> [u8; 3] {
     let cls = (line.class[i] as usize).min(CLASS_MAX);
-    let c = CLASS_LUT[cls];
+    let c = style.line[cls];
     if cls == WATERWAY_CLASS {
         let m = 0.4 + 0.6 * line.mag_at(i) as f32 / 255.0;
         [(c[0] as f32 * m) as u8, (c[1] as f32 * m) as u8, (c[2] as f32 * m) as u8]
@@ -494,14 +515,13 @@ fn contour_cov(elev_m: f32, slope: f32, c: &Contours) -> (f32, bool) {
     ((w + 0.5 - d_px).clamp(0.0, 1.0), is_index)
 }
 
-const CONTOUR_RGB: [u8; 3] = [92, 62, 34];
-const CONTOUR_INDEX_RGB: [u8; 3] = [64, 40, 18];
 
 #[inline(always)]
 fn compose_rgb(dem: &DemRef, vec: &VecRef, pool: &Pool, diamond: u8, uq: i64, vq: i64, luts: &FrameLuts, range: &mut ElevRange) -> u32 {
     let mask = luts.mask;
     // Terrain: tint from elevation, shade from the normal.
-    let mut tint = [FLAT_RGB[0] as f32, FLAT_RGB[1] as f32, FLAT_RGB[2] as f32];
+    let st = &luts.style;
+    let mut tint = [st.no_dem[0] as f32, st.no_dem[1] as f32, st.no_dem[2] as f32];
     let mut diffuse = 1.0f32;
     let mut light = [1.0f32; 3];
     let mut have_ground = false;
@@ -526,7 +546,7 @@ fn compose_rgb(dem: &DemRef, vec: &VecRef, pool: &Pool, diamond: u8, uq: i64, vq
                         let c = luts.hypso[(eq >> 4) as usize];
                         [c[0] as f32, c[1] as f32, c[2] as f32]
                     } else {
-                        [FLAT_WHITE[0] as f32, FLAT_WHITE[1] as f32, FLAT_WHITE[2] as f32]
+                        [st.flat[0] as f32, st.flat[1] as f32, st.flat[2] as f32]
                     };
                     have_ground = true;
                 }
@@ -546,7 +566,7 @@ fn compose_rgb(dem: &DemRef, vec: &VecRef, pool: &Pool, diamond: u8, uq: i64, vq
                 }
             }
         } else if mask.dem {
-            tint = [BG_RGB8[0] as f32, BG_RGB8[1] as f32, BG_RGB8[2] as f32];
+            tint = [st.bg[0] as f32, st.bg[1] as f32, st.bg[2] as f32];
         }
     }
     let mut rgb = tint;
@@ -563,7 +583,7 @@ fn compose_rgb(dem: &DemRef, vec: &VecRef, pool: &Pool, diamond: u8, uq: i64, vq
                 if let Some(line) = line {
                     let cov = line.cov[i];
                     if cov != 0 && (mask.boundaries || (line.class[i] as usize) < BOUNDARY_FIRST) {
-                        rgb = lerp3(rgb, line_colour(line, i), cov as f32 / 255.0);
+                        rgb = lerp3(rgb, line_colour(line, i, &luts.style), cov as f32 / 255.0);
                     }
                 }
             }
@@ -573,7 +593,7 @@ fn compose_rgb(dem: &DemRef, vec: &VecRef, pool: &Pool, diamond: u8, uq: i64, vq
             if let Some(land) = land {
                 let lc = land.cov[i];
                 if lc != 0 {
-                    rgb = lerp3(rgb, LAND_LUT[(land.class[i] as usize).min(13)], lc as f32 / 255.0 * 0.85);
+                    rgb = lerp3(rgb, st.land[(land.class[i] as usize).min(13)], lc as f32 / 255.0 * 0.85);
                 }
             }
         }
@@ -588,20 +608,20 @@ fn compose_rgb(dem: &DemRef, vec: &VecRef, pool: &Pool, diamond: u8, uq: i64, vq
                 let wc = water.cov[i];
                 if wc != 0 {
                     let s = 0.85 + 0.15 * diffuse;
-                    let wr = [WATER_RGB[0] as f32 * s, WATER_RGB[1] as f32 * s, WATER_RGB[2] as f32 * s];
+                    let wr = [st.water[0] as f32 * s, st.water[1] as f32 * s, st.water[2] as f32 * s];
                     let t = wc as f32 / 255.0;
                     rgb = [rgb[0] + (wr[0] - rgb[0]) * t, rgb[1] + (wr[1] - rgb[1]) * t, rgb[2] + (wr[2] - rgb[2]) * t];
                 }
             }
         }
         if contour.0 > 0.0 {
-            rgb = lerp3(rgb, if contour.1 { CONTOUR_INDEX_RGB } else { CONTOUR_RGB }, contour.0 * 0.85);
+            rgb = lerp3(rgb, if contour.1 { st.contour_index } else { st.contour }, contour.0 * 0.85);
         }
         if mask.line {
             if let Some(line) = line {
                 let cov = line.cov[i];
                 if cov != 0 && (mask.boundaries || (line.class[i] as usize) < BOUNDARY_FIRST) {
-                    rgb = lerp3(rgb, line_colour(line, i), cov as f32 / 255.0);
+                    rgb = lerp3(rgb, line_colour(line, i, &luts.style), cov as f32 / 255.0);
                 }
             }
         }
@@ -613,7 +633,7 @@ fn compose_rgb(dem: &DemRef, vec: &VecRef, pool: &Pool, diamond: u8, uq: i64, vq
             rgb = lerp3(rgb, col, 0.45);
         }
         if contour.0 > 0.0 {
-            rgb = lerp3(rgb, if contour.1 { CONTOUR_INDEX_RGB } else { CONTOUR_RGB }, contour.0 * 0.85);
+            rgb = lerp3(rgb, if contour.1 { st.contour_index } else { st.contour }, contour.0 * 0.85);
         }
     }
     ((rgb[0] as u32) << 16) | ((rgb[1] as u32) << 8) | rgb[2] as u32
@@ -814,6 +834,7 @@ mod tests {
 
         let luts = FrameLuts {
             hypso: build_hypso_lut(),
+            style: Style::default(),
             sun: [0.0, 0.0, 1.0],
             mask: LayerMask { contours: false, ..LayerMask::default() }.effective(),
             dem_depth: 12,
@@ -825,7 +846,7 @@ mod tests {
         let (stats, _want) = render_frame(&mut canvas, w, h, &cam, &pool, &luts, 12, 13);
         assert_eq!(stats.straddle_blocks, 0);
         // Expected: the flat white (land cover makes the elevation tint inert) lerped 85% to forest, lit by the SH irradiance at a flat normal in the device frame.
-        let t = FLAT_WHITE;
+        let t = luts.style.flat;
         let f = LAND_LUT[5];
         let e = luts.light.eval(0.0, 0.0, 1.0);
         let mix = |a: u8, b: u8, l: f32| ((a as f32 + (b as f32 - a as f32) * 0.85) * l.clamp(0.0, 1.3)) as u32;

@@ -4,6 +4,7 @@ pub mod plan;
 pub mod raster;
 pub mod residency;
 pub mod sh;
+pub mod theme;
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -112,6 +113,10 @@ pub struct MapCore {
     measure: Option<Measure>,
     /// The last plan came from the cache: the view and the cells were as before.
     plan_cached: bool,
+    /// The themes available (the built-ins until a host loads the vault's), the one in use, and a counter a GPU host watches to re-upload the tables.
+    pub themes: Vec<theme::Theme>,
+    pub theme: usize,
+    style_version: u64,
     /// Measure from the fix rather than the screen centre, until the camera moves.
     pub lock_to_fix: bool,
 }
@@ -125,6 +130,7 @@ impl MapCore {
             res: Residency::new(store),
             luts: FrameLuts {
                 hypso: build_hypso_lut(),
+                style: raster::Style::default(),
                 sun: [0.0, 0.0, 1.0],
                 mask: LayerMask::default(),
                 dem_depth: DEM_BASE_DEPTH,
@@ -159,6 +165,9 @@ impl MapCore {
             plan_cache: None,
             measure: None,
             plan_cached: false,
+            themes: theme::builtin(),
+            theme: 0,
+            style_version: 0,
             lock_to_fix: false,
         }
     }
@@ -417,6 +426,33 @@ impl MapCore {
         p
     }
 
+    /// Switch themes: the tables, the lighting colours and the theme's layer defaults.
+    /// The themes a host loaded (display-converted); the current one is re-applied by name, or the first if it is gone.
+    pub fn set_themes(&mut self, themes: Vec<theme::Theme>) {
+        if themes.is_empty() {
+            return;
+        }
+        let name = self.themes.get(self.theme).map(|t| t.name.clone());
+        self.themes = themes;
+        let i = name.and_then(|n| self.themes.iter().position(|t| t.name == n)).unwrap_or(0);
+        self.set_theme(i);
+    }
+
+    pub fn set_theme(&mut self, i: usize) {
+        self.theme = i.min(self.themes.len() - 1);
+        let t = self.themes[self.theme].clone();
+        self.luts.hypso = t.hypso_lut();
+        self.luts.style = t.style();
+        self.set_layers(t.layers);
+        self.luts_sun = (f32::NAN, f32::NAN, f64::NAN);
+        self.style_version += 1;
+        self.dirty = true;
+    }
+
+    pub fn style_version(&self) -> u64 {
+        self.style_version
+    }
+
     pub fn plan_cached(&self) -> bool {
         self.plan_cached
     }
@@ -483,9 +519,11 @@ impl MapCore {
                 // The frames, in order. The almanac gives a true azimuth; the sensor's world frame has magnetic north on its Y axis, so the sun is first expressed against magnetic north (azimuth less the declination, east positive). Rᵀ then takes it into the device frame: x right, y up the screen, z out of it — the lighting frame, since the Activity is locked to portrait. Last, when the map's up is not where the phone points, the device-frame sun is turned by (bearing − true heading): a device turned clockwise sees a fixed world vector turn counterclockwise, so this is the lighting the phone would show turned to match the map, tilt kept. With follow heading on the two agree and nothing turns; without a sensor (R identity, heading = declination) it collapses to the map-locked rotation by the bearing.
                 let frames = Frames { declination_deg: self.declination_deg, map_locked: !self.have_rotation, rot: self.device_rot, bearing_deg: self.cam.bearing.to_degrees() as f32, heading_mag_deg: self.device_heading };
                 let strength = (alt as f32 / 5.0).clamp(0.0, 1.0);
-                self.env = sh::Sh9::environment(frames.to_screen(az as f32, alt as f32), strength, frames.up());
-            } else if self.luts_sun.0 != self.sun_az || self.luts_sun.1 != self.sun_alt || self.device_heading != 0.0 {
-                self.env = sh::Sh9::sun_and_sky(self.sun_az - self.device_heading, self.sun_alt);
+                let t = &self.themes[self.theme.min(self.themes.len() - 1)];
+                self.env = sh::Sh9::environment(frames.to_screen(az as f32, alt as f32), strength, frames.up(), t.sun, t.sky);
+            } else if self.luts_sun.0 != self.sun_az || self.luts_sun.1 != self.sun_alt || self.device_heading != 0.0 || self.luts_sun.2.is_nan() {
+                let t = &self.themes[self.theme.min(self.themes.len() - 1)];
+                self.env = sh::Sh9::sun_and_sky_coloured(self.sun_az - self.device_heading, self.sun_alt, t.sun, t.sky);
             }
             let (sb, cb) = self.cam.bearing.sin_cos();
             self.luts.light = self.env.quadratic((sb as f32, cb as f32));

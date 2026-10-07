@@ -102,12 +102,16 @@ fn main() {
     let sync_ms = t.elapsed().as_secs_f32() * 1000.0;
     let overlay = map.overlay(w, h, true).to_vec();
     // MAHERE_PANEL=1 lays the open control panel over the GPU frame (the CPU frame has none, so the diff below is then meaningless).
-    if std::env::var("MAHERE_PANEL").as_deref() == Ok("1") {
+    let panel_mode = std::env::var("MAHERE_PANEL").unwrap_or_default();
+    if panel_mode == "1" || panel_mode == "themes" {
         let mut panel = mahere_panel::Panel::new();
         panel.set_open(true);
+        if panel_mode == "themes" {
+            panel.show_themes();
+        }
         let c = map.cam;
         let readouts = mahere_panel::Readouts { lat: c.lat, lon: c.lon, elev: map.elevation_at(c.lat, c.lon), heading_deg: c.bearing.to_degrees(), m_per_px: 111_320.0 / c.ppd, frame_ms: cpu_ms, resident: map.pool().map.len(), phone_heading: None, cache_used: 0, cache_max: 1 << 30 };
-        panel.paint(w, h, map.layers(), mahere_panel::Controls::default(), &readouts, None);
+        panel.paint(w, h, map.layers(), mahere_panel::Controls::default(), &readouts, None, &map.themes);
         let rgba = panel.overlay_rgba(&overlay, w, h);
         gpu.set_overlay_rgba(&device, &queue, w as u32, h as u32, &rgba);
     } else {

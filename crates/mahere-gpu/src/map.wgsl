@@ -43,6 +43,12 @@ struct Uniforms {
     pin: vec4<f32>,
     line_hi: array<vec4<f32>, 8>,
     measure: vec4<f32>,
+    style_water: vec4<f32>,
+    style_contour: vec4<f32>,
+    style_contour_index: vec4<f32>,
+    style_flat: vec4<f32>,
+    style_bg: vec4<f32>,
+    style_no_dem: vec4<f32>,
 };
 
 // a: diamond, depth, cu, cv. b: dem slot, line slot, land+water slot, img slot. c: flags. d: base, step, eu, nu. e: ev, nv, inv det.
@@ -322,7 +328,7 @@ fn fold(f: Fold, col: vec3<f32>, a: f32) -> Fold {
 fn compose(d: u32, u: u32, v: u32) -> Composed {
     let mask = U.mask;
     var out: Composed;
-    out.base = vec3<f32>(96.0, 100.0, 96.0);
+    out.base = U.style_no_dem.rgb;
     out.ground = false;
     out.n = vec3<f32>(0.0, 0.0, 1.0);
     out.k1 = 1.0;
@@ -347,7 +353,7 @@ fn compose(d: u32, u: u32, v: u32) -> Composed {
                 if ((mask & M_HYPSO) != 0u) {
                     out.base = unpack_rgb(lut[eq >> 4u]);
                 } else {
-                    out.base = vec3<f32>(232.0, 232.0, 230.0);
+                    out.base = U.style_flat.rgb;
                 }
                 out.ground = true;
             }
@@ -386,7 +392,7 @@ fn compose(d: u32, u: u32, v: u32) -> Composed {
                 }
             }
         } else if ((mask & M_DEM) != 0u) {
-            out.base = vec3<f32>(18.0, 20.0, 26.0);
+            out.base = U.style_bg.rgb;
         }
     }
     let vi = find(d, U.depths.y, u, v, FLAG_VEC);
@@ -433,7 +439,7 @@ fn compose(d: u32, u: u32, v: u32) -> Composed {
             out.water = f32(lw.z) / 255.0;
         }
         if (contour_cov > 0.0) {
-            let ink = select(vec3<f32>(92.0, 62.0, 34.0), vec3<f32>(64.0, 40.0, 18.0), contour_index);
+            let ink = select(U.style_contour.rgb, U.style_contour_index.rgb, contour_index);
             { let f = fold(Fold(out.k2, out.c2), ink, contour_cov * 0.85); out.k2 = f.k; out.c2 = f.c; }
         }
         if (draw_line) {
@@ -444,7 +450,7 @@ fn compose(d: u32, u: u32, v: u32) -> Composed {
             { let f = fold(Fold(out.k1, out.c1), band, 0.45); out.k1 = f.k; out.c1 = f.c; }
         }
         if (contour_cov > 0.0) {
-            let ink = select(vec3<f32>(92.0, 62.0, 34.0), vec3<f32>(64.0, 40.0, 18.0), contour_index);
+            let ink = select(U.style_contour.rgb, U.style_contour_index.rgb, contour_index);
             { let f = fold(Fold(out.k2, out.c2), ink, contour_cov * 0.85); out.k2 = f.k; out.c2 = f.c; }
         }
     }
@@ -474,7 +480,7 @@ fn shade(base: vec3<f32>, ground: bool, n: vec3<f32>, k1: f32, c1: vec3<f32>, wa
     }
     rgb = rgb * k1 + c1;
     if (water > 0.0) {
-        let wr = vec3<f32>(26.0, 58.0, 82.0) * (0.85 + 0.15 * diffuse);
+        let wr = U.style_water.rgb * (0.85 + 0.15 * diffuse);
         rgb = lerp3(rgb, wr, water);
     }
     return floor(rgb * k2 + c2);

@@ -2,7 +2,7 @@
 
 use bytemuck::{Pod, Zeroable};
 use mahere_engine::plan::{FLAG_DEM, FLAG_IMG, FLAG_LAND, FLAG_LINE, FLAG_WATER, FramePlan, TABLE_N};
-use mahere_engine::raster::{CLASS_LUT, FrameLuts, LAND_LUT, LayerMask};
+use mahere_engine::raster::{FrameLuts, LayerMask};
 use mahere_engine::residency::{DEMQ_H, DEMQ_W, Pool};
 use mahere_tiles::{CellKey, TEX, TRI};
 use rustc_hash::FxHashMap;
@@ -76,6 +76,12 @@ struct Uniforms {
     pin: [f32; 4],
     line_hi: [[f32; 4]; 8],
     measure: [f32; 4],
+    style_water: [f32; 4],
+    style_contour: [f32; 4],
+    style_contour_index: [f32; 4],
+    style_flat: [f32; 4],
+    style_bg: [f32; 4],
+    style_no_dem: [f32; 4],
 }
 
 /// The layer mask as the shader's bits.
@@ -251,10 +257,11 @@ pub struct GpuMap {
     pub pin: Option<(f32, f32, f32)>,
     /// The measurement, drawn by the present pass: origin and target in screen pixels.
     pub measure: Option<(f32, f32, f32, f32)>,
+    style_loaded: bool,
 }
 
 impl GpuMap {
-    pub fn new(device: &wgpu::Device, queue: &wgpu::Queue, present_format: wgpu::TextureFormat) -> GpuMap {
+    pub fn new(device: &wgpu::Device, _queue: &wgpu::Queue, present_format: wgpu::TextureFormat) -> GpuMap {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("mahere map"), source: wgpu::ShaderSource::Wgsl(include_str!("map.wgsl").into()) });
         let uint_array = wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Uint, view_dimension: wgpu::TextureViewDimension::D2Array, multisampled: false };
         let storage = wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: true }, has_dynamic_offset: false, min_binding_size: None };
@@ -312,20 +319,8 @@ impl GpuMap {
         let blocks = storage_buffer(device, "blocks", (blocks_cap * std::mem::size_of::<GpuBlock>()) as u64);
         let refs = storage_buffer(device, "refs", (refs_cap * std::mem::size_of::<GpuRef>()) as u64);
         let table = storage_buffer(device, "table", (TABLE_N * std::mem::size_of::<GpuSlot>()) as u64);
-        // Style tables: 4096 hypsometric rows, then the line classes and the land classes, each 0xRRGGBB.
-        let mut lut_data = vec![0u32; 4096 + 64];
-        let hypso = mahere_engine::raster::build_hypso_lut();
-        for (i, c) in hypso.iter().enumerate() {
-            lut_data[i] = ((c[0] as u32) << 16) | ((c[1] as u32) << 8) | c[2] as u32;
-        }
-        for (i, c) in CLASS_LUT.iter().enumerate() {
-            lut_data[4096 + i] = ((c[0] as u32) << 16) | ((c[1] as u32) << 8) | c[2] as u32;
-        }
-        for (i, c) in LAND_LUT.iter().enumerate() {
-            lut_data[4128 + i] = ((c[0] as u32) << 16) | ((c[1] as u32) << 8) | c[2] as u32;
-        }
-        let lut = storage_buffer(device, "lut", (lut_data.len() * 4) as u64);
-        queue.write_buffer(&lut, 0, bytemuck::cast_slice(&lut_data));
+        // Style tables: 4096 hypsometric rows, then the line classes and the land classes, each 0xRRGGBB; filled by `update_style` from the theme.
+        let lut = storage_buffer(device, "lut", ((4096 + 64) * 4) as u64);
 
         let max_layers = device.limits().max_texture_array_layers.max(1);
         let dem = Plane::new(device, "dem", DEMQ_W as u32, DEMQ_H as u32, wgpu::TextureFormat::R16Uint, max_layers);
@@ -364,6 +359,7 @@ impl GpuMap {
             sample_offset: [0.0, 0.0],
             pin: None,
             measure: None,
+            style_loaded: false,
         }
     }
 
@@ -566,6 +562,23 @@ impl GpuMap {
     }
 
     /// Draw a planned frame to `target` (`w × h`, the present format): upload the plan, the map pass at 2×, the present pass.
+    /// Upload the theme's tables: the hypsometric ramp and the line and land colours. Once at start and whenever the theme changes.
+    pub fn update_style(&mut self, queue: &wgpu::Queue, luts: &FrameLuts) {
+        let mut lut_data = vec![0u32; 4096 + 64];
+        let pack = |c: [u8; 3]| ((c[0] as u32) << 16) | ((c[1] as u32) << 8) | c[2] as u32;
+        for (i, c) in luts.hypso.iter().enumerate() {
+            lut_data[i] = pack(*c);
+        }
+        for (i, c) in luts.style.line.iter().enumerate() {
+            lut_data[4096 + i] = pack(*c);
+        }
+        for (i, c) in luts.style.land.iter().enumerate() {
+            lut_data[4128 + i] = pack(*c);
+        }
+        queue.write_buffer(&self.lut, 0, bytemuck::cast_slice(&lut_data));
+        self.style_loaded = true;
+    }
+
     /// Whether a G-buffer for a `w × h` screen exists to relight from.
     pub fn g_valid(&self, w: u32, h: u32) -> bool {
         self.gbuf.as_ref().is_some_and(|g| (g.w, g.h) == (w, h))
@@ -602,6 +615,9 @@ impl GpuMap {
         }
         if mode != RenderMode::Full {
             self.scale = 1;
+        }
+        if !self.style_loaded {
+            self.update_style(queue, luts);
         }
         if mode == RenderMode::Relight && !self.g_valid(w, h) {
             return self.render(device, queue, encoder, target, plan, luts, w, h, RenderMode::FullWithG);
@@ -691,6 +707,12 @@ impl GpuMap {
             },
             line_hi: std::array::from_fn(|i| std::array::from_fn(|j| plan.line_mag_hi[4 * i + j].max(1) as f32)),
             measure: self.measure.map_or([0.0; 4], |(ox, oy, tx, ty)| [ox, oy, tx, ty]),
+            style_water: rgb4(luts.style.water),
+            style_contour: rgb4(luts.style.contour),
+            style_contour_index: rgb4(luts.style.contour_index),
+            style_flat: rgb4(luts.style.flat),
+            style_bg: rgb4(luts.style.bg),
+            style_no_dem: rgb4(luts.style.no_dem),
         };
         let measure_on = self.measure.is_some();
         let u = Uniforms { depths: [plan.dem_depth as u32, plan.vec_depth as u32, plan.magnified as u32, measure_on as u32], ..u };
@@ -762,4 +784,8 @@ impl GpuMap {
             pass.draw(0..3, 0..1);
         }
     }
+}
+
+fn rgb4(c: [u8; 3]) -> [f32; 4] {
+    [c[0] as f32, c[1] as f32, c[2] as f32, 0.0]
 }
