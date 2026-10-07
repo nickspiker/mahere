@@ -514,7 +514,7 @@ pub mod themes {
         let stops: Vec<f32> = t.hypso.iter().map(|(m, _)| *m).collect();
         let stop_rgb: Vec<u8> = t.hypso.iter().flat_map(|(_, c)| c.to_vec()).collect();
         VsfBuilder::new()
-            .add_section("theme", vec![("name".to_string(), VsfType::x(t.name.clone())), ("layers".to_string(), VsfType::u(t.layers.bits() as usize, false))])
+            .add_section("theme", vec![("name".to_string(), VsfType::x(t.name.clone())), ("layers".to_string(), VsfType::u(t.layers.bits() as usize, false)), ("revision".to_string(), VsfType::u(t.revision as usize, false))])
             .add_section("hypso", vec![("metres".to_string(), VsfType::t_f5(Tensor::new(vec![stops.len()], stops))), ("rgb".to_string(), VsfType::t_u3(Tensor::new(vec![t.hypso.len(), 3], stop_rgb)))])
             .add_section("tables", vec![("land".to_string(), table_t(&t.land)), ("line".to_string(), table_t(&t.line))])
             .add_section(
@@ -527,6 +527,7 @@ pub mod themes {
                     ("water".to_string(), rgb_t(t.water)),
                     ("contour".to_string(), rgb_t(t.contour)),
                     ("index".to_string(), rgb_t(t.contour_index)),
+                    ("contouralpha".to_string(), VsfType::t_f5(Tensor::new(vec![2], t.contour_alpha.to_vec()))),
                 ],
             )
             .add_section("light", vec![("sun".to_string(), VsfType::t_f5(Tensor::new(vec![3], t.sun.to_vec()))), ("sky".to_string(), VsfType::t_f5(Tensor::new(vec![3], t.sky.to_vec())))])
@@ -595,6 +596,12 @@ pub mod themes {
             return None;
         }
         let hypso: [(f32, [u8; 3]); 5] = std::array::from_fn(|i| (metres[i], [rgb[3 * i], rgb[3 * i + 1], rgb[3 * i + 2]]));
+        let revision = match get("theme", "revision") {
+            Some(VsfType::u(r, _)) => *r as u32,
+            Some(VsfType::u3(r)) => *r as u32,
+            _ => 0,
+        };
+        let contour_alpha = get("inks", "contouralpha").and_then(floats_of).filter(|a| a.len() == 2).map_or([0.85, 0.85], |a| [a[0], a[1]]);
         let sun = floats_of(get("light", "sun")?)?;
         let sky = floats_of(get("light", "sky")?)?;
         if sun.len() != 3 || sky.len() != 3 {
@@ -602,6 +609,8 @@ pub mod themes {
         }
         Some(Theme {
             name: theme_name,
+            revision,
+            contour_alpha,
             hypso,
             sea: rgb3(get("inks", "sea")?)?,
             flat: rgb3(get("inks", "flat")?)?,
@@ -688,10 +697,10 @@ pub mod themes {
         decode(&bytes)
     }
 
-    /// The built-ins into the vault where they are missing, then every theme the vault holds, converted to the display and in index order.
+    /// The built-ins into the vault where they are missing or an older revision, then every theme the vault holds, converted to the display and in index order.
     pub fn load_all(store: &FlatStorage) -> Vec<Theme> {
         for t in mahere_engine::theme::builtin() {
-            if load(store, &t.name).is_none() {
+            if load(store, &t.name).is_none_or(|old| old.revision < t.revision) {
                 save(store, &t);
             }
         }

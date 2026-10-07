@@ -28,6 +28,10 @@ fn main() {
     let cells = std::env::var("MAHERE_CELLS").unwrap_or_else(|_| "data/cells".into());
     let store = Arc::new(DirStore(cells.into()));
     let mut map = MapCore::new(store, Camera { lat, lon, ppd, bearing });
+    // MAHERE_THEME=n picks a built-in theme (its layers first, MAHERE_LAYERS over them).
+    if let Some(t) = std::env::var("MAHERE_THEME").ok().and_then(|s| s.parse::<usize>().ok()) {
+        map.set_theme(t);
+    }
     if let Ok(spec) = std::env::var("MAHERE_LAYERS") {
         let mut m = map.layers();
         for tok in spec.split(',') {

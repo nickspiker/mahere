@@ -299,6 +299,10 @@ fn line_alpha(cls_id: u32, cov: u32, mag: u32) -> f32 {
     if (cls == WATERWAY_CLASS) {
         return f32(cov) / 255.0;
     }
+    // Boundaries sit under the map, never competing with a road or a trail.
+    if (cls >= BOUNDARY_FIRST) {
+        return f32(cov) / 255.0 * 0.55;
+    }
     return f32(cov) / 255.0 * (0.5 + 0.5 * line_scale(cls, mag));
 }
 
@@ -435,14 +439,18 @@ fn compose(d: u32, u: u32, v: u32) -> Composed {
         if (have_band) {
             { let f = fold(Fold(out.k1, out.c1), band, 0.45); out.k1 = f.k; out.c1 = f.c; }
         }
+        // Under the water: the contours and the waterway lines, so a lake covers the river running into it. Over it: every other line.
+        if (contour_cov > 0.0) {
+            let ink = select(U.style_contour, U.style_contour_index, contour_index);
+            { let f = fold(Fold(out.k1, out.c1), ink.rgb, contour_cov * ink.a); out.k1 = f.k; out.c1 = f.c; }
+        }
+        if (draw_line && line.x == WATERWAY_CLASS) {
+            { let f = fold(Fold(out.k1, out.c1), line_colour(line.x, line.z), line_alpha(line.x, line.y, line.z)); out.k1 = f.k; out.c1 = f.c; }
+        }
         if ((mask & M_WATER) != 0u && lw.z != 0u) {
             out.water = f32(lw.z) / 255.0;
         }
-        if (contour_cov > 0.0) {
-            let ink = select(U.style_contour.rgb, U.style_contour_index.rgb, contour_index);
-            { let f = fold(Fold(out.k2, out.c2), ink, contour_cov * 0.85); out.k2 = f.k; out.c2 = f.c; }
-        }
-        if (draw_line) {
+        if (draw_line && line.x != WATERWAY_CLASS) {
             { let f = fold(Fold(out.k2, out.c2), line_colour(line.x, line.z), line_alpha(line.x, line.y, line.z)); out.k2 = f.k; out.c2 = f.c; }
         }
     } else {
@@ -450,8 +458,8 @@ fn compose(d: u32, u: u32, v: u32) -> Composed {
             { let f = fold(Fold(out.k1, out.c1), band, 0.45); out.k1 = f.k; out.c1 = f.c; }
         }
         if (contour_cov > 0.0) {
-            let ink = select(U.style_contour.rgb, U.style_contour_index.rgb, contour_index);
-            { let f = fold(Fold(out.k2, out.c2), ink, contour_cov * 0.85); out.k2 = f.k; out.c2 = f.c; }
+            let ink = select(U.style_contour, U.style_contour_index, contour_index);
+            { let f = fold(Fold(out.k2, out.c2), ink.rgb, contour_cov * ink.a); out.k2 = f.k; out.c2 = f.c; }
         }
     }
     if ((mask & M_DEBUG) != 0u) {

@@ -363,7 +363,7 @@ fn load_cell(store: &dyn CellStore, key: CellKey, pack_cpu: bool) -> Loaded {
 pub const DEFAULT_CELLS_URL: &str = "https://brobdingnagian.holdmyoscilloscope.com/mahere/cells";
 
 /// Cell format epoch: bumped whenever the encoding changes incompatibly. It rides on the fetch URL as a query (so the CDN edge, which caches a key for hours, sees a new key) and in the vault key (so a cached cell of an older format is never read back as this one). Old clients keep fetching the old objects they understand.
-pub const CELL_EPOCH: u32 = 6;
+pub const CELL_EPOCH: u32 = 7;
 
 /// A store that can also keep what it's given (the vault).
 pub trait CellCache: CellStore {

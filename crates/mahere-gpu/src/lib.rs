@@ -708,8 +708,8 @@ impl GpuMap {
             line_hi: std::array::from_fn(|i| std::array::from_fn(|j| plan.line_mag_hi[4 * i + j].max(1) as f32)),
             measure: self.measure.map_or([0.0; 4], |(ox, oy, tx, ty)| [ox, oy, tx, ty]),
             style_water: rgb4(luts.style.water),
-            style_contour: rgb4(luts.style.contour),
-            style_contour_index: rgb4(luts.style.contour_index),
+            style_contour: with_alpha(luts.style.contour, luts.style.contour_alpha[0]),
+            style_contour_index: with_alpha(luts.style.contour_index, luts.style.contour_alpha[1]),
             style_flat: rgb4(luts.style.flat),
             style_bg: rgb4(luts.style.bg),
             style_no_dem: rgb4(luts.style.no_dem),
@@ -788,4 +788,8 @@ impl GpuMap {
 
 fn rgb4(c: [u8; 3]) -> [f32; 4] {
     [c[0] as f32, c[1] as f32, c[2] as f32, 0.0]
+}
+
+fn with_alpha(c: [u8; 3], a: f32) -> [f32; 4] {
+    [c[0] as f32, c[1] as f32, c[2] as f32, a]
 }

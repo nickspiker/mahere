@@ -397,7 +397,9 @@ pub fn load_features(path: &str) -> Result<Features, osmpbf::Error> {
                     "power" => RoadClass::from_power(v),
                     _ => None,
                 });
-                if let Some(class) = line {
+                // Sidewalks, crossings and traffic islands are footways that only shadow a street: a trail map leaves them out, or every downtown street grows a trail-coloured fringe.
+                let street_furniture = w.tags().any(|(k, v)| k == "footway" && matches!(v, "sidewalk" | "crossing" | "traffic_island" | "access_aisle"));
+                if let Some(class) = line.filter(|_| !street_furniture) {
                     let (uses, mag) = uses_and_magnitude(class, w.tags());
                     out.push(WayRec::Line(class, refs.clone(), uses, mag));
                 }

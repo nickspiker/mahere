@@ -149,6 +149,7 @@ pub struct Style {
     pub water: [u8; 3],
     pub contour: [u8; 3],
     pub contour_index: [u8; 3],
+    pub contour_alpha: [f32; 2],
     pub flat: [u8; 3],
     pub bg: [u8; 3],
     pub no_dem: [u8; 3],
@@ -603,6 +604,16 @@ fn compose_rgb(dem: &DemRef, vec: &VecRef, pool: &Pool, diamond: u8, uq: i64, vq
         if let Some(col) = slope_band {
             rgb = lerp3(rgb, col, 0.45);
         }
+        // Under the water: the contours and the waterway lines, so a lake covers the river running into it. Over it: every other line (bridges, trails along the shore, boundaries).
+        if contour.0 > 0.0 {
+            rgb = lerp3(rgb, if contour.1 { st.contour_index } else { st.contour }, contour.0 * st.contour_alpha[contour.1 as usize]);
+        }
+        let line_cov = |line: &ClassCell| -> u8 { if mask.line && (mask.boundaries || (line.class[i] as usize) < BOUNDARY_FIRST) { line.cov[i] } else { 0 } };
+        if let Some(line) = line {
+            if line_cov(line) != 0 && line.class[i] as usize == WATERWAY_CLASS {
+                rgb = lerp3(rgb, line_colour(line, i, &luts.style), line_cov(line) as f32 / 255.0);
+            }
+        }
         if mask.water {
             if let Some(water) = water {
                 let wc = water.cov[i];
@@ -614,15 +625,11 @@ fn compose_rgb(dem: &DemRef, vec: &VecRef, pool: &Pool, diamond: u8, uq: i64, vq
                 }
             }
         }
-        if contour.0 > 0.0 {
-            rgb = lerp3(rgb, if contour.1 { st.contour_index } else { st.contour }, contour.0 * 0.85);
-        }
-        if mask.line {
-            if let Some(line) = line {
-                let cov = line.cov[i];
-                if cov != 0 && (mask.boundaries || (line.class[i] as usize) < BOUNDARY_FIRST) {
-                    rgb = lerp3(rgb, line_colour(line, i, &luts.style), cov as f32 / 255.0);
-                }
+        if let Some(line) = line {
+            if line_cov(line) != 0 && line.class[i] as usize != WATERWAY_CLASS {
+                // Boundaries sit under the map, never competing with a road or a trail.
+                let a = if line.class[i] as usize >= BOUNDARY_FIRST { 0.55 } else { 1.0 };
+                rgb = lerp3(rgb, line_colour(line, i, &luts.style), line_cov(line) as f32 / 255.0 * a);
             }
         }
     } else {
@@ -633,7 +640,7 @@ fn compose_rgb(dem: &DemRef, vec: &VecRef, pool: &Pool, diamond: u8, uq: i64, vq
             rgb = lerp3(rgb, col, 0.45);
         }
         if contour.0 > 0.0 {
-            rgb = lerp3(rgb, if contour.1 { st.contour_index } else { st.contour }, contour.0 * 0.85);
+            rgb = lerp3(rgb, if contour.1 { st.contour_index } else { st.contour }, contour.0 * st.contour_alpha[contour.1 as usize]);
         }
     }
     ((rgb[0] as u32) << 16) | ((rgb[1] as u32) << 8) | rgb[2] as u32
@@ -847,7 +854,7 @@ mod tests {
         assert_eq!(stats.straddle_blocks, 0);
         // Expected: the flat white (land cover makes the elevation tint inert) lerped 85% to forest, lit by the SH irradiance at a flat normal in the device frame.
         let t = luts.style.flat;
-        let f = LAND_LUT[5];
+        let f = luts.style.land[5];
         let e = luts.light.eval(0.0, 0.0, 1.0);
         let mix = |a: u8, b: u8, l: f32| ((a as f32 + (b as f32 - a as f32) * 0.85) * l.clamp(0.0, 1.3)) as u32;
         let expect = (mix(t[0], f[0], e[0]) << 16) | (mix(t[1], f[1], e[1]) << 8) | mix(t[2], f[2], e[2]);
