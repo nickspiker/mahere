@@ -146,6 +146,9 @@ impl FluorApp for MahereApp {
                 let mut ctl = Controls { real_sun: self.map.real_sun, follow_heading: self.map.follow_heading, lock_to_fix: self.map.lock_to_fix, cache_budget: self.cache_budget };
                 if self.panel.tap(cx as f32, cy as f32, w, h, &mut mask, &mut ctl) {
                     self.cache_budget = ctl.cache_budget;
+                    if self.panel.take_clear_measure() {
+                        self.map.clear_measure();
+                    }
                     self.map.set_layers(mask);
                     if ctl.real_sun != self.map.real_sun {
                         self.map.set_real_sun(ctl.real_sun);

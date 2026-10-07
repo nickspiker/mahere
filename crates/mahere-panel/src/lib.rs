@@ -144,6 +144,9 @@ pub struct Panel {
     slider: (f32, f32, f32),
     slider_held: bool,
     cache_max: u64,
+    /// The ruler strip's close button (centre and radius) while a measurement is shown, and whether a tap just hit it.
+    strip_close: Option<(f32, f32, f32)>,
+    clear_measure: bool,
 }
 
 impl Default for Panel {
@@ -156,7 +159,7 @@ impl Panel {
     pub fn new() -> Panel {
         let mut hits: HitId = HIT_NONE;
         let checks = LAYERS.iter().map(|&(l, label)| (l, Checkbox::new(&mut hits, label, 0.0, 0.0, 10.0, 10.0, 10.0, false))).collect();
-        Panel { open: false, dirty: true, hits, checks, text: TextRenderer::new(), buf: Vec::new(), w: 0, h: 0, font: 16.0, gear: (0.0, 0.0, 0.0), panel_w: 0.0, slider: (0.0, 0.0, 0.0), slider_held: false, cache_max: CACHE_MIN + 1 }
+        Panel { open: false, dirty: true, hits, checks, text: TextRenderer::new(), buf: Vec::new(), w: 0, h: 0, font: 16.0, gear: (0.0, 0.0, 0.0), panel_w: 0.0, slider: (0.0, 0.0, 0.0), slider_held: false, cache_max: CACHE_MIN + 1, strip_close: None, clear_measure: false }
     }
 
     pub fn is_open(&self) -> bool {
@@ -201,6 +204,13 @@ impl Panel {
     /// A tap at screen (x, y): true if the panel took it. The gear toggles the panel; a row flips its layer in `mask`.
     pub fn tap(&mut self, x: f32, y: f32, w: usize, h: usize, mask: &mut LayerMask, ctl: &mut Controls) -> bool {
         self.layout(w, h);
+        if let Some((cx, cy, cr)) = self.strip_close {
+            if (x - cx).powi(2) + (y - cy).powi(2) <= (cr * 1.4).powi(2) {
+                self.clear_measure = true;
+                self.dirty = true;
+                return true;
+            }
+        }
         let (gx, gy, r) = self.gear;
         if (x - gx).powi(2) + (y - gy).powi(2) <= (r * 1.3).powi(2) {
             self.open = !self.open;
@@ -256,8 +266,9 @@ impl Panel {
         paint::circle_filled(&mut canvas, gx as isize, gy as isize, (gr * 0.52) as isize, GEAR_BG, None, None);
         paint::circle_filled(&mut canvas, gx as isize, gy as isize, (gr * 0.44) as isize, ink_col, None, None);
         paint::circle_filled(&mut canvas, gx as isize, gy as isize, gr as isize, GEAR_BG, None, None);
+        self.strip_close = None;
         if let Some(m) = measure {
-            Self::paint_strip(&mut canvas, &mut self.text, w, h, font, m);
+            self.strip_close = Some(Self::paint_strip(&mut canvas, &mut self.text, w, h, font, m));
         }
         if !self.open {
             return &self.buf;
@@ -381,10 +392,15 @@ impl Panel {
     }
 
     /// The measurement strip along the bottom: the elevation profile from origin to target as a filled area, with distance and bearing on the left and the elevations on the right.
-    fn paint_strip(canvas: &mut Canvas, text: &mut TextRenderer, w: usize, h: usize, font: f32, m: &MeasureView) {
+    /// Returns the close button's centre and radius.
+    fn paint_strip(canvas: &mut Canvas, text: &mut TextRenderer, w: usize, h: usize, font: f32, m: &MeasureView) -> (f32, f32, f32) {
         let band = font * 6.5;
         let top = h as f32 - band;
         let margin = font;
+        // The close button, top right of the strip: a cross in a disc.
+        let (cx, cy, cr) = (w as f32 - font * 0.9, top + font * 0.9, font * 0.55);
+        text.draw_text_center(canvas, "\u{00d7}", cx, cy, &TextStyle::new(font * 1.1, READOUT), None, None);
+        paint::circle_filled(canvas, cx as isize, cy as isize, cr as isize, GEAR_BG, None, None);
         let (lo, hi) = m.profile.iter().filter(|e| !e.is_nan()).fold((f32::MAX, f32::MIN), |(a, b), &e| (a.min(e), b.max(e)));
         let have = lo <= hi;
         let span = (hi - lo).max(1.0);
@@ -398,7 +414,7 @@ impl Panel {
             (Some(a), Some(b)) => format!("   {:+} m", (b - a).round() as i64),
             _ => String::new(),
         };
-        text.draw_text_right(canvas, &format!("{} → {}{rise}", e(m.elev_origin), e(m.elev_target)), w as f32 - margin, top + font * 0.9, &small, None, None);
+        text.draw_text_right(canvas, &format!("{} → {}{rise}", e(m.elev_origin), e(m.elev_target)), w as f32 - margin - font * 1.6, top + font * 0.9, &small, None, None);
         if have {
             text.draw_text_left(canvas, &format!("{} m", hi.round() as i64), margin, top + font * 1.9, &dim, None, None);
             text.draw_text_left(canvas, &format!("{} m", lo.round() as i64), margin, h as f32 - font * 0.6, &dim, None, None);
@@ -418,6 +434,12 @@ impl Panel {
             paint::fill_rect(canvas, x as isize, y as isize - 1, 1, 2, STRIP_EDGE, None, None);
         }
         paint::fill_rect(canvas, 0, top as isize, w as isize, band as isize, PANEL_BG, None, None);
+        (cx, cy, cr)
+    }
+
+    /// True once after a tap on the ruler's close button.
+    pub fn take_clear_measure(&mut self) -> bool {
+        std::mem::take(&mut self.clear_measure)
     }
 }
 

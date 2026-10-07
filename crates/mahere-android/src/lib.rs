@@ -41,6 +41,8 @@ pub struct AndroidApp {
     dragging: bool,
     /// Pixels the finger has travelled since the press: under a dozen at release is a tap.
     travel: f64,
+    /// A second finger touched during this press.
+    had_two: bool,
     last_cursor: (f64, f64),
     two: Option<TwoFinger>,
     /// Re-anchor the next CursorMoved instead of panning (finger handoff after a pinch would otherwise jump by the stale delta).
@@ -109,6 +111,8 @@ impl AndroidApp {
     }
 
     fn two_begin(&mut self, x0: f64, y0: f64, x1: f64, y1: f64) {
+        // A second finger means a gesture, never a tap, however little the first one travelled.
+        self.had_two = true;
         let geo_a = self.map.cam.screen_to_geo(x0, y0, self.w, self.h);
         let geo_b = self.map.cam.screen_to_geo(x1, y1, self.w, self.h);
         let d0 = ((x1 - x0).powi(2) + (y1 - y0).powi(2)).sqrt().max(1.0);
@@ -205,12 +209,16 @@ impl FluorApp for AndroidApp {
                 let mut ctl = self.controls();
                 if self.panel.tap(ctx.cursor_x as f32, ctx.cursor_y as f32, self.w, self.h, &mut mask, &mut ctl) {
                     self.apply_controls(ctl, mask);
+                    if self.panel.take_clear_measure() {
+                        self.map.clear_measure();
+                    }
                     self.dragging = false;
                     return EventResponse::Handled;
                 }
                 if self.two.is_none() {
                     self.dragging = true;
                     self.travel = 0.0;
+                    self.had_two = false;
                     self.last_cursor = (ctx.cursor_x as f64, ctx.cursor_y as f64);
                 }
                 EventResponse::Handled
@@ -218,7 +226,7 @@ impl FluorApp for AndroidApp {
             FEvent::MouseInput { state: ElementState::Released, button: MouseButton::Left } => {
                 self.panel.release();
                 // A press and release that never travelled is a tap: a new measurement to that point.
-                if self.dragging && self.two.is_none() && self.travel < 12.0 {
+                if self.dragging && self.two.is_none() && !self.had_two && self.travel < 12.0 {
                     self.map.tap(ctx.cursor_x as f64, ctx.cursor_y as f64, self.w, self.h);
                 }
                 self.dragging = false;
@@ -379,6 +387,7 @@ pub extern "system" fn Java_nz_mahere_app_MahereActivity_nativeInit(
         h: height as usize,
         dragging: false,
         travel: 0.0,
+        had_two: false,
         last_cursor: (0., 0.),
         two: None,
         suppress_move: false,
