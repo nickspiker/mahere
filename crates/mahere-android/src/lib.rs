@@ -51,8 +51,9 @@ pub struct AndroidApp {
     store: Option<std::sync::Arc<mahere_store::FlatStorage>>,
     /// The dated cell cache, flushed at the pause moment.
     cells_cache: Option<std::sync::Arc<mahere_store::VaultCells>>,
-    recorder: Option<mahere_store::TrackRecorder>,
+    recorder: Option<std::sync::Arc<std::sync::Mutex<mahere_store::TrackRecorder>>>,
     fixes_since_save: u32,
+    persist: Persist,
     /// The GPU path, created on the first draw; None after a failure means the CPU present is in use.
     gpu: Option<GpuHost>,
     gpu_failed: bool,
@@ -60,6 +61,45 @@ pub struct AndroidApp {
     /// Bytes the cell cache may hold; purged to it at the pause moment.
     cache_budget: u64,
     data_dir: Option<String>,
+}
+
+/// Vault writes, off the UI thread. The vault serialises every write through one queue, and the loader fills it with cells while the map streams: a settings save on the UI thread waited behind hundreds of them and the system killed the app as unresponsive. Touch, location and pause now hand their writes here and return at once.
+struct Persist {
+    tx: std::sync::mpsc::Sender<Box<dyn FnOnce() + Send>>,
+    /// The latest settings not yet written; a burst of changes (a slider drag) collapses into one write.
+    pending_settings: std::sync::Arc<std::sync::Mutex<Option<mahere_store::Settings>>>,
+}
+
+impl Persist {
+    fn new() -> Persist {
+        let (tx, rx) = std::sync::mpsc::channel::<Box<dyn FnOnce() + Send>>();
+        std::thread::Builder::new()
+            .name("mahere-persist".into())
+            .spawn(move || {
+                while let Ok(job) = rx.recv() {
+                    job();
+                }
+            })
+            .expect("persist thread");
+        Persist { tx, pending_settings: Default::default() }
+    }
+
+    fn run(&self, job: impl FnOnce() + Send + 'static) {
+        let _ = self.tx.send(Box::new(job));
+    }
+
+    fn settings(&self, store: std::sync::Arc<mahere_store::FlatStorage>, s: mahere_store::Settings) {
+        let was_pending = self.pending_settings.lock().unwrap().replace(s).is_some();
+        if !was_pending {
+            let pending = self.pending_settings.clone();
+            self.run(move || {
+                let latest = pending.lock().unwrap().take();
+                if let Some(s) = latest {
+                    let _ = mahere_store::save_settings(&store, &s);
+                }
+            });
+        }
+    }
 }
 
 /// A gigabyte of cells until the slider says otherwise.
@@ -102,7 +142,7 @@ impl AndroidApp {
     fn save_settings(&self) {
         if let Some(store) = &self.store {
             let s = mahere_store::Settings { cache_budget: self.cache_budget, layer_bits: self.map.layers().bits() as u64, real_sun: self.map.real_sun, follow_heading: self.map.follow_heading, lock_to_fix: self.map.lock_to_fix, theme: self.map.theme as u64 };
-            let _ = mahere_store::save_settings(store, &s);
+            self.persist.settings(store.clone(), s);
         }
     }
 
@@ -160,9 +200,10 @@ impl AndroidApp {
         }
         self.map.set_gps(fix);
         // Track recording: every fix into the vault (chunk-flushed), the session (camera + sun) refreshed every tenth fix.
-        if let Some(rec) = &mut self.recorder {
+        if let Some(rec) = &self.recorder {
             let elev = self.map.gps_elevation().unwrap_or(f32::NAN) as f64;
-            rec.on_fix(fix.lat, fix.lon, elev);
+            let rec = rec.clone();
+            self.persist.run(move || rec.lock().unwrap().on_fix(fix.lat, fix.lon, elev));
         }
         self.fixes_since_save += 1;
         if self.fixes_since_save >= 10 {
@@ -174,17 +215,11 @@ impl AndroidApp {
     fn save_session(&self) {
         if let Some(store) = &self.store {
             let c = &self.map.cam;
-            let _ = mahere_store::save_session(
-                store,
-                &mahere_store::Session {
-                    lat: c.lat,
-                    lon: c.lon,
-                    ppd: c.ppd,
-                    bearing: c.bearing,
-                    sun_az: self.map.sun_az as f64,
-                    sun_alt: self.map.sun_alt as f64,
-                },
-            );
+            let s = mahere_store::Session { lat: c.lat, lon: c.lon, ppd: c.ppd, bearing: c.bearing, sun_az: self.map.sun_az as f64, sun_alt: self.map.sun_alt as f64 };
+            let store = store.clone();
+            self.persist.run(move || {
+                let _ = mahere_store::save_session(&store, &s);
+            });
         }
     }
 }
@@ -388,7 +423,7 @@ pub extern "system" fn Java_nz_mahere_app_MahereActivity_nativeInit(
         map.set_follow_heading(s.follow_heading);
         map.set_lock_to_fix(s.lock_to_fix);
     }
-    let recorder = store.clone().map(mahere_store::TrackRecorder::new);
+    let recorder = store.clone().map(|s| std::sync::Arc::new(std::sync::Mutex::new(mahere_store::TrackRecorder::new(s))));
     let app = AndroidApp {
         map,
         w: width as usize,
@@ -405,6 +440,7 @@ pub extern "system" fn Java_nz_mahere_app_MahereActivity_nativeInit(
         cells_cache,
         recorder,
         fixes_since_save: 0,
+        persist: Persist::new(),
         gpu: None,
         gpu_failed: false,
         panel: Panel::new(),
@@ -559,14 +595,19 @@ pub extern "system" fn Java_nz_mahere_app_MahereActivity_nativeOnPause(
     ptr: jlong,
 ) {
     if ptr != 0 {
+        // Every write goes to the persist thread: the UI thread returns at once, and the system gives a paused app time to finish.
         let app = shell(ptr).app();
         app.save_session();
-        if let Some(rec) = &mut app.recorder {
-            rec.flush();
+        if let Some(rec) = &app.recorder {
+            let rec = rec.clone();
+            app.persist.run(move || rec.lock().unwrap().flush());
         }
         if let Some(c) = &app.cells_cache {
-            c.purge_to(app.cache_budget);
-            c.flush();
+            let (c, budget) = (c.clone(), app.cache_budget);
+            app.persist.run(move || {
+                c.purge_to(budget);
+                c.flush();
+            });
         }
         app.save_settings();
     }
