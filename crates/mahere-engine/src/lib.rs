@@ -117,6 +117,8 @@ pub struct MapCore {
     pub themes: Vec<theme::Theme>,
     pub theme: usize,
     style_version: u64,
+    /// Bumped whenever the lighting is rebuilt, so a host can tell a light-only change from a cell arriving.
+    light_version: u64,
     /// Measure from the fix rather than the screen centre, until the camera moves.
     pub lock_to_fix: bool,
 }
@@ -168,6 +170,7 @@ impl MapCore {
             themes: theme::builtin(),
             theme: 0,
             style_version: 0,
+            light_version: 0,
             lock_to_fix: false,
         }
     }
@@ -453,6 +456,10 @@ impl MapCore {
         self.style_version
     }
 
+    pub fn light_version(&self) -> u64 {
+        self.light_version
+    }
+
     pub fn plan_cached(&self) -> bool {
         self.plan_cached
     }
@@ -499,8 +506,12 @@ impl MapCore {
             let (lat, lon) = self.gps.map_or((self.cam.lat, self.cam.lon), |g| (g.lat, g.lon));
             let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0.0, |d| d.as_secs_f64());
             let (az, alt) = sh::sun_position(lat, lon, now);
-            self.sun_az = ((az - self.cam.bearing.to_degrees()).rem_euclid(360.0)) as f32;
-            self.sun_alt = alt as f32;
+            // The clock moves the sun a few thousandths of a degree a second: follow it in steps too small to see, so a still screen is not relit every frame.
+            let az = ((az - self.cam.bearing.to_degrees()).rem_euclid(360.0)) as f32;
+            if (az - self.sun_az).abs() > 0.05 || (alt as f32 - self.sun_alt).abs() > 0.05 {
+                self.sun_az = az;
+                self.sun_alt = alt as f32;
+            }
         }
         // Lighting lives in the device frame: the environment (sun + sky as SH) is fixed to the screen, and normals are rotated by the bearing at lookup. The world-frame sun vector stays for the water glint.
         if self.luts_sun != (self.sun_az, self.sun_alt, self.cam.bearing) {
@@ -522,6 +533,7 @@ impl MapCore {
                 let (sb, cb) = self.cam.bearing.sin_cos();
                 self.luts.light = sh::Quad::directional(frames.to_screen(az as f32, alt as f32), t.sun, (sb as f32, cb as f32));
                 self.luts_sun = (self.sun_az, self.sun_alt, self.cam.bearing);
+                self.light_version += 1;
             } else {
                 if self.luts_sun.0 != self.sun_az || self.luts_sun.1 != self.sun_alt || self.device_heading != 0.0 || self.luts_sun.2.is_nan() {
                     let t = &self.themes[self.theme.min(self.themes.len() - 1)];
@@ -530,6 +542,7 @@ impl MapCore {
                 let (sb, cb) = self.cam.bearing.sin_cos();
                 self.luts.light = self.env.quadratic((sb as f32, cb as f32));
                 self.luts_sun = (self.sun_az, self.sun_alt, self.cam.bearing);
+                self.light_version += 1;
             }
         }
         self.vec_depth = select_depth(self.cam.ppd, self.vec_depth, VEC_BASE_DEPTH);

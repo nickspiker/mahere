@@ -22,10 +22,9 @@ pub struct GpuHost {
     last_cam: Option<(u64, u64, u64, u64)>,
     /// The theme tables uploaded so far.
     style_version: Option<u64>,
-    /// The view and cells the G-buffer was written for.
-    g_key: Option<((u64, u64, u64, u64), u64, u32, u32)>,
-    last_change: std::time::Instant,
-    relights: u64,
+    /// The last frame drawn at 1×, and the last camera move.
+    last_low: std::time::Instant,
+    last_move: std::time::Instant,
     /// The last frame was drawn still, at the still factor: nothing more to draw until something changes.
     settled: bool,
     frames: u64,
@@ -82,9 +81,8 @@ impl GpuHost {
             overlay_at: std::time::Instant::now(),
             last_cam: None,
             style_version: None,
-            g_key: None,
-            last_change: std::time::Instant::now(),
-            relights: 0,
+            last_low: std::time::Instant::now(),
+            last_move: std::time::Instant::now(),
             settled: false,
             frames: 0,
             frame_ms: 0.0,
@@ -148,13 +146,10 @@ impl GpuHost {
             self.overlay_stamp = None;
         }
         let changed = map.tick(w as usize, h as usize) || fresh || panel_dirty;
-        let mut settle_frame = false;
-        if !changed {
-            if self.settled || self.last_change.elapsed() < std::time::Duration::from_millis(250) {
-                self.device.poll(wgpu::PollType::Poll).ok();
-                return !map.converged();
-            }
-            settle_frame = true;
+        let quiet = std::time::Duration::from_millis(250);
+        if !changed && (self.settled || self.last_low.elapsed() < quiet) {
+            self.device.poll(wgpu::PollType::Poll).ok();
+            return !map.converged();
         }
         if self.frames == 0 {
             map.set_gpu_only();
@@ -165,29 +160,22 @@ impl GpuHost {
         let t_sync = t0.elapsed().as_secs_f32() * 1000.0 - t_plan;
         self.plan_ms += t_plan;
         self.sync_ms += t_sync;
-        // What kind of frame: anything moving or arriving draws the map at 1× and writes the G-buffer; a change that touched only the light relights that G-buffer at 1×; the settle frame draws the map once at the still factor.
+        // What kind of frame. Only the camera drops to 1×: a pan, zoom or rotate, or within a quarter second of one (Nick 2026-10-06). Everything else — cells streaming in, the light turning with the phone, a pin moving, the panel — is drawn at the still factor, so a loading or relit map stays sharp instead of flickering between the two. A quarter second after the last 1× frame, one more at 3× settles it.
         let c0 = map.cam;
         let cam_key = (c0.lat.to_bits(), c0.lon.to_bits(), c0.ppd.to_bits(), c0.bearing.to_bits());
         let moving = self.last_cam != Some(cam_key);
         self.last_cam = Some(cam_key);
-        let g_key = (cam_key, map.pool_version(), w, h);
-        let light_only = !moving && !settle_frame && map.plan_cached() && !panel_dirty && self.g_key == Some(g_key) && self.map.g_valid(w, h);
-        let mode = if settle_frame {
-            RenderMode::Full
-        } else if light_only {
-            RenderMode::Relight
-        } else {
-            RenderMode::FullWithG
-        };
-        self.map.scale = if settle_frame { STILL_SCALE } else { MOVING_SCALE };
-        if mode == RenderMode::FullWithG {
-            self.g_key = Some(g_key);
+        let now = std::time::Instant::now();
+        if moving {
+            self.last_move = now;
         }
-        if !settle_frame {
-            self.last_change = std::time::Instant::now();
+        let in_motion = changed && (moving || self.last_move.elapsed() < quiet);
+        let mode = RenderMode::Full;
+        self.map.scale = if in_motion { MOVING_SCALE } else { STILL_SCALE };
+        if in_motion {
+            self.last_low = now;
         }
-        self.settled = settle_frame;
-        self.relights += (mode == RenderMode::Relight) as u64;
+        self.settled = !in_motion;
         let c = map.cam;
         let mask = map.layers();
         let mask_bits = mahere_gpu::mask_bits(mask);
@@ -242,9 +230,8 @@ impl GpuHost {
         self.frame_ms += t0.elapsed().as_secs_f32() * 1000.0;
         if self.report.elapsed().as_secs() >= 10 {
             let n = self.frames.max(1) as f32;
-            eprintln!("gpu: {} frames ({} relit), per frame {:.2} ms plan + {:.2} ms sync + {:.2} ms overlay and encode + {:.2} ms waiting for the swapchain, {} resident, {} pending, {} uploads, layers {:?}", self.frames, self.relights, self.plan_ms / n, self.sync_ms / n, (self.work_ms - self.plan_ms - self.sync_ms) / n, (self.frame_ms - self.work_ms) / n, map.pool().map.len(), map.pending_cells(), self.map.uploads, self.map.layers());
+            eprintln!("gpu: {} frames, per frame {:.2} ms plan + {:.2} ms sync + {:.2} ms overlay and encode + {:.2} ms waiting for the swapchain, {} resident, {} pending, {} uploads, layers {:?}", self.frames, self.plan_ms / n, self.sync_ms / n, (self.work_ms - self.plan_ms - self.sync_ms) / n, (self.frame_ms - self.work_ms) / n, map.pool().map.len(), map.pending_cells(), self.map.uploads, self.map.layers());
             self.frames = 0;
-            self.relights = 0;
             self.frame_ms = 0.0;
             self.work_ms = 0.0;
             self.plan_ms = 0.0;
