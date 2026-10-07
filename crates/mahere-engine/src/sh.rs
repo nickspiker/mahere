@@ -1,4 +1,4 @@
-//! Image-based lighting for the terrain: second-order spherical harmonics (Ramamoorthi & Hanrahan 2001). Nine coefficients per colour channel capture the irradiance an environment delivers to every normal direction to within a couple of percent for a diffuse surface, and evaluating it per pixel is a quadratic form in the normal — no table, no seams. The environment lives in the DEVICE frame (the sun stays top-left of the phone however the map turns), so normals are rotated by the bearing before lookup. Today the environment is a sun plus a sky dome; a front-camera capture is the same 27 numbers from a different source.
+//! Image-based lighting for the terrain: second-order spherical harmonics (Ramamoorthi & Hanrahan 2001). Nine coefficients per colour channel capture the irradiance an environment delivers to every normal direction to within a couple of percent for a diffuse surface, and evaluating it per pixel is a quadratic form in the normal â no table, no seams. The environment lives in the DEVICE frame (the sun stays top-left of the phone however the map turns), so normals are rotated by the bearing before lookup. Today the environment is a sun plus a sky dome; a front-camera capture is the same 27 numbers from a different source.
 
 /// Per-channel quadratic form of the irradiance, ready for the pixel loop.
 #[derive(Clone, Copy)]
@@ -7,6 +7,19 @@ pub struct Quad {
 }
 
 impl Quad {
+    /// One directional light and nothing else, exactly: irradiance `rgb Â· (n Â· dir)` per channel, which the pixel loop clamps at zero â so a face turned away from the light, or a light under the landscape, is black. `dir` is in the device frame; `bearing_sc` conjugates it onto world-frame normals as `Sh9::quadratic` does (b′ = Rᵀ b).
+    pub fn directional(dir: [f32; 3], rgb: [f32; 3], bearing_sc: (f32, f32)) -> Quad {
+        let (sb, cb) = bearing_sc;
+        let b = [cb * dir[0] + sb * dir[1], -sb * dir[0] + cb * dir[1], dir[2]];
+        let mut q = Quad { k: [[0.0; 10]; 3] };
+        for c in 0..3 {
+            q.k[c][6] = rgb[c] * b[0];
+            q.k[c][7] = rgb[c] * b[1];
+            q.k[c][8] = rgb[c] * b[2];
+        }
+        q
+    }
+
     /// Irradiance per channel for a unit normal in the world frame.
     #[inline(always)]
     pub fn eval(&self, x: f32, y: f32, z: f32) -> [f32; 3] {
@@ -82,7 +95,7 @@ impl Sh9 {
                 count += 1;
             }
         }
-        // Each sample carries the solid angle 2π / count of the hemisphere.
+        // Each sample carries the solid angle 2Ï / count of the hemisphere.
         let w = 2.0 * std::f32::consts::PI / count.max(1) as f32;
         for c in 0..3 {
             for k in 0..9 {
@@ -113,7 +126,7 @@ impl Sh9 {
         out
     }
 
-    /// The irradiance as a quadratic form per channel — E(n) = nᵀ A n + b·n + c — which is what the pixel loop evaluates: ten coefficients per channel, no basis functions. `bearing_sc` conjugates the device-frame environment onto world-frame normals so the loop never rotates.
+    /// The irradiance as a quadratic form per channel â E(n) = náµ A n + bÂ·n + c â which is what the pixel loop evaluates: ten coefficients per channel, no basis functions. `bearing_sc` conjugates the device-frame environment onto world-frame normals so the loop never rotates.
     pub fn quadratic(&self, bearing_sc: (f32, f32)) -> Quad {
         const C1: f32 = 0.429043;
         const C2: f32 = 0.511664;
@@ -128,7 +141,7 @@ impl Sh9 {
             let a = [[C1 * l[8], C1 * l[4], C1 * l[7]], [C1 * l[4], -C1 * l[8], C1 * l[5]], [C1 * l[7], C1 * l[5], C3 * l[6]]];
             let bv = [2.0 * C2 * l[3], 2.0 * C2 * l[1], 2.0 * C2 * l[2]];
             let k0 = C4 * l[0] - C5 * l[6];
-            // n_dev = R n_world with R rotating (x, y) by the bearing: x' = x cb - y sb, y' = x sb + y cb. Conjugate: A' = Rᵀ A R, b' = Rᵀ b.
+            // n_dev = R n_world with R rotating (x, y) by the bearing: x' = x cb - y sb, y' = x sb + y cb. Conjugate: A' = Ráµ A R, b' = Ráµ b.
             let r = [[cb, -sb, 0.0], [sb, cb, 0.0], [0.0, 0.0, 1.0]];
             let mut ar = [[0.0f32; 3]; 3];
             for i in 0..3 {
@@ -147,33 +160,26 @@ impl Sh9 {
                 r[0][1] * bv[0] + r[1][1] * bv[1] + r[2][1] * bv[2],
                 r[0][2] * bv[0] + r[1][2] * bv[1] + r[2][2] * bv[2],
             ];
-            // x², y², z², xy, xz, yz (cross terms doubled), x, y, z, 1.
+            // xÂ², yÂ², zÂ², xy, xz, yz (cross terms doubled), x, y, z, 1.
             q.k[c] = [ap[0][0], ap[1][1], ap[2][2], 2.0 * ap[0][1], 2.0 * ap[0][2], 2.0 * ap[1][2], bp[0], bp[1], bp[2], k0];
         }
         q
     }
 
-    /// The default environment: a warm sun at (azimuth clockwise from screen-up, altitude) in the device frame plus a cool sky dome, scaled so flat ground under the sun's zenith reads about as bright as today's hillshade (ambient ≈ 0.3, sun ≈ 0.7).
+    /// The default environment: a warm sun at (azimuth clockwise from screen-up, altitude) in the device frame plus a cool sky dome, scaled so flat ground under the sun's zenith reads about as bright as today's hillshade (ambient â 0.3, sun â 0.7).
     pub fn sun_and_sky(az_deg: f32, alt_deg: f32) -> Sh9 {
         Sh9::sun_and_sky_coloured(az_deg, alt_deg, [0.74, 0.70, 0.62], [0.85, 0.95, 1.15])
     }
 
-    /// The same with a theme's sun and sky colours.
+    /// The same with a theme's sun and sky colours: the cartographic light, a sun the user places above a sky dome.
     pub fn sun_and_sky_coloured(az_deg: f32, alt_deg: f32, sun: [f32; 3], sky: [f32; 3]) -> Sh9 {
-        // The direct light fades out over the last five degrees above the horizon and is gone below it; the sky dome stays, so dusk is dim and flat rather than black.
-        let strength = (alt_deg / 5.0).clamp(0.0, 1.0);
-        let (az, alt) = (az_deg.to_radians(), alt_deg.max(0.0).to_radians());
+        let (az, alt) = (az_deg.to_radians(), alt_deg.to_radians());
         // Device frame: x right, y up (screen), z out of the screen; "up" for the sky is +z.
-        Sh9::environment([az.sin() * alt.cos(), az.cos() * alt.cos(), alt.sin()], strength, [0.0, 0.0, 1.0], sun, sky)
-    }
-
-    /// The environment from vectors in the device frame: the sun's direction and strength, and which way the sky is. A phone tilted away from the sun sees neither and goes dark; one facing it is lit flat.
-    pub fn environment(sun_dir: [f32; 3], strength: f32, up: [f32; 3], sun: [f32; 3], sky: [f32; 3]) -> Sh9 {
         let mut sh = Sh9::ZERO;
-        sh.add_sun(sun_dir, [sun[0] * strength, sun[1] * strength, sun[2] * strength]);
-        // A sky of radiance S gives πS onto an upward normal: πS ≈ 0.3 for a unit tint.
+        sh.add_sun([az.sin() * alt.cos(), az.cos() * alt.cos(), alt.sin()], sun);
+        // A sky of radiance S gives ÏS onto an upward normal: ÏS â 0.3 for a unit tint.
         let s = 0.3 / std::f32::consts::PI;
-        sh.add_sky(up, [s * sky[0], s * sky[1], s * sky[2]]);
+        sh.add_sky([0.0, 0.0, 1.0], [s * sky[0], s * sky[1], s * sky[2]]);
         sh
     }
 }
@@ -186,7 +192,7 @@ mod tests {
     fn flat_ground_under_sun_and_sky_matches_the_old_shade() {
         let sh = Sh9::sun_and_sky(315.0, 40.0);
         let e = sh.irradiance([0.0, 0.0, 1.0]);
-        // Old: 0.3 + 0.7 * sin(40°) = 0.75; SH's cosine lobe is a soft approximation, so allow a margin.
+        // Old: 0.3 + 0.7 * sin(40Â°) = 0.75; SH's cosine lobe is a soft approximation, so allow a margin.
         let lum = 0.3 * e[0] + 0.6 * e[1] + 0.1 * e[2];
         assert!((0.6..0.9).contains(&lum), "luminance {lum}");
         // A slope facing away from the sun is darker than one facing it.
@@ -213,7 +219,7 @@ mod tests {
     }
 }
 
-/// Where the sun is: azimuth clockwise from true north and altitude above the horizon, degrees, for a place and a Unix time. NOAA's solar position approximation, good to a few tenths of a degree — the real sun the terrain can be lit by when the phone knows the time and where it is.
+/// Where the sun is: azimuth clockwise from true north and altitude above the horizon, degrees, for a place and a Unix time. NOAA's solar position approximation, good to a few tenths of a degree â the real sun the terrain can be lit by when the phone knows the time and where it is.
 pub fn sun_position(lat_deg: f64, lon_deg: f64, unix_secs: f64) -> (f64, f64) {
     // Julian centuries since J2000.
     let jd = unix_secs / 86400.0 + 2440587.5;
@@ -257,12 +263,37 @@ pub fn sun_position(lat_deg: f64, lon_deg: f64, unix_secs: f64) -> (f64, f64) {
 mod sun_tests {
     #[test]
     fn noon_sun_at_st_helens_in_october_is_south_and_low() {
-        // 2026-10-06 20:00 UTC = 13:00 PDT at Mount St Helens: the sun is a little west of south, about 38° up.
+        // 2026-10-06 20:00 UTC = 13:00 PDT at Mount St Helens: the sun is a little west of south, about 38Â° up.
         let (az, alt) = super::sun_position(46.2, -122.19, 1_791_316_800.0);
         assert!((170.0..200.0).contains(&az), "azimuth {az}");
         assert!((30.0..45.0).contains(&alt), "altitude {alt}");
         // Midnight: below the horizon.
         let (_, night) = super::sun_position(46.2, -122.19, 1_791_316_800.0 - 12.0 * 3600.0);
         assert!(night < 0.0, "altitude {night}");
+    }
+}
+
+#[cfg(test)]
+mod directional_tests {
+    use super::*;
+
+    #[test]
+    fn the_bare_sun_is_the_cosine_and_nothing_else() {
+        let q = Quad::directional([0.0, 0.0, 1.0], [1.0, 1.0, 1.0], (0.0, 1.0));
+        // Overhead: flat ground full, a 60° slope half, the underside negative (the pixel loop clamps it to black).
+        assert!((q.eval(0.0, 0.0, 1.0)[0] - 1.0).abs() < 1e-6);
+        let (s, c) = 60f32.to_radians().sin_cos();
+        assert!((q.eval(s, 0.0, c)[0] - 0.5).abs() < 1e-5);
+        // Under the landscape: flat ground gets nothing.
+        let night = Quad::directional([0.0, 0.6, -0.8], [1.0, 1.0, 1.0], (0.0, 1.0));
+        assert!(night.eval(0.0, 0.0, 1.0)[0] < 0.0);
+        // With a bearing, the light on a world normal equals the light on that normal turned into the device frame.
+        let (sb, cb) = (0.6f32, 0.8f32);
+        let dir = [0.3, 0.5, 0.8124];
+        let q = Quad::directional(dir, [1.0, 1.0, 1.0], (sb, cb));
+        let n = [0.2, -0.4, 0.894];
+        let dev = [n[0] * cb - n[1] * sb, n[0] * sb + n[1] * cb, n[2]];
+        let want = dir[0] * dev[0] + dir[1] * dev[1] + dir[2] * dev[2];
+        assert!((q.eval(n[0], n[1], n[2])[0] - want).abs() < 1e-5);
     }
 }

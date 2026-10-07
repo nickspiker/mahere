@@ -494,13 +494,13 @@ impl MapCore {
         self.res.drain();
         self.canvas_w = w;
         self.canvas_h = h;
-        // The real sun: azimuth and altitude from the clock and the position (the fix, or the view), as a screen-relative azimuth; below the horizon the light stays low and grazing rather than going out.
+        // The real sun: azimuth and altitude from the clock and the position (the fix, or the view), as a screen-relative azimuth. Nothing is clamped: below the horizon it is below the horizon.
         if self.real_sun {
             let (lat, lon) = self.gps.map_or((self.cam.lat, self.cam.lon), |g| (g.lat, g.lon));
             let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0.0, |d| d.as_secs_f64());
             let (az, alt) = sh::sun_position(lat, lon, now);
             self.sun_az = ((az - self.cam.bearing.to_degrees()).rem_euclid(360.0)) as f32;
-            self.sun_alt = alt.clamp(-10.0, 85.0) as f32;
+            self.sun_alt = alt as f32;
         }
         // Lighting lives in the device frame: the environment (sun + sky as SH) is fixed to the screen, and normals are rotated by the bearing at lookup. The world-frame sun vector stays for the water glint.
         if self.luts_sun != (self.sun_az, self.sun_alt, self.cam.bearing) {
@@ -512,22 +512,25 @@ impl MapCore {
                 alt.sin() as f32,
             ];
             if self.real_sun {
-                // The real sun and the real sky in the device frame: the landscape is lit exactly as the phone is held. Below the horizon the direct light is gone and only the sky remains.
+                // The real sun alone, in the device frame: the landscape is lit exactly as the phone is held, by max(0, n·sun) and nothing else. No sky, no fading: at night the sun is under the landscape and it renders black; turn the phone over and the sun lights it from below (Nick 2026-10-06).
                 let (lat, lon) = self.gps.map_or((self.cam.lat, self.cam.lon), |g| (g.lat, g.lon));
                 let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0.0, |d| d.as_secs_f64());
                 let (az, alt) = sh::sun_position(lat, lon, now);
                 // The frames, in order. The almanac gives a true azimuth; the sensor's world frame has magnetic north on its Y axis, so the sun is first expressed against magnetic north (azimuth less the declination, east positive). Rᵀ then takes it into the device frame: x right, y up the screen, z out of it — the lighting frame, since the Activity is locked to portrait. Last, when the map's up is not where the phone points, the device-frame sun is turned by (bearing − true heading): a device turned clockwise sees a fixed world vector turn counterclockwise, so this is the lighting the phone would show turned to match the map, tilt kept. With follow heading on the two agree and nothing turns; without a sensor (R identity, heading = declination) it collapses to the map-locked rotation by the bearing.
                 let frames = Frames { declination_deg: self.declination_deg, map_locked: !self.have_rotation, rot: self.device_rot, bearing_deg: self.cam.bearing.to_degrees() as f32, heading_mag_deg: self.device_heading };
-                let strength = (alt as f32 / 5.0).clamp(0.0, 1.0);
                 let t = &self.themes[self.theme.min(self.themes.len() - 1)];
-                self.env = sh::Sh9::environment(frames.to_screen(az as f32, alt as f32), strength, frames.up(), t.sun, t.sky);
-            } else if self.luts_sun.0 != self.sun_az || self.luts_sun.1 != self.sun_alt || self.device_heading != 0.0 || self.luts_sun.2.is_nan() {
-                let t = &self.themes[self.theme.min(self.themes.len() - 1)];
-                self.env = sh::Sh9::sun_and_sky_coloured(self.sun_az - self.device_heading, self.sun_alt, t.sun, t.sky);
+                let (sb, cb) = self.cam.bearing.sin_cos();
+                self.luts.light = sh::Quad::directional(frames.to_screen(az as f32, alt as f32), t.sun, (sb as f32, cb as f32));
+                self.luts_sun = (self.sun_az, self.sun_alt, self.cam.bearing);
+            } else {
+                if self.luts_sun.0 != self.sun_az || self.luts_sun.1 != self.sun_alt || self.device_heading != 0.0 || self.luts_sun.2.is_nan() {
+                    let t = &self.themes[self.theme.min(self.themes.len() - 1)];
+                    self.env = sh::Sh9::sun_and_sky_coloured(self.sun_az - self.device_heading, self.sun_alt, t.sun, t.sky);
+                }
+                let (sb, cb) = self.cam.bearing.sin_cos();
+                self.luts.light = self.env.quadratic((sb as f32, cb as f32));
+                self.luts_sun = (self.sun_az, self.sun_alt, self.cam.bearing);
             }
-            let (sb, cb) = self.cam.bearing.sin_cos();
-            self.luts.light = self.env.quadratic((sb as f32, cb as f32));
-            self.luts_sun = (self.sun_az, self.sun_alt, self.cam.bearing);
         }
         self.vec_depth = select_depth(self.cam.ppd, self.vec_depth, VEC_BASE_DEPTH);
         self.dem_depth = select_depth(self.cam.ppd, self.dem_depth, DEM_BASE_DEPTH);
