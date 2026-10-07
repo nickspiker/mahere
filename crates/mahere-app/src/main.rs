@@ -32,10 +32,12 @@ struct MahereApp {
 impl MahereApp {
     fn new(map: MapCore) -> Self {
         let mut hit_counter: HitId = HIT_NONE;
+        // The app orb: the paper-craft relief map (icon.jpeg, cropped to its disc), bundled as fluor's 256×256 VSF orb. A decode failure is non-fatal — the chrome just draws no orb.
+        let orb = fluor::host::icon::Icon::from_vsf_bytes(include_bytes!("../assets/mahere_orb.vsf")).ok();
         let chrome = DefaultChrome::new(
             Viewport::new(1280, 800),
             "mahere",
-            None,
+            orb,
             Some("drag pan · right-drag rotate · wheel zoom · A/D W/S sun · Q/E rotate · R home · 1-4 layers · 5 imagery · 6 contours · 7 slope · 8 infrared".to_string()),
             &mut hit_counter,
         );
@@ -64,6 +66,11 @@ impl FluorApp for MahereApp {
 
     fn title(&self) -> &str {
         "mahere"
+    }
+
+    /// The OS window / taskbar icon: the same orb the chrome draws.
+    fn window_icon(&self) -> Option<&fluor::host::icon::Icon> {
+        self.chrome.app_icon.as_ref()
     }
 
     fn init(&mut self, ctx: &mut Context) {
