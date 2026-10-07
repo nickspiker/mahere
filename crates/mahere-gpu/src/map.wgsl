@@ -20,7 +20,7 @@ const M_DEBUG: u32 = 16u;
 const M_IMAGERY: u32 = 32u;
 const M_CONTOURS: u32 = 64u;
 const M_SLOPE: u32 = 128u;
-const M_CANOPY: u32 = 256u;
+const M_INFRARED: u32 = 256u;
 const M_HYPSO: u32 = 512u;
 const M_BOUND: u32 = 1024u;
 
@@ -409,10 +409,14 @@ fn compose(d: u32, u: u32, v: u32) -> Composed {
         }
         let draw_line = (mask & M_LINE) != 0u && line.y != 0u && (line.x < BOUNDARY_FIRST || (mask & M_BOUND) != 0u);
         if ((mask & M_IMAGERY) != 0u) {
-            // Imagery stands in for the ground: nothing lights it.
+            // Imagery stands in for the ground: nothing lights it. True colour, or the near-infrared band as grey.
             out.ground = false;
             if (im.x != 0u || im.y != 0u || im.z != 0u) {
-                out.base = vec3<f32>(f32(im.z), f32(im.y), f32(im.x));
+                if ((mask & M_INFRARED) != 0u) {
+                    out.base = vec3<f32>(f32(im.w));
+                } else {
+                    out.base = vec3<f32>(f32(im.x), f32(im.y), f32(im.z));
+                }
             }
             if (draw_line) {
                 { let f = fold(Fold(out.k2, out.c2), line_colour(line.x, line.z), line_alpha(line.x, line.y, line.z)); out.k2 = f.k; out.c2 = f.c; }
@@ -421,11 +425,6 @@ fn compose(d: u32, u: u32, v: u32) -> Composed {
         }
         if ((mask & M_LAND) != 0u && lw.y != 0u) {
             out.base = lerp3(out.base, unpack_rgb(lut[LAND_BASE + min(lw.x, 13u)]), f32(lw.y) / 255.0 * 0.85);
-        }
-        if ((mask & M_CANOPY) != 0u && im.w != 0u) {
-            let c = min(f32(im.w) / 60.0, 1.0);
-            let green = floor(vec3<f32>((1.0 - c) * 190.0 + c * 20.0, (1.0 - c) * 230.0 + c * 110.0, (1.0 - c) * 150.0 + c * 40.0));
-            out.base = lerp3(out.base, green, 0.8);
         }
         if (have_band) {
             { let f = fold(Fold(out.k1, out.c1), band, 0.45); out.k1 = f.k; out.c1 = f.c; }

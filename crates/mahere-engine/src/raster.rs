@@ -49,8 +49,8 @@ pub struct LayerMask {
     pub contours: bool,
     /// Slope-angle bands over the terrain (25/30/35/45°), from the normal at draw time.
     pub slope: bool,
-    /// Canopy height tint over the terrain (needs the img section.s canopy band).
-    pub canopy: bool,
+    /// Imagery as the near-infrared band alone, greyscale, in place of true colour.
+    pub infrared: bool,
     /// The hypsometric gradient under the light; off leaves a flat white landscape lit by the sun alone.
     pub hypso: bool,
     /// Boundaries: parks, wilderness, national forests, other protected land, state and county lines.
@@ -59,7 +59,7 @@ pub struct LayerMask {
 
 impl Default for LayerMask {
     fn default() -> Self {
-        LayerMask { dem: true, land: true, water: true, line: true, debug: false, imagery: false, contours: true, slope: false, canopy: false, hypso: true, boundaries: true }
+        LayerMask { dem: true, land: true, water: true, line: true, debug: false, imagery: false, contours: true, slope: false, infrared: false, hypso: true, boundaries: true }
     }
 }
 
@@ -67,7 +67,7 @@ impl LayerMask {
     /// Which rows a dominating layer makes inert: imagery replaces everything but lines, land cover and a terrain that is off make the elevation tint moot. The panel greys these; the renderer treats them as off through [`LayerMask::effective`].
     pub fn inert(self) -> LayerMask {
         let im = self.imagery;
-        LayerMask { dem: im, land: im, water: im, line: false, debug: false, imagery: false, contours: im, slope: im, canopy: im, hypso: im || self.land || !self.dem, boundaries: !self.line }
+        LayerMask { dem: im, land: im, water: im, line: false, debug: false, imagery: false, contours: im, slope: im, infrared: !im, hypso: im || self.land || !self.dem, boundaries: !self.line }
     }
 
     /// The mask as bits, one per field in declaration order, for a shader or a settings document.
@@ -80,13 +80,13 @@ impl LayerMask {
             | (self.imagery as u32) << 5
             | (self.contours as u32) << 6
             | (self.slope as u32) << 7
-            | (self.canopy as u32) << 8
+            | (self.infrared as u32) << 8
             | (self.hypso as u32) << 9
             | (self.boundaries as u32) << 10
     }
 
     pub fn from_bits(b: u32) -> LayerMask {
-        LayerMask { dem: b & 1 != 0, land: b & 2 != 0, water: b & 4 != 0, line: b & 8 != 0, debug: b & 16 != 0, imagery: b & 32 != 0, contours: b & 64 != 0, slope: b & 128 != 0, canopy: b & 256 != 0, hypso: b & 512 != 0, boundaries: b & 1024 != 0 }
+        LayerMask { dem: b & 1 != 0, land: b & 2 != 0, water: b & 4 != 0, line: b & 8 != 0, debug: b & 16 != 0, imagery: b & 32 != 0, contours: b & 64 != 0, slope: b & 128 != 0, infrared: b & 256 != 0, hypso: b & 512 != 0, boundaries: b & 1024 != 0 }
     }
 
     /// The mask as drawn: every inert row off.
@@ -101,7 +101,7 @@ impl LayerMask {
             imagery: self.imagery,
             contours: self.contours && !i.contours,
             slope: self.slope && !i.slope,
-            canopy: self.canopy && !i.canopy,
+            infrared: self.infrared && !i.infrared,
             hypso: self.hypso && !i.hypso,
             boundaries: self.boundaries && !i.boundaries,
         }
@@ -553,10 +553,10 @@ fn compose_rgb(dem: &DemRef, vec: &VecRef, pool: &Pool, diamond: u8, uq: i64, vq
     if let VecRef::Cell { line, land, water, img, shift, .. } = vec {
         let i = tri_index(uq, vq, *shift);
         if mask.imagery {
-            // False colour: 1064 nm → R, NIR → G, red → B; no-data stays background.
+            // True colour, or the near-infrared band as grey; no-data stays background.
             if let Some(im) = img {
-                if im.red[i] != 0 || im.nir[i] != 0 || im.i1064[i] != 0 {
-                    rgb = [im.i1064[i] as f32, im.nir[i] as f32, im.red[i] as f32];
+                if im.red[i] != 0 || im.green[i] != 0 || im.blue[i] != 0 {
+                    rgb = if mask.infrared { [im.nir[i] as f32; 3] } else { [im.red[i] as f32, im.green[i] as f32, im.blue[i] as f32] };
                 }
             }
             if mask.line {
@@ -574,16 +574,6 @@ fn compose_rgb(dem: &DemRef, vec: &VecRef, pool: &Pool, diamond: u8, uq: i64, vq
                 let lc = land.cov[i];
                 if lc != 0 {
                     rgb = lerp3(rgb, LAND_LUT[(land.class[i] as usize).min(13)], lc as f32 / 255.0 * 0.85);
-                }
-            }
-        }
-        if mask.canopy {
-            if let Some(im) = img {
-                let c = im.canopy[i];
-                if c != 0 {
-                    // 0..60 m -> pale to deep green.
-                    let t = (c as f32 / 60.0).min(1.0);
-                    rgb = lerp3(rgb, [((1.0 - t) * 190.0 + t * 20.0) as u8, ((1.0 - t) * 230.0 + t * 110.0) as u8, ((1.0 - t) * 150.0 + t * 40.0) as u8], 0.8);
                 }
             }
         }

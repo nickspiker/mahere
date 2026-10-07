@@ -6,7 +6,7 @@
 //! - **line**: every road, trail, rail, power line and waterway stamped at its physical width as (class, coverage, magnitude, use) texels; waterways carry their upstream-network weight as width and coverage.
 //! - **land**: land cover (class, coverage) from OSM polygons.
 //! - **water**: lakes, ponds, reservoirs, riverbanks as coverage.
-//! - **img**: NAIP red and near-infrared, lidar 1064 nm intensity and canopy height, 8-bit, through the pyramid codec, never finer than depth 14.
+//! - **img**: NAIP red, green, blue and near-infrared, 8-bit, box-filtered into the texel, through the pyramid codec, never finer than depth 14.
 //!
 //! **Texels are triangles.** A cell's 256×256 UV squares are each split along `u+v = k` into a lower and an upper equilateral triangle. The triangular tiling has 6-fold symmetry and a line always crosses it edge-to-edge, so linework is isotropic. Each triangle subdivides into four — three corners and the inverted center — and that is the pyramid's box filter: coverage up the pyramid IS area, so minor features fade and dense ones glow with no styling.
 //!
@@ -321,28 +321,27 @@ pub fn apron_idx(side: usize, half: usize, i: usize) -> usize {
     (side * 2 + half) * TEX + i
 }
 
-/// Imagery bands, 8-bit, 0 = no data: NAIP red and near-infrared (passive, ~650 / ~850 nm) and the lidar return intensity at 1064 nm (active — no sun, no shadows). Never baked finer than depth 14 (IMG_MAX_DEPTH).
+/// Imagery bands, 8-bit, 0 = no data: NAIP red, green, blue and near-infrared (~650 / ~550 / ~450 / ~850 nm). Never baked finer than depth 14 (IMG_MAX_DEPTH).
 #[derive(Clone)]
 pub struct ImgCell {
     pub red: Vec<u8>,
+    pub green: Vec<u8>,
+    pub blue: Vec<u8>,
     pub nir: Vec<u8>,
-    pub i1064: Vec<u8>,
-    /// Canopy height, metres (first-return top minus ground), 0 = none; a fourth band from the same point cloud.
-    pub canopy: Vec<u8>,
 }
 
 impl ImgCell {
     pub fn new() -> ImgCell {
-        ImgCell { red: vec![0; TRI], nir: vec![0; TRI], i1064: vec![0; TRI], canopy: vec![0; TRI] }
+        ImgCell { red: vec![0; TRI], green: vec![0; TRI], blue: vec![0; TRI], nir: vec![0; TRI] }
     }
     pub fn is_empty(&self) -> bool {
-        self.red.iter().all(|&v| v == 0) && self.nir.iter().all(|&v| v == 0) && self.i1064.iter().all(|&v| v == 0) && self.canopy.iter().all(|&v| v == 0)
+        self.bands().iter().all(|b| b.iter().all(|&v| v == 0))
     }
     fn bands(&self) -> [&Vec<u8>; 4] {
-        [&self.red, &self.nir, &self.i1064, &self.canopy]
+        [&self.red, &self.green, &self.blue, &self.nir]
     }
     fn bands_mut(&mut self) -> [&mut Vec<u8>; 4] {
-        [&mut self.red, &mut self.nir, &mut self.i1064, &mut self.canopy]
+        [&mut self.red, &mut self.green, &mut self.blue, &mut self.nir]
     }
 }
 
@@ -757,28 +756,34 @@ pub fn dem_pyramid(base: &[(CellKey, DemCell)], min_depth: u8) -> Vec<(CellKey, 
 // ==================== IMAGERY LAYER ====================
 
 /// Sample NAIP (red, nir) and lidar intensity at every triangle centroid of `keys` (depth <= IMG_MAX_DEPTH); cells with nothing are dropped.
-pub fn bake_img(naip: Option<&mahere_dem::ImgStore>, intensity: Option<&mahere_dem::IntensityStore>, keys: &[CellKey]) -> Vec<(CellKey, ImgCell)> {
+/// Sample the imagery at every triangle centroid: the four NAIP bands, each the mean of four samples spread a third of a texel around the centroid, so 60 cm pixels are box-filtered into a 1.2 m texel instead of point-picked. 0 stays no data.
+pub fn bake_img(naip: Option<&mahere_dem::ImgStore>, keys: &[CellKey]) -> Vec<(CellKey, ImgCell)> {
     keys.par_iter()
         .map(|&key| {
             let (u0, v0, size) = key.uv_rect();
             let d = key.diamond();
             let step = size / TEX as f64;
             let mut cell = ImgCell::new();
+            let Some(n) = naip else { return (key, cell) };
             for ty in 0..TEX {
                 for tx in 0..TEX {
                     for half in 0..2 {
                         let (cx, cy) = tri_centroid(tx, ty, half);
-                        let (lat, lon) = uv_to_lat_lon(d, u0 + cx * step, v0 + cy * step);
                         let i = tri_idx(tx, ty, half);
-                        if let Some(px) = naip.and_then(|n| n.sample(lat, lon)) {
-                            cell.red[i] = px[0].max(1);
-                            cell.nir[i] = px[3].max(1);
+                        let (mut acc, mut hits) = ([0u32; 4], 0u32);
+                        for (ou, ov) in [(-0.3, -0.3), (0.3, -0.3), (-0.3, 0.3), (0.3, 0.3)] {
+                            let (lat, lon) = uv_to_lat_lon(d, u0 + (cx + ou) * step, v0 + (cy + ov) * step);
+                            if let Some(px) = n.sample(lat, lon) {
+                                for b in 0..4 {
+                                    acc[b] += px[b] as u32;
+                                }
+                                hits += 1;
+                            }
                         }
-                        if let Some(v) = intensity.and_then(|s| s.sample(lat, lon)) {
-                            cell.i1064[i] = v;
-                        }
-                        if let Some(v) = intensity.and_then(|s| s.canopy(lat, lon)) {
-                            cell.canopy[i] = v;
+                        if hits > 0 {
+                            for (b, plane) in cell.bands_mut().into_iter().enumerate() {
+                                plane[i] = ((acc[b] + hits / 2) / hits).clamp(1, 255) as u8;
+                            }
                         }
                     }
                 }
@@ -1086,15 +1091,15 @@ fn decode_dem_legacy(fields: &HashMap<String, Vec<VsfType>>, base: f32, step: f3
     Some(DemPlanes { elev, apron })
 }
 
-/// Imagery bands through the pyramid codec: 0 is no data for the passive and active bands (masked, filled), a value for canopy.
-const IMG_BANDS: [&str; 4] = ["red", "nir", "intensity", "canopy"];
+/// Imagery bands through the pyramid codec: 0 is no data (masked, filled).
+const IMG_BANDS: [&str; 4] = ["red", "green", "blue", "nir"];
 
 fn img_section(im: &ImgCell, loss: &Loss) -> vsf::VsfSection {
     let steps = pyr::Steps::tapered(loss.img);
     let mut s = vsf::VsfSection::new("img");
     s.add_field("loss", pyr::steps_vsf(&steps));
     for (name, band) in IMG_BANDS.iter().zip(im.bands()) {
-        let masked = *name != "canopy";
+        let masked = true;
         let mem: Vec<f32> = band.iter().map(|&v| if masked && v == 0 { f32::NAN } else { v as f32 }).collect();
         let (plane, mask) = quantise_plane(&mem, 0.0, 1.0);
         s.add_field_multi(*name, pyr::encode(&plane, &steps));
@@ -1116,7 +1121,7 @@ fn decode_img(fields: &HashMap<String, Vec<VsfType>>) -> Option<ImgCell> {
             Some(m) => Some(pyr::mask_from_vsf(m)?),
             None => None,
         };
-        let masked = *name != "canopy";
+        let masked = true;
         *out = plane
             .iter()
             .enumerate()
@@ -1389,14 +1394,7 @@ pub fn decode_cell(data: &[u8]) -> Result<CellPlanes, String> {
                 }
             }
             "img" => {
-                out.img = decode_img(&fields).or_else(|| {
-                    // Epoch 3: plain u8 planes in disk order, the lidar band under its wavelength.
-                    let red = first("red").and_then(plane_u8_mem)?;
-                    let nir = first("nir").and_then(plane_u8_mem)?;
-                    let i1064 = first("i1064").and_then(plane_u8_mem)?;
-                    let canopy = first("canopy").and_then(plane_u8_mem).unwrap_or_else(|| vec![0; TRI]);
-                    Some(ImgCell { red, nir, i1064, canopy })
-                })
+                out.img = decode_img(&fields)
             }
             _ => {}
         }

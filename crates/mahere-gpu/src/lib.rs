@@ -451,9 +451,9 @@ impl GpuMap {
                 if let Some((slot, true)) = slot {
                     for i in 0..TRI {
                         scratch[4 * i] = im.red[i];
-                        scratch[4 * i + 1] = im.nir[i];
-                        scratch[4 * i + 2] = im.i1064[i];
-                        scratch[4 * i + 3] = im.canopy[i];
+                        scratch[4 * i + 1] = im.green[i];
+                        scratch[4 * i + 2] = im.blue[i];
+                        scratch[4 * i + 3] = im.nir[i];
                     }
                     write_layer(queue, &self.img.tex, slot, w, h, 4, &scratch);
                     self.uploads += 1;

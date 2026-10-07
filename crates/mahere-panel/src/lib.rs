@@ -51,7 +51,7 @@ enum Layer {
     Line,
     Contours,
     Slope,
-    Canopy,
+    Infrared,
     Imagery,
     Debug,
 }
@@ -65,8 +65,8 @@ const LAYERS: [(Layer, &str); 14] = [
     (Layer::Boundaries, "Boundaries"),
     (Layer::Contours, "Contours"),
     (Layer::Slope, "Slope bands"),
-    (Layer::Canopy, "Canopy"),
     (Layer::Imagery, "Imagery"),
+    (Layer::Infrared, "Infrared"),
     (Layer::Debug, "Residency"),
     (Layer::RealSun, "Real sun"),
     (Layer::FollowHeading, "Follow heading"),
@@ -86,7 +86,7 @@ fn get(mask: &LayerMask, ctl: &Controls, l: Layer) -> bool {
         Layer::Boundaries => mask.boundaries,
         Layer::Contours => mask.contours,
         Layer::Slope => mask.slope,
-        Layer::Canopy => mask.canopy,
+        Layer::Infrared => mask.infrared,
         Layer::Imagery => mask.imagery,
         Layer::Debug => mask.debug,
     }
@@ -105,7 +105,7 @@ fn set(mask: &mut LayerMask, ctl: &mut Controls, l: Layer, v: bool) {
         Layer::Boundaries => mask.boundaries = v,
         Layer::Contours => mask.contours = v,
         Layer::Slope => mask.slope = v,
-        Layer::Canopy => mask.canopy = v,
+        Layer::Infrared => mask.infrared = v,
         Layer::Imagery => mask.imagery = v,
         Layer::Debug => mask.debug = v,
     }

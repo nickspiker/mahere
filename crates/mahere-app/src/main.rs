@@ -36,7 +36,7 @@ impl MahereApp {
             Viewport::new(1280, 800),
             "mahere",
             None,
-            Some("drag pan · right-drag rotate · wheel zoom · A/D W/S sun · Q/E rotate · R home · 1-4 layers · 5 imagery · 6 contours · 7 slope · 8 canopy".to_string()),
+            Some("drag pan · right-drag rotate · wheel zoom · A/D W/S sun · Q/E rotate · R home · 1-4 layers · 5 imagery · 6 contours · 7 slope · 8 infrared".to_string()),
             &mut hit_counter,
         );
         MahereApp {
@@ -294,7 +294,7 @@ impl FluorApp for MahereApp {
                             "5" => m.imagery = !m.imagery,
                             "6" => m.contours = !m.contours,
                             "7" => m.slope = !m.slope,
-                            "8" => m.canopy = !m.canopy,
+                            "8" => m.infrared = !m.infrared,
                             _ => m.debug = !m.debug,
                         }
                         self.map.set_layers(m);

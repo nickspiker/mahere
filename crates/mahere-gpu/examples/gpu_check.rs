@@ -40,7 +40,7 @@ fn main() {
                 "nowater" => m.water = false,
                 "nodem" => m.dem = false,
                 "slope" => m.slope = true,
-                "canopy" => m.canopy = true,
+                "infrared" => m.infrared = true,
                 "debug" => m.debug = true,
                 _ => {}
             }
