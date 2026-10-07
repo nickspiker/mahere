@@ -6,7 +6,8 @@ AREA=$1
 case "$AREA" in
     leavenworth)
         BOX=47.412343,-120.859099,47.648857,-120.571077
-        DEMS=$(ls data/dem/USGS_1M_10_x6[678]y52[6789]_WA_CentralWildfire_D22.tif)
+        # The 2022 flight first, the 2019 one behind it: a sample takes the first tile with data there, and the 2022 tiles have no-data holes across the south-west that the 2019 flight fills (the two together cover the whole box).
+        DEMS="$(ls data/dem/USGS_1M_10_x6[678]y52[6789]_WA_CentralWildfire_D22.tif) $(ls data/dem/USGS_1M_10_x6[67]y52[678]_WA_EasternCascades_2019_B19.tif)"
         NAIP=$(ls data/naip-$AREA/*.tif 2>/dev/null || true)
         ;;
     *) echo "unknown area $AREA" >&2; exit 2 ;;
