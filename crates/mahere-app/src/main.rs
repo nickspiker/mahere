@@ -30,6 +30,25 @@ struct MahereApp {
 }
 
 impl MahereApp {
+    /// The editor's requests: a built-in is copied before it is edited, a field change is live, and closing the editor writes the theme to the vault.
+    fn apply_theme_edits(&mut self) {
+        for e in self.panel.take_theme_edits() {
+            match e {
+                mahere_panel::ThemeEdit::Begin => {
+                    if self.map.current_theme().is_builtin() {
+                        self.map.duplicate_theme();
+                    }
+                }
+                mahere_panel::ThemeEdit::Set(f, v) => self.map.edit_theme(f, v),
+                mahere_panel::ThemeEdit::Done => {
+                    if let Some(store) = &self.store {
+                        mahere_store::themes::save(store, self.map.current_theme());
+                    }
+                }
+            }
+        }
+    }
+
     fn new(map: MapCore) -> Self {
         let mut hit_counter: HitId = HIT_NONE;
         // The app orb: the paper-craft relief map (icon.jpeg, cropped to its disc), bundled as fluor's 256×256 VSF orb. A decode failure is non-fatal — the chrome just draws no orb.
@@ -152,8 +171,9 @@ impl FluorApp for MahereApp {
                 let mut mask = self.map.layers();
                 let mut ctl = Controls { real_sun: self.map.real_sun, real_light: self.map.real_light, follow_heading: self.map.follow_heading, lock_to_fix: self.map.lock_to_fix, cache_budget: self.cache_budget, theme: self.map.theme, compressed: self.map.compressed() };
                 let was_open = self.panel.is_open();
-                if self.panel.tap(cx as f32, cy as f32, w, h, &mut mask, &mut ctl) {
+                if self.panel.tap(cx as f32, cy as f32, w, h, &mut mask, &mut ctl, &self.map.themes) {
                     self.cache_budget = ctl.cache_budget;
+                    self.apply_theme_edits();
                     if ctl.theme != self.map.theme {
                         self.map.set_theme(ctl.theme);
                     }
@@ -213,6 +233,7 @@ impl FluorApp for MahereApp {
                 let mut ctl = Controls { real_sun: self.map.real_sun, real_light: self.map.real_light, follow_heading: self.map.follow_heading, lock_to_fix: self.map.lock_to_fix, cache_budget: self.cache_budget, theme: self.map.theme, compressed: self.map.compressed() };
                 if self.panel.drag(hx, &mut ctl) {
                     self.cache_budget = ctl.cache_budget;
+                    self.apply_theme_edits();
                     ctx.window.request_redraw();
                     self.last_cursor = (x, y);
                     return EventResponse::Handled;

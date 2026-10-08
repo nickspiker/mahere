@@ -176,6 +176,109 @@ pub fn ink() -> Theme {
     }
 }
 
+/// One editable value of a theme: a colour (VSF RGB bytes, as the file holds them), a stop's height, a contour opacity, or the sun's or sky's light per channel.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Field {
+    Hypso(u8),
+    Sea,
+    Flat,
+    Bg,
+    NoDem,
+    Water,
+    Contour,
+    ContourIndex,
+    Land(u8),
+    Line(u8),
+    ContourAlpha(u8),
+    Sun,
+    Sky,
+}
+
+impl Field {
+    /// Every field, in the order the editor lists them.
+    pub fn all() -> Vec<Field> {
+        let mut v: Vec<Field> = (0..5).map(Field::Hypso).collect();
+        v.extend([Field::Sea, Field::Flat, Field::Bg, Field::NoDem]);
+        v.extend((1..14).map(Field::Land));
+        v.extend((1..18).map(Field::Line));
+        v.extend([Field::Water, Field::Contour, Field::ContourIndex, Field::ContourAlpha(0), Field::ContourAlpha(1), Field::Sun, Field::Sky]);
+        v
+    }
+
+    pub fn name(self) -> String {
+        match self {
+            Field::Hypso(i) => format!("Terrain stop {}", i + 1),
+            Field::Sea => "Sea".into(),
+            Field::Flat => "Flat ground".into(),
+            Field::Bg => "No data".into(),
+            Field::NoDem => "Terrain off".into(),
+            Field::Water => "Water".into(),
+            Field::Contour => "Contour".into(),
+            Field::ContourIndex => "Index contour".into(),
+            Field::Land(i) => LAND_NAMES[i as usize].to_string(),
+            Field::Line(i) => CLASS_NAMES[i as usize].to_string(),
+            Field::ContourAlpha(0) => "Contour opacity".into(),
+            Field::ContourAlpha(_) => "Index opacity".into(),
+            Field::Sun => "Sun".into(),
+            Field::Sky => "Sky".into(),
+        }
+    }
+
+    /// Whether the field is a colour (three VSF RGB bytes) as opposed to a light (three channels, 0 to 3) or a single number.
+    pub fn is_colour(self) -> bool {
+        !matches!(self, Field::ContourAlpha(_) | Field::Sun | Field::Sky)
+    }
+}
+
+impl Theme {
+    /// A field's values: a colour's bytes (and a stop's metres in the fourth slot), a light's channels, or an opacity in the first slot.
+    pub fn get(&self, f: Field) -> [f32; 4] {
+        let c = |c: [u8; 3]| [c[0] as f32, c[1] as f32, c[2] as f32, 0.0];
+        match f {
+            Field::Hypso(i) => {
+                let (m, col) = self.hypso[i as usize];
+                [col[0] as f32, col[1] as f32, col[2] as f32, m]
+            }
+            Field::Sea => c(self.sea),
+            Field::Flat => c(self.flat),
+            Field::Bg => c(self.bg),
+            Field::NoDem => c(self.no_dem),
+            Field::Water => c(self.water),
+            Field::Contour => c(self.contour),
+            Field::ContourIndex => c(self.contour_index),
+            Field::Land(i) => c(self.land[i as usize]),
+            Field::Line(i) => c(self.line[i as usize]),
+            Field::ContourAlpha(i) => [self.contour_alpha[i as usize], 0.0, 0.0, 0.0],
+            Field::Sun => [self.sun[0], self.sun[1], self.sun[2], 0.0],
+            Field::Sky => [self.sky[0], self.sky[1], self.sky[2], 0.0],
+        }
+    }
+
+    pub fn set(&mut self, f: Field, v: [f32; 4]) {
+        let c = [v[0].clamp(0.0, 255.0) as u8, v[1].clamp(0.0, 255.0) as u8, v[2].clamp(0.0, 255.0) as u8];
+        match f {
+            Field::Hypso(i) => self.hypso[i as usize] = (v[3].max(0.0), c),
+            Field::Sea => self.sea = c,
+            Field::Flat => self.flat = c,
+            Field::Bg => self.bg = c,
+            Field::NoDem => self.no_dem = c,
+            Field::Water => self.water = c,
+            Field::Contour => self.contour = c,
+            Field::ContourIndex => self.contour_index = c,
+            Field::Land(i) => self.land[i as usize] = c,
+            Field::Line(i) => self.line[i as usize] = c,
+            Field::ContourAlpha(i) => self.contour_alpha[i as usize] = v[0].clamp(0.0, 1.0),
+            Field::Sun => self.sun = [v[0].max(0.0), v[1].max(0.0), v[2].max(0.0)],
+            Field::Sky => self.sky = [v[0].max(0.0), v[1].max(0.0), v[2].max(0.0)],
+        }
+    }
+
+    /// A built-in, which the editor copies rather than changes.
+    pub fn is_builtin(&self) -> bool {
+        self.revision > 0
+    }
+}
+
 /// The built-in themes, as authored: VSF RGB, gamma 2. The renderers convert to the display at their one encode.
 pub fn builtin() -> Vec<Theme> {
     vec![trail(), topo(), night(), alpine(), desert(), ink()]

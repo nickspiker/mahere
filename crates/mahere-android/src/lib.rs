@@ -135,6 +135,27 @@ impl AndroidApp {
         self.ui_pinch = Some(d);
     }
 
+    /// The editor's requests: a built-in is copied before it is edited, a field change is live, and closing the editor writes the theme to the vault.
+    fn apply_theme_edits(&mut self) {
+        for e in self.panel.take_theme_edits() {
+            match e {
+                mahere_panel::ThemeEdit::Begin => {
+                    if self.map.current_theme().is_builtin() {
+                        self.map.duplicate_theme();
+                        self.save_settings();
+                    }
+                }
+                mahere_panel::ThemeEdit::Set(f, v) => self.map.edit_theme(f, v),
+                mahere_panel::ThemeEdit::Done => {
+                    if let Some(store) = &self.store {
+                        let (store, t) = (store.clone(), self.map.current_theme().clone());
+                        self.persist.run(move || mahere_store::themes::save(&store, &t));
+                    }
+                }
+            }
+        }
+    }
+
     /// Apply what the panel changed and keep it.
     fn apply_controls(&mut self, ctl: Controls, mask: mahere_engine::LayerMask) {
         self.map.set_layers(mask);
@@ -267,8 +288,9 @@ impl FluorApp for AndroidApp {
                 let mut mask = self.map.layers();
                 let mut ctl = self.controls();
                 let was_open = self.panel.is_open();
-                if self.panel.tap(ctx.cursor_x as f32, ctx.cursor_y as f32, self.w, self.h, &mut mask, &mut ctl) {
+                if self.panel.tap(ctx.cursor_x as f32, ctx.cursor_y as f32, self.w, self.h, &mut mask, &mut ctl, &self.map.themes) {
                     self.apply_controls(ctl, mask);
+                    self.apply_theme_edits();
                     if self.panel.take_clear_measure() {
                         self.map.clear_measure();
                     }
@@ -305,6 +327,7 @@ impl FluorApp for AndroidApp {
                 if self.panel.drag(x as f32, &mut ctl) {
                     let mask = self.map.layers();
                     self.apply_controls(ctl, mask);
+                    self.apply_theme_edits();
                     self.last_cursor = (x, y);
                     return EventResponse::Handled;
                 }

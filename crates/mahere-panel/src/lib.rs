@@ -6,8 +6,8 @@ use fluor::canvas::{Canvas, Damage};
 use fluor::paint::{self, HitId, HIT_NONE};
 use fluor::text::{TextRenderer, TextStyle};
 use fluor::theme;
-use fluor::widgets::Checkbox;
-use mahere_engine::theme::{CLASS_NAMES, LAND_NAMES, Theme};
+use fluor::widgets::{Checkbox, Slider};
+use mahere_engine::theme::{CLASS_NAMES, Field, LAND_NAMES, Theme};
 use mahere_engine::{LayerMask, MeasureView};
 
 /// The two modes the panel switches besides the layers.
@@ -163,21 +163,46 @@ const STRIP_EDGE: u32 = ink(0xFF_C4_40, 255);
 const READOUT: u32 = ink(0xC8_CC_D4, 255);
 const READOUT_DIM: u32 = ink(0x80_86_92, 255);
 
-/// Which page the column shows.
+/// The pages, stacked: opening one slides the page under it left into a rail and opens the new one beside it (Nick 2026-10-08). The rail takes a tap back.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Page {
     Layers,
     Themes,
+    /// The legend as the editor: every colour and number of the current theme a row.
+    Edit,
+    /// One field's sliders.
+    Field(Field),
 }
+
+/// What the editor asks of the host, polled after every tap and drag.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ThemeEdit {
+    /// The editor opened on the current theme: a built-in is to be copied first.
+    Begin,
+    /// A field changed; apply it live.
+    Set(Field, [f32; 4]),
+    /// The editor closed: save the current theme.
+    Done,
+}
+
+/// The rail's share of the column when a page is stacked over another.
+const RAIL: f32 = 0.38;
 
 pub struct Panel {
     open: bool,
     dirty: bool,
     /// The UI's scale, fluor's RU multiplier: 1 is the default size, pinched while the panel is open and kept in the settings.
     ru: f32,
-    page: Page,
-    /// The theme page's rows: the back row, then one per theme, as (centre y, half height) in screen pixels.
+    stack: Vec<Page>,
+    /// The theme page's rows: the back row, then one per theme, then the edit row, as (centre y, half height) in screen pixels.
     theme_rows: Vec<(f32, f32)>,
+    /// The editor's rows: (centre y, half height, the field).
+    edit_rows: Vec<(f32, f32, Field)>,
+    /// The open field's sliders and the values they hold, and which slider a finger is on.
+    sliders: Vec<Slider>,
+    field_vals: [f32; 4],
+    held: Option<usize>,
+    edits: Vec<ThemeEdit>,
     hits: HitId,
     checks: Vec<(Layer, Checkbox)>,
     text: TextRenderer,
@@ -208,7 +233,7 @@ impl Panel {
     pub fn new() -> Panel {
         let mut hits: HitId = HIT_NONE;
         let checks = LAYERS.iter().map(|&(l, label)| (l, Checkbox::new(&mut hits, label, 0.0, 0.0, 10.0, 10.0, 10.0, false))).collect();
-        Panel { open: false, dirty: true, ru: 1.0, page: Page::Layers, theme_rows: Vec::new(), hits, checks, text: TextRenderer::new(), buf: Vec::new(), w: 0, h: 0, font: 16.0, gear: (0.0, 0.0, 0.0), panel_w: 0.0, theme_row: (0.0, 0.0, 0.0), slider: (0.0, 0.0, 0.0), slider_held: false, cache_max: CACHE_MIN + 1, strip_close: None, clear_measure: false }
+        Panel { open: false, dirty: true, ru: 1.0, stack: vec![Page::Layers], theme_rows: Vec::new(), edit_rows: Vec::new(), sliders: Vec::new(), field_vals: [0.0; 4], held: None, edits: Vec::new(), hits, checks, text: TextRenderer::new(), buf: Vec::new(), w: 0, h: 0, font: 16.0, gear: (0.0, 0.0, 0.0), panel_w: 0.0, theme_row: (0.0, 0.0, 0.0), slider: (0.0, 0.0, 0.0), slider_held: false, cache_max: CACHE_MIN + 1, strip_close: None, clear_measure: false }
     }
 
     pub fn is_open(&self) -> bool {
@@ -223,8 +248,68 @@ impl Panel {
     /// Open on the theme page.
     pub fn show_themes(&mut self) {
         self.open = true;
-        self.page = Page::Themes;
+        self.stack = vec![Page::Layers, Page::Themes];
         self.dirty = true;
+    }
+
+    /// What the editor changed since last asked.
+    pub fn take_theme_edits(&mut self) -> Vec<ThemeEdit> {
+        std::mem::take(&mut self.edits)
+    }
+
+    fn page(&self) -> Page {
+        *self.stack.last().unwrap_or(&Page::Layers)
+    }
+
+    /// Back one page; leaving the editor asks the host to save.
+    fn pop(&mut self) {
+        if let Some(Page::Edit) = self.stack.pop() {
+            self.edits.push(ThemeEdit::Done);
+        }
+        if self.stack.is_empty() {
+            self.stack.push(Page::Layers);
+        }
+        self.sliders.clear();
+        self.held = None;
+        self.dirty = true;
+    }
+
+    /// The rail's width when a page is stacked, else zero: the content starts after it.
+    fn rail_w(&self) -> f32 {
+        if self.stack.len() >= 2 { self.panel_w * RAIL } else { 0.0 }
+    }
+
+    /// Open a field's page: one slider per value, from the theme's own bytes.
+    fn open_field(&mut self, f: Field, t: &Theme) {
+        self.field_vals = t.get(f);
+        let n = match f {
+            Field::Hypso(_) => 4,
+            Field::ContourAlpha(_) => 1,
+            _ => 3,
+        };
+        self.sliders = (0..n).map(|i| Slider::new(&mut self.hits, 0.0, 0.0, 10.0, 10.0, Self::slider_pos(f, i, self.field_vals[i]))).collect();
+        self.stack.push(Page::Field(f));
+        self.held = None;
+        self.dirty = true;
+    }
+
+    /// A field value's place on its slider, 0..1, and back: bytes over 255, metres over 4000, an opacity as is, a light over 3.
+    fn slider_pos(f: Field, i: usize, v: f32) -> f32 {
+        match (f, i) {
+            (Field::Hypso(_), 3) => v / 4000.0,
+            (Field::ContourAlpha(_), _) => v,
+            (Field::Sun | Field::Sky, _) => v / 3.0,
+            _ => v / 255.0,
+        }
+    }
+
+    fn slider_val(f: Field, i: usize, pos: f32) -> f32 {
+        match (f, i) {
+            (Field::Hypso(_), 3) => pos * 4000.0,
+            (Field::ContourAlpha(_), _) => pos,
+            (Field::Sun | Field::Sky, _) => pos * 3.0,
+            _ => (pos * 255.0).round(),
+        }
     }
 
     /// True once after anything the panel shows changed (opened, closed, a row flipped), for hosts that only repaint on change.
@@ -284,7 +369,7 @@ impl Panel {
     }
 
     /// A tap at screen (x, y): true if the panel took it. The gear toggles the panel; a row flips its layer in `mask`.
-    pub fn tap(&mut self, x: f32, y: f32, w: usize, h: usize, mask: &mut LayerMask, ctl: &mut Controls) -> bool {
+    pub fn tap(&mut self, x: f32, y: f32, w: usize, h: usize, mask: &mut LayerMask, ctl: &mut Controls, themes: &[Theme]) -> bool {
         self.layout(w, h);
         if let Some((cx, cy, cr)) = self.strip_close {
             if (x - cx).powi(2) + (y - cy).powi(2) <= (cr * 1.4).powi(2) {
@@ -302,27 +387,61 @@ impl Panel {
         if !self.open {
             return false;
         }
-        if self.page == Page::Themes {
-            if x >= self.panel_w {
-                return false;
-            }
-            for (i, &(cy, hh)) in self.theme_rows.iter().enumerate() {
-                if (y - cy).abs() <= hh {
-                    if i == 0 {
-                        self.page = Page::Layers;
-                    } else {
-                        ctl.theme = i - 1;
-                    }
-                    self.dirty = true;
-                    return true;
-                }
-            }
+        if x >= self.panel_w {
+            return false;
+        }
+        // The rail is the page under this one: a tap there goes back.
+        if self.stack.len() >= 2 && x < self.rail_w() {
+            self.pop();
             return true;
+        }
+        match self.page() {
+            Page::Themes => {
+                let n = self.theme_rows.len();
+                for (i, &(cy, hh)) in self.theme_rows.iter().enumerate() {
+                    if (y - cy).abs() <= hh {
+                        if i == 0 {
+                            self.pop();
+                        } else if i + 1 == n {
+                            self.stack.push(Page::Edit);
+                            self.edits.push(ThemeEdit::Begin);
+                        } else {
+                            ctl.theme = i - 1;
+                        }
+                        self.dirty = true;
+                        return true;
+                    }
+                }
+                return true;
+            }
+            Page::Edit => {
+                if let Some(&(_, _, f)) = self.edit_rows.iter().find(|&&(cy, hh, _)| (y - cy).abs() <= hh) {
+                    if let Some(t) = themes.get(ctl.theme) {
+                        self.open_field(f, t);
+                    }
+                }
+                return true;
+            }
+            Page::Field(f) => {
+                for (i, sl) in self.sliders.iter_mut().enumerate() {
+                    let b = sl.bbox();
+                    if y >= b.y - b.h * 0.5 && y <= b.y + b.h * 1.5 && x >= b.x - self.font && x <= b.x + b.w + self.font {
+                        sl.set_value_from_x(x);
+                        self.held = Some(i);
+                        self.field_vals[i] = Self::slider_val(f, i, sl.value());
+                        self.edits.push(ThemeEdit::Set(f, self.field_vals));
+                        self.dirty = true;
+                        return true;
+                    }
+                }
+                return true;
+            }
+            Page::Layers => {}
         }
         // The theme row above the layers opens the theme page.
         let (tx, ty, tr) = self.theme_row;
         if (y - ty).abs() <= tr && x >= tx && x < self.panel_w {
-            self.page = Page::Themes;
+            self.stack.push(Page::Themes);
             self.dirty = true;
             return true;
         }
@@ -397,6 +516,8 @@ impl Panel {
                 }
             }
         }
+        let (page, rail, depth) = (self.page(), self.rail_w(), self.stack.len());
+        let under = if depth >= 2 { self.stack[depth - 2] } else { Page::Layers };
         let mut damage = Damage::new();
         let mut canvas = Canvas::new(&mut self.buf, w, h, &mut damage);
         self.strip_close = None;
@@ -406,8 +527,38 @@ impl Panel {
         if !self.open {
             return &self.buf;
         }
-        if self.page == Page::Themes {
-            self.theme_rows = Self::paint_themes(&mut canvas, &mut self.text, font, self.panel_w, self.gear, h, themes, ctl.theme);
+        if page != Page::Layers {
+            // Top first: the content page, its background, then the rail (the page under it, smaller and dimmed) and the column's background.
+            let cw = self.panel_w - rail;
+            let current = themes.get(ctl.theme);
+            match page {
+                Page::Themes => self.theme_rows = Self::paint_themes(&mut canvas, &mut self.text, font, rail, cw, self.gear, h, themes, ctl.theme),
+                Page::Edit => {
+                    if let Some(t) = current {
+                        self.edit_rows = Self::paint_edit(&mut canvas, &mut self.text, font, rail, cw, self.gear, h, t);
+                    }
+                }
+                Page::Field(f) => Self::paint_field(&mut canvas, &mut self.text, font, rail, cw, self.gear, f, &mut self.sliders, self.field_vals, current),
+                Page::Layers => {}
+            }
+            paint::fill_rect(&mut canvas, rail as isize, 0, cw as isize, h as isize, PANEL_BG, None, None);
+            if depth >= 2 {
+                paint::fill_rect(&mut canvas, 0, 0, rail as isize, h as isize, PANEL_DIM, None, None);
+                let small = font * 0.72;
+                match under {
+                    Page::Themes => {
+                        Self::paint_themes(&mut canvas, &mut self.text, small, 0.0, rail, self.gear, h, themes, ctl.theme);
+                    }
+                    Page::Edit => {
+                        if let Some(t) = current {
+                            Self::paint_edit(&mut canvas, &mut self.text, small, 0.0, rail, self.gear, h, t);
+                        }
+                    }
+                    _ => {
+                        self.text.draw_text_left(&mut canvas, "\u{2039}", font * 0.9, self.gear.1 + self.gear.2 + font * 1.7, &TextStyle::new(font, theme::TEXTBOX_TEXT), None, None);
+                    }
+                }
+            }
             paint::fill_rect(&mut canvas, 0, 0, self.panel_w as isize, h as isize, PANEL_BG, None, None);
             return &self.buf;
         }
@@ -613,6 +764,15 @@ impl Panel {
 
     /// A move while the slider is held: the budget follows the finger. True while it does.
     pub fn drag(&mut self, x: f32, ctl: &mut Controls) -> bool {
+        if let (Some(i), Page::Field(f)) = (self.held, self.page()) {
+            if let Some(sl) = self.sliders.get_mut(i) {
+                sl.set_value_from_x(x);
+                self.field_vals[i] = Self::slider_val(f, i, sl.value());
+                self.edits.push(ThemeEdit::Set(f, self.field_vals));
+                self.dirty = true;
+            }
+            return true;
+        }
         if !self.slider_held {
             return false;
         }
@@ -622,6 +782,7 @@ impl Panel {
 
     pub fn release(&mut self) {
         self.slider_held = false;
+        self.held = None;
     }
 
     fn paint_slider(canvas: &mut Canvas, text: &mut TextRenderer, font: f32, slider: (f32, f32, f32), ctl: &Controls, r: &Readouts) {
@@ -643,8 +804,9 @@ impl Panel {
 impl Panel {
     /// The theme page: a back row, one row per theme (the current one ticked), and under them the legend of the chosen theme — the terrain ramp, the land cover swatches, the line classes and the inks. Returns the rows as (centre y, half height), the back row first.
     #[allow(clippy::too_many_arguments)]
-    fn paint_themes(canvas: &mut Canvas, text: &mut TextRenderer, font: f32, panel_w: f32, gear: (f32, f32, f32), h: usize, themes: &[Theme], current: usize) -> Vec<(f32, f32)> {
-        let x0 = font * 0.9;
+    fn paint_themes(canvas: &mut Canvas, text: &mut TextRenderer, font: f32, ox: f32, panel_w: f32, gear: (f32, f32, f32), h: usize, themes: &[Theme], current: usize) -> Vec<(f32, f32)> {
+        let x0 = ox + font * 0.9;
+        let panel_w = ox + panel_w;
         let row = font * 1.6;
         let mut y = gear.1 + gear.2 + font * 0.9 + row * 0.5;
         let mut rows = Vec::new();
@@ -660,6 +822,15 @@ impl Panel {
             rows.push((y, row * 0.5));
             y += row;
         }
+        // The last row opens the editor on the current theme.
+        let edit_label = match themes.get(current) {
+            Some(t) if t.is_builtin() => format!("\u{270e}  Edit a copy of {}", t.name),
+            Some(t) => format!("\u{270e}  Edit {}", t.name),
+            None => "\u{270e}  Edit".into(),
+        };
+        text.draw_text_left(canvas, &edit_label, x0, y, &title, None, None);
+        rows.push((y, row * 0.5));
+        y += row;
         let Some(t) = themes.get(current) else { return rows };
         // Legend: the ramp as a bar from sea to summit.
         y += font * 0.5;
@@ -724,6 +895,114 @@ impl Panel {
             }
         }
         rows
+    }
+}
+
+impl Panel {
+    /// The editor: the back row, then every field of the theme as a row with its swatch (a number for the numbers), two to a line for the tables. Returns the rows for hit testing.
+    fn paint_edit(canvas: &mut Canvas, text: &mut TextRenderer, font: f32, ox: f32, cw: f32, gear: (f32, f32, f32), h: usize, t: &Theme) -> Vec<(f32, f32, Field)> {
+        let x0 = ox + font * 0.9;
+        let row = font * 1.25;
+        let mut y = gear.1 + gear.2 + font * 0.9 + font * 0.8;
+        let title = TextStyle::new(font, theme::TEXTBOX_TEXT);
+        let small = TextStyle::new(font * 0.8, READOUT);
+        let dim = TextStyle::new(font * 0.72, READOUT_DIM);
+        text.draw_text_left(canvas, &format!("\u{2039}  {}", t.name), x0, y, &title, None, None);
+        y += row * 1.3;
+        let mut rows = Vec::new();
+        let half = (cw - font * 1.8) * 0.5;
+        let mut col = 0usize;
+        let mut section = "";
+        for f in Field::all() {
+            let sec = match f {
+                Field::Hypso(_) => "terrain",
+                Field::Sea | Field::Flat | Field::Bg | Field::NoDem => "ground",
+                Field::Land(_) => "land cover",
+                Field::Line(_) => "lines",
+                Field::Water | Field::Contour | Field::ContourIndex | Field::ContourAlpha(_) => "inks",
+                Field::Sun | Field::Sky => "light",
+            };
+            if sec != section {
+                if col == 1 {
+                    y += row;
+                    col = 0;
+                }
+                section = sec;
+                y += font * 0.3;
+                text.draw_text_left(canvas, sec, x0, y, &dim, None, None);
+                y += font * 0.9;
+            }
+            if y > h as f32 - font {
+                break;
+            }
+            let x = x0 + col as f32 * half;
+            let v = t.get(f);
+            if f.is_colour() {
+                let c = [v[0] as u8, v[1] as u8, v[2] as u8];
+                let (sw, sh) = if matches!(f, Field::Line(_)) { (font * 0.8, (font * 0.16).max(2.0)) } else { (font * 0.8, font * 0.6) };
+                paint::fill_rect(canvas, x as isize, (y - sh * 0.5) as isize, sw as isize, sh as isize, swatch(c), None, None);
+            } else {
+                let label = match f {
+                    Field::ContourAlpha(_) => format!("{:.2}", v[0]),
+                    _ => format!("{:.1}", 0.3 * v[0] + 0.6 * v[1] + 0.1 * v[2]),
+                };
+                text.draw_text_left(canvas, &label, x, y, &small, None, None);
+            }
+            let name = match f {
+                Field::Hypso(i) => format!("{} m", t.hypso[i as usize].0.round() as i64),
+                _ => f.name(),
+            };
+            text.draw_text_left(canvas, &name, x + font * 1.1, y, &small, None, None);
+            rows.push((y, row * 0.5, f));
+            let two = matches!(f, Field::Land(_) | Field::Line(_));
+            if two && col == 0 {
+                col = 1;
+            } else {
+                col = 0;
+                y += row;
+            }
+        }
+        rows
+    }
+
+    /// One field: its name, the colour or light as a swatch through the display encode, and a slider per value with the value beside it.
+    fn paint_field(canvas: &mut Canvas, text: &mut TextRenderer, font: f32, ox: f32, cw: f32, gear: (f32, f32, f32), f: Field, sliders: &mut [Slider], vals: [f32; 4], t: Option<&Theme>) {
+        let _ = t;
+        let x0 = ox + font * 0.9;
+        let mut y = gear.1 + gear.2 + font * 0.9 + font * 0.8;
+        let title = TextStyle::new(font, theme::TEXTBOX_TEXT);
+        let small = TextStyle::new(font * 0.8, READOUT);
+        let dim = TextStyle::new(font * 0.72, READOUT_DIM);
+        text.draw_text_left(canvas, &format!("\u{2039}  {}", f.name()), x0, y, &title, None, None);
+        y += font * 1.6;
+        // The swatch: a colour as the map shows it unlit; a light as the colour it would make white ground.
+        let sw = cw - font * 1.8;
+        if f.is_colour() {
+            paint::fill_rect(canvas, x0 as isize, y as isize, sw as isize, (font * 1.6) as isize, swatch([vals[0] as u8, vals[1] as u8, vals[2] as u8]), None, None);
+        } else if !matches!(f, Field::ContourAlpha(_)) {
+            let c = mahere_engine::colour::Display::default().encode([vals[0] * 0.5, vals[1] * 0.5, vals[2] * 0.5], true);
+            paint::fill_rect(canvas, x0 as isize, y as isize, sw as isize, (font * 1.6) as isize, (theme::dark(theme::fmt(((c[0] as u32) << 16) | ((c[1] as u32) << 8) | c[2] as u32)) & 0x00FF_FFFF) | 0xFF00_0000, None, None);
+        }
+        y += font * 2.4;
+        let labels: [&str; 4] = match f {
+            Field::ContourAlpha(_) => ["opacity", "", "", ""],
+            Field::Hypso(_) => ["R", "G", "B", "metres"],
+            _ => ["R", "G", "B", ""],
+        };
+        for (i, sl) in sliders.iter_mut().enumerate() {
+            text.draw_text_left(canvas, labels[i], x0, y, &dim, None, None);
+            let val = match (f, i) {
+                (Field::Hypso(_), 3) => format!("{} m", vals[3].round() as i64),
+                (Field::ContourAlpha(_), _) => format!("{:.2}", vals[0]),
+                (Field::Sun | Field::Sky, _) => format!("{:.2}", vals[i]),
+                _ => format!("{}", vals[i] as u8),
+            };
+            text.draw_text_left(canvas, &val, x0 + font * 4.5, y, &small, None, None);
+            y += font * 0.9;
+            sl.set_rect(x0 + sw * 0.5, y, sw, font * 1.1);
+            sl.render_content_into(canvas, None, HIT_NONE);
+            y += font * 1.7;
+        }
     }
 }
 

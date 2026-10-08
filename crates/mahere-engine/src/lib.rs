@@ -556,6 +556,39 @@ impl MapCore {
         self.dirty = true;
     }
 
+    /// Change one field of the current theme, live: the tables and the light follow at once. Nothing is written; the host saves when the editor closes.
+    pub fn edit_theme(&mut self, f: theme::Field, v: [f32; 4]) {
+        let i = self.theme.min(self.themes.len() - 1);
+        self.themes[i].set(f, v);
+        let t = self.themes[i].clone();
+        self.luts.hypso = t.hypso_lut();
+        self.luts.style = t.style();
+        self.luts_sun = (f32::NAN, f32::NAN, f64::NAN);
+        self.style_version += 1;
+        self.dirty = true;
+    }
+
+    /// A copy of the current theme under a new name (its name with the first free number), a user theme, selected. The editor copies a built-in before touching it.
+    pub fn duplicate_theme(&mut self) -> usize {
+        let i = self.theme.min(self.themes.len() - 1);
+        let mut t = self.themes[i].clone();
+        let base = t.name.trim_end_matches(|c: char| c.is_ascii_digit() || c == ' ').to_string();
+        let mut n = 2;
+        while self.themes.iter().any(|x| x.name == format!("{base} {n}")) {
+            n += 1;
+        }
+        t.name = format!("{base} {n}");
+        t.revision = 0;
+        self.themes.push(t);
+        let j = self.themes.len() - 1;
+        self.set_theme(j);
+        j
+    }
+
+    pub fn current_theme(&self) -> &theme::Theme {
+        &self.themes[self.theme.min(self.themes.len() - 1)]
+    }
+
     pub fn style_version(&self) -> u64 {
         self.style_version
     }
