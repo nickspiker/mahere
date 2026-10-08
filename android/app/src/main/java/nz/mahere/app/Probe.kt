@@ -32,11 +32,11 @@ class Probe(private val context: Context, private val onFrame: (RawFrame, FloatA
     private var handler: Handler? = null
     private var request: CaptureRequest.Builder? = null
     private var exposureNs = 4_000_000L
-    private var exposureRange = LongRange(100_000L, 50_000_000L)
+    /// Thirty frames a second: the long exposure fits in one.
+    private val frameNs = 33_333_333L
+    private var exposureRange = LongRange(100_000L, 33_000_000L)
     private var clippedAtNs = Long.MAX_VALUE
     private var clippedWhen = 0L
-    private var lastLongNs = 0L
-    private var lastShortNs = 0L
     /** Exposure by sensor timestamp, from the capture results, so an image knows which of the two it is. */
     private val exposures = LinkedHashMap<Long, Long>()
     val running get() = device != null
@@ -109,7 +109,7 @@ class Probe(private val context: Context, private val onFrame: (RawFrame, FloatA
         if (cst != null) for (i in 0 until 9) xyzToCam[i] = cst.getElement(i % 3, i / 3).toFloat()
         val isoRange = c.get(CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE)
         val iso = isoRange?.lower ?: 100
-        c.get(CameraCharacteristics.SENSOR_INFO_EXPOSURE_TIME_RANGE)?.let { exposureRange = LongRange(it.lower, minOf(it.upper, 50_000_000L)) }
+        c.get(CameraCharacteristics.SENSOR_INFO_EXPOSURE_TIME_RANGE)?.let { exposureRange = LongRange(it.lower, minOf(it.upper, 33_000_000L)) }
         exposureNs = exposureNs.coerceIn(exposureRange)
         Log.i("mahere", "probe: camera $id ${size.width}x${size.height} focal $bestFocal tan $tanW x $tanH orientation $orientation cfa $cfa black ${black.toList()} white $white iso $iso")
 
@@ -127,15 +127,6 @@ class Probe(private val context: Context, private val onFrame: (RawFrame, FloatA
                     return@setOnImageAvailableListener
                 }
                 val long = exp >= exposureNs
-                // A few frames a second of each are plenty for a light that changes with the clouds.
-                val now = System.nanoTime()
-                if (long) {
-                    if (now - lastLongNs < 250_000_000L) return@setOnImageAvailableListener
-                    lastLongNs = now
-                } else {
-                    if (now - lastShortNs < 250_000_000L) return@setOnImageAvailableListener
-                    lastShortNs = now
-                }
                 val plane = img.planes[0]
                 val stats = FloatArray(2)
                 onFrame(RawFrame(plane.buffer, img.width, img.height, plane.rowStride, cfa, black, white, orientation, tanW, tanH, xyzToCam, exp, exposureNs), stats)
@@ -154,8 +145,7 @@ class Probe(private val context: Context, private val onFrame: (RawFrame, FloatA
                     b.set(CaptureRequest.CONTROL_AE_MODE, CameraMetadata.CONTROL_AE_MODE_OFF)
                     b.set(CaptureRequest.SENSOR_SENSITIVITY, iso)
                     b.set(CaptureRequest.SENSOR_EXPOSURE_TIME, exposureNs)
-                    // Ten frames a second at most: the sensor idles between.
-                    b.set(CaptureRequest.SENSOR_FRAME_DURATION, 100_000_000L)
+                    b.set(CaptureRequest.SENSOR_FRAME_DURATION, frameNs)
                     request = b
                     @Suppress("DEPRECATION")
                     d.createCaptureSession(listOf(r.surface), object : CameraCaptureSession.StateCallback() {
@@ -183,7 +173,7 @@ class Probe(private val context: Context, private val onFrame: (RawFrame, FloatA
         return true
     }
 
-    /** Halve the exposure while more than a twentieth of a percent of the frame clips (a lamp or the sun clips at any exposure; the rest of the frame must not), double it while 99.9% of the frame sits under a tenth of white, within the sensor's range and a 50 ms cap. An exposure that clipped is remembered for ten seconds and not returned to, so a lamp in the frame does not have the loop hunting between two stops. */
+    /** Halve the exposure while more than a twentieth of a percent of the frame clips (a lamp or the sun clips at any exposure; the rest of the frame must not), double it while 99.9% of the frame sits under a tenth of white, within the sensor's range and a frame. An exposure that clipped is remembered for ten seconds and not returned to, so a lamp in the frame does not have the loop hunting between two stops. */
     private fun steer(clipped: Float, p999: Float) {
         val now = System.nanoTime()
         val next = when {

@@ -96,36 +96,52 @@ pub fn bin(raw: &Raw, cols: usize) -> Binned {
         Cfa::Gbrg => (0, 1, 1, 0),
         Cfa::Bggr => (1, 1, 0, 0),
     };
-    let mut out = vec![[0f32; 3]; w * h];
-    let mut clipped = vec![0u16; w * h];
     let clip_at = raw.white.saturating_sub(2);
     let n = (f * f) as f32;
-    for y in 0..h {
-        for x in 0..w {
-            let mut acc = [0f32; 3];
-            for j in 0..f {
-                for i in 0..f {
-                    let (qx, qy) = ((x * f + i) * 2, (y * f + j) * 2);
-                    let mut g = 0f32;
-                    for (dx, dy) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
-                        let v = sample(qx + dx, qy + dy);
-                        hist[((v as f32 * hist_scale) as usize).min(255)] += 1;
-                        if v >= clip_at {
-                            clipped[y * w + x] = clipped[y * w + x].saturating_add(1);
+    // A row of bins per task: eight million samples a frame at thirty frames a second wants every core.
+    use rayon::prelude::*;
+    let rows: Vec<(Vec<[f32; 3]>, Vec<u16>, [u32; 256])> = (0..h)
+        .into_par_iter()
+        .map(|y| {
+            let mut out = vec![[0f32; 3]; w];
+            let mut clipped = vec![0u16; w];
+            let mut hist = [0u32; 256];
+            for x in 0..w {
+                let mut acc = [0f32; 3];
+                for j in 0..f {
+                    for i in 0..f {
+                        let (qx, qy) = ((x * f + i) * 2, (y * f + j) * 2);
+                        let mut g = 0f32;
+                        for (dx, dy) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
+                            let v = sample(qx + dx, qy + dy);
+                            hist[((v as f32 * hist_scale) as usize).min(255)] += 1;
+                            if v >= clip_at {
+                                clipped[x] = clipped[x].saturating_add(1);
+                            }
+                            let lin = (v.saturating_sub(raw.black[dy * 2 + dx])) as f32 * scale;
+                            if (dx, dy) == (rx, ry) {
+                                acc[0] += lin;
+                            } else if (dx, dy) == (bx, by) {
+                                acc[2] += lin;
+                            } else {
+                                g += lin;
+                            }
                         }
-                        let lin = (v.saturating_sub(raw.black[dy * 2 + dx])) as f32 * scale;
-                        if (dx, dy) == (rx, ry) {
-                            acc[0] += lin;
-                        } else if (dx, dy) == (bx, by) {
-                            acc[2] += lin;
-                        } else {
-                            g += lin;
-                        }
+                        acc[1] += g * 0.5;
                     }
-                    acc[1] += g * 0.5;
                 }
+                out[x] = [acc[0] / n, acc[1] / n, acc[2] / n];
             }
-            out[y * w + x] = [acc[0] / n, acc[1] / n, acc[2] / n];
+            (out, clipped, hist)
+        })
+        .collect();
+    let mut out = Vec::with_capacity(w * h);
+    let mut clipped = Vec::with_capacity(w * h);
+    for (o, c, hh) in rows {
+        out.extend(o);
+        clipped.extend(c);
+        for k in 0..256 {
+            hist[k] += hh[k];
         }
     }
     let total: u32 = hist.iter().sum();

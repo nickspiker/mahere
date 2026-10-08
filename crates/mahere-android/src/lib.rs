@@ -688,7 +688,9 @@ pub extern "system" fn Java_nz_mahere_app_MahereActivity_nativeOnProbe(
     let mut pedestal = [0f32; 4];
     let _ = env.get_float_array_region(&black, 0, &mut pedestal);
     let raw = Raw { data, w: w as usize, h: h as usize, row_stride: row_stride as usize, cfa, black: pedestal.map(|b| b as u16), white: white as u16 };
+    let t0 = std::time::Instant::now();
     let mut b = bin(&raw, 48);
+    let bin_ms = t0.elapsed().as_secs_f32() * 1e3;
     let app = shell(ptr).app();
     // The short bracket: kept for the next long frame, which fills what it clipped from it.
     if exposure_ns < long_ns {
@@ -725,7 +727,7 @@ pub extern "system" fn Java_nz_mahere_app_MahereActivity_nativeOnProbe(
     let mut last = LAST.lock().unwrap();
     if last.is_none_or(|t| t.elapsed().as_secs_f32() > 1.0) {
         *last = Some(std::time::Instant::now());
-        eprintln!("probe: clipped {:.5} p999 {:.3} filled {filled} bins from the bracket; {:.1} ms; cam {cam_mean:?} vsf {vsf_mean:?} screen {:?} ({:.3}/s)", st.clipped, st.p999, long_ns as f32 * 1e-6, sh.irradiance([0.0, 0.0, 1.0]), sh.screen_luminance());
+        eprintln!("probe: clipped {:.5} p999 {:.3} filled {filled} bins from the bracket; exposure {:.1} ms, bin {bin_ms:.1} ms; cam {cam_mean:?} vsf {vsf_mean:?} screen {:?} ({:.3}/s)", st.clipped, st.p999, long_ns as f32 * 1e-6, sh.irradiance([0.0, 0.0, 1.0]), sh.screen_luminance());
     }
     app.map.set_probe(sh);
 }
