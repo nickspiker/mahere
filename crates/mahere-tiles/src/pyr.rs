@@ -526,7 +526,7 @@ mod tests {
 
     #[test]
     fn packing_matches_vsf_bit_layout() {
-        let vals: Vec<u32> = (0..1000).map(|i| (i * 2654435761u32) >> 19).collect();
+        let vals: Vec<u32> = (0..1000u32).map(|i| i.wrapping_mul(2654435761) >> 19).collect();
         for w in [1u32, 3, 8, 13, 17, 32] {
             let mask = if w == 32 { u32::MAX } else { (1 << w) - 1 };
             let masked: Vec<u32> = vals.iter().map(|&v| v & mask).collect();

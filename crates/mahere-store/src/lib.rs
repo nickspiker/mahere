@@ -129,6 +129,8 @@ pub struct Settings {
     pub lock_to_fix: bool,
     /// Index into the engine's themes.
     pub theme: u64,
+    /// The highlight rail on the display; stored as its absence (flag 8 = straight) so settings from before it load rolled.
+    pub rolloff: bool,
 }
 
 fn settings_key() -> String {
@@ -136,7 +138,7 @@ fn settings_key() -> String {
 }
 
 pub fn save_settings(store: &FlatStorage, s: &Settings) -> Result<(), StorageError> {
-    let flags = (s.real_sun as u64) | (s.follow_heading as u64) << 1 | (s.lock_to_fix as u64) << 2;
+    let flags = (s.real_sun as u64) | (s.follow_heading as u64) << 1 | (s.lock_to_fix as u64) << 2 | (!s.rolloff as u64) << 3;
     let t = VsfType::t_u6(Tensor::new(vec![4], vec![s.cache_budget, s.layer_bits, flags, s.theme]));
     store.write_device(&settings_key(), &t.flatten())
 }
@@ -152,7 +154,7 @@ pub fn load_settings(store: &FlatStorage) -> Option<Settings> {
     if d.len() < 3 {
         return None;
     }
-    Some(Settings { cache_budget: d[0], layer_bits: d[1], real_sun: d[2] & 1 != 0, follow_heading: d[2] & 2 != 0, lock_to_fix: d[2] & 4 != 0, theme: d.get(3).copied().unwrap_or(0) })
+    Some(Settings { cache_budget: d[0], layer_bits: d[1], real_sun: d[2] & 1 != 0, follow_heading: d[2] & 2 != 0, lock_to_fix: d[2] & 4 != 0, theme: d.get(3).copied().unwrap_or(0), rolloff: d[2] & 8 == 0 })
 }
 
 /// Width-agnostic float-array read, per VSF doctrine.
@@ -485,7 +487,7 @@ mod index_tests {
 
 // ==================== THEMES ====================
 
-/// Themes on disk: one VSF document per theme in the vault under (`d` theme, `x` name), colours authored in VSF RGB at gamma 2 as Photon authors its palette, and converted to the display when loaded. The built-ins are written on first launch so a user can edit them in place; an index document (`d` theme, `d` index) lists the names.
+/// Themes on disk: one VSF document per theme in the vault under (`d` theme, `x` name), colours authored in VSF RGB at gamma 2 as Photon authors its palette and kept that way: the renderers convert to the display at their one encode. The built-ins are written on first launch so a user can edit them in place; an index document (`d` theme, `d` index) lists the names.
 pub mod themes {
     use super::{name, vault_key};
     use kete::FlatStorage;
@@ -627,32 +629,6 @@ pub mod themes {
         })
     }
 
-    /// VSF RGB (gamma 2) to this display, Photon's rule: Android and Linux surfaces are BT.2020-tagged or assumed so, so the primaries convert and the transfer stays gamma 2; macOS surfaces are tagged VSF RGB and take the authored value as is.
-    pub fn to_display(c: [u8; 3]) -> [u8; 3] {
-        if cfg!(target_os = "macos") {
-            return c;
-        }
-        let lin = [(c[0] as f32 / 255.0).powi(2), (c[1] as f32 / 255.0).powi(2), (c[2] as f32 / 255.0).powi(2)];
-        let out = vsf::colour::convert::apply_matrix_3x3_f32(&vsf::colour::VSF_RGB2REC2020, &lin);
-        let e = |x: f32| (x.clamp(0.0, 1.0).sqrt() * 255.0).round() as u8;
-        [e(out[0]), e(out[1]), e(out[2])]
-    }
-
-    /// A theme with every colour converted to the display.
-    pub fn display(t: &Theme) -> Theme {
-        let mut d = t.clone();
-        for (_, c) in d.hypso.iter_mut() {
-            *c = to_display(*c);
-        }
-        for c in [&mut d.sea, &mut d.flat, &mut d.bg, &mut d.no_dem, &mut d.water, &mut d.contour, &mut d.contour_index] {
-            *c = to_display(*c);
-        }
-        for c in d.land.iter_mut().chain(d.line.iter_mut()) {
-            *c = to_display(*c);
-        }
-        d
-    }
-
     fn write_index(store: &FlatStorage, names: &[String]) {
         let joined: Vec<VsfType> = names.iter().map(|n| VsfType::x(n.clone())).collect();
         let mut section = vsf::VsfSection::new("themes");
@@ -697,14 +673,14 @@ pub mod themes {
         decode(&bytes)
     }
 
-    /// The built-ins into the vault where they are missing or an older revision, then every theme the vault holds, converted to the display and in index order.
+    /// The built-ins into the vault where they are missing or an older revision, then every theme the vault holds, in index order, as authored (VSF RGB): the renderers convert to the display at their one encode.
     pub fn load_all(store: &FlatStorage) -> Vec<Theme> {
         for t in mahere_engine::theme::builtin() {
             if load(store, &t.name).is_none_or(|old| old.revision < t.revision) {
                 save(store, &t);
             }
         }
-        names(store).iter().filter_map(|n| load(store, n)).map(|t| display(&t)).collect()
+        names(store).iter().filter_map(|n| load(store, n)).collect()
     }
 }
 

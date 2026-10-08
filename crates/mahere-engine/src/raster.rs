@@ -2,6 +2,7 @@
 //!
 //! Two depth selections: the dem's and the vector layers' (line, land, water share a base and live in the same cell). Each block resolves one dem ref and one vector ref; a pixel composes dem → land tint → shade → water → line, each gated by the client's layer mask.
 
+use crate::colour::lin;
 use mahere_coord::Coord;
 use mahere_tiles::{CellKey, ClassCell, CovCell, ELEV_NODATA};
 use rayon::prelude::*;
@@ -300,6 +301,9 @@ pub struct FrameLuts {
     pub contours: Contours,
     /// The lighting environment, as the per-channel quadratic form the pixel loop evaluates on world normals (device-frame SH conjugated by the bearing once per frame).
     pub light: crate::sh::Quad,
+    /// The display encode, and whether the highlight rail is on.
+    pub display: crate::colour::Display,
+    pub rolled: bool,
 }
 
 pub struct FrameStats {
@@ -433,26 +437,29 @@ pub fn tri_index(uq: i64, vq: i64, shift: u32) -> usize {
     (((ty << 8) | tx) << 1) | half
 }
 
-/// A line texel's colour: the class LUT, with waterways darkened by their log magnitude (a trickle at ~40%, a big river at full).
+/// A line texel's colour, linear: the class LUT, with waterways dimmed by their log magnitude (a trickle at ~40%, a big river at full).
 #[inline(always)]
-fn line_colour(line: &ClassCell, i: usize, style: &Style) -> [u8; 3] {
+fn line_colour(line: &ClassCell, i: usize, style: &Style) -> [f32; 3] {
     let cls = (line.class[i] as usize).min(CLASS_MAX);
-    let c = style.line[cls];
+    let c = lin(style.line[cls]);
     if cls == WATERWAY_CLASS {
         let m = 0.4 + 0.6 * line.mag_at(i) as f32 / 255.0;
-        [(c[0] as f32 * m) as u8, (c[1] as f32 * m) as u8, (c[2] as f32 * m) as u8]
+        [c[0] * m, c[1] * m, c[2] * m]
     } else {
         c
     }
 }
 
 #[inline(always)]
-fn lerp3(a: [f32; 3], b: [u8; 3], t: f32) -> [f32; 3] {
-    [
-        a[0] + (b[0] as f32 - a[0]) * t,
-        a[1] + (b[1] as f32 - a[1]) * t,
-        a[2] + (b[2] as f32 - a[2]) * t,
-    ]
+fn lerp3(a: [f32; 3], b: [f32; 3], t: f32) -> [f32; 3] {
+    [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t]
+}
+
+/// The packed display pixel of a linear colour.
+#[inline(always)]
+fn pack(luts: &FrameLuts, rgb: [f32; 3]) -> u32 {
+    let c = luts.display.encode(rgb, luts.rolled);
+    ((c[0] as u32) << 16) | ((c[1] as u32) << 8) | c[2] as u32
 }
 
 /// A dem ref's depth (from its prefix shift).
@@ -524,7 +531,8 @@ fn compose_rgb(dem: &DemRef, vec: &VecRef, pool: &Pool, diamond: u8, uq: i64, vq
     let mask = luts.mask;
     // Terrain: tint from elevation, shade from the normal.
     let st = &luts.style;
-    let mut tint = [st.no_dem[0] as f32, st.no_dem[1] as f32, st.no_dem[2] as f32];
+    // All linear from here: every authored colour decoded from gamma 2, one encode at the end.
+    let mut tint = lin(st.no_dem);
     let mut diffuse = 1.0f32;
     let mut light = [1.0f32; 3];
     let mut have_ground = false;
@@ -547,12 +555,11 @@ fn compose_rgb(dem: &DemRef, vec: &VecRef, pool: &Pool, diamond: u8, uq: i64, vq
                     light = [e[0].clamp(0.0, 1.3), e[1].clamp(0.0, 1.3), e[2].clamp(0.0, 1.3)];
                     let sea = (eq as f32 * 0.25 - 500.0).abs() < 0.75 && nz > 0.9995 * 32767.0;
                     tint = if sea {
-                        [st.sea[0] as f32, st.sea[1] as f32, st.sea[2] as f32]
+                        lin(st.sea)
                     } else if mask.hypso {
-                        let c = luts.hypso[(eq >> 4) as usize];
-                        [c[0] as f32, c[1] as f32, c[2] as f32]
+                        lin(luts.hypso[(eq >> 4) as usize])
                     } else {
-                        [st.flat[0] as f32, st.flat[1] as f32, st.flat[2] as f32]
+                        lin(st.flat)
                     };
                     have_ground = true;
                 }
@@ -572,7 +579,7 @@ fn compose_rgb(dem: &DemRef, vec: &VecRef, pool: &Pool, diamond: u8, uq: i64, vq
                 }
             }
         } else if mask.dem {
-            tint = [st.bg[0] as f32, st.bg[1] as f32, st.bg[2] as f32];
+            tint = lin(st.bg);
         }
     }
     let mut rgb = tint;
@@ -580,11 +587,13 @@ fn compose_rgb(dem: &DemRef, vec: &VecRef, pool: &Pool, diamond: u8, uq: i64, vq
     let imagery = if mask.imagery { img_texel(pool, diamond, uq, vq) } else { None };
     if mask.imagery {
         if let Some(px) = imagery {
-            rgb = if mask.infrared { [px[3] as f32; 3] } else { [px[0] as f32, px[1] as f32, px[2] as f32] };
+            // Stored rolled; unrolled to scene light before anything mixes with it.
+            let t = crate::colour::img_table();
+            rgb = if mask.infrared { [t[px[3] as usize]; 3] } else { [t[px[0] as usize], t[px[1] as usize], t[px[2] as usize]] };
         }
     }
     if mask.imagery && matches!(vec, VecRef::None) {
-        return ((rgb[0] as u32) << 16) | ((rgb[1] as u32) << 8) | rgb[2] as u32;
+        return pack(luts, rgb);
     }
     if let VecRef::Cell { line, land, water, shift, .. } = vec {
         let i = tri_index(uq, vq, *shift);
@@ -597,13 +606,13 @@ fn compose_rgb(dem: &DemRef, vec: &VecRef, pool: &Pool, diamond: u8, uq: i64, vq
                     }
                 }
             }
-            return ((rgb[0] as u32) << 16) | ((rgb[1] as u32) << 8) | rgb[2] as u32;
+            return pack(luts, rgb);
         }
         if mask.land {
             if let Some(land) = land {
                 let lc = land.cov[i];
                 if lc != 0 {
-                    rgb = lerp3(rgb, st.land[(land.class[i] as usize).min(13)], lc as f32 / 255.0 * 0.85);
+                    rgb = lerp3(rgb, lin(st.land[(land.class[i] as usize).min(13)]), lc as f32 / 255.0 * 0.85);
                 }
             }
         }
@@ -611,11 +620,11 @@ fn compose_rgb(dem: &DemRef, vec: &VecRef, pool: &Pool, diamond: u8, uq: i64, vq
             rgb = [rgb[0] * light[0], rgb[1] * light[1], rgb[2] * light[2]];
         }
         if let Some(col) = slope_band {
-            rgb = lerp3(rgb, col, 0.45);
+            rgb = lerp3(rgb, lin(col), 0.45);
         }
         // Under the water: the contours and the waterway lines, so a lake covers the river running into it. Over it: every other line (bridges, trails along the shore, boundaries).
         if contour.0 > 0.0 {
-            rgb = lerp3(rgb, if contour.1 { st.contour_index } else { st.contour }, contour.0 * st.contour_alpha[contour.1 as usize]);
+            rgb = lerp3(rgb, lin(if contour.1 { st.contour_index } else { st.contour }), contour.0 * st.contour_alpha[contour.1 as usize]);
         }
         let line_cov = |line: &ClassCell| -> u8 { if mask.line && (mask.boundaries || (line.class[i] as usize) < BOUNDARY_FIRST) { line.cov[i] } else { 0 } };
         if let Some(line) = line {
@@ -628,7 +637,8 @@ fn compose_rgb(dem: &DemRef, vec: &VecRef, pool: &Pool, diamond: u8, uq: i64, vq
                 let wc = water.cov[i];
                 if wc != 0 {
                     let s = 0.85 + 0.15 * diffuse;
-                    let wr = [st.water[0] as f32 * s, st.water[1] as f32 * s, st.water[2] as f32 * s];
+                    let w = lin(st.water);
+                    let wr = [w[0] * s, w[1] * s, w[2] * s];
                     let t = wc as f32 / 255.0;
                     rgb = [rgb[0] + (wr[0] - rgb[0]) * t, rgb[1] + (wr[1] - rgb[1]) * t, rgb[2] + (wr[2] - rgb[2]) * t];
                 }
@@ -646,13 +656,13 @@ fn compose_rgb(dem: &DemRef, vec: &VecRef, pool: &Pool, diamond: u8, uq: i64, vq
             rgb = [rgb[0] * light[0], rgb[1] * light[1], rgb[2] * light[2]];
         }
         if let Some(col) = slope_band {
-            rgb = lerp3(rgb, col, 0.45);
+            rgb = lerp3(rgb, lin(col), 0.45);
         }
         if contour.0 > 0.0 {
-            rgb = lerp3(rgb, if contour.1 { st.contour_index } else { st.contour }, contour.0 * st.contour_alpha[contour.1 as usize]);
+            rgb = lerp3(rgb, lin(if contour.1 { st.contour_index } else { st.contour }), contour.0 * st.contour_alpha[contour.1 as usize]);
         }
     }
-    ((rgb[0] as u32) << 16) | ((rgb[1] as u32) << 8) | rgb[2] as u32
+    pack(luts, rgb)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -857,6 +867,8 @@ mod tests {
             dem_depth: 12,
             contours: Contours { interval: 0.0, index_every: 5, m_per_px: 1.0 },
             light: crate::sh::Sh9::sun_and_sky(315.0, 40.0).quadratic((0.0, 1.0)),
+            display: crate::colour::Display::default(),
+            rolled: true,
         };
         let (w, h) = (64usize, 64usize);
         let mut canvas = vec![0u32; w * h];
@@ -866,8 +878,9 @@ mod tests {
         let t = luts.style.flat;
         let f = luts.style.land[5];
         let e = luts.light.eval(0.0, 0.0, 1.0);
-        let mix = |a: u8, b: u8, l: f32| ((a as f32 + (b as f32 - a as f32) * 0.85) * l.clamp(0.0, 1.3)) as u32;
-        let expect = (mix(t[0], f[0], e[0]) << 16) | (mix(t[1], f[1], e[1]) << 8) | mix(t[2], f[2], e[2]);
+        let (tl, fl) = (lin(t), lin(f));
+        let mix = |c: usize| (tl[c] + (fl[c] - tl[c]) * 0.85) * e[c].clamp(0.0, 1.3);
+        let expect = pack(&luts, [mix(0), mix(1), mix(2)]);
         let center = canvas[(h / 2) * w + w / 2];
         assert_eq!(center, expect, "center {center:#08x} vs expected {expect:#08x}");
         assert!(canvas.iter().all(|&p| p == expect), "unresolved pixels in frame");
@@ -876,8 +889,8 @@ mod tests {
         let luts = FrameLuts { mask: LayerMask { land: false, contours: false, ..LayerMask::default() }.effective(), ..luts };
         render_frame(&mut canvas, w, h, &cam, &pool, &luts, 12, 13);
         let t = luts.hypso[375];
-        let lit = |a: u8, l: f32| (a as f32 * l.clamp(0.0, 1.3)) as u32;
-        let expect = (lit(t[0], e[0]) << 16) | (lit(t[1], e[1]) << 8) | lit(t[2], e[2]);
+        let tl = lin(t);
+        let expect = pack(&luts, [tl[0] * e[0].clamp(0.0, 1.3), tl[1] * e[1].clamp(0.0, 1.3), tl[2] * e[2].clamp(0.0, 1.3)]);
         assert_eq!(canvas[(h / 2) * w + w / 2], expect);
     }
 }

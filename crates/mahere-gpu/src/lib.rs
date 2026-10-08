@@ -83,6 +83,9 @@ struct Uniforms {
     style_bg: [f32; 4],
     style_no_dem: [f32; 4],
     style_sea: [f32; 4],
+    display: [[f32; 4]; 3],
+    tone: [f32; 4],
+    img_table: [[f32; 4]; 64],
 }
 
 /// The layer mask as the shader's bits.
@@ -715,6 +718,12 @@ impl GpuMap {
             style_bg: rgb4(luts.style.bg),
             style_no_dem: rgb4(luts.style.no_dem),
             style_sea: rgb4(luts.style.sea),
+            display: luts.display.rows(),
+            tone: [luts.rolled as u32 as f32, 0.0, 0.0, 0.0],
+            img_table: {
+                let t = mahere_engine::colour::img_table();
+                std::array::from_fn(|i| std::array::from_fn(|j| t[4 * i + j]))
+            },
         };
         let measure_on = self.measure.is_some();
         let u = Uniforms { depths: [plan.dem_depth as u32, plan.vec_depth as u32, plan.magnified as u32, measure_on as u32], ..u };
@@ -788,10 +797,12 @@ impl GpuMap {
     }
 }
 
+/// A style colour as the shader takes it: linear light.
 fn rgb4(c: [u8; 3]) -> [f32; 4] {
-    [c[0] as f32, c[1] as f32, c[2] as f32, 0.0]
+    with_alpha(c, 0.0)
 }
 
 fn with_alpha(c: [u8; 3], a: f32) -> [f32; 4] {
-    [c[0] as f32, c[1] as f32, c[2] as f32, a]
+    let l = mahere_engine::colour::lin(c);
+    [l[0], l[1], l[2], a]
 }

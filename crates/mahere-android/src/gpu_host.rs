@@ -138,6 +138,7 @@ impl GpuHost {
                 },
             );
             self.configured = (w, h);
+            tag_bt2020(&self.window);
         }
         // Nothing changed and nothing arrived: the surface keeps its last image, and the CPU keeps its budget. The poll still runs so finished uploads release their staging memory. Once a quarter second has passed since the last change, one more frame is drawn at the still factor and stays on screen.
         let fresh = self.configured != (w, h) || self.frames == 0;
@@ -239,5 +240,27 @@ impl GpuHost {
             self.report = std::time::Instant::now();
         }
         !map.converged()
+    }
+}
+
+/// Tag the window's buffers BT.2020, gamma 2.2, full range, as fluor does for its CPU present: the map writes VSF RGB converted to BT.2020 primaries at gamma 2, and without the tag the compositor reads those bytes as sRGB and washes them out. Android names no gamma 2.0 transfer, so 2.2 is the nearest (the panel shows a touch darker than authored, the documented cost). The Vulkan swapchain sets its own sRGB dataspace when it is created, so this follows every configure. Resolved at run time: the symbol arrived in API 28 and the floor is 26, where the buffers simply stay sRGB.
+fn tag_bt2020(window: &NativeWindow) {
+    type SetDataSpace = unsafe extern "C" fn(*mut ndk_sys::ANativeWindow, i32) -> i32;
+    const STANDARD_BT2020: i32 = 6 << 16;
+    const TRANSFER_GAMMA2_2: i32 = 4 << 22;
+    const RANGE_FULL: i32 = 1 << 27;
+    unsafe {
+        let lib = libc::dlopen(c"libandroid.so".as_ptr(), libc::RTLD_NOW);
+        if lib.is_null() {
+            return;
+        }
+        let f = libc::dlsym(lib, c"ANativeWindow_setBuffersDataSpace".as_ptr());
+        if f.is_null() {
+            eprintln!("gpu: no setBuffersDataSpace (API < 28), buffers stay sRGB");
+            return;
+        }
+        let f: SetDataSpace = std::mem::transmute(f);
+        let r = f(window.ptr().as_ptr(), STANDARD_BT2020 | TRANSFER_GAMMA2_2 | RANGE_FULL);
+        eprintln!("gpu: buffers tagged BT.2020 gamma 2.2 ({r})");
     }
 }

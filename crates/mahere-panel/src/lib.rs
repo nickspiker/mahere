@@ -21,6 +21,8 @@ pub struct Controls {
     pub cache_budget: u64,
     /// The theme, an index into the engine's themes.
     pub theme: usize,
+    /// Highlights roll into white (Opsin's rail); off, the same exposure is shown straight, darker in the shadows.
+    pub rolloff: bool,
 }
 
 /// What the readouts show.
@@ -44,6 +46,7 @@ pub struct Readouts {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Layer {
     RealSun,
+    Rolloff,
     FollowHeading,
     LockToFix,
     Dem,
@@ -59,7 +62,7 @@ enum Layer {
     Debug,
 }
 
-const LAYERS: [(Layer, &str); 14] = [
+const LAYERS: [(Layer, &str); 15] = [
     (Layer::Dem, "Terrain"),
     (Layer::Hypso, "Elevation tint"),
     (Layer::Land, "Land cover"),
@@ -72,6 +75,7 @@ const LAYERS: [(Layer, &str); 14] = [
     (Layer::Infrared, "Infrared"),
     (Layer::Debug, "Residency"),
     (Layer::RealSun, "Real sun"),
+    (Layer::Rolloff, "Highlight rolloff"),
     (Layer::FollowHeading, "Follow heading"),
     (Layer::LockToFix, "Measure from me"),
 ];
@@ -79,6 +83,7 @@ const LAYERS: [(Layer, &str); 14] = [
 fn get(mask: &LayerMask, ctl: &Controls, l: Layer) -> bool {
     match l {
         Layer::RealSun => ctl.real_sun,
+        Layer::Rolloff => ctl.rolloff,
         Layer::FollowHeading => ctl.follow_heading,
         Layer::LockToFix => ctl.lock_to_fix,
         Layer::Dem => mask.dem,
@@ -98,6 +103,7 @@ fn get(mask: &LayerMask, ctl: &Controls, l: Layer) -> bool {
 fn set(mask: &mut LayerMask, ctl: &mut Controls, l: Layer, v: bool) {
     match l {
         Layer::RealSun => ctl.real_sun = v,
+        Layer::Rolloff => ctl.rolloff = v,
         Layer::FollowHeading => ctl.follow_heading = v,
         Layer::LockToFix => ctl.lock_to_fix = v,
         Layer::Dem => mask.dem = v,
@@ -216,7 +222,7 @@ impl Panel {
         let mut last = top;
         for (i, (l, cb)) in self.checks.iter_mut().enumerate() {
             // The modes sit a little apart from the layers.
-            let gap = if matches!(l, Layer::RealSun | Layer::FollowHeading | Layer::LockToFix) { row * 0.5 } else { 0.0 };
+            let gap = if matches!(l, Layer::RealSun | Layer::Rolloff | Layer::FollowHeading | Layer::LockToFix) { row * 0.5 } else { 0.0 };
             let cy = top + row * (i as f32 + 0.5) + gap;
             cb.set_font_size(self.font);
             cb.set_rect(x0 + (self.panel_w - x0 * 1.5) * 0.5, cy, self.panel_w - x0 * 1.5, row);
@@ -648,7 +654,8 @@ fn name_index(name: &str, names: &[&str]) -> usize {
     names.iter().position(|n| *n == name).unwrap_or(0)
 }
 
-/// A legend swatch of a display colour, opaque, in fluor's stored form.
+/// A legend swatch of an authored theme colour, as the map shows it unlit (through the same display encode), opaque, in fluor's stored form.
 fn swatch(c: [u8; 3]) -> u32 {
+    let c = mahere_engine::colour::Display::default().swatch(c);
     (theme::dark(theme::fmt(((c[0] as u32) << 16) | ((c[1] as u32) << 8) | c[2] as u32)) & 0x00FF_FFFF) | 0xFF00_0000
 }

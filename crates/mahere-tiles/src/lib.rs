@@ -15,6 +15,7 @@
 //! Files are zstd'd VSF at `{name}.vsf.zst` where the name is the cell's flattened VSF value (`u` depth, `wm` cell) in base64url: no delimiters, no numerals — a directory layout that is byte-for-byte the bucket.
 
 pub mod pyr;
+pub mod tone;
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -326,26 +327,42 @@ pub fn apron_idx(side: usize, half: usize, i: usize) -> usize {
     (side * 2 + half) * TEX + i
 }
 
-/// Imagery bands, 8-bit, 0 = no data: NAIP red, green, blue and near-infrared (~650 / ~550 / ~450 / ~850 nm). Never baked finer than depth 14 (IMG_MAX_DEPTH).
+/// Imagery bands, 8-bit, 0 = no data: VSF RGB red, green, blue, then near-infrared, each scene light stored through the tone `tone` (a [`tone`] tag; [`tone::IMG_TAG`] for everything baked now, 0 for cells from before tones). Never baked finer than depth 14 (IMG_MAX_DEPTH).
 #[derive(Clone)]
 pub struct ImgCell {
     pub red: Vec<u8>,
     pub green: Vec<u8>,
     pub blue: Vec<u8>,
     pub nir: Vec<u8>,
+    pub tone: u8,
 }
 
 impl ImgCell {
     pub fn new() -> ImgCell {
-        ImgCell { red: vec![0; TRI], green: vec![0; TRI], blue: vec![0; TRI], nir: vec![0; TRI] }
+        ImgCell { red: vec![0; TRI], green: vec![0; TRI], blue: vec![0; TRI], nir: vec![0; TRI], tone: tone::IMG_TAG }
+    }
+
+    /// Bring the cell to tone `t`: every lit byte unrolled to scene light and rolled again. A cell already in `t` is untouched.
+    pub fn retone(&mut self, t: u8) {
+        if self.tone == t {
+            return;
+        }
+        let from = tone::table(self.tone);
+        let lut: [u8; 256] = std::array::from_fn(|b| if b == 0 { 0 } else { tone::roll(t, from[b]) });
+        for plane in self.bands_mut() {
+            for v in plane.iter_mut() {
+                *v = lut[*v as usize];
+            }
+        }
+        self.tone = t;
     }
     pub fn is_empty(&self) -> bool {
         self.bands().iter().all(|b| b.iter().all(|&v| v == 0))
     }
-    fn bands(&self) -> [&Vec<u8>; 4] {
+    pub fn bands(&self) -> [&Vec<u8>; 4] {
         [&self.red, &self.green, &self.blue, &self.nir]
     }
-    fn bands_mut(&mut self) -> [&mut Vec<u8>; 4] {
+    pub fn bands_mut(&mut self) -> [&mut Vec<u8>; 4] {
         [&mut self.red, &mut self.green, &mut self.blue, &mut self.nir]
     }
 }
@@ -813,8 +830,7 @@ pub fn dem_pyramid(base: &[(CellKey, DemCell)], min_depth: u8) -> Vec<(CellKey, 
 
 // ==================== IMAGERY LAYER ====================
 
-/// Sample NAIP (red, nir) and lidar intensity at every triangle centroid of `keys` (depth <= IMG_MAX_DEPTH); cells with nothing are dropped.
-/// Sample the imagery at every triangle centroid: the four NAIP bands, each the mean of four samples spread a third of a texel around the centroid, so 60 cm pixels are box-filtered into a 1.2 m texel instead of point-picked. 0 stays no data.
+/// Sample the imagery at every triangle centroid: the four bands as scene light, each the mean of four samples spread a third of a texel around the centroid, so 60 cm pixels are box-filtered (in linear light) into a 1.2 m texel instead of point-picked, then stored in the agreed tone. 0 stays no data.
 /// `nir`, when given, is a separate single-band near-infrared source (Sentinel-2 ships its bands as separate files) that takes the place of the colour source's fourth band.
 pub fn bake_img(naip: Option<&mahere_dem::ImgStore>, nir: Option<&mahere_dem::ImgStore>, keys: &[CellKey]) -> Vec<(CellKey, ImgCell)> {
     keys.par_iter()
@@ -829,22 +845,22 @@ pub fn bake_img(naip: Option<&mahere_dem::ImgStore>, nir: Option<&mahere_dem::Im
                     for half in 0..2 {
                         let (cx, cy) = tri_centroid(tx, ty, half);
                         let i = tri_idx(tx, ty, half);
-                        let (mut acc, mut hits) = ([0u32; 4], 0u32);
+                        let (mut acc, mut hits) = ([0f32; 4], 0u32);
                         for (ou, ov) in [(-0.3, -0.3), (0.3, -0.3), (-0.3, 0.3), (0.3, 0.3)] {
                             let (lat, lon) = uv_to_lat_lon(d, u0 + (cx + ou) * step, v0 + (cy + ov) * step);
                             if let Some(mut px) = n.sample(lat, lon) {
                                 if let Some(nr) = nir {
-                                    px[3] = nr.sample(lat, lon).map_or(0, |q| q[0]);
+                                    px[3] = nr.sample(lat, lon).map_or(0.0, |q| q[0]);
                                 }
                                 for b in 0..4 {
-                                    acc[b] += px[b] as u32;
+                                    acc[b] += px[b];
                                 }
                                 hits += 1;
                             }
                         }
                         if hits > 0 {
                             for (b, plane) in cell.bands_mut().into_iter().enumerate() {
-                                plane[i] = ((acc[b] + hits / 2) / hits).clamp(1, 255) as u8;
+                                plane[i] = tone::roll(tone::IMG_TAG, acc[b] / hits as f32);
                             }
                         }
                     }
@@ -856,7 +872,7 @@ pub fn bake_img(naip: Option<&mahere_dem::ImgStore>, nir: Option<&mahere_dem::Im
         .collect()
 }
 
-/// The global imagery bake: every texel the mean of sixteen samples at the centroids of its grandchild triangles (no data ignored), so the source is read at four times the texel's resolution and a 108 m triangle box-filters the 37 m pixels under it instead of point-picking a few. Cells with nothing are dropped.
+/// The global imagery bake: every texel the mean of sixteen samples of scene light at the centroids of its grandchild triangles (no data ignored), so the source is read at four times the texel's resolution and a 108 m triangle box-filters the 37 m pixels under it instead of point-picking a few, then stored in the agreed tone. Cells with nothing are dropped.
 pub fn bake_img_filtered(img: &mahere_dem::ImgStore, keys: &[CellKey]) -> Vec<(CellKey, ImgCell)> {
     keys.par_iter()
         .map(|&key| {
@@ -867,7 +883,7 @@ pub fn bake_img_filtered(img: &mahere_dem::ImgStore, keys: &[CellKey]) -> Vec<(C
             for ty in 0..TEX {
                 for tx in 0..TEX {
                     for half in 0..2 {
-                        let (mut acc, mut hits) = ([0u32; 4], 0u32);
+                        let (mut acc, mut hits) = ([0f32; 4], 0u32);
                         for (cx, cy, ch) in tri_children(0, 0, half) {
                             for (gx, gy, gh) in tri_children(cx, cy, ch) {
                                 let off = tri_off(gh);
@@ -875,7 +891,7 @@ pub fn bake_img_filtered(img: &mahere_dem::ImgStore, keys: &[CellKey]) -> Vec<(C
                                 let v = v0 + (ty as f64 + (gy as f64 + off) * 0.25) * step;
                                 if let Some(px) = img.sample_lat_lon(uv_to_lat_lon(d, u, v)) {
                                     for b in 0..4 {
-                                        acc[b] += px[b] as u32;
+                                        acc[b] += px[b];
                                     }
                                     hits += 1;
                                 }
@@ -884,7 +900,7 @@ pub fn bake_img_filtered(img: &mahere_dem::ImgStore, keys: &[CellKey]) -> Vec<(C
                         if hits > 0 {
                             let i = tri_idx(tx, ty, half);
                             for (b, plane) in cell.bands_mut().into_iter().enumerate() {
-                                plane[i] = ((acc[b] + hits / 2) / hits).clamp(1, 255) as u8;
+                                plane[i] = tone::roll(tone::IMG_TAG, acc[b] / hits as f32);
                             }
                         }
                     }
@@ -896,7 +912,7 @@ pub fn bake_img_filtered(img: &mahere_dem::ImgStore, keys: &[CellKey]) -> Vec<(C
         .collect()
 }
 
-/// Parent texel = mean of the lit children per band (0 = no data, ignored).
+/// Parent texel = mean of the lit children per band (0 = no data, ignored), averaged as scene light and rolled again in the agreed tone.
 pub fn img_pyramid(base: &[(CellKey, ImgCell)], min_depth: u8) -> Vec<(CellKey, ImgCell)> {
     let mut out: Vec<(CellKey, ImgCell)> = Vec::new();
     let mut last: Option<usize> = None;
@@ -917,17 +933,18 @@ pub fn img_pyramid(base: &[(CellKey, ImgCell)], min_depth: u8) -> Vec<(CellKey, 
             .par_iter()
             .map(|&p| {
                 let kids: [Option<&&ImgCell>; 4] = std::array::from_fn(|q| by_key.get(&p.child(q as u64)));
+                let tables: [&[f32; 256]; 4] = std::array::from_fn(|q| tone::table(kids[q].map_or(tone::IMG_TAG, |c| c.tone)));
                 let mut cell = ImgCell::new();
                 for ty in 0..TEX {
                     for tx in 0..TEX {
                         for half in 0..2 {
-                            let mut acc = [0u32; 4];
+                            let mut acc = [0f32; 4];
                             let mut n = [0u32; 4];
                             for (q, i) in child_cell_texels(tx, ty, half) {
                                 let Some(child) = kids[q as usize] else { continue };
                                 for (b, plane) in child.bands().into_iter().enumerate() {
                                     if plane[i] != 0 {
-                                        acc[b] += plane[i] as u32;
+                                        acc[b] += tables[q as usize][plane[i] as usize];
                                         n[b] += 1;
                                     }
                                 }
@@ -935,7 +952,7 @@ pub fn img_pyramid(base: &[(CellKey, ImgCell)], min_depth: u8) -> Vec<(CellKey, 
                             let i = tri_idx(tx, ty, half);
                             for (b, plane) in cell.bands_mut().into_iter().enumerate() {
                                 if n[b] > 0 {
-                                    plane[i] = (acc[b] / n[b]) as u8;
+                                    plane[i] = tone::roll(tone::IMG_TAG, acc[b] / n[b] as f32);
                                 }
                             }
                         }
@@ -1200,6 +1217,7 @@ fn img_section(im: &ImgCell, loss: &Loss) -> vsf::VsfSection {
     let steps = pyr::Steps::tapered(loss.img);
     let mut s = vsf::VsfSection::new("img");
     s.add_field("loss", pyr::steps_vsf(&steps));
+    s.add_field("tone", VsfType::u3(im.tone));
     for (name, band) in IMG_BANDS.iter().zip(im.bands()) {
         let masked = true;
         let mem: Vec<f32> = band.iter().map(|&v| if masked && v == 0 { f32::NAN } else { v as f32 }).collect();
@@ -1215,6 +1233,11 @@ fn img_section(im: &ImgCell, loss: &Loss) -> vsf::VsfSection {
 fn decode_img(fields: &HashMap<String, Vec<VsfType>>) -> Option<ImgCell> {
     let steps = pyr::steps_from_vsf(fields.get("loss").and_then(|v| v.first()));
     let mut im = ImgCell::new();
+    // Cells from before tones carry none: plain gamma 2.
+    im.tone = match fields.get("tone").and_then(|v| v.first()) {
+        Some(VsfType::u3(t)) => *t,
+        _ => 0,
+    };
     let mut any = false;
     for (name, out) in IMG_BANDS.iter().zip(im.bands_mut()) {
         let Some(values) = fields.get(*name) else { continue };
@@ -1329,7 +1352,8 @@ impl CellPlanes {
         let CellPlanes { dem: old_dem, line: old_line, land: old_land, water: old_water, img: old_img } = old;
         let (mut old_line, mut old_land, mut old_water) = (old_line, old_land, old_water);
         match (&mut out.img, old_img) {
-            (Some(n), Some(o)) => {
+            (Some(n), Some(mut o)) => {
+                o.retone(n.tone);
                 for (np, op) in n.bands_mut().into_iter().zip(o.bands()) {
                     for i in 0..TRI {
                         if np[i] == 0 {

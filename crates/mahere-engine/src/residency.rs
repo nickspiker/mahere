@@ -354,7 +354,12 @@ fn load_cell(store: &dyn CellStore, key: CellKey, pack_cpu: bool) -> Loaded {
             }
         }
     }
-    Loaded { key, entry: Some(Entry { present, line_mag_max, elev_lo, elev_hi, dem, dem_q, line: planes.line, land: planes.land, water: planes.water, img: planes.img }) }
+    // The renderers unroll imagery through one table, the agreed tone's; a cell stored in any other is brought to it here, once.
+    let mut img = planes.img;
+    if let Some(im) = &mut img {
+        im.retone(mahere_tiles::tone::IMG_TAG);
+    }
+    Loaded { key, entry: Some(Entry { present, line_mag_max, elev_lo, elev_hi, dem, dem_q, line: planes.line, land: planes.land, water: planes.water, img }) }
 }
 
 // ==================== TIERED STORE: VAULT CACHE OVER THE BUCKET ====================

@@ -50,6 +50,11 @@ struct Uniforms {
     style_bg: vec4<f32>,
     style_no_dem: vec4<f32>,
     style_sea: vec4<f32>,
+    // The display: VSF RGB to its primaries (rows), and x = 1 when the highlight rail is on.
+    display: array<vec4<f32>, 3>,
+    tone: vec4<f32>,
+    // Stored imagery byte to scene light (the cells' tone unrolled), 256 entries.
+    img_table: array<vec4<f32>, 64>,
 };
 
 // a: diamond, depth, cu, cv. b: dem slot, line slot, land+water slot, img slot. c: flags. d: base, step, eu, nu. e: ev, nv, inv det.
@@ -275,8 +280,31 @@ fn light_eval(n: vec3<f32>) -> vec3<f32> {
     return out;
 }
 
+// Every authored colour is VSF RGB at gamma 2, quantised ×256: a byte is the light (b/256)². The style uniforms arrive already linear; the tables and constants are decoded here.
+fn dec(c: vec3<f32>) -> vec3<f32> {
+    let x = c / 256.0;
+    return x * x;
+}
+
 fn unpack_rgb(p: u32) -> vec3<f32> {
-    return vec3<f32>(f32((p >> 16u) & 255u), f32((p >> 8u) & 255u), f32(p & 255u));
+    return dec(vec3<f32>(f32((p >> 16u) & 255u), f32((p >> 8u) & 255u), f32(p & 255u)));
+}
+
+fn img_light(b: u32) -> f32 {
+    return U.img_table[b >> 2u][b & 3u];
+}
+
+// Opsin's highlight rail, (3x − x³)/2, clamped first because past 1 the cubic folds back.
+fn rail(x: vec3<f32>) -> vec3<f32> {
+    let c = clamp(x, vec3<f32>(0.0), vec3<f32>(1.0));
+    return (3.0 * c - c * c * c) * 0.5;
+}
+
+// The one display encode: linear VSF RGB to the display's gamma-2 code values 0..255, truncated. Exposure 2/3, then the rail (or straight), then the square root.
+fn to_display(x: vec3<f32>) -> vec3<f32> {
+    let d = vec3<f32>(dot(U.display[0].xyz, x), dot(U.display[1].xyz, x), dot(U.display[2].xyz, x)) * (2.0 / 3.0);
+    let t = select(clamp(d, vec3<f32>(0.0), vec3<f32>(1.0)), rail(d), U.tone.x > 0.5);
+    return min(floor(sqrt(t) * 256.0), vec3<f32>(255.0));
 }
 
 // A line's magnitude against the largest of its class in view, 0..1.
@@ -289,7 +317,7 @@ fn line_colour(cls_id: u32, mag: u32) -> vec3<f32> {
     let c = unpack_rgb(lut[CLASS_BASE + cls]);
     if (cls == WATERWAY_CLASS) {
         // Water on a linear scale up to the largest magnitude in view: the biggest river on screen is full, a trickle a third.
-        return floor(c * (0.35 + 0.65 * line_scale(cls, mag)));
+        return c * (0.35 + 0.65 * line_scale(cls, mag));
     }
     return c;
 }
@@ -386,16 +414,16 @@ fn compose(d: u32, u: u32, v: u32) -> Composed {
             if ((mask & M_SLOPE) != 0u) {
                 let deg = degrees(atan(slope));
                 if (deg >= 45.0) {
-                    band = vec3<f32>(150.0, 40.0, 200.0);
+                    band = dec(vec3<f32>(150.0, 40.0, 200.0));
                     have_band = true;
                 } else if (deg >= 35.0) {
-                    band = vec3<f32>(230.0, 50.0, 40.0);
+                    band = dec(vec3<f32>(230.0, 50.0, 40.0));
                     have_band = true;
                 } else if (deg >= 30.0) {
-                    band = vec3<f32>(250.0, 150.0, 40.0);
+                    band = dec(vec3<f32>(250.0, 150.0, 40.0));
                     have_band = true;
                 } else if (deg >= 25.0) {
-                    band = vec3<f32>(250.0, 220.0, 60.0);
+                    band = dec(vec3<f32>(250.0, 220.0, 60.0));
                     have_band = true;
                 }
             }
@@ -416,7 +444,7 @@ fn compose(d: u32, u: u32, v: u32) -> Composed {
     let vi = find(d, U.depths.y, u, v, FLAG_VEC);
     if (vi == NONE && (mask & M_IMAGERY) != 0u && (im.x != 0u || im.y != 0u || im.z != 0u)) {
         out.ground = false;
-        out.base = select(vec3<f32>(f32(im.x), f32(im.y), f32(im.z)), vec3<f32>(f32(im.w)), (mask & M_INFRARED) != 0u);
+        out.base = select(vec3<f32>(img_light(im.x), img_light(im.y), img_light(im.z)), vec3<f32>(img_light(im.w)), (mask & M_INFRARED) != 0u);
         return out;
     }
     if (vi != NONE) {
@@ -434,13 +462,13 @@ fn compose(d: u32, u: u32, v: u32) -> Composed {
         }
         let draw_line = (mask & M_LINE) != 0u && line.y != 0u && (line.x < BOUNDARY_FIRST || (mask & M_BOUND) != 0u);
         if ((mask & M_IMAGERY) != 0u) {
-            // Imagery stands in for the ground: nothing lights it. True colour, or the near-infrared band as grey.
+            // Imagery stands in for the ground: nothing lights it. True colour, or the near-infrared band as grey, unrolled to scene light.
             out.ground = false;
             if (im.x != 0u || im.y != 0u || im.z != 0u) {
                 if ((mask & M_INFRARED) != 0u) {
-                    out.base = vec3<f32>(f32(im.w));
+                    out.base = vec3<f32>(img_light(im.w));
                 } else {
-                    out.base = vec3<f32>(f32(im.x), f32(im.y), f32(im.z));
+                    out.base = vec3<f32>(img_light(im.x), img_light(im.y), img_light(im.z));
                 }
             }
             if (draw_line) {
@@ -480,11 +508,11 @@ fn compose(d: u32, u: u32, v: u32) -> Composed {
     if ((mask & M_DEBUG) != 0u) {
         var tintd = vec3<f32>(-1.0);
         if (found_depth == NONE) {
-            tintd = vec3<f32>(255.0, 0.0, 255.0);
+            tintd = dec(vec3<f32>(255.0, 0.0, 255.0));
         } else if (found_depth + 2u <= U.depths.x) {
-            tintd = vec3<f32>(255.0, 40.0, 40.0);
+            tintd = dec(vec3<f32>(255.0, 40.0, 40.0));
         } else if (found_depth + 1u == U.depths.x) {
-            tintd = vec3<f32>(255.0, 170.0, 0.0);
+            tintd = dec(vec3<f32>(255.0, 170.0, 0.0));
         }
         if (tintd.x >= 0.0) {
             { let f = fold(Fold(out.k2, out.c2), tintd, 0.5); out.k2 = f.k; out.c2 = f.c; }
@@ -493,7 +521,7 @@ fn compose(d: u32, u: u32, v: u32) -> Composed {
     return out;
 }
 
-// The light applied: the same arithmetic whether the pieces come from the page table or from the G-buffer.
+// The light applied, all linear: the same arithmetic whether the pieces come from the page table or from the G-buffer.
 fn shade(base: vec3<f32>, ground: bool, n: vec3<f32>, k1: f32, c1: vec3<f32>, water: f32, k2: f32, c2: vec3<f32>) -> vec3<f32> {
     var rgb = base;
     var diffuse = 1.0;
@@ -506,7 +534,7 @@ fn shade(base: vec3<f32>, ground: bool, n: vec3<f32>, k1: f32, c1: vec3<f32>, wa
         let wr = U.style_water.rgb * (0.85 + 0.15 * diffuse);
         rgb = lerp3(rgb, wr, water);
     }
-    return floor(rgb * k2 + c2);
+    return rgb * k2 + c2;
 }
 
 fn sample_uv(in: VOut) -> vec3<u32> {
@@ -522,7 +550,7 @@ fn sample_uv(in: VOut) -> vec3<u32> {
 fn fs_map(in: VOut) -> @location(0) vec4<f32> {
     let s = sample_uv(in);
     let p = compose(s.x, s.y, s.z);
-    return vec4<f32>(shade(p.base, p.ground, p.n, p.k1, p.c1, p.water, p.k2, p.c2) / 255.0, 1.0);
+    return vec4<f32>(to_display(shade(p.base, p.ground, p.n, p.k1, p.c1, p.water, p.k2, p.c2)) / 255.0, 1.0);
 }
 
 // The map pass that writes the G-buffer instead of a colour: base + ground, normal + water, c1 + k1, c2 + k2. The relight pass then shades it.
@@ -538,10 +566,11 @@ fn fs_map_g(in: VOut) -> GOut {
     let s = sample_uv(in);
     let p = compose(s.x, s.y, s.z);
     var g: GOut;
-    g.base = vec4<f32>(p.base / 255.0, select(0.0, 1.0, p.ground));
+    // Linear light kept at gamma 2 so 8 bits hold the shadows; the base with four times headroom for unrolled imagery.
+    g.base = vec4<f32>(sqrt(p.base * 0.25), select(0.0, 1.0, p.ground));
     g.normal = vec4<f32>(p.n * 0.5 + 0.5, p.water);
-    g.post1 = vec4<f32>(p.c1 / 255.0, p.k1);
-    g.post2 = vec4<f32>(p.c2 / 255.0, p.k2);
+    g.post1 = vec4<f32>(sqrt(p.c1), p.k1);
+    g.post2 = vec4<f32>(sqrt(p.c2), p.k2);
     return g;
 }
 
@@ -559,8 +588,8 @@ fn fs_relight(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     let nw = textureLoad(g_normal, xy, 0);
     let p1 = textureLoad(g_post1, xy, 0);
     let p2 = textureLoad(g_post2, xy, 0);
-    let rgb = shade(b.rgb * 255.0, b.a > 0.5, normalize(nw.xyz * 2.0 - 1.0), p1.a, p1.rgb * 255.0, nw.w, p2.a, p2.rgb * 255.0);
-    return vec4<f32>(rgb / 255.0, 1.0);
+    let rgb = shade(b.rgb * b.rgb * 4.0, b.a > 0.5, normalize(nw.xyz * 2.0 - 1.0), p1.a, p1.rgb * p1.rgb, nw.w, p2.a, p2.rgb * p2.rgb);
+    return vec4<f32>(to_display(rgb) / 255.0, 1.0);
 }
 
 // ==================== PRESENT: 2×2 bin plus the overlay ====================
@@ -579,16 +608,18 @@ fn vs_present(@builtin(vertex_index) vi: u32) -> @builtin(position) vec4<f32> {
 fn fs_present(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     let s = i32(U.scale);
     let p = vec2<i32>(pos.xy) * s;
-    var c = vec4<f32>(0.0);
+    // The bin averages the light the display will emit: each sample's code value (b/256)², then back to gamma 2. The round only recovers the stored integer from the texture's 0..1.
+    var c = vec3<f32>(0.0);
     for (var j = 0; j < s; j++) {
         for (var i = 0; i < s; i++) {
-            c += textureLoad(map_tex, p + vec2<i32>(i, j), 0);
+            let e = round(textureLoad(map_tex, p + vec2<i32>(i, j), 0).rgb * 255.0) / 256.0;
+            c += e * e;
         }
     }
-    c = c / f32(s * s);
-    // The overlay is premultiplied: straight over.
+    c = sqrt(c / f32(s * s));
+    // The overlay is premultiplied display values: straight over.
     let o = textureLoad(overlay_tex, vec2<i32>(pos.xy), 0);
-    var rgb = c.rgb * (1.0 - o.a) + o.rgb;
+    var rgb = c * (1.0 - o.a) + o.rgb * (255.0 / 256.0);
     // The GPS pin: an accuracy ring and a crosshair, feathered over a pixel, in the engine's pin blue.
     if (U.pin.w > 0.5) {
         let d = pos.xy - U.pin.xy;
@@ -596,7 +627,7 @@ fn fs_present(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         let ring = clamp(1.0 - abs(dist - U.pin.z) + 0.45, 0.0, 1.0);
         let cross = select(0.0, clamp(1.6 - min(abs(d.x), abs(d.y)) + 0.5, 0.0, 1.0), max(abs(d.x), abs(d.y)) <= 9.0);
         let cov = max(ring, cross);
-        rgb = mix(rgb, vec3<f32>(64.0, 156.0, 255.0) / 255.0, cov);
+        rgb = mix(rgb, vec3<f32>(64.0, 156.0, 255.0) / 256.0, cov);
     }
     // The measurement: a line from origin to target and a crosshair on the target, feathered over a pixel.
     if (U.depths.w != 0u) {
@@ -610,7 +641,8 @@ fn fs_present(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         let dt = pos.xy - t;
         let cross = select(0.0, clamp(1.6 - min(abs(dt.x), abs(dt.y)) + 0.5, 0.0, 1.0), max(abs(dt.x), abs(dt.y)) <= 12.0 && min(abs(dt.x), abs(dt.y)) <= 1.6 && length(dt) > 3.0);
         let cov = max(line_cov * 0.85, cross);
-        rgb = mix(rgb, vec3<f32>(255.0, 196.0, 64.0) / 255.0, cov);
+        rgb = mix(rgb, vec3<f32>(255.0, 196.0, 64.0) / 256.0, cov);
     }
-    return vec4<f32>(rgb, 1.0);
+    // Truncated to the code value, written exactly so the hardware's own rounding has nothing to do.
+    return vec4<f32>(min(floor(rgb * 256.0), vec3<f32>(255.0)) / 255.0, 1.0);
 }

@@ -1,5 +1,6 @@
 //! mahere's host-independent map core — the #pagetable edition. A frame is fetches: 32 px block grid → diamond UV → page table → plane fetch → LUT composite. No vectors, no reservoir, no source data at runtime: the renderer's entire diet is baked cells served by a CellStore through the clipmap residency layer. Frontends feed input and blit `canvas`.
 
+pub mod colour;
 pub mod plan;
 pub mod raster;
 pub mod residency;
@@ -138,6 +139,8 @@ impl MapCore {
                 dem_depth: DEM_BASE_DEPTH,
                 contours: Contours { interval: 0.0, index_every: 5, m_per_px: 1.0 },
                 light: sh::Sh9::sun_and_sky(315.0, 40.0).quadratic((0.0, 1.0)),
+                display: colour::Display::default(),
+                rolled: true,
             },
             env: sh::Sh9::sun_and_sky(315.0, 40.0),
             luts_sun: (f32::NAN, f32::NAN, f64::NAN),
@@ -448,6 +451,17 @@ impl MapCore {
         self.luts.style = t.style();
         self.set_layers(t.layers);
         self.luts_sun = (f32::NAN, f32::NAN, f64::NAN);
+        self.style_version += 1;
+        self.dirty = true;
+    }
+
+    /// Whether the display rolls highlights into white (Opsin's rail) or shows them straight.
+    pub fn rolloff(&self) -> bool {
+        self.luts.rolled
+    }
+
+    pub fn set_rolloff(&mut self, on: bool) {
+        self.luts.rolled = on;
         self.style_version += 1;
         self.dirty = true;
     }

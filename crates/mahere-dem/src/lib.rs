@@ -286,6 +286,22 @@ fn sample_kind(r: &DecodingResult) -> &'static str {
 }
 
 #[cfg(test)]
+mod img_tests {
+    #[test]
+    fn a_flat_reflector_is_neutral() {
+        let m = super::sentinel_to_vsf();
+        let v = super::mul3(m, [0.3, 0.3, 0.3]);
+        for c in v {
+            assert!((c - 0.3).abs() < 1e-3, "{v:?}");
+        }
+        let w = super::srgb_to_vsf([1.0, 1.0, 1.0]);
+        for c in w {
+            assert!((c - 1.0).abs() < 2e-3, "{w:?}");
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -313,9 +329,9 @@ mod tests {
     }
 }
 
-// ==================== IMAGERY: MULTI-BAND u8 GeoTIFF (NAIP) ====================
+// ==================== IMAGERY: ORTHOIMAGES TO SCENE LIGHT ====================
 
-/// A multi-band 8-bit orthoimage tile (NAIP: red, green, blue, near-infrared at 60 cm), geographic or UTM grid like a dem tile, interleaved samples.
+/// A multi-band orthoimage tile, geographic or UTM grid like a dem tile, interleaved samples kept as they came: 8-bit display-referred (NAIP: red, green, blue, near-infrared at 60 cm) or 16-bit reflectance (Sentinel-2: B04, B03, B02, B08, or one near-infrared band alone). [`ImgStore::sample`] turns either into scene light in VSF RGB.
 pub struct ImgTile {
     width: usize,
     height: usize,
@@ -323,7 +339,74 @@ pub struct ImgTile {
     grid: Grid,
     origin: (f64, f64),
     step: (f64, f64),
-    data: Vec<u8>,
+    data: Samples,
+}
+
+enum Samples {
+    /// Display-referred bytes, taken as sRGB.
+    Display(Vec<u8>),
+    /// Reflectance, 10000 per unit plus `offset`.
+    Reflectance { data: Vec<u16>, offset: u16 },
+}
+
+/// Scene light 1 (paper white) for a reflectance source: 30% for the visible bands, 50% for the near-infrared, where leaves are bright. Reflectance is against a flat white diffuser, so sunlit slopes and snow pass 1; the stored tone has headroom for five times paper white.
+pub const VISIBLE_WHITE: f32 = 0.30;
+pub const NIR_WHITE: f32 = 0.50;
+
+/// Sentinel-2's red, green and blue bands (665, 560, 490 nm) to VSF RGB, row-major. Three narrow bands sample a reflectance spectrum that is smooth, so the spectrum is taken as the straight-line interpolation between the band centres, held flat beyond the end bands, and integrated against the Stockman & Sharpe 2000 10° cone fundamentals under Illuminant E, then into VSF RGB. A flat reflector is Illuminant E exactly, so equal reflectance comes out neutral with no fitted weights. (Taking the bands as monochromatic primaries instead fails: a line at 490 nm is cyan, more M than S, and white then needs a negative 560 nm band.)
+pub fn sentinel_to_vsf() -> &'static [[f32; 3]; 3] {
+    static M: std::sync::OnceLock<[[f32; 3]; 3]> = std::sync::OnceLock::new();
+    M.get_or_init(|| {
+        let cones = &vsf::colour::LMS_2000_10DEG_1NM;
+        let start = cones.start_nm as usize;
+        let n = cones.data.len() / 3;
+        // The interpolation's weight on each band at a wavelength: hats between the centres, flat past the ends. Bands in order blue, green, red.
+        let nodes = [490.0f32, 560.0, 665.0];
+        let weight = |nm: f32| -> [f32; 3] {
+            if nm <= nodes[0] {
+                [1.0, 0.0, 0.0]
+            } else if nm >= nodes[2] {
+                [0.0, 0.0, 1.0]
+            } else if nm <= nodes[1] {
+                let t = (nm - nodes[0]) / (nodes[1] - nodes[0]);
+                [1.0 - t, t, 0.0]
+            } else {
+                let t = (nm - nodes[1]) / (nodes[2] - nodes[1]);
+                [0.0, 1.0 - t, t]
+            }
+        };
+        // c[cone][band]: each band's basis spectrum seen by each cone (the cones sum to 1 over the table, so Illuminant E is (1, 1, 1)).
+        let mut c = [[0f32; 3]; 3];
+        for k in 0..n {
+            let w = weight((start + k) as f32);
+            for cone in 0..3 {
+                for band in 0..3 {
+                    c[cone][band] += cones.data[k * 3 + cone] * w[band];
+                }
+            }
+        }
+        // vsf's matrices are column-major.
+        let l = &vsf::colour::LMS2VSF_RGB;
+        let to_vsf = [[l[0], l[3], l[6]], [l[1], l[4], l[7]], [l[2], l[5], l[8]]];
+        // Columns reordered to the samples' order: red (665), green (560), blue (490).
+        let m: [[f32; 3]; 3] = std::array::from_fn(|r| std::array::from_fn(|band| (0..3).map(|j| to_vsf[r][j] * c[j][band]).sum()));
+        std::array::from_fn(|r| [m[r][2], m[r][1], m[r][0]])
+    })
+}
+
+/// sRGB bytes to linear light, the sRGB transfer exactly (it is what a display-referred source was made for).
+fn srgb_table() -> &'static [f32; 256] {
+    static T: std::sync::OnceLock<[f32; 256]> = std::sync::OnceLock::new();
+    T.get_or_init(|| {
+        std::array::from_fn(|b| {
+            let c = b as f32 / 255.0;
+            if c <= 0.040_45 { c / 12.92 } else { ((c + 0.055) / 1.055).powf(2.4) }
+        })
+    })
+}
+
+fn mul3(m: &[[f32; 3]; 3], x: [f32; 3]) -> [f32; 3] {
+    std::array::from_fn(|r| m[r][0] * x[0] + m[r][1] * x[1] + m[r][2] * x[2])
 }
 
 pub struct ImgStore {
@@ -350,26 +433,27 @@ impl ImgTile {
             // Sentinel-2 L2A as served by the Planetary Computer: 15-bit samples, which the decoder refuses; read the tiles by hand.
             let data = read_tiled_u15(path, &mut dec, w as usize, h as usize)?;
             eprintln!("img tile {path}: {w}x{h} x1 (15-bit) {grid:?}");
-            return Ok(ImgTile { width: w as usize, height: h as usize, bands: 1, grid, origin, step: (scale[0], scale[1]), data });
+            return Ok(ImgTile { width: w as usize, height: h as usize, bands: 1, grid, origin, step: (scale[0], scale[1]), data: Samples::Reflectance { data, offset: 1000 } });
         }
         // GDAL metadata names the reflectance offset when the producer removed it (the ESA WorldCover composite: offset 0); a bare Sentinel-2 L2A band from processing baseline 4 on carries the 1000 offset in its samples.
         let meta = dec.get_tag_ascii_string(Tag::Unknown(42112)).unwrap_or_default();
         let offset: u16 = if meta.contains("role=\"offset\">0<") { 0 } else { 1000 };
-        let data = match dec.read_image().map_err(|e| format!("{path}: {e}"))? {
-            DecodingResult::U8(v) => v,
-            // Sixteen-bit reflectance (Sentinel-2 L2A: 10000 per unit), every fourth sample near-infrared when there are four bands.
+        let (data, n) = match dec.read_image().map_err(|e| format!("{path}: {e}"))? {
+            DecodingResult::U8(v) => {
+                let n = v.len();
+                (Samples::Display(v), n)
+            }
             DecodingResult::U16(v) => {
-                let bands = v.len() / (w as usize * h as usize).max(1);
-                let (vis, nir) = (reflectance_lut(offset, VISIBLE_WHITE), reflectance_lut(offset, NIR_WHITE));
-                v.into_iter().enumerate().map(|(i, d)| if bands == 4 && i % 4 == 3 { nir[d as usize] } else { vis[d as usize] }).collect()
+                let n = v.len();
+                (Samples::Reflectance { data: v, offset }, n)
             }
             other => return Err(format!("{path}: expected U8 or U16 samples, got {}", sample_kind(&other))),
         };
         let px = w as usize * h as usize;
-        if data.len() % px != 0 {
-            return Err(format!("{path}: sample count {} is not a multiple of {px} pixels", data.len()));
+        if n % px != 0 {
+            return Err(format!("{path}: sample count {n} is not a multiple of {px} pixels"));
         }
-        let bands = data.len() / px;
+        let bands = n / px;
         eprintln!("img tile {path}: {w}x{h} x{bands} {grid:?}");
         Ok(ImgTile { width: w as usize, height: h as usize, bands, grid, origin, step: (scale[0], scale[1]), data })
     }
@@ -386,6 +470,44 @@ impl ImgTile {
         }
         Some((px as usize, py as usize))
     }
+
+    /// The scene light of the pixel whose first sample is at `i`, or None when every band is 0.
+    fn light(&self, i: usize) -> Option<[f32; 4]> {
+        let n = self.bands.min(4);
+        match &self.data {
+            Samples::Display(d) => {
+                let px = &d[i..i + n];
+                if px.iter().all(|&v| v == 0) {
+                    return None;
+                }
+                let t = srgb_table();
+                if n == 1 {
+                    return Some([t[px[0] as usize], 0.0, 0.0, 0.0]);
+                }
+                let rgb = [t[px[0] as usize], t[px[1] as usize], t[px.get(2).copied().unwrap_or(0) as usize]];
+                let v = srgb_to_vsf(rgb);
+                Some([v[0], v[1], v[2], px.get(3).map_or(0.0, |&b| t[b as usize])])
+            }
+            Samples::Reflectance { data, offset } => {
+                let px = &data[i..i + n];
+                if px.iter().all(|&v| v == 0) {
+                    return None;
+                }
+                let r = |d: u16| d.saturating_sub(*offset) as f32 / 10000.0;
+                if n == 1 {
+                    return Some([r(px[0]) / NIR_WHITE, 0.0, 0.0, 0.0]);
+                }
+                let v = mul3(sentinel_to_vsf(), [r(px[0]), r(px[1]), r(px.get(2).copied().unwrap_or(0))]);
+                Some([v[0] / VISIBLE_WHITE, v[1] / VISIBLE_WHITE, v[2] / VISIBLE_WHITE, px.get(3).map_or(0.0, |&d| r(d) / NIR_WHITE)])
+            }
+        }
+    }
+}
+
+/// Linear sRGB to VSF RGB (vsf's matrix, D65 adapted to E; column-major there).
+fn srgb_to_vsf(x: [f32; 3]) -> [f32; 3] {
+    let m = &vsf::colour::SRGB2VSF_RGB;
+    [m[0] * x[0] + m[3] * x[1] + m[6] * x[2], m[1] * x[0] + m[4] * x[1] + m[7] * x[2], m[2] * x[0] + m[5] * x[1] + m[8] * x[2]]
 }
 
 impl ImgStore {
@@ -417,23 +539,19 @@ impl ImgStore {
     }
 
     /// [`ImgStore::sample`] at a (lat, lon) pair, longitude wrapped into -180..180 as the source tiles are.
-    pub fn sample_lat_lon(&self, p: (f64, f64)) -> Option<[u8; 4]> {
+    pub fn sample_lat_lon(&self, p: (f64, f64)) -> Option<[f32; 4]> {
         self.sample(p.0, (p.1 + 180.0).rem_euclid(360.0) - 180.0)
     }
 
-    /// Nearest-pixel sample of up to four bands at (lat, lon): None outside coverage or where every band is 0 (NAIP's no-data collar).
-    pub fn sample(&self, lat: f64, lon: f64) -> Option<[u8; 4]> {
+    /// Nearest-pixel scene light at (lat, lon): VSF RGB red, green, blue (paper white 1), then near-infrared (paper white 1 at [`NIR_WHITE`]); a single-band tile is near-infrared alone and comes back in the first slot. None outside coverage or where every band is 0 (the no-data collar).: None outside coverage or where every band is 0 (NAIP's no-data collar).
+    pub fn sample(&self, lat: f64, lon: f64) -> Option<[f32; 4]> {
         let near = self.by_square.get(&(lat.floor() as i32, lon.floor() as i32)).map_or(&[][..], |v| &v[..]);
         for &ti in near.iter().chain(&self.others) {
             let t = &self.tiles[ti];
             if let Some((px, py)) = t.pixel_at(lat, lon) {
                 let i = (py * t.width + px) * t.bands;
-                let mut out = [0u8; 4];
-                for b in 0..t.bands.min(4) {
-                    out[b] = t.data[i + b];
-                }
-                if out.iter().any(|&v| v != 0) {
-                    return Some(out);
+                if let Some(x) = t.light(i) {
+                    return Some(x);
                 }
             }
         }
@@ -605,21 +723,9 @@ impl IntensityStore {
     }
 }
 
-/// Reflectance shown as white: 30% for the visible bands (bright soil and concrete near the top, snow and cloud clipped), 50% for the near-infrared (where leaves are bright).
-const VISIBLE_WHITE: f32 = 0.30;
-const NIR_WHITE: f32 = 0.50;
-
-/// Sixteen-bit reflectance samples (10000 per unit, less `offset`) to display bytes: exposed so `white` reflectance is full scale, then encoded at gamma 2 as every colour in the house is, so the linear light the renderer recovers is proportional to the reflectance. 0 stays 0 (no data); anything else is at least 1.
-fn reflectance_lut(offset: u16, white: f32) -> Vec<u8> {
-    (0..=u16::MAX)
-        .map(|d| if d == 0 { 0 } else { (255.0 * ((d.saturating_sub(offset) as f32 / 10000.0) / white).sqrt()).round().clamp(1.0, 255.0) as u8 })
-        .collect()
-}
-
-/// A tiled, deflate-compressed, single-band TIFF of 15-bit samples (no predictor), read tile by tile and mapped as near-infrared reflectance (10000 per unit with a 1000 offset) by [`reflectance_lut`], 0 kept for no data.
-fn read_tiled_u15<R: std::io::Read + std::io::Seek>(path: &str, dec: &mut Decoder<R>, w: usize, h: usize) -> Result<Vec<u8>, String> {
+/// A tiled, deflate-compressed, single-band TIFF of 15-bit samples (no predictor), read tile by tile into 16-bit samples as they are.
+fn read_tiled_u15<R: std::io::Read + std::io::Seek>(path: &str, dec: &mut Decoder<R>, w: usize, h: usize) -> Result<Vec<u16>, String> {
     use std::io::{Read, Seek, SeekFrom};
-    let lut = reflectance_lut(1000, NIR_WHITE);
     let get = |dec: &mut Decoder<R>, t: Tag| dec.get_tag_u32_vec(t).ok().and_then(|v| v.first().copied());
     let (tw, th) = (get(dec, Tag::TileWidth).ok_or("no TileWidth")? as usize, get(dec, Tag::TileLength).ok_or("no TileLength")? as usize);
     if get(dec, Tag::Compression) != Some(8) || get(dec, Tag::Predictor).unwrap_or(1) != 1 {
@@ -629,7 +735,7 @@ fn read_tiled_u15<R: std::io::Read + std::io::Seek>(path: &str, dec: &mut Decode
     let counts = dec.get_tag_u64_vec(Tag::TileByteCounts).map_err(|e| format!("{path}: {e}"))?;
     let across = w.div_ceil(tw);
     let mut file = File::open(path).map_err(|e| format!("{path}: {e}"))?;
-    let mut out = vec![0u8; w * h];
+    let mut out = vec![0u16; w * h];
     let mut raw = Vec::new();
     for (t, (&off, &len)) in offsets.iter().zip(&counts).enumerate() {
         raw.resize(len as usize, 0);
@@ -656,7 +762,7 @@ fn read_tiled_u15<R: std::io::Read + std::io::Seek>(path: &str, dec: &mut Decode
                 let d = ((acc >> nbits) & 0x7FFF) as u16;
                 let x = x0 + rx;
                 if x < w {
-                    out[y * w + x] = lut[d as usize];
+                    out[y * w + x] = d;
                 }
             }
         }

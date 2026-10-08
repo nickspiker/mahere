@@ -1,5 +1,7 @@
 package nz.mahere.app
 
+import android.content.pm.ActivityInfo
+import android.os.Build
 import android.Manifest
 import android.app.Activity
 import android.content.Context
@@ -64,6 +66,13 @@ class MahereActivity : Activity(), SurfaceHolder.Callback, Choreographer.FrameCa
         surfaceView.holder.addCallback(this)
         setContentView(surfaceView)
         hideSystemBars()
+        // The map tags its buffers BT.2020 (gpu_host::tag_bt2020); wide-gamut mode lets the panel show them without an sRGB clamp, and minimal post-processing asks the compositor to skip vendor saturation passes.
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            window.colorMode = ActivityInfo.COLOR_MODE_WIDE_COLOR_GAMUT
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            window.attributes = window.attributes.also { it.preferMinimalPostProcessing = true }
+        }
 
         // Cells stream from the bucket into the vault now; nothing ships in the APK. Drop the staged copy earlier builds left behind.
         thread {
