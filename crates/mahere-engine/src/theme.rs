@@ -5,7 +5,7 @@
 use crate::raster::{LayerMask, Style};
 
 /// Bumped whenever the built-ins change, so a vault holding an older copy of one is refreshed.
-pub const BUILTIN_REVISION: u32 = 3;
+pub const BUILTIN_REVISION: u32 = 4;
 
 #[derive(Clone, Debug)]
 pub struct Theme {
@@ -292,11 +292,172 @@ impl Theme {
     }
 }
 
-pub const BUILTIN_NAMES: [&str; 6] = ["Trail", "Topo", "Night", "Alpine", "Desert", "Ink"];
+/// A cyanotype: Prussian-blue paper that deepens with height, white lines, pale cyan contours, water a paler wash. A survey blueprint, cool light from straight above.
+pub fn blueprint() -> Theme {
+    Theme {
+        name: "Blueprint".to_string(),
+        revision: BUILTIN_REVISION,
+        edited: false,
+        hypso: [(0.0, [34, 70, 128]), (600.0, [30, 62, 116]), (1200.0, [26, 54, 104]), (1900.0, [22, 46, 92]), (2600.0, [18, 38, 78])],
+        sea: [22, 46, 92],
+        flat: [30, 62, 116],
+        bg: [10, 20, 40],
+        no_dem: [28, 56, 104],
+        land: [[0, 0, 0], [40, 82, 136], [44, 78, 132], [40, 84, 138], [38, 76, 128], [30, 74, 124], [36, 80, 140], [50, 84, 134], [44, 70, 118], [70, 104, 150], [42, 68, 112], [46, 72, 120], [50, 76, 124], [22, 46, 92]],
+        line: [[0, 0, 0], [255, 255, 255], [246, 248, 255], [232, 238, 250], [214, 224, 242], [196, 210, 232], [178, 194, 220], [150, 168, 200], [204, 196, 160], [255, 226, 120], [200, 206, 220], [160, 176, 204], [140, 200, 240], [170, 230, 210], [180, 232, 190], [170, 224, 170], [160, 220, 220], [230, 190, 240]],
+        water: [90, 150, 210],
+        contour: [140, 190, 235],
+        contour_index: [190, 225, 250],
+        contour_alpha: [0.45, 0.75],
+        sun: [0.90, 0.95, 1.05],
+        sky: [1.10, 1.14, 1.24],
+        layers: ALL,
+    }
+}
+
+/// An atlas plate of the 1890s: cream paper that browns toward the hills, woodland in dusky green, oxblood roads, umber rail, water in a faded blue, contours in sepia. A warm lamp over the page.
+pub fn atlas() -> Theme {
+    Theme {
+        name: "Atlas".to_string(),
+        revision: BUILTIN_REVISION,
+        edited: false,
+        hypso: [(0.0, [236, 226, 196]), (600.0, [230, 214, 178]), (1200.0, [220, 198, 158]), (1900.0, [206, 180, 140]), (2600.0, [190, 162, 126])],
+        sea: [176, 200, 206],
+        flat: [238, 230, 206],
+        bg: [60, 48, 36],
+        no_dem: [226, 216, 190],
+        land: [[0, 0, 0], [210, 214, 164], [228, 216, 170], [206, 212, 160], [212, 206, 160], [164, 180, 130], [188, 206, 184], [236, 224, 180], [206, 196, 176], [238, 236, 222], [204, 190, 166], [210, 198, 186], [218, 204, 186], [176, 200, 206]],
+        line: [[0, 0, 0], [122, 28, 30], [136, 40, 34], [150, 54, 40], [112, 70, 46], [98, 76, 56], [86, 74, 62], [120, 108, 92], [110, 82, 50], [160, 36, 60], [70, 52, 40], [130, 112, 92], [80, 120, 150], [96, 130, 90], [110, 140, 90], [120, 124, 70], [100, 130, 110], [140, 100, 130]],
+        water: [150, 184, 194],
+        contour: [150, 112, 70],
+        contour_index: [118, 82, 46],
+        contour_alpha: [0.45, 0.72],
+        sun: [1.04, 0.98, 0.86],
+        sky: [1.06, 1.08, 1.12],
+        layers: ALL,
+    }
+}
+
+/// Volcanic: black ground that glows ember-orange toward the summits, water as cooled black glass with a blue edge, trails in bright yellow, roads in hot greys. A low red sun under a dark sky.
+pub fn ember() -> Theme {
+    Theme {
+        name: "Ember".to_string(),
+        revision: BUILTIN_REVISION,
+        edited: false,
+        hypso: [(0.0, [30, 24, 26]), (500.0, [64, 34, 30]), (1000.0, [124, 52, 30]), (1600.0, [196, 104, 40]), (2400.0, [244, 190, 90])],
+        sea: [14, 18, 30],
+        flat: [48, 40, 40],
+        bg: [8, 6, 8],
+        no_dem: [40, 34, 34],
+        land: [[0, 0, 0], [60, 56, 40], [70, 58, 40], [62, 60, 42], [66, 56, 42], [44, 50, 38], [50, 58, 56], [84, 70, 48], [62, 58, 56], [120, 118, 124], [74, 64, 58], [70, 62, 66], [78, 70, 70], [14, 18, 30]],
+        line: [[0, 0, 0], [240, 110, 60], [236, 130, 70], [230, 150, 84], [212, 170, 110], [196, 186, 170], [176, 172, 168], [140, 136, 134], [190, 140, 90], [255, 230, 70], [150, 150, 156], [140, 130, 170], [70, 130, 200], [110, 170, 100], [130, 180, 100], [150, 160, 90], [100, 170, 150], [190, 130, 210]],
+        water: [30, 44, 70],
+        contour: [150, 110, 90],
+        contour_index: [200, 150, 110],
+        contour_alpha: [0.30, 0.55],
+        sun: [1.20, 0.80, 0.55],
+        sky: [0.85, 0.84, 0.95],
+        layers: ALL,
+    }
+}
+
+/// Monsoon country: emerald lowlands rising through saturated greens to ochre ridges, teal water, hot-pink trails, roads in deep plum. Warm hazy light.
+pub fn monsoon() -> Theme {
+    Theme {
+        name: "Monsoon".to_string(),
+        revision: BUILTIN_REVISION,
+        edited: false,
+        hypso: [(0.0, [70, 160, 100]), (500.0, [116, 180, 96]), (1000.0, [184, 184, 100]), (1600.0, [222, 170, 104]), (2400.0, [240, 224, 190])],
+        sea: [44, 150, 170],
+        flat: [160, 196, 140],
+        bg: [20, 40, 36],
+        no_dem: [140, 180, 130],
+        land: [[0, 0, 0], [120, 196, 110], [196, 204, 120], [130, 200, 116], [140, 190, 120], [60, 150, 90], [80, 180, 170], [226, 212, 150], [170, 176, 160], [230, 240, 240], [176, 160, 130], [168, 160, 176], [190, 184, 176], [44, 150, 170]],
+        line: [[0, 0, 0], [96, 30, 80], [110, 40, 92], [124, 52, 104], [100, 60, 96], [86, 66, 90], [72, 62, 80], [110, 100, 116], [120, 80, 60], [255, 60, 150], [50, 40, 60], [120, 110, 160], [20, 120, 150], [40, 110, 70], [70, 130, 70], [90, 120, 50], [50, 130, 110], [150, 90, 170]],
+        water: [50, 160, 180],
+        contour: [60, 90, 70],
+        contour_index: [30, 60, 44],
+        contour_alpha: [0.46, 0.72],
+        sun: [1.06, 1.00, 0.84],
+        sky: [1.00, 1.08, 1.14],
+        layers: ALL,
+    }
+}
+
+/// An Admiralty chart: buff land kept flat and quiet, the water a pale white-blue that holds the eye, soundings-blue contours, black roads, magenta for every boundary as a chart draws its limits. Even light, no drama.
+pub fn chart() -> Theme {
+    Theme {
+        name: "Chart".to_string(),
+        revision: BUILTIN_REVISION,
+        edited: false,
+        hypso: [(0.0, [240, 232, 192]), (600.0, [240, 232, 192]), (1200.0, [240, 232, 192]), (1900.0, [240, 232, 192]), (2600.0, [240, 232, 192])],
+        sea: [206, 230, 244],
+        flat: [240, 232, 192],
+        bg: [214, 222, 230],
+        no_dem: [228, 220, 186],
+        land: [[0, 0, 0], [224, 224, 176], [232, 224, 182], [222, 224, 174], [226, 220, 180], [204, 212, 164], [206, 224, 212], [238, 230, 190], [222, 216, 200], [240, 244, 246], [220, 210, 194], [224, 214, 206], [228, 220, 204], [206, 230, 244]],
+        line: [[0, 0, 0], [40, 40, 40], [52, 52, 52], [66, 66, 66], [84, 84, 84], [100, 100, 100], [120, 120, 120], [150, 150, 150], [130, 100, 70], [200, 30, 110], [60, 60, 60], [150, 140, 170], [60, 130, 200], [210, 60, 170], [210, 60, 170], [210, 60, 170], [210, 60, 170], [210, 60, 170]],
+        water: [190, 222, 240],
+        contour: [90, 140, 190],
+        contour_index: [50, 100, 160],
+        contour_alpha: [0.40, 0.70],
+        sun: [0.32, 0.32, 0.33],
+        sky: [2.20, 2.22, 2.26],
+        layers: LayerMask { hypso: false, ..ALL },
+    }
+}
+
+/// Neon: near-black violet ground, ridges that light up magenta with height, cyan water, trails in electric yellow, roads in cool neon, contours as a faint blue grid. A magenta sun over a violet sky.
+pub fn neon() -> Theme {
+    Theme {
+        name: "Neon".to_string(),
+        revision: BUILTIN_REVISION,
+        edited: false,
+        hypso: [(0.0, [22, 12, 40]), (600.0, [44, 18, 70]), (1200.0, [90, 28, 110]), (1900.0, [160, 40, 150]), (2600.0, [240, 90, 200])],
+        sea: [6, 30, 50],
+        flat: [36, 20, 56],
+        bg: [6, 4, 14],
+        no_dem: [30, 18, 48],
+        land: [[0, 0, 0], [30, 60, 60], [56, 40, 70], [34, 62, 64], [44, 46, 70], [18, 54, 60], [20, 60, 80], [70, 54, 70], [50, 44, 66], [110, 110, 160], [58, 40, 60], [60, 36, 80], [66, 44, 84], [6, 30, 50]],
+        line: [[0, 0, 0], [255, 90, 220], [240, 110, 230], [220, 130, 240], [180, 140, 240], [150, 150, 230], [130, 140, 210], [110, 110, 170], [200, 120, 160], [240, 255, 60], [120, 120, 180], [150, 110, 220], [40, 220, 255], [60, 240, 180], [80, 240, 140], [120, 230, 120], [60, 230, 220], [220, 120, 255]],
+        water: [20, 160, 220],
+        contour: [70, 100, 200],
+        contour_index: [110, 150, 255],
+        contour_alpha: [0.40, 0.66],
+        sun: [1.10, 0.70, 1.10],
+        sky: [0.80, 0.80, 1.10],
+        layers: ALL,
+    }
+}
+
+/// First light: rose-gold valleys rising through peach to lavender summits, water a dusty teal, roads in plum, trails in deep rose. A long low sun from the side and a cool sky.
+pub fn dawn() -> Theme {
+    Theme {
+        name: "Dawn".to_string(),
+        revision: BUILTIN_REVISION,
+        edited: false,
+        hypso: [(0.0, [232, 196, 172]), (600.0, [238, 204, 176]), (1200.0, [240, 212, 190]), (1900.0, [228, 206, 214]), (2600.0, [214, 200, 236])],
+        sea: [150, 190, 200],
+        flat: [238, 212, 196],
+        bg: [50, 40, 60],
+        no_dem: [226, 204, 190],
+        land: [[0, 0, 0], [214, 206, 160], [236, 210, 168], [212, 208, 164], [224, 200, 170], [186, 180, 150], [196, 206, 200], [244, 220, 184], [218, 200, 196], [244, 240, 250], [214, 196, 186], [220, 200, 210], [230, 210, 206], [150, 190, 200]],
+        line: [[0, 0, 0], [120, 40, 90], [134, 52, 100], [150, 66, 110], [120, 78, 110], [108, 88, 112], [96, 84, 104], [130, 116, 130], [130, 84, 70], [190, 30, 90], [70, 56, 76], [140, 120, 170], [60, 130, 170], [90, 140, 100], [110, 150, 100], [120, 130, 80], [80, 140, 130], [160, 100, 170]],
+        water: [140, 186, 198],
+        contour: [170, 120, 120],
+        contour_index: [140, 86, 96],
+        contour_alpha: [0.38, 0.64],
+        sun: [1.10, 0.92, 0.78],
+        sky: [0.96, 1.04, 1.26],
+        layers: ALL,
+    }
+}
+
+pub const BUILTIN_NAMES: [&str; 13] = ["Trail", "Topo", "Night", "Alpine", "Desert", "Ink", "Blueprint", "Atlas", "Ember", "Monsoon", "Chart", "Neon", "Dawn"];
 
 /// The built-in themes, as authored: VSF RGB, gamma 2. The renderers convert to the display at their one encode.
 pub fn builtin() -> Vec<Theme> {
-    vec![trail(), topo(), night(), alpine(), desert(), ink()]
+    vec![trail(), topo(), night(), alpine(), desert(), ink(), blueprint(), atlas(), ember(), monsoon(), chart(), neon(), dawn()]
 }
 
 impl Theme {
