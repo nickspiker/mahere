@@ -106,6 +106,8 @@ pub struct MapCore {
     /// The world-fixed sphere the camera paints, and the lens its frames come through.
     sphere: Option<Box<probe::Sphere>>,
     lens: Option<probe::Lens>,
+    /// The real sun's direction in the device frame, as last lit.
+    sun_device: [f32; 3],
     /// Turn the map with the device so screen-up is the way the phone points.
     pub follow_heading: bool,
     /// Magnetic declination at the position, degrees, east positive: true heading = the sensor's magnetic heading + this.
@@ -174,6 +176,7 @@ impl MapCore {
             probe: None,
             sphere: None,
             lens: None,
+            sun_device: [0.0, 0.0, 1.0],
             follow_heading: false,
             declination_deg: 0.0,
             have_rotation: false,
@@ -393,10 +396,47 @@ impl MapCore {
 
     /// The sphere's light at the current rotation.
     fn relight_probe(&mut self) {
-        let Some(sphere) = &self.sphere else { return };
+        let Some(sphere) = &mut self.sphere else { return };
         self.probe = sphere.light(&self.device_rot);
         self.luts_sun = (f32::NAN, f32::NAN, f64::NAN);
         self.dirty = true;
+    }
+
+    /// The light as a ball the size of the gear, `size × size` display RGBA, oriented to the screen (x right, y up, z out): with real light, the painted sphere itself, every visible point the radiance in that direction and the unpainted left clear; with the real sun, a white ball lit by it with the sun as a point where it stands. None when neither mode is on.
+    pub fn orb(&self, size: usize) -> Option<Vec<[u8; 4]>> {
+        if !(self.real_light || self.real_sun) || size == 0 {
+            return None;
+        }
+        let t = &self.themes[self.theme.min(self.themes.len() - 1)];
+        let sun = colour::lin(t.sun.map(|v| (v.sqrt() * 256.0).min(255.0) as u8));
+        let mut out = vec![[0u8; 4]; size * size];
+        let r = size as f32 * 0.5;
+        for py in 0..size {
+            for px in 0..size {
+                let (x, y) = ((px as f32 + 0.5 - r) / r, (r - py as f32 - 0.5) / r);
+                let rr = x * x + y * y;
+                if rr > 1.0 {
+                    continue;
+                }
+                let d = [x, y, (1.0 - rr).sqrt()];
+                let lit: Option<[f32; 3]> = if self.real_light {
+                    self.sphere.as_ref().and_then(|s| {
+                        let rot = &self.device_rot;
+                        s.radiance([rot[0] * d[0] + rot[1] * d[1] + rot[2] * d[2], rot[3] * d[0] + rot[4] * d[1] + rot[5] * d[2], rot[6] * d[0] + rot[7] * d[1] + rot[8] * d[2]])
+                    })
+                } else {
+                    let s = self.sun_device;
+                    let cos = d[0] * s[0] + d[1] * s[1] + d[2] * s[2];
+                    // The disc of the sun: a few degrees across, white.
+                    if cos > 0.996 { Some([4.0; 3]) } else { Some([sun[0] * cos.max(0.0) + 0.04, sun[1] * cos.max(0.0) + 0.04, sun[2] * cos.max(0.0) + 0.05]) }
+                };
+                if let Some(l) = lit {
+                    let c = self.luts.display.encode(l, self.luts.compressed);
+                    out[py * size + px] = [c[0], c[1], c[2], 255];
+                }
+            }
+        }
+        Some(out)
     }
 
     /// How much of the sphere the camera has painted, 0..1.
@@ -601,7 +641,8 @@ impl MapCore {
                 let frames = Frames { declination_deg: self.declination_deg, map_locked: !self.have_rotation, rot: self.device_rot, bearing_deg: self.cam.bearing.to_degrees() as f32, heading_mag_deg: self.device_heading };
                 let t = &self.themes[self.theme.min(self.themes.len() - 1)];
                 let (sb, cb) = self.cam.bearing.sin_cos();
-                self.luts.light = sh::Quad::directional(frames.to_screen(az as f32, alt as f32), t.sun, (sb as f32, cb as f32));
+                self.sun_device = frames.to_screen(az as f32, alt as f32);
+                self.luts.light = sh::Quad::directional(self.sun_device, t.sun, (sb as f32, cb as f32));
                 self.luts_sun = (self.sun_az, self.sun_alt, self.cam.bearing);
                 self.light_version += 1;
             } else {

@@ -311,31 +311,59 @@ impl Panel {
         x < self.panel_w
     }
 
-    /// Paint for a `w × h` screen: the gear always, the column when open. Returns the buffer in fluor's pixel convention.
-    pub fn paint(&mut self, w: usize, h: usize, mask: LayerMask, ctl: Controls, r: &Readouts, measure: Option<&MeasureView>, themes: &[Theme]) -> &[u32] {
+    /// Paint for a `w × h` screen: the gear always (or, when `orb` gives one, the light as a ball in its place), the column when open. Returns the buffer in fluor's pixel convention.
+    pub fn paint(&mut self, w: usize, h: usize, mask: LayerMask, ctl: Controls, r: &Readouts, measure: Option<&MeasureView>, themes: &[Theme], orb: Option<&dyn Fn(usize) -> Option<Vec<[u8; 4]>>>) -> &[u32] {
         self.layout(w, h);
         self.buf.clear();
         self.buf.resize(w * h, 0);
         if w == 0 || h == 0 {
             return &self.buf;
         }
-        let mut damage = Damage::new();
-        let mut canvas = Canvas::new(&mut self.buf, w, h, &mut damage);
         let font = self.font;
-        // Topmost first: the gear's hole, its ring and eight teeth, then the disc under them.
         let (gx, gy, gr) = self.gear;
         let ink_col = theme::TEXTBOX_TEXT;
-        paint::circle_filled(&mut canvas, gx as isize, gy as isize, (gr * 0.18) as isize, GEAR_BG, None, None);
-        paint::circle_filled(&mut canvas, gx as isize, gy as isize, (gr * 0.36) as isize, ink_col, None, None);
-        for k in 0..8 {
-            let a = k as f32 * core::f32::consts::FRAC_PI_4;
-            let (s, c) = a.sin_cos();
-            let (tx, ty) = (gx + c * gr * 0.58, gy + s * gr * 0.58);
-            paint::circle_filled(&mut canvas, tx as isize, ty as isize, (gr * 0.17).max(2.0) as isize, ink_col, None, None);
+        // The light as a ball where the gear sits, when a mode has one.
+        let ball = orb.and_then(|f| {
+            let size = (gr * 2.0) as usize;
+            f(size).map(|img| (size, img))
+        });
+        {
+            let mut damage = Damage::new();
+            let mut canvas = Canvas::new(&mut self.buf, w, h, &mut damage);
+            if ball.is_none() {
+                // Topmost first: the gear's hole, its ring and eight teeth, then the disc under them.
+                paint::circle_filled(&mut canvas, gx as isize, gy as isize, (gr * 0.18) as isize, GEAR_BG, None, None);
+                paint::circle_filled(&mut canvas, gx as isize, gy as isize, (gr * 0.36) as isize, ink_col, None, None);
+                for k in 0..8 {
+                    let a = k as f32 * core::f32::consts::FRAC_PI_4;
+                    let (s, c) = a.sin_cos();
+                    let (tx, ty) = (gx + c * gr * 0.58, gy + s * gr * 0.58);
+                    paint::circle_filled(&mut canvas, tx as isize, ty as isize, (gr * 0.17).max(2.0) as isize, ink_col, None, None);
+                }
+                paint::circle_filled(&mut canvas, gx as isize, gy as isize, (gr * 0.52) as isize, GEAR_BG, None, None);
+                paint::circle_filled(&mut canvas, gx as isize, gy as isize, (gr * 0.44) as isize, ink_col, None, None);
+            }
+            paint::circle_filled(&mut canvas, gx as isize, gy as isize, gr as isize, GEAR_BG, None, None);
         }
-        paint::circle_filled(&mut canvas, gx as isize, gy as isize, (gr * 0.52) as isize, GEAR_BG, None, None);
-        paint::circle_filled(&mut canvas, gx as isize, gy as isize, (gr * 0.44) as isize, ink_col, None, None);
-        paint::circle_filled(&mut canvas, gx as isize, gy as isize, gr as isize, GEAR_BG, None, None);
+        // The ball's display pixels straight into the buffer over the disc; where nothing is painted the disc shows.
+        if let Some((size, img)) = &ball {
+            let (x0, y0) = ((gx - gr) as isize, (gy - gr) as isize);
+            for py in 0..*size {
+                for px in 0..*size {
+                    let p = img[py * size + px];
+                    if p[3] == 0 {
+                        continue;
+                    }
+                    let (x, y) = (x0 + px as isize, y0 + py as isize);
+                    if x < 0 || y < 0 || x as usize >= w || y as usize >= h {
+                        continue;
+                    }
+                    self.buf[y as usize * w + x as usize] = (theme::dark(theme::fmt(((p[0] as u32) << 16) | ((p[1] as u32) << 8) | p[2] as u32)) & 0x00FF_FFFF) | 0xFF00_0000;
+                }
+            }
+        }
+        let mut damage = Damage::new();
+        let mut canvas = Canvas::new(&mut self.buf, w, h, &mut damage);
         self.strip_close = None;
         if let Some(m) = measure {
             self.strip_close = Some(Self::paint_strip(&mut canvas, &mut self.text, w, h, font, m));

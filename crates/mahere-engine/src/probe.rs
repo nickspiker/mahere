@@ -283,6 +283,8 @@ pub struct Sphere {
     pub seen: Vec<bool>,
     /// Unit direction of each triangle's centre, in the world frame.
     pub centres: Vec<[f32; 3]>,
+    /// The level the last light was held to: the brightest irradiance any normal sees, in the sphere's units.
+    pub level: f32,
 }
 
 /// The triangle a world direction falls in: the depth-2 cell's diamond and grid, and which half by the carry of the fractional parts of u and v.
@@ -317,7 +319,7 @@ impl Sphere {
                 }
             }
         }
-        Sphere { tris: vec![[0; 3]; TRIS], seen: vec![false; TRIS], centres }
+        Sphere { tris: vec![[0; 3]; TRIS], seen: vec![false; TRIS], centres, level: 0.0 }
     }
 
     /// Paint a frame: every bin's direction taken through the device's rotation `rot` (row-major, world = rot · device) into the world, the bins landing in a triangle averaged and written over it.
@@ -341,7 +343,7 @@ impl Sphere {
     }
 
     /// The painted sphere as the light, projected in the device frame for `rot` and held to its own level: the brightest a normal can be lit by it is one. None until something is painted.
-    pub fn light(&self, rot: &[f32; 9]) -> Option<Sh9> {
+    pub fn light(&mut self, rot: &[f32; 9]) -> Option<Sh9> {
         let omega = 4.0 * std::f32::consts::PI / TRIS as f32;
         let mut world = Sh9::ZERO;
         let mut device = Sh9::ZERO;
@@ -375,7 +377,22 @@ impl Sphere {
         if peak <= 0.0 {
             return None;
         }
+        self.level = peak;
         Some(device.scaled(1.0 / peak))
+    }
+
+    /// The radiance painted in a world direction as light on the map's scale (a sphere of this radiance everywhere would light every normal to one), or None where nothing is painted yet.
+    pub fn radiance(&self, world: [f32; 3]) -> Option<[f32; 3]> {
+        if self.level <= 0.0 {
+            return None;
+        }
+        let t = tri_of(world);
+        if !self.seen[t] {
+            return None;
+        }
+        let k = std::f32::consts::PI / self.level;
+        let r = self.tris[t];
+        Some([r[0] as f32 * k, r[1] as f32 * k, r[2] as f32 * k])
     }
 }
 
@@ -423,6 +440,10 @@ mod tests {
         // A 57° × 75° field covers around a tenth of the sphere.
         assert!((15..=60).contains(&seen), "{seen} triangles painted");
         let sh = s.light(&IDENTITY).unwrap();
+        // On the map's scale a sphere of radiance one lights every normal to one, so a patch a tenth of the sphere that lights its own direction to one is brighter than one.
+        let r = s.radiance([0.0, 0.0, 1.0]).unwrap();
+        assert!(r[1] > 1.0 && r[1] < 4.0, "{r:?}");
+        assert!(s.radiance([0.0, 0.0, -1.0]).is_none());
         let out = sh.irradiance([0.0, 0.0, 1.0]);
         let back = sh.irradiance([0.0, 0.0, -1.0]);
         assert!(out[1] > 0.9 && out[1] <= 1.01, "{out:?}");
@@ -461,6 +482,7 @@ mod tests {
         // And the light it gives, seen from the turned phone, is the same light turned back, to within the triangles' 16°.
         let la = a.light(&IDENTITY).unwrap();
         let lb = b.light(&quarter).unwrap();
+        let _ = (&a, &b);
         for n in [[0.7071, 0.0, 0.7071], [0.0, 0.7071, 0.7071]] {
             let (ea, eb) = (la.irradiance(n), lb.irradiance(n));
             assert!((ea[1] - eb[1]).abs() < 0.05, "{n:?}: {ea:?} vs {eb:?}");
