@@ -14,7 +14,7 @@ import android.os.HandlerThread
 import android.util.Log
 
 /**
- * The front camera as a light meter: the widest raw-capable front lens, fully manual (no auto-exposure, ISO at the floor), its exposure stepped down until no sample clips and up when the frame is dim, a few frames a second. Every frame goes to Rust as the raw Bayer samples with the sensor's colour matrix and lens geometry; nothing is kept or shown.
+ * The front camera as a light meter: the widest raw-capable front lens, fully manual (no auto-exposure, ISO at the floor), its exposure stepped down until almost nothing clips and up when the frame is dim. Frames alternate a long exposure with a bracket six stops shorter, so a lamp that is white in the long frame has a real brightness in the short one. Every frame goes to Rust as the raw Bayer samples with the sensor's colour matrix and lens geometry; nothing is kept or shown.
  */
 class Probe(private val context: Context, private val onFrame: (RawFrame, FloatArray) -> Unit) {
 
@@ -22,6 +22,7 @@ class Probe(private val context: Context, private val onFrame: (RawFrame, FloatA
         val buffer: java.nio.ByteBuffer, val width: Int, val height: Int, val rowStride: Int,
         val cfa: Int, val black: FloatArray, val white: Int, val orientation: Int,
         val tanW: Float, val tanH: Float, val xyzToCam: FloatArray,
+        val exposureNs: Long, val longNs: Long,
     )
 
     private var device: CameraDevice? = null
@@ -32,8 +33,39 @@ class Probe(private val context: Context, private val onFrame: (RawFrame, FloatA
     private var request: CaptureRequest.Builder? = null
     private var exposureNs = 4_000_000L
     private var exposureRange = LongRange(100_000L, 50_000_000L)
-    private var lastFrameNs = 0L
+    private var clippedAtNs = Long.MAX_VALUE
+    private var clippedWhen = 0L
+    private var lastLongNs = 0L
+    private var lastShortNs = 0L
+    /** Exposure by sensor timestamp, from the capture results, so an image knows which of the two it is. */
+    private val exposures = LinkedHashMap<Long, Long>()
     val running get() = device != null
+
+    private val shortNs get() = (exposureNs / 64).coerceIn(exposureRange)
+
+    private val captureCallback = object : CameraCaptureSession.CaptureCallback() {
+        // At the start of the exposure, before its image can arrive: the request says which of the two it is, the timestamp is the image's.
+        override fun onCaptureStarted(s: CameraCaptureSession, req: CaptureRequest, timestamp: Long, frameNumber: Long) {
+            val exp = req.get(CaptureRequest.SENSOR_EXPOSURE_TIME) ?: return
+            synchronized(exposures) {
+                exposures[timestamp] = exp
+                while (exposures.size > 16) exposures.remove(exposures.keys.first())
+            }
+        }
+    }
+
+    /** The long frame then the short bracket, repeating. */
+    private fun burst() {
+        val b = request ?: return
+        b.set(CaptureRequest.SENSOR_EXPOSURE_TIME, exposureNs)
+        val long = b.build()
+        b.set(CaptureRequest.SENSOR_EXPOSURE_TIME, shortNs)
+        val short = b.build()
+        try {
+            session?.setRepeatingBurst(listOf(long, short), captureCallback, handler)
+        } catch (_: Exception) {
+        }
+    }
 
     /** Open the widest raw front camera. False when there is none. */
     fun start(): Boolean {
@@ -90,14 +122,24 @@ class Probe(private val context: Context, private val onFrame: (RawFrame, FloatA
         r.setOnImageAvailableListener({ rd ->
             val img = rd.acquireLatestImage() ?: return@setOnImageAvailableListener
             try {
-                // A few frames a second are plenty for a light that changes with the clouds.
+                val exp = synchronized(exposures) { exposures[img.timestamp] } ?: run {
+                    Log.w("mahere", "probe: frame ${img.timestamp} has no exposure on record")
+                    return@setOnImageAvailableListener
+                }
+                val long = exp >= exposureNs
+                // A few frames a second of each are plenty for a light that changes with the clouds.
                 val now = System.nanoTime()
-                if (now - lastFrameNs < 250_000_000L) return@setOnImageAvailableListener
-                lastFrameNs = now
+                if (long) {
+                    if (now - lastLongNs < 250_000_000L) return@setOnImageAvailableListener
+                    lastLongNs = now
+                } else {
+                    if (now - lastShortNs < 250_000_000L) return@setOnImageAvailableListener
+                    lastShortNs = now
+                }
                 val plane = img.planes[0]
                 val stats = FloatArray(2)
-                onFrame(RawFrame(plane.buffer, img.width, img.height, plane.rowStride, cfa, black, white, orientation, tanW, tanH, xyzToCam), stats)
-                steer(stats[0], stats[1])
+                onFrame(RawFrame(plane.buffer, img.width, img.height, plane.rowStride, cfa, black, white, orientation, tanW, tanH, xyzToCam, exp, exposureNs), stats)
+                if (long) steer(stats[0], stats[1])
             } finally {
                 img.close()
             }
@@ -119,7 +161,7 @@ class Probe(private val context: Context, private val onFrame: (RawFrame, FloatA
                     d.createCaptureSession(listOf(r.surface), object : CameraCaptureSession.StateCallback() {
                         override fun onConfigured(s: CameraCaptureSession) {
                             session = s
-                            s.setRepeatingRequest(b.build(), null, h)
+                            burst()
                         }
                         override fun onConfigureFailed(s: CameraCaptureSession) {
                             Log.w("mahere", "probe: session failed")
@@ -141,22 +183,23 @@ class Probe(private val context: Context, private val onFrame: (RawFrame, FloatA
         return true
     }
 
-    /** Halve the exposure while more than a twentieth of a percent of the frame clips (a lamp or the sun clips at any exposure; the rest of the frame must not), double it while 99.9% of the frame sits under a quarter of white, within the sensor's range and a 50 ms cap. */
+    /** Halve the exposure while more than a twentieth of a percent of the frame clips (a lamp or the sun clips at any exposure; the rest of the frame must not), double it while 99.9% of the frame sits under a tenth of white, within the sensor's range and a 50 ms cap. An exposure that clipped is remembered for ten seconds and not returned to, so a lamp in the frame does not have the loop hunting between two stops. */
     private fun steer(clipped: Float, p999: Float) {
+        val now = System.nanoTime()
         val next = when {
-            clipped > 0.0005f -> exposureNs / 2
-            p999 < 0.25f -> exposureNs * 2
+            clipped > 0.0005f -> {
+                clippedAtNs = exposureNs
+                clippedWhen = now
+                exposureNs / 2
+            }
+            p999 < 0.1f -> exposureNs * 2
             else -> return
         }.coerceIn(exposureRange)
         if (next == exposureNs) return
+        if (next > exposureNs && next >= clippedAtNs && now - clippedWhen < 10_000_000_000L) return
         Log.i("mahere", "probe: clipped $clipped p999 $p999, exposure $exposureNs -> $next ns")
         exposureNs = next
-        val b = request ?: return
-        b.set(CaptureRequest.SENSOR_EXPOSURE_TIME, exposureNs)
-        try {
-            session?.setRepeatingRequest(b.build(), null, handler)
-        } catch (_: Exception) {
-        }
+        burst()
     }
 
     fun stop() {

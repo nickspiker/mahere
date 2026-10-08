@@ -57,6 +57,8 @@ pub struct AndroidApp {
     /// The GPU path, created on the first draw; None after a failure means the CPU present is in use.
     gpu: Option<GpuHost>,
     gpu_failed: bool,
+    /// The latest short bracket from the front camera (its exposure in ns, the binned frame): the long frame's clipped bins take their light from it.
+    probe_short: Option<(i64, mahere_engine::probe::Binned)>,
     panel: Panel,
     /// Bytes the cell cache may hold; purged to it at the pause moment.
     cache_budget: u64,
@@ -451,6 +453,7 @@ pub extern "system" fn Java_nz_mahere_app_MahereActivity_nativeInit(
         persist: Persist::new(),
         gpu: None,
         gpu_failed: false,
+            probe_short: None,
         panel: Panel::new(),
         cache_budget: settings.map_or(DEFAULT_CACHE_BUDGET, |s| if s.cache_budget == 0 { DEFAULT_CACHE_BUDGET } else { s.cache_budget }),
         data_dir: Some(dir.clone()),
@@ -669,6 +672,8 @@ pub extern "system" fn Java_nz_mahere_app_MahereActivity_nativeOnProbe(
     tan_h: jfloat,
     xyz_to_cam: JFloatArray,
     stats: JFloatArray,
+    exposure_ns: jlong,
+    long_ns: jlong,
 ) {
     use mahere_engine::probe::{Cfa, Raw, bin, to_vsf, upright};
     if ptr == 0 {
@@ -683,8 +688,21 @@ pub extern "system" fn Java_nz_mahere_app_MahereActivity_nativeOnProbe(
     let mut pedestal = [0f32; 4];
     let _ = env.get_float_array_region(&black, 0, &mut pedestal);
     let raw = Raw { data, w: w as usize, h: h as usize, row_stride: row_stride as usize, cfa, black: pedestal.map(|b| b as u16), white: white as u16 };
-    let (bw, bh, mut rgb, st) = bin(&raw, 48);
+    let mut b = bin(&raw, 48);
+    let app = shell(ptr).app();
+    // The short bracket: kept for the next long frame, which fills what it clipped from it.
+    if exposure_ns < long_ns {
+        app.probe_short = Some((exposure_ns, b));
+        return;
+    }
+    let st = b.stats;
     let _ = env.set_float_array_region(&stats, 0, &[st.clipped, st.p999]);
+    let mut filled = 0usize;
+    if let Some((short_ns, short)) = &app.probe_short {
+        filled = b.clipped.iter().filter(|&&c| c > 0).count();
+        b.fill_clipped(short, long_ns as f32 / (*short_ns).max(1) as f32);
+    }
+    let (bw, bh, mut rgb) = (b.w, b.h, b.rgb);
     let mean = |v: &[[f32; 3]]| {
         let n = v.len().max(1) as f32;
         v.iter().fold([0f32; 3], |a, p| [a[0] + p[0] / n, a[1] + p[1] / n, a[2] + p[2] / n])
@@ -702,7 +720,7 @@ pub extern "system" fn Java_nz_mahere_app_MahereActivity_nativeOnProbe(
     let mut last = LAST.lock().unwrap();
     if last.is_none_or(|t| t.elapsed().as_secs_f32() > 1.0) {
         *last = Some(std::time::Instant::now());
-        eprintln!("probe: clipped {:.5} p999 {:.3} cam {cam_mean:?} vsf {vsf_mean:?} screen {:?}", st.clipped, st.p999, sh.irradiance([0.0, 0.0, 1.0]));
+        eprintln!("probe: clipped {:.5} p999 {:.3} filled {filled} bins from the bracket; cam {cam_mean:?} vsf {vsf_mean:?} screen {:?}", st.clipped, st.p999, sh.irradiance([0.0, 0.0, 1.0]));
     }
-    shell(ptr).app().map.set_probe(sh);
+    app.map.set_probe(sh);
 }

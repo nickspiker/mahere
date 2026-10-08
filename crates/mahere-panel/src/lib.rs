@@ -84,6 +84,16 @@ const LAYERS: [(Layer, &str); 16] = [
     (Layer::LockToFix, "Measure from me"),
 ];
 
+/// A row that takes a tap but changes nothing: a layer another layer has greyed, or the one of real sun and real light the other has taken (the sun is either the almanac's or the camera's).
+fn inert(mask: &LayerMask, ctl: &Controls, l: Layer) -> bool {
+    match l {
+        Layer::RealSun => ctl.real_light,
+        Layer::RealLight => ctl.real_sun,
+        Layer::Linear | Layer::FollowHeading | Layer::LockToFix => false,
+        _ => get(&mask.inert(), &Controls::default(), l),
+    }
+}
+
 fn get(mask: &LayerMask, ctl: &Controls, l: Layer) -> bool {
     match l {
         Layer::RealSun => ctl.real_sun,
@@ -281,11 +291,10 @@ impl Panel {
             self.dirty = true;
             return true;
         }
-        let inert = mask.inert();
         for (l, cb) in &mut self.checks {
             if cb.bbox().contains(x, y) {
                 // A row a dominating layer has greyed takes the tap but changes nothing.
-                if get(&inert, &Controls::default(), *l) {
+                if inert(mask, ctl, *l) {
                     return true;
                 }
                 let v = !get(mask, ctl, *l);
@@ -343,11 +352,10 @@ impl Panel {
         let (tx, ty, _) = self.theme_row;
         let current = themes.get(ctl.theme).map_or("Trail", |t| t.name.as_str());
         self.text.draw_text_left(&mut canvas, &format!("Theme   {current}  \u{203a}"), tx, ty, &TextStyle::new(font, theme::TEXTBOX_TEXT), None, None);
-        let inert = mask.inert();
         for (l, cb) in &mut self.checks {
             cb.set_checked(get(&mask, &ctl, *l));
             // Greyed: a wash of the panel colour over the row, painted first so it lies on top.
-            if get(&inert, &Controls::default(), *l) {
+            if inert(&mask, &ctl, *l) {
                 let b = cb.bbox();
                 paint::fill_rect(&mut canvas, b.x as isize, b.y as isize, b.w as isize, b.h as isize, PANEL_DIM, None, None);
             }

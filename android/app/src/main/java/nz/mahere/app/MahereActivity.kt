@@ -56,13 +56,14 @@ class MahereActivity : Activity(), SurfaceHolder.Callback, Choreographer.FrameCa
     private external fun nativeOnProbe(
         ptr: Long, buffer: java.nio.ByteBuffer, width: Int, height: Int, rowStride: Int,
         cfa: Int, black: FloatArray, white: Int, orientation: Int, tanW: Float, tanH: Float, xyzToCam: FloatArray, stats: FloatArray,
+        exposureNs: Long, longNs: Long,
     )
 
     // The front camera as the light, opened when the engine asks for it (the Real light row) and closed when it stops asking.
     private val probe by lazy {
         Probe(this) { f, stats ->
             val p = nativePtr
-            if (p != 0L) nativeOnProbe(p, f.buffer, f.width, f.height, f.rowStride, f.cfa, f.black, f.white, f.orientation, f.tanW, f.tanH, f.xyzToCam, stats)
+            if (p != 0L) nativeOnProbe(p, f.buffer, f.width, f.height, f.rowStride, f.cfa, f.black, f.white, f.orientation, f.tanW, f.tanH, f.xyzToCam, stats, f.exposureNs, f.longNs)
         }
     }
     private var cameraAsked = false

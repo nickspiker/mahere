@@ -52,8 +52,32 @@ pub struct Stats {
     pub p999: f32,
 }
 
-/// Bin a raw frame to about `cols` columns of linear camera RGB (each 2×2 Bayer quad is one sample, then an integer box over those), with the frame's exposure statistics.
-pub fn bin(raw: &Raw, cols: usize) -> (usize, usize, Vec<[f32; 3]>, Stats) {
+/// A binned frame: linear camera RGB per bin, how many of each bin's raw samples were at white, and the frame's exposure statistics.
+pub struct Binned {
+    pub w: usize,
+    pub h: usize,
+    pub rgb: Vec<[f32; 3]>,
+    pub clipped: Vec<u16>,
+    pub stats: Stats,
+}
+
+impl Binned {
+    /// Fill the bins this frame clipped from a shorter exposure of the same scene, scaled by the exposure ratio: a lamp that is white at the long exposure gets its real brightness from the short one. A clipped bin's mean is a floor; the short frame's is the truth up to its own clip.
+    pub fn fill_clipped(&mut self, short: &Binned, ratio: f32) {
+        if (short.w, short.h) != (self.w, self.h) {
+            return;
+        }
+        for i in 0..self.rgb.len() {
+            if self.clipped[i] > 0 {
+                let s = short.rgb[i];
+                self.rgb[i] = [s[0] * ratio, s[1] * ratio, s[2] * ratio];
+            }
+        }
+    }
+}
+
+/// Bin a raw frame to about `cols` columns of linear camera RGB (each 2×2 Bayer quad is one sample, then an integer box over those), counting the samples at white in each bin, with the frame's exposure statistics.
+pub fn bin(raw: &Raw, cols: usize) -> Binned {
     let (qw, qh) = (raw.w / 2, raw.h / 2);
     let f = (qw / cols.max(1)).max(1);
     let (w, h) = (qw / f, qh / f);
@@ -73,6 +97,8 @@ pub fn bin(raw: &Raw, cols: usize) -> (usize, usize, Vec<[f32; 3]>, Stats) {
         Cfa::Bggr => (1, 1, 0, 0),
     };
     let mut out = vec![[0f32; 3]; w * h];
+    let mut clipped = vec![0u16; w * h];
+    let clip_at = raw.white.saturating_sub(2);
     let n = (f * f) as f32;
     for y in 0..h {
         for x in 0..w {
@@ -84,6 +110,9 @@ pub fn bin(raw: &Raw, cols: usize) -> (usize, usize, Vec<[f32; 3]>, Stats) {
                     for (dx, dy) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
                         let v = sample(qx + dx, qy + dy);
                         hist[((v as f32 * hist_scale) as usize).min(255)] += 1;
+                        if v >= clip_at {
+                            clipped[y * w + x] = clipped[y * w + x].saturating_add(1);
+                        }
                         let lin = (v.saturating_sub(raw.black[dy * 2 + dx])) as f32 * scale;
                         if (dx, dy) == (rx, ry) {
                             acc[0] += lin;
@@ -100,7 +129,7 @@ pub fn bin(raw: &Raw, cols: usize) -> (usize, usize, Vec<[f32; 3]>, Stats) {
         }
     }
     let total: u32 = hist.iter().sum();
-    let clipped = hist[255] as f32 / total.max(1) as f32;
+    let clipped_frac = hist[255] as f32 / total.max(1) as f32;
     let mut seen = 0u32;
     let mut p999 = 1.0;
     for (i, &c) in hist.iter().enumerate() {
@@ -110,7 +139,7 @@ pub fn bin(raw: &Raw, cols: usize) -> (usize, usize, Vec<[f32; 3]>, Stats) {
             break;
         }
     }
-    (w, h, out, Stats { clipped, p999 })
+    Binned { w, h, rgb: out, clipped, stats: Stats { clipped: clipped_frac, p999 } }
 }
 
 /// Camera RGB to VSF RGB: `xyz_to_cam` is Android's row-major XYZ→camera matrix, inverted here; XYZ then goes to VSF RGB colorimetrically (Illuminant E to white, no adaptation). Negative light clamps to zero.
@@ -272,13 +301,21 @@ mod tests {
             }
         }
         let raw = Raw { data: &data, w, h, row_stride: w * 2, cfa: Cfa::Rggb, black: [64; 4], white: 1023 };
-        let (bw, bh, rgb, stats) = bin(&raw, 4);
-        assert_eq!((bw, bh), (4, 2));
+        let b = bin(&raw, 4);
+        assert_eq!((b.w, b.h), (4, 2));
         let s = 1.0 / 959.0;
-        assert!((rgb[0][0] - 300.0 * s).abs() < 1e-4 && (rgb[0][1] - 200.0 * s).abs() < 1e-4 && (rgb[0][2] - 100.0 * s).abs() < 1e-4, "{:?}", rgb[0]);
-        // One sample of 32 at white: 3% clipped, and the 99.9th percentile is that white sample.
-        assert!((stats.clipped - 1.0 / 32.0).abs() < 1e-6, "{stats:?}");
-        assert_eq!(stats.p999, 1.0);
+        assert!((b.rgb[0][0] - 300.0 * s).abs() < 1e-4 && (b.rgb[0][1] - 200.0 * s).abs() < 1e-4 && (b.rgb[0][2] - 100.0 * s).abs() < 1e-4, "{:?}", b.rgb[0]);
+        // One sample of 32 at white: 3% clipped, in the last bin, and the 99.9th percentile is that white sample.
+        assert!((b.stats.clipped - 1.0 / 32.0).abs() < 1e-6, "{:?}", b.stats);
+        assert_eq!(b.stats.p999, 1.0);
+        assert_eq!(b.clipped, vec![0, 0, 0, 0, 0, 0, 0, 1]);
+        // A short bracket at a quarter of the exposure fills that bin, scaled back up.
+        let mut long = bin(&raw, 4);
+        let mut short = bin(&raw, 4);
+        short.rgb[7] = [0.1, 0.2, 0.3];
+        long.fill_clipped(&short, 4.0);
+        assert_eq!(long.rgb[7], [0.4, 0.8, 1.2]);
+        assert_eq!(long.rgb[0], short.rgb[0]);
     }
 
     #[test]
