@@ -799,6 +799,6 @@ pub extern "system" fn Java_nz_mahere_app_MahereActivity_nativeOnProbe(
         let n = rgb.len().max(1) as u64;
         let sum = rgb.iter().fold([0u64; 3], |a, p| [a[0] + p[0] as u64, a[1] + p[1] as u64, a[2] + p[2] as u64]);
         let mean = [sum[0] / n, sum[1] / n, sum[2] / n];
-        eprintln!("probe: clipped {:.5} p999 {:.3} filled {filled} bins from the bracket; stop {stop} (short {}), bin {bin_ms:.1} ms; mean {mean:?}; sphere {:.0}% painted", st.clipped, st.p999, app.probe_short.as_ref().map_or(0, |s| s.0), app.map.probe_coverage() * 100.0);
+        eprintln!("probe: clipped {:.5} p999 {:.3} filled {filled} bins from the bracket; stop {stop} (short {}), bin {bin_ms:.1} ms; mean {mean:?}; sphere {:.0}% painted; {:?} = (level, light on world up, on the screen, brightest triangle)", st.clipped, st.p999, app.probe_short.as_ref().map_or(0, |s| s.0), app.map.probe_coverage() * 100.0, app.map.probe_report());
     }
 }

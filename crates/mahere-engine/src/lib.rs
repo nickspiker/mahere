@@ -439,6 +439,18 @@ impl MapCore {
         Some(out)
     }
 
+    /// For the log: the sphere's level, and the light's luminance on the world's up and on the screen's normal after it, with the brightest triangle's luminance on the map's scale.
+    pub fn probe_report(&self) -> Option<(f32, f32, f32, f32)> {
+        let s = self.sphere.as_ref()?;
+        let p = self.probe.as_ref()?;
+        let lum = |e: [f32; 3]| 0.3 * e[0] + 0.6 * e[1] + 0.1 * e[2];
+        let r = &self.device_rot;
+        // World up in the device frame: rotᵀ · (0, 0, 1).
+        let up_dev = [r[6], r[7], r[8]];
+        let brightest = s.tris.iter().map(|t| lum([t[0] as f32, t[1] as f32, t[2] as f32])).fold(0.0, f32::max) * std::f32::consts::PI / s.level.max(1e-6);
+        Some((s.level, lum(p.irradiance(up_dev)), lum(p.irradiance([0.0, 0.0, 1.0])), brightest))
+    }
+
     /// How much of the sphere the camera has painted, 0..1: the triangles no longer black.
     pub fn probe_coverage(&self) -> f32 {
         self.sphere.as_ref().map_or(0.0, |s| s.tris.iter().filter(|&&v| v != [0; 3]).count() as f32 / probe::TRIS as f32)
