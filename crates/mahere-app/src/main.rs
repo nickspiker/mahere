@@ -34,15 +34,21 @@ impl MahereApp {
     fn apply_theme_edits(&mut self) {
         for e in self.panel.take_theme_edits() {
             match e {
-                mahere_panel::ThemeEdit::Begin => {
-                    if self.map.current_theme().is_builtin() {
+                mahere_panel::ThemeEdit::Set(f, v) => self.map.edit_theme(f, v),
+                mahere_panel::ThemeEdit::Done | mahere_panel::ThemeEdit::Duplicate | mahere_panel::ThemeEdit::Reset => {
+                    if e == mahere_panel::ThemeEdit::Duplicate {
                         self.map.duplicate_theme();
                     }
-                }
-                mahere_panel::ThemeEdit::Set(f, v) => self.map.edit_theme(f, v),
-                mahere_panel::ThemeEdit::Done => {
+                    if e == mahere_panel::ThemeEdit::Reset && !self.map.reset_theme() {
+                        continue;
+                    }
                     if let Some(store) = &self.store {
                         mahere_store::themes::save(store, self.map.current_theme());
+                    }
+                }
+                mahere_panel::ThemeEdit::Delete => {
+                    if let (Some(name), Some(store)) = (self.map.delete_theme(), &self.store) {
+                        mahere_store::themes::delete(store, &name);
                     }
                 }
             }

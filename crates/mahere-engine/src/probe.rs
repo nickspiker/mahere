@@ -340,7 +340,7 @@ impl Sphere {
         }
     }
 
-    /// The painted sphere as the light, projected in the device frame for `rot` and held to its own level: the brightest a normal can be lit by it is one. None while the sphere is all black.
+    /// The painted sphere as the light, projected in the device frame for `rot` and held to its own level: flat ground, the world's up, is lit to one, so a slope facing the light goes past one and rolls into white as it does under the themed sun; the level does not move when the phone turns. While the sphere holds no light above the horizon (the camera has only seen the floor), the brightest normal is one instead. None while the sphere is all black.
     pub fn light(&mut self, rot: &[f32; 9]) -> Option<Sh9> {
         let omega = 4.0 * std::f32::consts::PI / TRIS as f32;
         let mut world = Sh9::ZERO;
@@ -361,17 +361,17 @@ impl Sphere {
                 }
             }
         }
-        // The level: the brightest irradiance any normal sees, sampled at the triangle centres.
+        let lum = |e: [f32; 3]| 0.3 * e[0] + 0.6 * e[1] + 0.1 * e[2];
+        let up = lum(world.irradiance([0.0, 0.0, 1.0]));
         let mut peak = 0f32;
         for c in &self.centres {
-            let e = world.irradiance(*c);
-            peak = peak.max(0.3 * e[0] + 0.6 * e[1] + 0.1 * e[2]);
+            peak = peak.max(lum(world.irradiance(*c)));
         }
         if peak <= 0.0 {
             return None;
         }
-        self.level = peak;
-        Some(device.scaled(1.0 / peak))
+        self.level = if up > peak * 0.2 { up } else { peak };
+        Some(device.scaled(1.0 / self.level))
     }
 
     /// The radiance painted in a world direction as light on the map's scale: a sphere of this radiance everywhere would light every normal to one. Black where nothing has been painted.
@@ -426,13 +426,14 @@ mod tests {
         // A 57° × 75° field covers around a tenth of the sphere.
         assert!((15..=60).contains(&seen), "{seen} triangles painted");
         let sh = s.light(&IDENTITY).unwrap();
-        // On the map's scale a sphere of radiance one lights every normal to one, so a patch a tenth of the sphere that lights its own direction to one is brighter than one.
+        // On the map's scale a sphere of radiance one lights every normal to one, so a patch a tenth of the sphere that lights flat ground to one is brighter than one.
         let r = s.radiance([0.0, 0.0, 1.0]);
         assert!(r[1] > 1.0 && r[1] < 4.0, "{r:?}");
         assert_eq!(s.radiance([0.0, 0.0, -1.0]), [0.0; 3]);
+        // Painted straight up with the phone flat, the patch is the world's up: flat ground is lit to one.
         let out = sh.irradiance([0.0, 0.0, 1.0]);
         let back = sh.irradiance([0.0, 0.0, -1.0]);
-        assert!(out[1] > 0.9 && out[1] <= 1.01, "{out:?}");
+        assert!((out[1] - 1.0).abs() < 0.02, "{out:?}");
         assert!(back[1] < 0.2, "{back:?}");
     }
 

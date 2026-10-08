@@ -10,8 +10,10 @@ pub const BUILTIN_REVISION: u32 = 3;
 #[derive(Clone, Debug)]
 pub struct Theme {
     pub name: String,
-    /// Which built-in revision this is; a stored built-in older than [`BUILTIN_REVISION`] is replaced.
+    /// Which built-in revision this is; a stored built-in older than [`BUILTIN_REVISION`] is replaced, unless the user has edited it.
     pub revision: u32,
+    /// The user has changed it from what shipped: an update never overwrites it, and a reset takes the shipped one back.
+    pub edited: bool,
     /// Hypsometric stops: metres and the colour there, interpolated between; the sea below half a metre takes `sea`.
     pub hypso: [(f32, [u8; 3]); 5],
     pub sea: [u8; 3],
@@ -49,6 +51,7 @@ pub fn trail() -> Theme {
     Theme {
         name: "Trail".to_string(),
         revision: BUILTIN_REVISION,
+        edited: false,
         hypso: [(0.0, [180, 206, 154]), (600.0, [198, 210, 162]), (1200.0, [218, 212, 178]), (1900.0, [230, 222, 204]), (2600.0, [244, 244, 246])],
         sea: [150, 192, 228],
         flat: [234, 230, 222],
@@ -71,6 +74,7 @@ pub fn topo() -> Theme {
     Theme {
         name: "Topo".to_string(),
         revision: BUILTIN_REVISION,
+        edited: false,
         hypso: [(0.0, [236, 240, 230]), (600.0, [240, 240, 232]), (1200.0, [242, 240, 234]), (1900.0, [244, 242, 240]), (2600.0, [250, 250, 252])],
         sea: [160, 204, 240],
         flat: [246, 246, 242],
@@ -93,6 +97,7 @@ pub fn night() -> Theme {
     Theme {
         name: "Night".to_string(),
         revision: BUILTIN_REVISION,
+        edited: false,
         hypso: [(0.0, [80, 92, 94]), (600.0, [88, 96, 98]), (1200.0, [96, 100, 104]), (1900.0, [108, 112, 118]), (2600.0, [132, 136, 146])],
         sea: [34, 66, 104],
         flat: [86, 90, 96],
@@ -115,6 +120,7 @@ pub fn alpine() -> Theme {
     Theme {
         name: "Alpine".to_string(),
         revision: BUILTIN_REVISION,
+        edited: false,
         hypso: [(0.0, [178, 198, 186]), (800.0, [198, 212, 206]), (1500.0, [216, 226, 230]), (2200.0, [234, 240, 246]), (3000.0, [252, 253, 255])],
         sea: [126, 174, 222],
         flat: [236, 240, 244],
@@ -137,6 +143,7 @@ pub fn desert() -> Theme {
     Theme {
         name: "Desert".to_string(),
         revision: BUILTIN_REVISION,
+        edited: false,
         hypso: [(0.0, [214, 198, 162]), (600.0, [222, 196, 152]), (1200.0, [226, 190, 142]), (1900.0, [222, 190, 154]), (2600.0, [238, 228, 216])],
         sea: [104, 164, 206],
         flat: [234, 222, 198],
@@ -159,6 +166,7 @@ pub fn ink() -> Theme {
     Theme {
         name: "Ink".to_string(),
         revision: BUILTIN_REVISION,
+        edited: false,
         hypso: [(0.0, [240, 240, 238]), (600.0, [242, 242, 240]), (1200.0, [244, 244, 242]), (1900.0, [246, 246, 244]), (2600.0, [250, 250, 250])],
         sea: [200, 202, 208],
         flat: [244, 244, 242],
@@ -273,11 +281,18 @@ impl Theme {
         }
     }
 
-    /// A built-in, which the editor copies rather than changes.
+    /// One of the shipped themes, by name: edited in place, reset to what shipped, never deleted.
     pub fn is_builtin(&self) -> bool {
-        self.revision > 0
+        BUILTIN_NAMES.contains(&self.name.as_str())
+    }
+
+    /// The shipped theme of this name, if it is one.
+    pub fn shipped(&self) -> Option<Theme> {
+        builtin().into_iter().find(|b| b.name == self.name)
     }
 }
+
+pub const BUILTIN_NAMES: [&str; 6] = ["Trail", "Topo", "Night", "Alpine", "Desert", "Ink"];
 
 /// The built-in themes, as authored: VSF RGB, gamma 2. The renderers convert to the display at their one encode.
 pub fn builtin() -> Vec<Theme> {

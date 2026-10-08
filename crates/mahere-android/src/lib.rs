@@ -138,18 +138,32 @@ impl AndroidApp {
     /// The editor's requests: a built-in is copied before it is edited, a field change is live, and closing the editor writes the theme to the vault.
     fn apply_theme_edits(&mut self) {
         for e in self.panel.take_theme_edits() {
+            let save_current = |me: &Self| {
+                if let Some(store) = &me.store {
+                    let (store, t) = (store.clone(), me.map.current_theme().clone());
+                    me.persist.run(move || mahere_store::themes::save(&store, &t));
+                }
+            };
             match e {
-                mahere_panel::ThemeEdit::Begin => {
-                    if self.map.current_theme().is_builtin() {
-                        self.map.duplicate_theme();
-                        self.save_settings();
+                mahere_panel::ThemeEdit::Set(f, v) => self.map.edit_theme(f, v),
+                mahere_panel::ThemeEdit::Done => save_current(self),
+                mahere_panel::ThemeEdit::Duplicate => {
+                    self.map.duplicate_theme();
+                    save_current(self);
+                    self.save_settings();
+                }
+                mahere_panel::ThemeEdit::Reset => {
+                    if self.map.reset_theme() {
+                        save_current(self);
                     }
                 }
-                mahere_panel::ThemeEdit::Set(f, v) => self.map.edit_theme(f, v),
-                mahere_panel::ThemeEdit::Done => {
-                    if let Some(store) = &self.store {
-                        let (store, t) = (store.clone(), self.map.current_theme().clone());
-                        self.persist.run(move || mahere_store::themes::save(&store, &t));
+                mahere_panel::ThemeEdit::Delete => {
+                    if let Some(name) = self.map.delete_theme() {
+                        if let Some(store) = &self.store {
+                            let store = store.clone();
+                            self.persist.run(move || mahere_store::themes::delete(&store, &name));
+                        }
+                        self.save_settings();
                     }
                 }
             }

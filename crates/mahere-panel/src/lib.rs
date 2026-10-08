@@ -177,12 +177,23 @@ enum Page {
 /// What the editor asks of the host, polled after every tap and drag.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum ThemeEdit {
-    /// The editor opened on the current theme: a built-in is to be copied first.
-    Begin,
     /// A field changed; apply it live.
     Set(Field, [f32; 4]),
     /// The editor closed: save the current theme.
     Done,
+    /// A copy of the current theme under the next number, selected.
+    Duplicate,
+    /// A built-in back to what shipped.
+    Reset,
+    /// The user's own theme removed.
+    Delete,
+}
+
+/// A row of the editor: a field to open, or an action.
+#[derive(Clone, Copy)]
+enum Row {
+    Field(Field, [f32; 4]),
+    Act(ThemeEdit),
 }
 
 /// The rail's share of the column when a page is stacked over another.
@@ -196,11 +207,13 @@ pub struct Panel {
     stack: Vec<Page>,
     /// The theme page's rows: the back row, then one per theme, then the edit row, as (centre y, half height) in screen pixels.
     theme_rows: Vec<(f32, f32)>,
-    /// The editor's rows: (centre y, half height, the field, its values).
-    edit_rows: Vec<(f32, f32, Field, [f32; 4])>,
+    /// The editor's rows: (centre y, half height, what the row is).
+    edit_rows: Vec<(f32, f32, Row)>,
     /// How far the editor's list is scrolled, and a press on it: where it started, the row under it, and whether it has moved (a scroll, not a choice).
     edit_scroll: f32,
-    press: Option<(f32, f32, Option<(Field, [f32; 4])>, bool)>,
+    /// How far the editor's list may scroll: its height past the screen, from the last paint.
+    edit_extent: f32,
+    press: Option<(f32, f32, Option<Row>, bool)>,
     /// The open field's sliders and the values they hold, and which slider a finger is on.
     sliders: Vec<Slider>,
     field_vals: [f32; 4],
@@ -236,7 +249,7 @@ impl Panel {
     pub fn new() -> Panel {
         let mut hits: HitId = HIT_NONE;
         let checks = LAYERS.iter().map(|&(l, label)| (l, Checkbox::new(&mut hits, label, 0.0, 0.0, 10.0, 10.0, 10.0, false))).collect();
-        Panel { open: false, dirty: true, ru: 1.0, stack: vec![Page::Layers], theme_rows: Vec::new(), edit_rows: Vec::new(), edit_scroll: 0.0, press: None, sliders: Vec::new(), field_vals: [0.0; 4], held: None, edits: Vec::new(), hits, checks, text: TextRenderer::new(), buf: Vec::new(), w: 0, h: 0, font: 16.0, gear: (0.0, 0.0, 0.0), panel_w: 0.0, theme_row: (0.0, 0.0, 0.0), slider: (0.0, 0.0, 0.0), slider_held: false, cache_max: CACHE_MIN + 1, strip_close: None, clear_measure: false }
+        Panel { open: false, dirty: true, ru: 1.0, stack: vec![Page::Layers], theme_rows: Vec::new(), edit_rows: Vec::new(), edit_scroll: 0.0, edit_extent: 0.0, press: None, sliders: Vec::new(), field_vals: [0.0; 4], held: None, edits: Vec::new(), hits, checks, text: TextRenderer::new(), buf: Vec::new(), w: 0, h: 0, font: 16.0, gear: (0.0, 0.0, 0.0), panel_w: 0.0, theme_row: (0.0, 0.0, 0.0), slider: (0.0, 0.0, 0.0), slider_held: false, cache_max: CACHE_MIN + 1, strip_close: None, clear_measure: false }
     }
 
     pub fn is_open(&self) -> bool {
@@ -407,7 +420,7 @@ impl Panel {
                             self.pop();
                         } else if i + 1 == n {
                             self.stack.push(Page::Edit);
-                            self.edits.push(ThemeEdit::Begin);
+                            self.edit_scroll = 0.0;
                         } else {
                             ctl.theme = i - 1;
                         }
@@ -419,7 +432,7 @@ impl Panel {
             }
             Page::Edit => {
                 // The row opens on release, so a drag scrolls the list instead.
-                let under = self.edit_rows.iter().find(|&&(cy, hh, _, _)| (y - cy).abs() <= hh).map(|&(_, _, f, v)| (f, v));
+                let under = self.edit_rows.iter().find(|&&(cy, hh, _)| (y - cy).abs() <= hh).map(|&(_, _, r)| r);
                 self.press = Some((x, y, under, false));
                 return true;
             }
@@ -536,7 +549,9 @@ impl Panel {
                 Page::Themes => self.theme_rows = Self::paint_themes(&mut canvas, &mut self.text, font, rail, cw, self.gear, h, themes, ctl.theme),
                 Page::Edit => {
                     if let Some(t) = current {
-                        self.edit_rows = Self::paint_edit(&mut canvas, &mut self.text, font, rail, cw, self.gear, h, t, self.edit_scroll);
+                        let (rows, extent) = Self::paint_edit(&mut canvas, &mut self.text, font, rail, cw, self.gear, h, t, self.edit_scroll);
+                        self.edit_rows = rows;
+                        self.edit_extent = extent;
                     }
                 }
                 Page::Field(f) => Self::paint_field(&mut canvas, &mut self.text, font, rail, cw, self.gear, f, &mut self.sliders, self.field_vals, current),
@@ -552,7 +567,7 @@ impl Panel {
                     }
                     Page::Edit => {
                         if let Some(t) = current {
-                            Self::paint_edit(&mut canvas, &mut self.text, small, 0.0, rail, self.gear, h, t, 0.0);
+                            let _ = Self::paint_edit(&mut canvas, &mut self.text, small, 0.0, rail, self.gear, h, t, 0.0);
                         }
                     }
                     _ => {
@@ -768,7 +783,8 @@ impl Panel {
         if let (Some((px, py, under, moved)), Page::Edit) = (self.press, self.page()) {
             let moved = moved || (y - py).abs() + (x - px).abs() > 12.0;
             if moved {
-                self.edit_scroll = (self.edit_scroll - (y - py)).max(0.0);
+                // Never past the last row: the list's height less the screen's, known from the last paint.
+                self.edit_scroll = (self.edit_scroll - (y - py)).clamp(0.0, self.edit_extent);
                 self.dirty = true;
             }
             self.press = Some((x, y, under, moved));
@@ -793,8 +809,17 @@ impl Panel {
     pub fn release(&mut self) {
         self.slider_held = false;
         self.held = None;
-        if let Some((_, _, Some((f, v)), false)) = self.press.take() {
-            self.open_field(f, v);
+        match self.press.take() {
+            Some((_, _, Some(Row::Field(f, v)), false)) => self.open_field(f, v),
+            Some((_, _, Some(Row::Act(a)), false)) => {
+                self.edits.push(a);
+                // Deleting leaves the editor; the others stay on the theme they changed.
+                if a == ThemeEdit::Delete {
+                    self.pop();
+                }
+                self.dirty = true;
+            }
+            _ => {}
         }
     }
 
@@ -835,7 +860,6 @@ impl Panel {
         }
         // The last row opens the editor on the current theme.
         let edit_label = match themes.get(current) {
-            Some(t) if t.is_builtin() => format!("\u{270e}  Edit a copy of {}", t.name),
             Some(t) => format!("\u{270e}  Edit {}", t.name),
             None => "\u{270e}  Edit".into(),
         };
@@ -849,7 +873,7 @@ impl Panel {
 impl Panel {
     /// The editor: the back row, then every field of the theme as a row with its swatch (a number for the numbers), one to a line, scrolled by `scroll`. Returns the rows on screen for hit testing, with their values.
     #[allow(clippy::too_many_arguments)]
-    fn paint_edit(canvas: &mut Canvas, text: &mut TextRenderer, font: f32, ox: f32, cw: f32, gear: (f32, f32, f32), h: usize, t: &Theme, scroll: f32) -> Vec<(f32, f32, Field, [f32; 4])> {
+    fn paint_edit(canvas: &mut Canvas, text: &mut TextRenderer, font: f32, ox: f32, cw: f32, gear: (f32, f32, f32), h: usize, t: &Theme, scroll: f32) -> (Vec<(f32, f32, Row)>, f32) {
         let x0 = ox + font * 0.9;
         let row = font * 1.15;
         let top = gear.1 + gear.2 + font * 0.9 + font * 0.8;
@@ -902,11 +926,29 @@ impl Panel {
                 // A number is wider than a swatch: its name sits further along.
                 let name_x = x0 + if f.is_colour() { font * 1.1 } else { font * 2.6 };
                 text.draw_text_left(canvas, &name, name_x, y, &small, None, None);
-                rows.push((y, row * 0.5, f, v));
+                rows.push((y, row * 0.5, Row::Field(f, v)));
             }
             y += row;
         }
-        rows
+        // The actions: a copy for anyone, the shipped theme back for a built-in that has been changed, deletion for the user's own.
+        let mut actions: Vec<(&str, ThemeEdit)> = vec![("\u{29c9}  Duplicate", ThemeEdit::Duplicate)];
+        if t.is_builtin() && t.edited {
+            actions.push(("\u{21ba}  Reset to shipped", ThemeEdit::Reset));
+        }
+        if !t.is_builtin() {
+            actions.push(("\u{2715}  Delete", ThemeEdit::Delete));
+        }
+        y += font * 0.6;
+        for (label, a) in actions {
+            if y > top + row && y < h as f32 + row {
+                text.draw_text_left(canvas, label, x0, y, &TextStyle::new(font * 0.9, theme::TEXTBOX_TEXT), None, None);
+                rows.push((y, row * 0.5, Row::Act(a)));
+            }
+            y += row * 1.2;
+        }
+        // The list's reach past the screen, with the scroll put back: what a drag may take it to.
+        let extent = (y + scroll + font - h as f32).max(0.0);
+        (rows, extent)
     }
 
     /// One field: its name, the colour or light as a swatch through the display encode, and a slider per value with the value beside it.

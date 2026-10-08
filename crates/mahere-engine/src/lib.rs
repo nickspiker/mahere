@@ -560,6 +560,7 @@ impl MapCore {
     pub fn edit_theme(&mut self, f: theme::Field, v: [f32; 4]) {
         let i = self.theme.min(self.themes.len() - 1);
         self.themes[i].set(f, v);
+        self.themes[i].edited = true;
         let t = self.themes[i].clone();
         self.luts.hypso = t.hypso_lut();
         self.luts.style = t.style();
@@ -568,7 +569,27 @@ impl MapCore {
         self.dirty = true;
     }
 
-    /// A copy of the current theme under a new name (its name with the first free number), a user theme, selected. The editor copies a built-in before touching it.
+    /// The current theme back to what shipped, when it is a built-in: true if it changed.
+    pub fn reset_theme(&mut self) -> bool {
+        let i = self.theme.min(self.themes.len() - 1);
+        let Some(shipped) = self.themes[i].shipped() else { return false };
+        self.themes[i] = shipped;
+        self.set_theme(i);
+        true
+    }
+
+    /// Remove the current theme when it is the user's own; the first theme takes its place. Returns the removed theme's name.
+    pub fn delete_theme(&mut self) -> Option<String> {
+        let i = self.theme.min(self.themes.len() - 1);
+        if self.themes[i].is_builtin() || self.themes.len() < 2 {
+            return None;
+        }
+        let gone = self.themes.remove(i);
+        self.set_theme(0);
+        Some(gone.name)
+    }
+
+    /// A copy of the current theme under a new name (its name with the first free number), a user theme, selected.
     pub fn duplicate_theme(&mut self) -> usize {
         let i = self.theme.min(self.themes.len() - 1);
         let mut t = self.themes[i].clone();
@@ -579,6 +600,7 @@ impl MapCore {
         }
         t.name = format!("{base} {n}");
         t.revision = 0;
+        t.edited = true;
         self.themes.push(t);
         let j = self.themes.len() - 1;
         self.set_theme(j);

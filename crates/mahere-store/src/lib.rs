@@ -519,7 +519,7 @@ pub mod themes {
         let stops: Vec<f32> = t.hypso.iter().map(|(m, _)| *m).collect();
         let stop_rgb: Vec<u8> = t.hypso.iter().flat_map(|(_, c)| c.to_vec()).collect();
         VsfBuilder::new()
-            .add_section("theme", vec![("name".to_string(), VsfType::x(t.name.clone())), ("layers".to_string(), VsfType::u(t.layers.bits() as usize, false)), ("revision".to_string(), VsfType::u(t.revision as usize, false))])
+            .add_section("theme", vec![("name".to_string(), VsfType::x(t.name.clone())), ("layers".to_string(), VsfType::u(t.layers.bits() as usize, false)), ("revision".to_string(), VsfType::u(t.revision as usize, false)), ("edited".to_string(), VsfType::u(t.edited as usize, false))])
             .add_section("hypso", vec![("metres".to_string(), VsfType::t_f5(Tensor::new(vec![stops.len()], stops))), ("rgb".to_string(), VsfType::t_u3(Tensor::new(vec![t.hypso.len(), 3], stop_rgb)))])
             .add_section("tables", vec![("land".to_string(), table_t(&t.land)), ("line".to_string(), table_t(&t.line))])
             .add_section(
@@ -606,6 +606,12 @@ pub mod themes {
             Some(VsfType::u3(r)) => *r as u32,
             _ => 0,
         };
+        let edited = match get("theme", "edited") {
+            Some(VsfType::u(r, _)) => *r != 0,
+            Some(VsfType::u3(r)) => *r != 0,
+            // A theme saved before the flag with a name no built-in has is the user's own.
+            _ => !mahere_engine::theme::BUILTIN_NAMES.contains(&theme_name.as_str()),
+        };
         let contour_alpha = get("inks", "contouralpha").and_then(floats_of).filter(|a| a.len() == 2).map_or([0.85, 0.85], |a| [a[0], a[1]]);
         let sun = floats_of(get("light", "sun")?)?;
         let sky = floats_of(get("light", "sky")?)?;
@@ -615,6 +621,7 @@ pub mod themes {
         Some(Theme {
             name: theme_name,
             revision,
+            edited,
             contour_alpha,
             hypso,
             sea: rgb3(get("inks", "sea")?)?,
@@ -679,11 +686,19 @@ pub mod themes {
     /// The built-ins into the vault where they are missing or an older revision, then every theme the vault holds, in index order, as authored (VSF RGB): the renderers convert to the display at their one encode.
     pub fn load_all(store: &FlatStorage) -> Vec<Theme> {
         for t in mahere_engine::theme::builtin() {
-            if load(store, &t.name).is_none_or(|old| old.revision < t.revision) {
+            // A newer shipped revision replaces the stored one unless the user has edited it; theirs stays until they reset.
+            if load(store, &t.name).is_none_or(|old| old.revision < t.revision && !old.edited) {
                 save(store, &t);
             }
         }
         names(store).iter().filter_map(|n| load(store, n)).collect()
+    }
+
+    /// Remove a theme document and its index entry.
+    pub fn delete(store: &FlatStorage, theme_name: &str) {
+        let _ = store.delete_device(&theme_key(theme_name));
+        let list: Vec<String> = names(store).into_iter().filter(|n| n != theme_name).collect();
+        write_index(store, &list);
     }
 }
 
