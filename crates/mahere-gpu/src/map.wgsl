@@ -50,7 +50,7 @@ struct Uniforms {
     style_bg: vec4<f32>,
     style_no_dem: vec4<f32>,
     style_sea: vec4<f32>,
-    // The display: VSF RGB to its primaries (rows), and x = 1 when the highlight rail is on.
+    // The display: VSF RGB to its primaries (rows), and x = 1 when highlights are compressed (else linear).
     display: array<vec4<f32>, 3>,
     tone: vec4<f32>,
     // Stored imagery byte to scene light (the cells' tone unrolled), 256 entries.
@@ -300,10 +300,10 @@ fn rail(x: vec3<f32>) -> vec3<f32> {
     return (3.0 * c - c * c * c) * 0.5;
 }
 
-// The one display encode: linear VSF RGB to the display's gamma-2 code values 0..255, truncated. Exposure 2/3, then the rail (or straight), then the square root.
+// The one display encode: linear VSF RGB to the display's gamma-2 code values 0..255, truncated. Compressed: exposure 2/3 into the rail. Linear: exposure 1/5 straight, so the widest stored range (imagery at five times paper white) reaches white unclipped. Then the square root.
 fn to_display(x: vec3<f32>) -> vec3<f32> {
-    let d = vec3<f32>(dot(U.display[0].xyz, x), dot(U.display[1].xyz, x), dot(U.display[2].xyz, x)) * (2.0 / 3.0);
-    let t = select(clamp(d, vec3<f32>(0.0), vec3<f32>(1.0)), rail(d), U.tone.x > 0.5);
+    let d = vec3<f32>(dot(U.display[0].xyz, x), dot(U.display[1].xyz, x), dot(U.display[2].xyz, x));
+    let t = select(clamp(d * (1.0 / 5.0), vec3<f32>(0.0), vec3<f32>(1.0)), rail(d * (2.0 / 3.0)), U.tone.x > 0.5);
     return min(floor(sqrt(t) * 256.0), vec3<f32>(255.0));
 }
 

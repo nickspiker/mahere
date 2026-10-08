@@ -301,9 +301,9 @@ pub struct FrameLuts {
     pub contours: Contours,
     /// The lighting environment, as the per-channel quadratic form the pixel loop evaluates on world normals (device-frame SH conjugated by the bearing once per frame).
     pub light: crate::sh::Quad,
-    /// The display encode, and whether the highlight rail is on.
+    /// The display encode, and whether highlights are compressed (else linear).
     pub display: crate::colour::Display,
-    pub rolled: bool,
+    pub compressed: bool,
 }
 
 pub struct FrameStats {
@@ -458,7 +458,7 @@ fn lerp3(a: [f32; 3], b: [f32; 3], t: f32) -> [f32; 3] {
 /// The packed display pixel of a linear colour.
 #[inline(always)]
 fn pack(luts: &FrameLuts, rgb: [f32; 3]) -> u32 {
-    let c = luts.display.encode(rgb, luts.rolled);
+    let c = luts.display.encode(rgb, luts.compressed);
     ((c[0] as u32) << 16) | ((c[1] as u32) << 8) | c[2] as u32
 }
 
@@ -868,7 +868,7 @@ mod tests {
             contours: Contours { interval: 0.0, index_every: 5, m_per_px: 1.0 },
             light: crate::sh::Sh9::sun_and_sky(315.0, 40.0).quadratic((0.0, 1.0)),
             display: crate::colour::Display::default(),
-            rolled: true,
+            compressed: true,
         };
         let (w, h) = (64usize, 64usize);
         let mut canvas = vec![0u32; w * h];

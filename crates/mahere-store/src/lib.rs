@@ -129,8 +129,8 @@ pub struct Settings {
     pub lock_to_fix: bool,
     /// Index into the engine's themes.
     pub theme: u64,
-    /// The highlight rail on the display; stored as its absence (flag 8 = straight) so settings from before it load rolled.
-    pub rolloff: bool,
+    /// Highlights compressed rather than linear; stored as its absence (flag 8 = linear) so settings from before it load compressed.
+    pub compressed: bool,
 }
 
 fn settings_key() -> String {
@@ -138,7 +138,7 @@ fn settings_key() -> String {
 }
 
 pub fn save_settings(store: &FlatStorage, s: &Settings) -> Result<(), StorageError> {
-    let flags = (s.real_sun as u64) | (s.follow_heading as u64) << 1 | (s.lock_to_fix as u64) << 2 | (!s.rolloff as u64) << 3;
+    let flags = (s.real_sun as u64) | (s.follow_heading as u64) << 1 | (s.lock_to_fix as u64) << 2 | (!s.compressed as u64) << 3;
     let t = VsfType::t_u6(Tensor::new(vec![4], vec![s.cache_budget, s.layer_bits, flags, s.theme]));
     store.write_device(&settings_key(), &t.flatten())
 }
@@ -154,7 +154,7 @@ pub fn load_settings(store: &FlatStorage) -> Option<Settings> {
     if d.len() < 3 {
         return None;
     }
-    Some(Settings { cache_budget: d[0], layer_bits: d[1], real_sun: d[2] & 1 != 0, follow_heading: d[2] & 2 != 0, lock_to_fix: d[2] & 4 != 0, theme: d.get(3).copied().unwrap_or(0), rolloff: d[2] & 8 == 0 })
+    Some(Settings { cache_budget: d[0], layer_bits: d[1], real_sun: d[2] & 1 != 0, follow_heading: d[2] & 2 != 0, lock_to_fix: d[2] & 4 != 0, theme: d.get(3).copied().unwrap_or(0), compressed: d[2] & 8 == 0 })
 }
 
 /// Width-agnostic float-array read, per VSF doctrine.

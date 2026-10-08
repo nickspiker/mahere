@@ -117,7 +117,7 @@ fn free_bytes(dir: &str) -> Option<u64> {
 
 impl AndroidApp {
     fn controls(&self) -> Controls {
-        Controls { real_sun: self.map.real_sun, follow_heading: self.map.follow_heading, lock_to_fix: self.map.lock_to_fix, cache_budget: self.cache_budget, theme: self.map.theme, rolloff: self.map.rolloff() }
+        Controls { real_sun: self.map.real_sun, follow_heading: self.map.follow_heading, lock_to_fix: self.map.lock_to_fix, cache_budget: self.cache_budget, theme: self.map.theme, compressed: self.map.compressed() }
     }
 
     /// Apply what the panel changed and keep it.
@@ -126,8 +126,8 @@ impl AndroidApp {
         if ctl.real_sun != self.map.real_sun {
             self.map.set_real_sun(ctl.real_sun);
         }
-        if ctl.rolloff != self.map.rolloff() {
-            self.map.set_rolloff(ctl.rolloff);
+        if ctl.compressed != self.map.compressed() {
+            self.map.set_compressed(ctl.compressed);
         }
         if ctl.follow_heading != self.map.follow_heading {
             self.map.set_follow_heading(ctl.follow_heading);
@@ -144,7 +144,7 @@ impl AndroidApp {
 
     fn save_settings(&self) {
         if let Some(store) = &self.store {
-            let s = mahere_store::Settings { cache_budget: self.cache_budget, layer_bits: self.map.layers().bits() as u64, real_sun: self.map.real_sun, follow_heading: self.map.follow_heading, lock_to_fix: self.map.lock_to_fix, theme: self.map.theme as u64, rolloff: self.map.rolloff() };
+            let s = mahere_store::Settings { cache_budget: self.cache_budget, layer_bits: self.map.layers().bits() as u64, real_sun: self.map.real_sun, follow_heading: self.map.follow_heading, lock_to_fix: self.map.lock_to_fix, theme: self.map.theme as u64, compressed: self.map.compressed() };
             self.persist.settings(store.clone(), s);
         }
     }
@@ -423,7 +423,7 @@ pub extern "system" fn Java_nz_mahere_app_MahereActivity_nativeInit(
         map.set_theme(s.theme as usize);
         map.set_layers(mahere_engine::LayerMask::from_bits(s.layer_bits as u32));
         map.set_real_sun(s.real_sun);
-        map.set_rolloff(s.rolloff);
+        map.set_compressed(s.compressed);
         map.set_follow_heading(s.follow_heading);
         map.set_lock_to_fix(s.lock_to_fix);
     }

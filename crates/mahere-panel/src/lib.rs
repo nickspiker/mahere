@@ -21,8 +21,8 @@ pub struct Controls {
     pub cache_budget: u64,
     /// The theme, an index into the engine's themes.
     pub theme: usize,
-    /// Highlights roll into white (Opsin's rail); off, the same exposure is shown straight, darker in the shadows.
-    pub rolloff: bool,
+    /// Highlights compressed into white (exposure 2/3 into Opsin's rail); off, linear: the stored range straight, 2.3 stops darker.
+    pub compressed: bool,
 }
 
 /// What the readouts show.
@@ -46,7 +46,7 @@ pub struct Readouts {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Layer {
     RealSun,
-    Rolloff,
+    Compressed,
     FollowHeading,
     LockToFix,
     Dem,
@@ -75,7 +75,7 @@ const LAYERS: [(Layer, &str); 15] = [
     (Layer::Infrared, "Infrared"),
     (Layer::Debug, "Residency"),
     (Layer::RealSun, "Real sun"),
-    (Layer::Rolloff, "Highlight rolloff"),
+    (Layer::Compressed, "Compressed highlights"),
     (Layer::FollowHeading, "Follow heading"),
     (Layer::LockToFix, "Measure from me"),
 ];
@@ -83,7 +83,7 @@ const LAYERS: [(Layer, &str); 15] = [
 fn get(mask: &LayerMask, ctl: &Controls, l: Layer) -> bool {
     match l {
         Layer::RealSun => ctl.real_sun,
-        Layer::Rolloff => ctl.rolloff,
+        Layer::Compressed => ctl.compressed,
         Layer::FollowHeading => ctl.follow_heading,
         Layer::LockToFix => ctl.lock_to_fix,
         Layer::Dem => mask.dem,
@@ -103,7 +103,7 @@ fn get(mask: &LayerMask, ctl: &Controls, l: Layer) -> bool {
 fn set(mask: &mut LayerMask, ctl: &mut Controls, l: Layer, v: bool) {
     match l {
         Layer::RealSun => ctl.real_sun = v,
-        Layer::Rolloff => ctl.rolloff = v,
+        Layer::Compressed => ctl.compressed = v,
         Layer::FollowHeading => ctl.follow_heading = v,
         Layer::LockToFix => ctl.lock_to_fix = v,
         Layer::Dem => mask.dem = v,
@@ -222,7 +222,7 @@ impl Panel {
         let mut last = top;
         for (i, (l, cb)) in self.checks.iter_mut().enumerate() {
             // The modes sit a little apart from the layers.
-            let gap = if matches!(l, Layer::RealSun | Layer::Rolloff | Layer::FollowHeading | Layer::LockToFix) { row * 0.5 } else { 0.0 };
+            let gap = if matches!(l, Layer::RealSun | Layer::Compressed | Layer::FollowHeading | Layer::LockToFix) { row * 0.5 } else { 0.0 };
             let cy = top + row * (i as f32 + 0.5) + gap;
             cb.set_font_size(self.font);
             cb.set_rect(x0 + (self.panel_w - x0 * 1.5) * 0.5, cy, self.panel_w - x0 * 1.5, row);

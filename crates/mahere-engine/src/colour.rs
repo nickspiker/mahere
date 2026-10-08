@@ -1,13 +1,16 @@
 //! The colour path. Every colour the map holds is VSF RGB (703/523/462 nm, Illuminant E) at gamma 2, quantised ×256 by truncation: a byte `b` is the light `(b/256)²`, a light `x` is the byte `⌊√x·256⌋`. No rounding anywhere: it is slower and biases brightness.
 //!
-//! Light is mixed and shaded linear. There is one display encode, at the very end: the display exposure, VSF RGB to the display's primaries, the clamp, optionally the highlight rail, the square root.
+//! Light is mixed and shaded linear. There is one display encode, at the very end: exposure, VSF RGB to the display's primaries, the clamp, the highlight curve if compressed, the square root.
 //!
-//! The rail is Opsin's HDR rolloff, `(3x − x³)/2`: slope 3/2 at black, flat at white. With the exposure at 2/3 the shadows and mid-tones pass at unity, and everything from there to 1.5 rolls smoothly into white instead of clipping. Off, the same exposure is shown straight: the shadows 1.5× darker, nothing clipping before 1.5.
+//! Compressed (the default): exposure 2/3 into Opsin's rail `(3x − x³)/2`, slope 3/2 at black and flat at white, so shadows and mid-tones pass at unity and everything up to 1.5 rolls smoothly into white instead of clipping. Linear: the stored range shown straight, exposure 1/5 so imagery's full headroom (five times paper white) reaches white without clipping, everything 2.3 stops darker than compressed.
 //!
 //! Data with more range than a byte holds (imagery: snow, glint, concrete) is stored rolled through a tagged tone ([`mahere_tiles::tone`]) and unrolled to scene light (a 256-entry table) before anything is mixed.
 
-/// The display exposure before the rail: 2/3 cancels the rail's slope at black, so dark and mid colours land where they were authored.
+/// Compressed highlights: the exposure before the rail, 2/3, cancels the rail's slope at black, so dark and mid colours land where they were authored.
 pub const EXPOSURE: f32 = 2.0 / 3.0;
+
+/// Linear highlights: the exposure that brings the widest stored range (imagery's headroom, five times paper white) to white, so nothing in the data clips.
+pub const LINEAR_EXPOSURE: f32 = 1.0 / 5.0;
 
 pub use mahere_tiles::tone::{dec, enc, rail};
 
@@ -46,11 +49,11 @@ impl Display {
         [[m[0], m[3], m[6], 0.0], [m[1], m[4], m[7], 0.0], [m[2], m[5], m[8], 0.0]]
     }
 
-    /// Rail on: the highlights roll into white. Rail off: the same exposure straight, shadows 1.5× darker (0.58 stop), clipping only past 1.5.
-    pub fn encode(&self, x: [f32; 3], rolled: bool) -> [u8; 3] {
+    /// Compressed: exposure 2/3 into the rail. Linear: exposure 1/5 straight.
+    pub fn encode(&self, x: [f32; 3], compressed: bool) -> [u8; 3] {
         let m = &self.m;
         let d = [m[0] * x[0] + m[3] * x[1] + m[6] * x[2], m[1] * x[0] + m[4] * x[1] + m[7] * x[2], m[2] * x[0] + m[5] * x[1] + m[8] * x[2]];
-        let t = |v: f32| if rolled { rail(v * EXPOSURE) } else { v * EXPOSURE };
+        let t = |v: f32| if compressed { rail(v * EXPOSURE) } else { (v * LINEAR_EXPOSURE).clamp(0.0, 1.0) };
         [enc(t(d[0])), enc(t(d[1])), enc(t(d[2]))]
     }
 

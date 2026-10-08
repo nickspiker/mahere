@@ -140,7 +140,7 @@ impl MapCore {
                 contours: Contours { interval: 0.0, index_every: 5, m_per_px: 1.0 },
                 light: sh::Sh9::sun_and_sky(315.0, 40.0).quadratic((0.0, 1.0)),
                 display: colour::Display::default(),
-                rolled: true,
+                compressed: true,
             },
             env: sh::Sh9::sun_and_sky(315.0, 40.0),
             luts_sun: (f32::NAN, f32::NAN, f64::NAN),
@@ -455,13 +455,13 @@ impl MapCore {
         self.dirty = true;
     }
 
-    /// Whether the display rolls highlights into white (Opsin's rail) or shows them straight.
-    pub fn rolloff(&self) -> bool {
-        self.luts.rolled
+    /// Highlights compressed (exposure 2/3 into Opsin's rail) or linear (the stored range straight, 2.3 stops darker).
+    pub fn compressed(&self) -> bool {
+        self.luts.compressed
     }
 
-    pub fn set_rolloff(&mut self, on: bool) {
-        self.luts.rolled = on;
+    pub fn set_compressed(&mut self, on: bool) {
+        self.luts.compressed = on;
         self.style_version += 1;
         self.dirty = true;
     }

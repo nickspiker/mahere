@@ -719,7 +719,7 @@ impl GpuMap {
             style_no_dem: rgb4(luts.style.no_dem),
             style_sea: rgb4(luts.style.sea),
             display: luts.display.rows(),
-            tone: [luts.rolled as u32 as f32, 0.0, 0.0, 0.0],
+            tone: [luts.compressed as u32 as f32, 0.0, 0.0, 0.0],
             img_table: {
                 let t = mahere_engine::colour::img_table();
                 std::array::from_fn(|i| std::array::from_fn(|j| t[4 * i + j]))
