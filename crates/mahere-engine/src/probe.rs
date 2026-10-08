@@ -34,15 +34,24 @@ impl Cfa {
     }
 }
 
-/// A raw sensor frame: 16-bit little-endian samples, `row_stride` bytes per row, the sensor's `white` level and its `black` pedestal at each of the four Bayer positions (row-major within the quad: (0,0), (1,0), (0,1), (1,1)). The pedestals differ a little per channel, and a frame near black is all pedestal, so each is taken from its own.
+/// A raw sensor frame: 16-bit little-endian samples, or Android's packed 10-bit (four samples' high bytes then a byte of their low two bits, which reads in five eighths of the bytes), `row_stride` bytes per row, the sensor's `white` level and its `black` pedestal at each of the four Bayer positions (row-major within the quad: (0,0), (1,0), (0,1), (1,1)). The pedestals differ a little per channel, and a frame near black is all pedestal, so each is taken from its own.
 pub struct Raw<'a> {
     pub data: &'a [u8],
     pub w: usize,
     pub h: usize,
     pub row_stride: usize,
+    pub packed10: bool,
     pub cfa: Cfa,
     pub black: [u16; 4],
     pub white: u16,
+}
+
+/// One sample of a packed 10-bit row.
+#[inline(always)]
+fn packed(row: &[u8], col: usize) -> u16 {
+    let g = &row[(col >> 2) * 5..(col >> 2) * 5 + 5];
+    let i = col & 3;
+    ((g[i] as u16) << 2) | ((g[4] >> (2 * i)) & 3) as u16
 }
 
 /// What the exposure loop steers on: the fraction of raw samples at white, and the level (as a fraction of white) under which 99.9% of them lie. A lamp or the sun in the frame clips at any exposure a phone has, so the loop asks for almost nothing clipped rather than nothing, and for the bulk of the frame well up the range.
@@ -79,7 +88,8 @@ impl Binned {
 /// Bin a raw frame to about `cols` columns of linear camera RGB (each 2×2 Bayer quad is one sample, then an integer box over those), counting the samples at white in each bin, with the frame's exposure statistics.
 pub fn bin(raw: &Raw, cols: usize) -> Binned {
     let (qw, qh) = (raw.w / 2, raw.h / 2);
-    let f = (qw / cols.max(1)).max(1);
+    // An even number of quads a bin, so a bin is whole five-byte groups of a packed row.
+    let f = ((qw / cols.max(1)) & !1).max(2);
     let (w, h) = (qw / f, qh / f);
     // Where red and blue sit in the quad, as positions 0..4 row-major; green is the other two.
     let (rp, bp) = match raw.cfa {
@@ -101,6 +111,36 @@ pub fn bin(raw: &Raw, cols: usize) -> Binned {
             let mut hist = [0u32; 256];
             for j in 0..f {
                 let qy = (y * f + j) * 2;
+                if raw.packed10 {
+                    // Whole five-byte groups, a bin a run of f/2 of them (f is even): the high bytes shifted up, the low bits picked out of the fifth, even columns to one sum and odd to the other.
+                    let row_bytes = raw.w / 4 * 5;
+                    let row0 = &raw.data[qy * raw.row_stride..][..row_bytes];
+                    let row1 = &raw.data[(qy + 1) * raw.row_stride..][..row_bytes];
+                    let gb = f / 2 * 5;
+                    for x in 0..w {
+                        let (mut s, mut clip) = ([0u32; 4], 0u32);
+                        for (k, row) in [row0, row1].into_iter().enumerate() {
+                            for c in row[x * gb..x * gb + gb].chunks_exact(5) {
+                                let lo = c[4];
+                                let v0 = ((c[0] as u16) << 2) | (lo & 3) as u16;
+                                let v1 = ((c[1] as u16) << 2) | ((lo >> 2) & 3) as u16;
+                                let v2 = ((c[2] as u16) << 2) | ((lo >> 4) & 3) as u16;
+                                let v3 = ((c[3] as u16) << 2) | ((lo >> 6) & 3) as u16;
+                                s[2 * k] += v0 as u32 + v2 as u32;
+                                s[2 * k + 1] += v1 as u32 + v3 as u32;
+                                clip += (v0 >= clip_at) as u32 + (v1 >= clip_at) as u32 + (v2 >= clip_at) as u32 + (v3 >= clip_at) as u32;
+                            }
+                        }
+                        for k in 0..4 {
+                            sums[x][k] += s[k];
+                        }
+                        clipped[x] = clipped[x].saturating_add(clip.min(u16::MAX as u32) as u16);
+                    }
+                    for c in row0.chunks_exact(20) {
+                        hist[((((c[0] as u16) << 2) | (c[4] & 3) as u16) >> shift) as usize] += 1;
+                    }
+                    continue;
+                }
                 let row0 = &raw.data[qy * raw.row_stride..][..raw.w * 2];
                 let row1 = &raw.data[(qy + 1) * raw.row_stride..][..raw.w * 2];
                 for x in 0..w {
@@ -324,22 +364,43 @@ mod tests {
                 data[(y * w + x) * 2..(y * w + x) * 2 + 2].copy_from_slice(&v.to_le_bytes());
             }
         }
-        let raw = Raw { data: &data, w, h, row_stride: w * 2, cfa: Cfa::Rggb, black: [64; 4], white: 1023 };
-        let b = bin(&raw, 4);
-        assert_eq!((b.w, b.h), (4, 2));
+        let raw = Raw { data: &data, w, h, row_stride: w * 2, packed10: false, cfa: Cfa::Rggb, black: [64; 4], white: 1023 };
+        let b = bin(&raw, 2);
+        assert_eq!((b.w, b.h), (2, 1));
         let s = 1.0 / 959.0;
         assert!((b.rgb[0][0] - 300.0 * s).abs() < 1e-4 && (b.rgb[0][1] - 200.0 * s).abs() < 1e-4 && (b.rgb[0][2] - 100.0 * s).abs() < 1e-4, "{:?}", b.rgb[0]);
         // One sample of 32 at white: 3% clipped, in the last bin. The percentile is from a sixteenth of the samples, so a frame this small says little about it.
         assert!((b.stats.clipped - 1.0 / 32.0).abs() < 1e-6, "{:?}", b.stats);
         assert!((0.0..=1.0).contains(&b.stats.p999));
-        assert_eq!(b.clipped, vec![0, 0, 0, 0, 0, 0, 0, 1]);
+        assert_eq!(b.clipped, vec![0, 1]);
         // A short bracket at a quarter of the exposure fills that bin, scaled back up.
-        let mut long = bin(&raw, 4);
-        let mut short = bin(&raw, 4);
-        short.rgb[7] = [0.1, 0.2, 0.3];
+        let mut long = bin(&raw, 2);
+        let mut short = bin(&raw, 2);
+        short.rgb[1] = [0.1, 0.2, 0.3];
         long.fill_clipped(&short, 4.0);
-        assert_eq!(long.rgb[7], [0.4, 0.8, 1.2]);
+        assert_eq!(long.rgb[1], [0.4, 0.8, 1.2]);
         assert_eq!(long.rgb[0], short.rgb[0]);
+    }
+
+    #[test]
+    fn packed_ten_bit_reads_as_sixteen() {
+        let (w, h) = (8usize, 2usize);
+        let vals: Vec<u16> = (0..w * h).map(|i| (i as u16 * 97 + 5) & 1023).collect();
+        let mut wide = vec![0u8; w * h * 2];
+        let mut packed10 = vec![0u8; w / 4 * 5 * h];
+        for y in 0..h {
+            for x in 0..w {
+                let v = vals[y * w + x];
+                wide[(y * w + x) * 2..(y * w + x) * 2 + 2].copy_from_slice(&v.to_le_bytes());
+                let g = y * (w / 4 * 5) + (x / 4) * 5;
+                packed10[g + x % 4] = (v >> 2) as u8;
+                packed10[g + 4] |= ((v & 3) as u8) << (2 * (x % 4));
+            }
+        }
+        let a = bin(&Raw { data: &wide, w, h, row_stride: w * 2, packed10: false, cfa: Cfa::Rggb, black: [0; 4], white: 1023 }, 2);
+        let b = bin(&Raw { data: &packed10, w, h, row_stride: w / 4 * 5, packed10: true, cfa: Cfa::Rggb, black: [0; 4], white: 1023 }, 2);
+        assert_eq!(a.rgb, b.rgb);
+        assert_eq!(a.clipped, b.clipped);
     }
 
     #[test]

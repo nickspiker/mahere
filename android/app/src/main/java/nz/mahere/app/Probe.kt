@@ -19,7 +19,7 @@ import android.util.Log
 class Probe(private val context: Context, private val onFrame: (RawFrame, FloatArray) -> Unit) {
 
     class RawFrame(
-        val buffer: java.nio.ByteBuffer, val width: Int, val height: Int, val rowStride: Int,
+        val buffer: java.nio.ByteBuffer, val width: Int, val height: Int, val rowStride: Int, val packed10: Boolean,
         val cfa: Int, val black: FloatArray, val white: Int, val orientation: Int,
         val tanW: Float, val tanH: Float, val xyzToCam: FloatArray,
         val exposureNs: Long, val longNs: Long,
@@ -90,13 +90,20 @@ class Probe(private val context: Context, private val onFrame: (RawFrame, FloatA
             return false
         }
         val c = cm.getCameraCharacteristics(id)
-        val sizes = c.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)?.getOutputSizes(ImageFormat.RAW_SENSOR) ?: return false
-        val size = sizes.minByOrNull { it.width.toLong() * it.height } ?: return false
+        val map = c.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP) ?: return false
+        // Packed 10-bit when the sensor offers it: five eighths of the bytes of the 16-bit stream, and the read is most of the cost.
+        val format = if (map.getOutputSizes(ImageFormat.RAW10)?.isNotEmpty() == true) ImageFormat.RAW10 else ImageFormat.RAW_SENSOR
+        val sizes = map.getOutputSizes(format) ?: return false
         val physical = c.get(CameraCharacteristics.SENSOR_INFO_PHYSICAL_SIZE) ?: return false
         val array = c.get(CameraCharacteristics.SENSOR_INFO_PIXEL_ARRAY_SIZE) ?: return false
-        // The raw stream may be a crop of the array: scale the physical size by what it delivers.
-        val tanW = (physical.width * size.width / array.width) / (2f * bestFocal)
-        val tanH = (physical.height * size.height / array.height) / (2f * bestFocal)
+        // The smallest raw stream with the array's own shape: a scaled full field, the fewest bytes to read (the camera's buffers are uncached, and the read is most of the cost). Any other size is a crop, and the field scales with it.
+        val arrayAspect = array.width.toFloat() / array.height
+        val fullField = { s: android.util.Size -> kotlin.math.abs(s.width.toFloat() / s.height - arrayAspect) < 0.02f * arrayAspect }
+        val size = sizes.filter(fullField).minByOrNull { it.width.toLong() * it.height } ?: sizes.minByOrNull { it.width.toLong() * it.height } ?: return false
+        val (fieldW, fieldH) = if (fullField(size)) Pair(physical.width, physical.height) else Pair(physical.width * size.width / array.width, physical.height * size.height / array.height)
+        val tanW = fieldW / (2f * bestFocal)
+        val tanH = fieldH / (2f * bestFocal)
+        Log.i("mahere", "probe: ${if (format == ImageFormat.RAW10) "packed 10-bit" else "16-bit"} sizes ${sizes.joinToString { "${it.width}x${it.height}" }}, array ${array.width}x${array.height}")
         val orientation = c.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 0
         val cfa = c.get(CameraCharacteristics.SENSOR_INFO_COLOR_FILTER_ARRANGEMENT) ?: 0
         val white = c.get(CameraCharacteristics.SENSOR_INFO_WHITE_LEVEL) ?: 1023
@@ -117,7 +124,7 @@ class Probe(private val context: Context, private val onFrame: (RawFrame, FloatA
         thread = t
         val h = Handler(t.looper)
         handler = h
-        val r = ImageReader.newInstance(size.width, size.height, ImageFormat.RAW_SENSOR, 3)
+        val r = ImageReader.newInstance(size.width, size.height, format, 3)
         reader = r
         r.setOnImageAvailableListener({ rd ->
             val img = rd.acquireLatestImage() ?: return@setOnImageAvailableListener
@@ -129,7 +136,7 @@ class Probe(private val context: Context, private val onFrame: (RawFrame, FloatA
                 val long = exp >= exposureNs
                 val plane = img.planes[0]
                 val stats = FloatArray(2)
-                onFrame(RawFrame(plane.buffer, img.width, img.height, plane.rowStride, cfa, black, white, orientation, tanW, tanH, xyzToCam, exp, exposureNs), stats)
+                onFrame(RawFrame(plane.buffer, img.width, img.height, plane.rowStride, format == ImageFormat.RAW10, cfa, black, white, orientation, tanW, tanH, xyzToCam, exp, exposureNs), stats)
                 if (long) steer(stats[0], stats[1])
             } finally {
                 img.close()

@@ -54,7 +54,7 @@ class MahereActivity : Activity(), SurfaceHolder.Callback, Choreographer.FrameCa
     private external fun nativeProbeWanted(ptr: Long): Boolean
     private external fun nativeProbeDenied(ptr: Long)
     private external fun nativeOnProbe(
-        ptr: Long, buffer: java.nio.ByteBuffer, width: Int, height: Int, rowStride: Int,
+        ptr: Long, buffer: java.nio.ByteBuffer, width: Int, height: Int, rowStride: Int, packed10: Boolean,
         cfa: Int, black: FloatArray, white: Int, orientation: Int, tanW: Float, tanH: Float, xyzToCam: FloatArray, stats: FloatArray,
         exposureNs: Long, longNs: Long,
     )
@@ -63,7 +63,7 @@ class MahereActivity : Activity(), SurfaceHolder.Callback, Choreographer.FrameCa
     private val probe by lazy {
         Probe(this) { f, stats ->
             val p = nativePtr
-            if (p != 0L) nativeOnProbe(p, f.buffer, f.width, f.height, f.rowStride, f.cfa, f.black, f.white, f.orientation, f.tanW, f.tanH, f.xyzToCam, stats, f.exposureNs, f.longNs)
+            if (p != 0L) nativeOnProbe(p, f.buffer, f.width, f.height, f.rowStride, f.packed10, f.cfa, f.black, f.white, f.orientation, f.tanW, f.tanH, f.xyzToCam, stats, f.exposureNs, f.longNs)
         }
     }
     private var cameraAsked = false

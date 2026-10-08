@@ -664,6 +664,7 @@ pub extern "system" fn Java_nz_mahere_app_MahereActivity_nativeOnProbe(
     w: jint,
     h: jint,
     row_stride: jint,
+    packed10: jboolean,
     cfa: jint,
     black: JFloatArray,
     white: jint,
@@ -687,7 +688,7 @@ pub extern "system" fn Java_nz_mahere_app_MahereActivity_nativeOnProbe(
     let data = unsafe { std::slice::from_raw_parts(addr, len) };
     let mut pedestal = [0f32; 4];
     let _ = env.get_float_array_region(&black, 0, &mut pedestal);
-    let raw = Raw { data, w: w as usize, h: h as usize, row_stride: row_stride as usize, cfa, black: pedestal.map(|b| b as u16), white: white as u16 };
+    let raw = Raw { data, w: w as usize, h: h as usize, row_stride: row_stride as usize, packed10: packed10 != 0, cfa, black: pedestal.map(|b| b as u16), white: white as u16 };
     let t0 = std::time::Instant::now();
     let mut b = bin(&raw, 48);
     let bin_ms = t0.elapsed().as_secs_f32() * 1e3;
