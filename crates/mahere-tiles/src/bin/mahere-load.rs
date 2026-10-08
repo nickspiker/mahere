@@ -31,8 +31,10 @@ fn main() {
     };
     let tifs = list("--dem");
     assert!(!tifs.is_empty(), "--dem <tif>...");
-    // Imagery: --naip <4-band tif>... (red, green, blue, near-infrared).
+    // Imagery: --naip <tif>... (red, green, blue, near-infrared in one file, or true colour alone), --nir <tif>... (a separate near-infrared band, as Sentinel-2 ships it), --img-base <depth> (default the vector base, never past depth 14).
     let naip = list("--naip");
+    let nir = list("--nir");
+    let img_base_arg: Option<u8> = arg(&args, "--img-base").map(|v| v.parse().unwrap());
     let in_box = |la: f32, lo: f32| {
         (la as f64) >= lat0 && (la as f64) <= lat1 && (lo as f64) >= lon0 && (lo as f64) <= lon1
     };
@@ -96,9 +98,10 @@ fn main() {
         let naip_store = if naip.is_empty() { None } else { Some(mahere_dem::ImgStore::load(&naip).expect("naip")) };
         eprintln!("imagery sources loaded {:.1}s", t.elapsed().as_secs_f32());
         let t = std::time::Instant::now();
-        let img_base = vec_base.min(mahere_tiles::IMG_MAX_DEPTH);
+        let nir_store = if nir.is_empty() { None } else { Some(mahere_dem::ImgStore::load(&nir).expect("nir")) };
+        let img_base = img_base_arg.unwrap_or(vec_base).min(mahere_tiles::IMG_MAX_DEPTH);
         let keys = mahere_tiles::cells_covering(lat0, lon0, lat1, lon1, img_base);
-        img_cells = mahere_tiles::bake_img(naip_store.as_ref(), &keys);
+        img_cells = mahere_tiles::bake_img(naip_store.as_ref(), nir_store.as_ref(), &keys);
         eprintln!("depth {img_base}: {} img cells sampled, {:.1}s", img_cells.len(), t.elapsed().as_secs_f32());
         let pyramid = mahere_tiles::img_pyramid(&img_cells, min_depth);
         eprintln!("img pyramid: {} cells", pyramid.len());

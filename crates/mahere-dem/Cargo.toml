@@ -7,6 +7,7 @@ repository.workspace = true
 description = "mahere's raster elevation boundary: USGS 3DEP GeoTIFFs in, elevation and gradient samples out"
 
 [dependencies]
+flate2 = "1"
 tiff = "0.9"
 las = { version = "0.11", features = ["laz"] }
 rayon = "1"

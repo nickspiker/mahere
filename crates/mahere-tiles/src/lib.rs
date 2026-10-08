@@ -815,7 +815,8 @@ pub fn dem_pyramid(base: &[(CellKey, DemCell)], min_depth: u8) -> Vec<(CellKey, 
 
 /// Sample NAIP (red, nir) and lidar intensity at every triangle centroid of `keys` (depth <= IMG_MAX_DEPTH); cells with nothing are dropped.
 /// Sample the imagery at every triangle centroid: the four NAIP bands, each the mean of four samples spread a third of a texel around the centroid, so 60 cm pixels are box-filtered into a 1.2 m texel instead of point-picked. 0 stays no data.
-pub fn bake_img(naip: Option<&mahere_dem::ImgStore>, keys: &[CellKey]) -> Vec<(CellKey, ImgCell)> {
+/// `nir`, when given, is a separate single-band near-infrared source (Sentinel-2 ships its bands as separate files) that takes the place of the colour source's fourth band.
+pub fn bake_img(naip: Option<&mahere_dem::ImgStore>, nir: Option<&mahere_dem::ImgStore>, keys: &[CellKey]) -> Vec<(CellKey, ImgCell)> {
     keys.par_iter()
         .map(|&key| {
             let (u0, v0, size) = key.uv_rect();
@@ -831,7 +832,10 @@ pub fn bake_img(naip: Option<&mahere_dem::ImgStore>, keys: &[CellKey]) -> Vec<(C
                         let (mut acc, mut hits) = ([0u32; 4], 0u32);
                         for (ou, ov) in [(-0.3, -0.3), (0.3, -0.3), (-0.3, 0.3), (0.3, 0.3)] {
                             let (lat, lon) = uv_to_lat_lon(d, u0 + (cx + ou) * step, v0 + (cy + ov) * step);
-                            if let Some(px) = n.sample(lat, lon) {
+                            if let Some(mut px) = n.sample(lat, lon) {
+                                if let Some(nr) = nir {
+                                    px[3] = nr.sample(lat, lon).map_or(0, |q| q[0]);
+                                }
                                 for b in 0..4 {
                                     acc[b] += px[b] as u32;
                                 }

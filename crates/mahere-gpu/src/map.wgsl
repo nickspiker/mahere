@@ -403,7 +403,22 @@ fn compose(d: u32, u: u32, v: u32) -> Composed {
             out.base = U.style_bg.rgb;
         }
     }
+    // Imagery has its own depth (a global 10 m layer sits several levels above the vector cells), so it is found on its own: the finest cell at or above the vector depth that carries any.
+    var im = vec4<u32>(0u);
+    if ((mask & (M_IMAGERY | M_INFRARED)) != 0u) {
+        let ii = find(d, U.depths.y, u, v, FLAG_IMG);
+        if (ii != NONE) {
+            let ri = refs[ii];
+            let ti = tri(u, v, ri.a.y);
+            im = textureLoad(img_tex, vec2<i32>(i32(2u * ti.x + ti.z), i32(ti.y)), i32(ri.b.w), 0);
+        }
+    }
     let vi = find(d, U.depths.y, u, v, FLAG_VEC);
+    if (vi == NONE && (mask & M_IMAGERY) != 0u && (im.x != 0u || im.y != 0u || im.z != 0u)) {
+        out.ground = false;
+        out.base = select(vec3<f32>(f32(im.x), f32(im.y), f32(im.z)), vec3<f32>(f32(im.w)), (mask & M_INFRARED) != 0u);
+        return out;
+    }
     if (vi != NONE) {
         let r = refs[vi];
         let flags = r.c.x;
@@ -411,15 +426,11 @@ fn compose(d: u32, u: u32, v: u32) -> Composed {
         let xy = vec2<i32>(i32(2u * t.x + t.z), i32(t.y));
         var line = vec4<u32>(0u);
         var lw = vec4<u32>(0u);
-        var im = vec4<u32>(0u);
         if ((flags & FLAG_LINE) != 0u) {
             line = textureLoad(line_tex, xy, i32(r.b.y), 0);
         }
         if ((flags & (FLAG_LAND | FLAG_WATER)) != 0u) {
             lw = textureLoad(lw_tex, xy, i32(r.b.z), 0);
-        }
-        if ((flags & FLAG_IMG) != 0u) {
-            im = textureLoad(img_tex, xy, i32(r.b.w), 0);
         }
         let draw_line = (mask & M_LINE) != 0u && line.y != 0u && (line.x < BOUNDARY_FIRST || (mask & M_BOUND) != 0u);
         if ((mask & M_IMAGERY) != 0u) {

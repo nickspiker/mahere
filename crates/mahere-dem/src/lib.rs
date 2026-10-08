@@ -342,9 +342,18 @@ impl ImgTile {
             Err(e) => return Err(format!("{path}: GeoKeyDirectory: {e}")),
         };
         let origin = (tie[3] - tie[0] * scale[0], tie[4] + tie[1] * scale[1]);
+        let bits = dec.get_tag_u32_vec(Tag::BitsPerSample).ok().and_then(|b| b.first().copied());
+        if bits == Some(15) {
+            // Sentinel-2 L2A as served by the Planetary Computer: 15-bit samples, which the decoder refuses; read the tiles by hand.
+            let data = read_tiled_u15(path, &mut dec, w as usize, h as usize)?;
+            eprintln!("img tile {path}: {w}x{h} x1 (15-bit) {grid:?}");
+            return Ok(ImgTile { width: w as usize, height: h as usize, bands: 1, grid, origin, step: (scale[0], scale[1]), data });
+        }
         let data = match dec.read_image().map_err(|e| format!("{path}: {e}"))? {
             DecodingResult::U8(v) => v,
-            other => return Err(format!("{path}: expected U8 samples, got {}", sample_kind(&other))),
+            // Sixteen-bit reflectance (Sentinel-2 L2A: 10000 per unit, offset by 1000 since processing baseline 4): reflectance 0 to 0.45 onto 1 to 255, 0 kept for no data.
+            DecodingResult::U16(v) => v.into_iter().map(|d| if d == 0 { 0 } else { (d.saturating_sub(1000) / 18).clamp(1, 255) as u8 }).collect(),
+            other => return Err(format!("{path}: expected U8 or U16 samples, got {}", sample_kind(&other))),
         };
         let px = w as usize * h as usize;
         if data.len() % px != 0 {
@@ -562,4 +571,51 @@ impl IntensityStore {
         let v = self.data[gy as usize * self.width + gx as usize];
         (v != 0).then_some(v)
     }
+}
+
+/// A tiled, deflate-compressed, single-band TIFF of 15-bit samples (no predictor), read tile by tile and mapped like 16-bit reflectance: 10000 per unit with a 1000 offset, reflectance 0 to 0.45 onto 1 to 255, 0 kept for no data.
+fn read_tiled_u15<R: std::io::Read + std::io::Seek>(path: &str, dec: &mut Decoder<R>, w: usize, h: usize) -> Result<Vec<u8>, String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let get = |dec: &mut Decoder<R>, t: Tag| dec.get_tag_u32_vec(t).ok().and_then(|v| v.first().copied());
+    let (tw, th) = (get(dec, Tag::TileWidth).ok_or("no TileWidth")? as usize, get(dec, Tag::TileLength).ok_or("no TileLength")? as usize);
+    if get(dec, Tag::Compression) != Some(8) || get(dec, Tag::Predictor).unwrap_or(1) != 1 {
+        return Err(format!("{path}: 15-bit reader handles deflate without a predictor only"));
+    }
+    let offsets = dec.get_tag_u64_vec(Tag::TileOffsets).map_err(|e| format!("{path}: {e}"))?;
+    let counts = dec.get_tag_u64_vec(Tag::TileByteCounts).map_err(|e| format!("{path}: {e}"))?;
+    let across = w.div_ceil(tw);
+    let mut file = File::open(path).map_err(|e| format!("{path}: {e}"))?;
+    let mut out = vec![0u8; w * h];
+    let mut raw = Vec::new();
+    for (t, (&off, &len)) in offsets.iter().zip(&counts).enumerate() {
+        raw.resize(len as usize, 0);
+        file.seek(SeekFrom::Start(off)).map_err(|e| e.to_string())?;
+        file.read_exact(&mut raw).map_err(|e| e.to_string())?;
+        let mut bytes = Vec::with_capacity(tw * th * 15 / 8 + 8);
+        flate2::read::ZlibDecoder::new(&raw[..]).read_to_end(&mut bytes).map_err(|e| format!("{path}: tile {t}: {e}"))?;
+        let (x0, y0) = ((t % across) * tw, (t / across) * th);
+        let row_bytes = (tw * 15).div_ceil(8);
+        for ry in 0..th {
+            let y = y0 + ry;
+            if y >= h {
+                break;
+            }
+            let row = &bytes[ry * row_bytes..((ry + 1) * row_bytes).min(bytes.len())];
+            let (mut acc, mut nbits, mut pos) = (0u32, 0u32, 0usize);
+            for rx in 0..tw {
+                while nbits < 15 {
+                    acc = (acc << 8) | row.get(pos).copied().unwrap_or(0) as u32;
+                    pos += 1;
+                    nbits += 8;
+                }
+                nbits -= 15;
+                let d = ((acc >> nbits) & 0x7FFF) as u16;
+                let x = x0 + rx;
+                if x < w {
+                    out[y * w + x] = if d == 0 { 0 } else { (d.saturating_sub(1000) / 18).clamp(1, 255) as u8 };
+                }
+            }
+        }
+    }
+    Ok(out)
 }

@@ -3,7 +3,7 @@
 //! Two depth selections: the dem's and the vector layers' (line, land, water share a base and live in the same cell). Each block resolves one dem ref and one vector ref; a pixel composes dem → land tint → shade → water → line, each gated by the client's layer mask.
 
 use mahere_coord::Coord;
-use mahere_tiles::{CellKey, ClassCell, CovCell, ELEV_NODATA, ImgCell};
+use mahere_tiles::{CellKey, ClassCell, CovCell, ELEV_NODATA};
 use rayon::prelude::*;
 use rustc_hash::FxHashSet;
 
@@ -267,7 +267,6 @@ enum VecRef<'a> {
         line: Option<&'a ClassCell>,
         land: Option<&'a ClassCell>,
         water: Option<&'a CovCell>,
-        img: Option<&'a ImgCell>,
         shift: u32,
         prefix_shift: u32,
         prefix: u64,
@@ -408,7 +407,6 @@ fn resolve_vec<'a>(pool: &'a Pool, depth: u8, raw: u64) -> VecRef<'a> {
             line: e.line.as_ref(),
             land: e.land.as_ref(),
             water: e.water.as_ref(),
-            img: e.img.as_ref(),
             shift: 16 + (22 - d as u32),
             prefix_shift: 60 - 2 * d as u32,
             prefix: pfx,
@@ -578,15 +576,19 @@ fn compose_rgb(dem: &DemRef, vec: &VecRef, pool: &Pool, diamond: u8, uq: i64, vq
         }
     }
     let mut rgb = tint;
-    if let VecRef::Cell { line, land, water, img, shift, .. } = vec {
+    // Imagery has its own depth (a global 10 m layer sits several levels above the vector cells), so it is found on its own: the finest resident cell carrying any.
+    let imagery = if mask.imagery { img_texel(pool, diamond, uq, vq) } else { None };
+    if mask.imagery {
+        if let Some(px) = imagery {
+            rgb = if mask.infrared { [px[3] as f32; 3] } else { [px[0] as f32, px[1] as f32, px[2] as f32] };
+        }
+    }
+    if mask.imagery && matches!(vec, VecRef::None) {
+        return ((rgb[0] as u32) << 16) | ((rgb[1] as u32) << 8) | rgb[2] as u32;
+    }
+    if let VecRef::Cell { line, land, water, shift, .. } = vec {
         let i = tri_index(uq, vq, *shift);
         if mask.imagery {
-            // True colour, or the near-infrared band as grey; no-data stays background.
-            if let Some(im) = img {
-                if im.red[i] != 0 || im.green[i] != 0 || im.blue[i] != 0 {
-                    rgb = if mask.infrared { [im.nir[i] as f32; 3] } else { [im.red[i] as f32, im.green[i] as f32, im.blue[i] as f32] };
-                }
-            }
             if mask.line {
                 if let Some(line) = line {
                     let cov = line.cov[i];
@@ -878,4 +880,13 @@ mod tests {
         let expect = (lit(t[0], e[0]) << 16) | (lit(t[1], e[1]) << 8) | lit(t[2], e[2]);
         assert_eq!(canvas[(h / 2) * w + w / 2], expect);
     }
+}
+
+/// The imagery under a point — red, green, blue, near-infrared — from the finest resident cell carrying imagery, or none (no data, or every band 0).
+fn img_texel(pool: &Pool, diamond: u8, uq: i64, vq: i64) -> Option<[u8; 4]> {
+    let raw = raw_of(diamond, uq, vq);
+    let (e, d, _) = probe(pool, VEC_BASE_DEPTH, raw >> (60 - 2 * VEC_BASE_DEPTH as u32), |e| e.img.is_some())?;
+    let im = e.img.as_ref()?;
+    let i = tri_index(uq, vq, 16 + (22 - d as u32));
+    (im.red[i] != 0 || im.green[i] != 0 || im.blue[i] != 0).then(|| [im.red[i], im.green[i], im.blue[i], im.nir[i]])
 }
