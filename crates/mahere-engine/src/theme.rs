@@ -119,10 +119,8 @@ impl Theme {
         let mut lut = Box::new([[0u8; 3]; 4096]);
         for (i, out) in lut.iter_mut().enumerate() {
             let elev = (i as f32 * 16.0) / 4.0 - 500.0;
-            if elev < 0.5 {
-                *out = self.sea;
-                continue;
-            }
+            // Below the first stop (land under sea level, the Dead Sea, a polder) takes the first stop; the sea itself is told apart at draw time, where elevation is exactly zero and the ground dead flat.
+            let _ = self.sea;
             let last = self.hypso[self.hypso.len() - 1].1;
             let mut tint = [last[0] as f32, last[1] as f32, last[2] as f32];
             for w in self.hypso.windows(2) {
@@ -141,6 +139,6 @@ impl Theme {
     }
 
     pub fn style(&self) -> Style {
-        Style { land: self.land, line: self.line, water: self.water, contour: self.contour, contour_index: self.contour_index, contour_alpha: self.contour_alpha, flat: self.flat, bg: self.bg, no_dem: self.no_dem }
+        Style { land: self.land, line: self.line, water: self.water, contour: self.contour, contour_index: self.contour_index, contour_alpha: self.contour_alpha, sea: self.sea, flat: self.flat, bg: self.bg, no_dem: self.no_dem }
     }
 }

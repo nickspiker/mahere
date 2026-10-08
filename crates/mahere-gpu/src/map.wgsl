@@ -2,7 +2,7 @@
 
 const NONE: u32 = 0xFFFFFFFFu;
 const MIN_DEPTH: u32 = 6u;
-const TABLE_N: u32 = 4096u;
+const TABLE_N: u32 = 16384u;
 const ELEV_NODATA: u32 = 0xFFFFu;
 
 const FLAG_DEM: u32 = 1u;
@@ -49,6 +49,7 @@ struct Uniforms {
     style_flat: vec4<f32>,
     style_bg: vec4<f32>,
     style_no_dem: vec4<f32>,
+    style_sea: vec4<f32>,
 };
 
 // a: diamond, depth, cu, cv. b: dem slot, line slot, land+water slot, img slot. c: flags. d: base, step, eu, nu. e: ev, nv, inv det.
@@ -354,7 +355,10 @@ fn compose(d: u32, u: u32, v: u32) -> Composed {
             let eq = u32(clamp((s.elev + 500.0) * 4.0, 0.0, 65534.0));
             if ((mask & M_DEM) != 0u) {
                 out.n = s.n;
-                if ((mask & M_HYPSO) != 0u) {
+                // The open sea: exactly zero and dead flat, which is how a global DEM writes the ocean (below-sea-level land keeps its colour).
+                if (abs(s.elev) < 0.75 && s.n.z > 0.9995) {
+                    out.base = U.style_sea.rgb;
+                } else if ((mask & M_HYPSO) != 0u) {
                     out.base = unpack_rgb(lut[eq >> 4u]);
                 } else {
                     out.base = U.style_flat.rgb;

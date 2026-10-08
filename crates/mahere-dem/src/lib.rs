@@ -34,6 +34,8 @@ pub struct DemTile {
 /// A set of tiles answering point queries; tiles are searched in order, so overlapping collars resolve to the first tile loaded.
 pub struct DemStore {
     tiles: Vec<DemTile>,
+    /// Every one-degree square the source publishes a tile for, when the source is a global set (Copernicus publishes a tile wherever there is land): a point in a square outside it is open sea.
+    land_squares: Option<std::collections::HashSet<(i32, i32)>>,
 }
 
 /// GeoKey IDs (OGC GeoTIFF).
@@ -184,12 +186,27 @@ pub fn utm_forward(lat: f64, lon: f64, zone: u8) -> (f64, f64) {
 }
 
 impl DemStore {
+    /// Tiles decode in parallel, kept in the order given: a sample takes the first tile with data, so earlier paths win.
     pub fn load(paths: &[String]) -> Result<DemStore, String> {
-        let mut tiles = Vec::new();
-        for p in paths {
-            tiles.push(DemTile::load(p)?);
+        use rayon::prelude::*;
+        let tiles: Result<Vec<DemTile>, String> = paths.par_iter().map(|p| DemTile::load(p)).collect();
+        Ok(DemStore { tiles: tiles?, land_squares: None })
+    }
+
+    /// Declare the source global: the one-degree squares (floor of latitude, floor of longitude) it has tiles for. Points outside every one of them read as sea level.
+    pub fn set_land_squares(&mut self, squares: std::collections::HashSet<(i32, i32)>) {
+        self.land_squares = Some(squares);
+    }
+
+    /// Elevation, or 0 in a square the global source has no tile for (open sea).
+    pub fn elevation_or_sea(&self, p: (f64, f64)) -> Option<f32> {
+        if let Some(e) = self.elevation(p.0, p.1) {
+            return Some(e);
         }
-        Ok(DemStore { tiles })
+        let land = self.land_squares.as_ref()?;
+        let lon = (p.1 + 180.0).rem_euclid(360.0) - 180.0;
+        let sq = (p.0.floor() as i32, lon.floor() as i32);
+        (!land.contains(&sq)).then_some(0.0)
     }
 
     pub fn tile_count(&self) -> usize {

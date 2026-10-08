@@ -200,7 +200,7 @@ impl MapCore {
     /// Exact geo-anchored zoom: the geography under (ax, ay) stays there.
     pub fn zoom_about(&mut self, factor: f64, ax: f64, ay: f64, w: usize, h: usize) {
         let (alat, alon) = self.cam.screen_to_geo(ax, ay, w, h);
-        self.cam.ppd = (self.cam.ppd * factor).clamp(40., 4_000_000.);
+        self.cam.ppd = (self.cam.ppd * factor).clamp(6., 4_000_000.);
         self.place_anchor(alat, alon, ax, ay, w, h);
     }
 
@@ -224,7 +224,7 @@ impl MapCore {
     }
 
     pub fn set_ppd(&mut self, ppd: f64) {
-        self.cam.ppd = ppd.clamp(40., 4_000_000.);
+        self.cam.ppd = ppd.clamp(6., 4_000_000.);
         self.unlock_measure();
         self.dirty = true;
     }

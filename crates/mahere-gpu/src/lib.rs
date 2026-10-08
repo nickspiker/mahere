@@ -82,6 +82,7 @@ struct Uniforms {
     style_flat: [f32; 4],
     style_bg: [f32; 4],
     style_no_dem: [f32; 4],
+    style_sea: [f32; 4],
 }
 
 /// The layer mask as the shader's bits.
@@ -713,6 +714,7 @@ impl GpuMap {
             style_flat: rgb4(luts.style.flat),
             style_bg: rgb4(luts.style.bg),
             style_no_dem: rgb4(luts.style.no_dem),
+            style_sea: rgb4(luts.style.sea),
         };
         let measure_on = self.measure.is_some();
         let u = Uniforms { depths: [plan.dem_depth as u32, plan.vec_depth as u32, plan.magnified as u32, measure_on as u32], ..u };

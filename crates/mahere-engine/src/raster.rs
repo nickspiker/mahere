@@ -14,7 +14,7 @@ pub const BLOCK: usize = 32;
 /// Deepest depths any bake produces; regions baked shallower simply fall back to their parents through the page table.
 pub const VEC_BASE_DEPTH: u8 = 14;
 pub const DEM_BASE_DEPTH: u8 = 14;
-pub const MIN_DEPTH: u8 = 6;
+pub const MIN_DEPTH: u8 = 0;
 
 /// texel/pixel ratio constant: diamond edge 7054 km, 111320 m/deg, 256 texels/cell. ratio r(d) = ppd * K / 2^d; pick d so r ∈ (0.5, 1].
 const K: f64 = 7_054_000.0 / (111_320.0 * 256.0);
@@ -150,6 +150,8 @@ pub struct Style {
     pub contour: [u8; 3],
     pub contour_index: [u8; 3],
     pub contour_alpha: [f32; 2],
+    /// The open sea: ground at exactly zero and dead flat, which is how a global DEM writes the ocean.
+    pub sea: [u8; 3],
     pub flat: [u8; 3],
     pub bg: [u8; 3],
     pub no_dem: [u8; 3],
@@ -316,7 +318,9 @@ pub(crate) struct CornerPt {
 }
 
 pub(crate) fn corner(cam: &Camera, px: f64, py: f64, w: usize, h: usize) -> CornerPt {
+    // Zoomed far out the screen reaches past a pole; hold it at the pole rather than wrap onto the far side.
     let (lat, lon) = cam.screen_to_geo(px, py, w, h);
+    let lat = lat.clamp(-89.999, 89.999);
     let c = Coord::from_lat_lon(lat, lon);
     let (iu, iv) = c.uv();
     CornerPt { diamond: c.diamond(), u: (iu as i64) << 16, v: (iv as i64) << 16 }
@@ -543,7 +547,10 @@ fn compose_rgb(dem: &DemRef, vec: &VecRef, pool: &Pool, diamond: u8, uq: i64, vq
                     const K: f32 = 1.0 / 32767.0;
                     let e = luts.light.eval(nx * K, ny * K, nz * K);
                     light = [e[0].clamp(0.0, 1.3), e[1].clamp(0.0, 1.3), e[2].clamp(0.0, 1.3)];
-                    tint = if mask.hypso {
+                    let sea = (eq as f32 * 0.25 - 500.0).abs() < 0.75 && nz > 0.9995 * 32767.0;
+                    tint = if sea {
+                        [st.sea[0] as f32, st.sea[1] as f32, st.sea[2] as f32]
+                    } else if mask.hypso {
                         let c = luts.hypso[(eq >> 4) as usize];
                         [c[0] as f32, c[1] as f32, c[2] as f32]
                     } else {
@@ -804,7 +811,8 @@ mod tests {
         assert_eq!(select_depth(6300.0, 11, 13), 11);
         // Far outside the band it snaps.
         assert_eq!(select_depth(24_000.0, 11, 13), 13);
-        assert_eq!(select_depth(100.0, 11, 13), MIN_DEPTH);
+        assert_eq!(select_depth(100.0, 11, 13), 5);
+        assert_eq!(select_depth(1.0, 11, 13), MIN_DEPTH);
     }
 
     /// One synthetic flat cell at depth 6; a rendered frame must light it exactly as the compose math says, through the whole block/page-table path (including parent fallback from the nominal depth). With a forest over half of it, the land tint shows exactly there.

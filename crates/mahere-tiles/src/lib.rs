@@ -310,6 +310,11 @@ pub struct DemCell {
 pub const APRON: usize = 4 * 2 * TEX;
 
 impl DemCell {
+    /// A cell with no data anywhere, apron included.
+    pub fn empty() -> DemCell {
+        DemCell::new()
+    }
+
     fn new() -> DemCell {
         DemCell { elev: vec![f32::NAN; TRI], apron: vec![f32::NAN; APRON] }
     }
@@ -701,6 +706,59 @@ pub fn bake_dem(dem: &DemStore, keys: &[CellKey]) -> Vec<(CellKey, DemCell)> {
         })
         .filter(|(_, c)| c.elev.iter().any(|e| !e.is_nan()))
         .collect()
+}
+
+/// Elevation for a triangle texel at (tx, ty, half) of a cell grid — indices may run one past the cell for the apron — as the mean of the four child-triangle centroids one level finer (no-data ignored): the source is read at twice the texel's resolution, which is what a triangle needs to show what it can resolve.
+fn dem_texel_filtered(dem: &DemStore, d: u8, u0: f64, v0: f64, step: f64, tx: i64, ty: i64, half: usize) -> f32 {
+    let (mut sum, mut n) = (0.0f32, 0u32);
+    for (cx, cy, ch) in tri_children(0, 0, half) {
+        let off = tri_off(ch);
+        let gx = tx as f64 + (cx as f64 + off) * 0.5;
+        let gy = ty as f64 + (cy as f64 + off) * 0.5;
+        if let Some(e) = dem.elevation_or_sea(uv_to_lat_lon(d, u0 + gx * step, v0 + gy * step)) {
+            sum += e;
+            n += 1;
+        }
+    }
+    if n > 0 { sum / n as f32 } else { f32::NAN }
+}
+
+/// The global bake: every texel and its apron box-filtered from the source (`dem_texel_filtered`), the apron sampled directly so a cell's edge normals are exact without its neighbours in memory. Cells with no data at all are dropped.
+pub fn bake_dem_filtered(dem: &DemStore, keys: &[CellKey]) -> Vec<(CellKey, DemCell)> {
+    keys.par_iter()
+        .map(|&key| {
+            let (u0, v0, size) = key.uv_rect();
+            let d = key.diamond();
+            let step = size / TEX as f64;
+            let mut cell = DemCell::new();
+            for ty in 0..TEX {
+                for tx in 0..TEX {
+                    for half in 0..2 {
+                        cell.elev[tri_idx(tx, ty, half)] = dem_texel_filtered(dem, d, u0, v0, step, tx as i64, ty as i64, half);
+                    }
+                }
+            }
+            fill_apron_from_source(dem, key, &mut cell);
+            (key, cell)
+        })
+        .filter(|(_, c)| c.elev.iter().any(|e| !e.is_nan()))
+        .collect()
+}
+
+/// A cell's apron — the texels one step outside each edge — sampled from the source.
+pub fn fill_apron_from_source(dem: &DemStore, key: CellKey, cell: &mut DemCell) {
+    let (u0, v0, size) = key.uv_rect();
+    let d = key.diamond();
+    let step = size / TEX as f64;
+    for half in 0..2 {
+        for i in 0..TEX {
+            let ii = i as i64;
+            cell.apron[apron_idx(0, half, i)] = dem_texel_filtered(dem, d, u0, v0, step, -1, ii, half);
+            cell.apron[apron_idx(1, half, i)] = dem_texel_filtered(dem, d, u0, v0, step, TEX as i64, ii, half);
+            cell.apron[apron_idx(2, half, i)] = dem_texel_filtered(dem, d, u0, v0, step, ii, -1, half);
+            cell.apron[apron_idx(3, half, i)] = dem_texel_filtered(dem, d, u0, v0, step, ii, TEX as i64, half);
+        }
+    }
 }
 
 /// Every depth from `base.depth - 1` down to `min_depth`, each texel the mean of its four triangle children (no-data ignored). Building the pyramid from the base set is what guarantees every ancestor of a baked cell exists.

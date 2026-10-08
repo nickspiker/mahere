@@ -172,7 +172,7 @@ pub struct Residency {
 const RETRY_AFTER: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// Cells at this depth and above are never evicted.
-pub const PIN_DEPTH: u8 = 8;
+pub const PIN_DEPTH: u8 = 4;
 
 impl Residency {
     pub fn new(store: Arc<dyn CellStore>) -> Residency {

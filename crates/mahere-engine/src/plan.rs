@@ -17,7 +17,7 @@ pub const NONE: u32 = u32::MAX;
 pub const SUB: usize = 4;
 
 /// Page table slots; a power of two, several times the largest resident set.
-pub const TABLE_N: usize = 4096;
+pub const TABLE_N: usize = 16384;
 
 /// Depths at which the view's neighbouring cells are fetched ahead, so a zoom out is already covered.
 pub const PREFETCH_DEPTH: u8 = 10;
@@ -295,7 +295,7 @@ mod tests {
         }
         let cam = Camera { lat: 46.2, lon: -122.19, ppd: 6000.0, bearing: 0.3 };
         let plan = plan_frame(256, 128, &cam, &pool, 12, 12);
-        assert_eq!(plan.refs.len(), 7);
+        assert_eq!(plan.refs.len(), (12 - MIN_DEPTH + 1) as usize);
         for (i, r) in plan.refs.iter().enumerate() {
             let mut h = table_hash(r.diamond as u32, r.key.depth as u32, r.cu, r.cv) as usize;
             let mut found = false;
