@@ -5,7 +5,7 @@
 use crate::raster::{LayerMask, Style};
 
 /// Bumped whenever the built-ins change, so a vault holding an older copy of one is refreshed.
-pub const BUILTIN_REVISION: u32 = 2;
+pub const BUILTIN_REVISION: u32 = 3;
 
 #[derive(Clone, Debug)]
 pub struct Theme {
@@ -42,29 +42,31 @@ pub const CLASS_NAMES: [&str; 18] = ["", "Motorway", "Trunk", "Primary", "Second
 
 const ALL: LayerMask = LayerMask { dem: true, land: true, water: true, line: true, debug: false, imagery: false, contours: true, slope: false, infrared: false, hypso: true, boundaries: true };
 
-/// The field map: a pale, warm ground that greens in the valleys and lightens toward the peaks, soft relief, roads in dark greys rising to amber and red-orange, trails in crimson.
+// The light is linear: flat ground under a 40° sun sees about `sun · 0.64 + sky · 0.3`, a slope turned from the sun about `sky · 0.25`, a slope facing it up to `sun + sky · 0.3`, which the display's rail rolls into white. A sun near 1 over a sky near 1.2 keeps flat ground at its authored colour with the shade side a third of it.
+
+/// The field map: a pale, warm ground that greens in the valleys and lightens toward the peaks, honest relief under a warm sun and a cool sky, roads in greys rising to amber and red-orange, trails in crimson.
 pub fn trail() -> Theme {
     Theme {
         name: "Trail".to_string(),
         revision: BUILTIN_REVISION,
-        hypso: [(0.0, [196, 210, 176]), (600.0, [208, 212, 180]), (1200.0, [220, 214, 192]), (1900.0, [228, 224, 214]), (2600.0, [242, 242, 244])],
+        hypso: [(0.0, [180, 206, 154]), (600.0, [198, 210, 162]), (1200.0, [218, 212, 178]), (1900.0, [230, 222, 204]), (2600.0, [244, 244, 246])],
         sea: [150, 192, 228],
-        flat: [232, 232, 228],
+        flat: [234, 230, 222],
         bg: [44, 48, 56],
         no_dem: [206, 206, 200],
-        land: [[0, 0, 0], [190, 214, 160], [222, 214, 172], [198, 214, 160], [200, 206, 170], [154, 190, 142], [172, 206, 196], [232, 222, 184], [206, 202, 196], [234, 242, 250], [202, 194, 186], [210, 204, 214], [222, 216, 210], [150, 192, 228]],
-        line: [[0, 0, 0], [214, 92, 42], [222, 120, 46], [222, 152, 52], [196, 156, 66], [140, 130, 110], [118, 118, 124], [146, 146, 152], [140, 96, 58], [206, 34, 78], [76, 76, 86], [146, 136, 168], [62, 130, 206], [64, 150, 80], [104, 160, 76], [118, 140, 66], [76, 150, 118], [150, 98, 172]],
-        water: [150, 192, 228],
-        contour: [150, 122, 92],
-        contour_index: [124, 94, 64],
-        contour_alpha: [0.32, 0.55],
-        sun: [0.52, 0.50, 0.46],
-        sky: [1.75, 1.80, 1.90],
+        land: [[0, 0, 0], [190, 214, 160], [222, 214, 172], [198, 214, 160], [200, 206, 170], [150, 188, 138], [172, 206, 196], [232, 222, 184], [206, 202, 196], [234, 242, 250], [202, 194, 186], [210, 204, 214], [222, 216, 210], [150, 192, 228]],
+        line: [[0, 0, 0], [208, 80, 34], [218, 110, 40], [218, 144, 46], [190, 148, 58], [126, 116, 98], [104, 104, 112], [130, 130, 138], [124, 84, 48], [200, 24, 70], [64, 64, 74], [140, 128, 164], [52, 120, 200], [56, 140, 72], [96, 152, 68], [110, 132, 58], [68, 142, 110], [144, 90, 166]],
+        water: [146, 190, 228],
+        contour: [140, 110, 80],
+        contour_index: [112, 82, 54],
+        contour_alpha: [0.40, 0.66],
+        sun: [1.02, 0.95, 0.82],
+        sky: [1.08, 1.12, 1.22],
         layers: ALL,
     }
 }
 
-/// A printed quad: white ground with no elevation tint, woodland in pale green, brown contours with heavier index lines, red highways, black roads, magenta trails, blue water.
+/// A printed quad: white ground with no elevation tint, woodland in pale green, brown contours with heavier index lines, red highways, black roads, magenta trails, blue water. The relief is soft, as a print's shaded relief is.
 pub fn topo() -> Theme {
     Theme {
         name: "Topo".to_string(),
@@ -74,43 +76,109 @@ pub fn topo() -> Theme {
         flat: [246, 246, 242],
         bg: [226, 226, 222],
         no_dem: [236, 236, 232],
-        land: [[0, 0, 0], [222, 236, 206], [240, 236, 214], [224, 236, 206], [226, 232, 210], [204, 226, 192], [208, 230, 226], [244, 236, 214], [228, 226, 222], [246, 250, 254], [226, 220, 214], [232, 226, 234], [236, 230, 228], [160, 204, 240]],
-        line: [[0, 0, 0], [196, 36, 36], [200, 46, 44], [204, 60, 50], [70, 66, 66], [80, 78, 78], [58, 58, 62], [102, 102, 106], [120, 92, 62], [186, 24, 128], [44, 44, 52], [140, 120, 170], [40, 120, 204], [64, 150, 84], [110, 160, 90], [120, 140, 70], [80, 150, 126], [142, 92, 168]],
-        water: [160, 204, 240],
-        contour: [178, 130, 84],
-        contour_index: [146, 98, 56],
-        contour_alpha: [0.42, 0.72],
-        sun: [0.40, 0.40, 0.40],
-        sky: [2.05, 2.05, 2.10],
+        land: [[0, 0, 0], [222, 236, 206], [240, 236, 214], [224, 236, 206], [226, 232, 210], [200, 224, 188], [208, 230, 226], [244, 236, 214], [228, 226, 222], [246, 250, 254], [226, 220, 214], [232, 226, 234], [236, 230, 228], [160, 204, 240]],
+        line: [[0, 0, 0], [190, 30, 30], [196, 40, 38], [200, 54, 44], [60, 56, 56], [70, 68, 68], [48, 48, 52], [92, 92, 96], [110, 82, 54], [180, 16, 120], [36, 36, 44], [132, 112, 164], [34, 112, 200], [56, 142, 76], [100, 152, 80], [112, 132, 62], [72, 142, 118], [134, 84, 160]],
+        water: [156, 202, 240],
+        contour: [170, 120, 74],
+        contour_index: [138, 88, 46],
+        contour_alpha: [0.50, 0.80],
+        sun: [0.72, 0.72, 0.72],
+        sky: [1.55, 1.55, 1.60],
         layers: LayerMask { hypso: false, ..ALL },
     }
 }
 
-/// For a dark room or a five o'clock start: slate ground with its relief still readable, land cover as quiet tints, light roads, amber highways, a bright coral for trails, water a clear deep blue rather than a hole.
+/// For a dark room or a five o'clock start: slate ground with its relief readable, land cover as quiet tints, light roads, amber highways, a bright coral for trails, water a clear deep blue rather than a hole.
 pub fn night() -> Theme {
     Theme {
         name: "Night".to_string(),
         revision: BUILTIN_REVISION,
-        hypso: [(0.0, [62, 72, 74]), (600.0, [68, 74, 76]), (1200.0, [74, 78, 80]), (1900.0, [84, 88, 92]), (2600.0, [108, 112, 120])],
-        sea: [30, 62, 100],
-        flat: [82, 86, 92],
+        hypso: [(0.0, [80, 92, 94]), (600.0, [88, 96, 98]), (1200.0, [96, 100, 104]), (1900.0, [108, 112, 118]), (2600.0, [132, 136, 146])],
+        sea: [34, 66, 104],
+        flat: [86, 90, 96],
         bg: [14, 16, 20],
-        no_dem: [60, 64, 70],
-        land: [[0, 0, 0], [70, 92, 66], [88, 86, 64], [72, 92, 64], [76, 84, 66], [54, 80, 60], [58, 84, 82], [108, 100, 80], [88, 88, 90], [124, 132, 142], [82, 78, 74], [80, 78, 90], [92, 88, 90], [30, 62, 100]],
-        line: [[0, 0, 0], [250, 168, 72], [246, 180, 84], [240, 196, 108], [222, 206, 150], [206, 202, 188], [182, 182, 188], [148, 148, 156], [196, 154, 112], [255, 112, 142], [156, 156, 166], [150, 140, 182], [86, 156, 236], [100, 180, 110], [130, 190, 108], [150, 170, 96], [100, 180, 150], [190, 140, 214]],
-        water: [36, 78, 122],
-        contour: [140, 140, 128],
-        contour_index: [172, 168, 150],
-        contour_alpha: [0.28, 0.50],
-        sun: [0.50, 0.50, 0.56],
-        sky: [1.60, 1.65, 1.80],
+        no_dem: [62, 66, 72],
+        land: [[0, 0, 0], [72, 94, 68], [90, 88, 66], [74, 94, 66], [78, 86, 68], [56, 82, 62], [60, 86, 84], [110, 102, 82], [90, 90, 92], [126, 134, 144], [84, 80, 76], [82, 80, 92], [94, 90, 92], [34, 66, 104]],
+        line: [[0, 0, 0], [252, 172, 76], [248, 184, 88], [242, 200, 112], [226, 210, 156], [212, 208, 196], [190, 190, 196], [156, 156, 164], [204, 160, 116], [255, 116, 146], [164, 164, 174], [156, 146, 188], [92, 162, 240], [104, 184, 114], [134, 194, 112], [154, 174, 100], [104, 184, 154], [194, 144, 218]],
+        water: [40, 82, 128],
+        contour: [146, 146, 134],
+        contour_index: [178, 174, 156],
+        contour_alpha: [0.22, 0.44],
+        sun: [1.15, 1.15, 1.26],
+        sky: [0.80, 0.86, 1.02],
         layers: ALL,
     }
 }
 
-/// The built-in themes, as authored: VSF RGB, gamma 2. A host converts them to its display before use.
+/// Snow and rock: a cool ground that runs from sage valleys to white summits, blue-grey contours as a Swiss sheet draws them on ice and scree, shadows tinted by a blue sky, charcoal roads, deep crimson trails.
+pub fn alpine() -> Theme {
+    Theme {
+        name: "Alpine".to_string(),
+        revision: BUILTIN_REVISION,
+        hypso: [(0.0, [178, 198, 186]), (800.0, [198, 212, 206]), (1500.0, [216, 226, 230]), (2200.0, [234, 240, 246]), (3000.0, [252, 253, 255])],
+        sea: [126, 174, 222],
+        flat: [236, 240, 244],
+        bg: [40, 46, 58],
+        no_dem: [214, 220, 226],
+        land: [[0, 0, 0], [190, 212, 186], [214, 216, 190], [192, 212, 180], [196, 206, 190], [134, 172, 148], [170, 204, 206], [226, 220, 196], [198, 202, 208], [242, 248, 255], [198, 196, 194], [204, 204, 214], [216, 214, 218], [126, 174, 222]],
+        line: [[0, 0, 0], [150, 46, 40], [164, 60, 46], [120, 64, 56], [72, 72, 82], [82, 82, 92], [92, 92, 102], [120, 120, 130], [104, 76, 54], [178, 18, 66], [48, 48, 60], [130, 124, 160], [36, 106, 188], [58, 132, 84], [92, 146, 82], [104, 126, 70], [66, 136, 120], [128, 88, 160]],
+        water: [130, 180, 226],
+        contour: [104, 124, 156],
+        contour_index: [74, 94, 128],
+        contour_alpha: [0.40, 0.64],
+        sun: [1.05, 1.00, 0.94],
+        sky: [1.00, 1.14, 1.40],
+        layers: ALL,
+    }
+}
+
+/// Canyon country: sandstone and ochre ground that pales on the high mesas, warm sun over a blue sky so the shade sides cool, red and rust roads, trails in a deep teal that stands off the rock.
+pub fn desert() -> Theme {
+    Theme {
+        name: "Desert".to_string(),
+        revision: BUILTIN_REVISION,
+        hypso: [(0.0, [214, 198, 162]), (600.0, [222, 196, 152]), (1200.0, [226, 190, 142]), (1900.0, [222, 190, 154]), (2600.0, [238, 228, 216])],
+        sea: [104, 164, 206],
+        flat: [234, 222, 198],
+        bg: [52, 40, 32],
+        no_dem: [220, 206, 182],
+        land: [[0, 0, 0], [206, 206, 150], [222, 206, 150], [196, 204, 140], [212, 196, 150], [156, 174, 118], [176, 200, 170], [240, 222, 176], [214, 188, 160], [240, 244, 248], [206, 186, 166], [210, 196, 190], [222, 206, 190], [104, 164, 206]],
+        line: [[0, 0, 0], [150, 38, 28], [172, 58, 32], [186, 88, 38], [160, 104, 54], [116, 92, 74], [94, 82, 74], [126, 114, 104], [108, 72, 42], [16, 112, 148], [62, 56, 54], [128, 118, 148], [38, 116, 186], [70, 132, 70], [104, 146, 72], [120, 128, 62], [76, 138, 112], [140, 88, 152]],
+        water: [108, 168, 210],
+        contour: [150, 102, 66],
+        contour_index: [118, 74, 42],
+        contour_alpha: [0.40, 0.66],
+        sun: [1.06, 0.96, 0.82],
+        sky: [1.00, 1.08, 1.28],
+        layers: ALL,
+    }
+}
+
+/// Black on paper: a monochrome sheet for printing or for when colour is noise. Grey relief, land cover as faint grey tints, every road in greys by weight, trails in solid black, water a cool grey.
+pub fn ink() -> Theme {
+    Theme {
+        name: "Ink".to_string(),
+        revision: BUILTIN_REVISION,
+        hypso: [(0.0, [240, 240, 238]), (600.0, [242, 242, 240]), (1200.0, [244, 244, 242]), (1900.0, [246, 246, 244]), (2600.0, [250, 250, 250])],
+        sea: [200, 202, 208],
+        flat: [244, 244, 242],
+        bg: [30, 30, 30],
+        no_dem: [236, 236, 234],
+        land: [[0, 0, 0], [234, 234, 232], [238, 238, 236], [232, 232, 230], [232, 232, 230], [218, 218, 216], [226, 228, 230], [242, 242, 238], [228, 228, 228], [250, 250, 252], [226, 226, 224], [228, 228, 228], [232, 232, 230], [200, 202, 208]],
+        line: [[0, 0, 0], [24, 24, 24], [32, 32, 32], [44, 44, 44], [58, 58, 58], [72, 72, 72], [88, 88, 88], [112, 112, 112], [92, 92, 92], [0, 0, 0], [40, 40, 40], [140, 140, 140], [104, 106, 114], [120, 120, 120], [120, 120, 120], [120, 120, 120], [120, 120, 120], [120, 120, 120]],
+        water: [204, 206, 212],
+        contour: [128, 128, 128],
+        contour_index: [84, 84, 84],
+        contour_alpha: [0.42, 0.72],
+        sun: [0.86, 0.86, 0.86],
+        sky: [1.36, 1.36, 1.36],
+        layers: LayerMask { hypso: false, ..ALL },
+    }
+}
+
+/// The built-in themes, as authored: VSF RGB, gamma 2. The renderers convert to the display at their one encode.
 pub fn builtin() -> Vec<Theme> {
-    vec![trail(), topo(), night()]
+    vec![trail(), topo(), night(), alpine(), desert(), ink()]
 }
 
 impl Theme {
