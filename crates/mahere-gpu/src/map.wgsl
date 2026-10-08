@@ -527,7 +527,8 @@ fn shade(base: vec3<f32>, ground: bool, n: vec3<f32>, k1: f32, c1: vec3<f32>, wa
     var diffuse = 1.0;
     if (ground) {
         diffuse = max(dot(n, U.sun.xyz), 0.0);
-        rgb = rgb * clamp(light_eval(n), vec3<f32>(0.0), vec3<f32>(1.3));
+        // No cap: the display's highlight curve is the only place light meets white. The floor is physics (the sky's harmonics ring a little below zero facing away), not a clip.
+        rgb = rgb * max(light_eval(n), vec3<f32>(0.0));
     }
     rgb = rgb * k1 + c1;
     if (water > 0.0) {
@@ -566,8 +567,8 @@ fn fs_map_g(in: VOut) -> GOut {
     let s = sample_uv(in);
     let p = compose(s.x, s.y, s.z);
     var g: GOut;
-    // Linear light kept at gamma 2 so 8 bits hold the shadows; the base with four times headroom for unrolled imagery.
-    g.base = vec4<f32>(sqrt(p.base * 0.25), select(0.0, 1.0, p.ground));
+    // Linear light kept at gamma 2 so 8 bits hold the shadows; the base with five times headroom, the most unrolled imagery carries.
+    g.base = vec4<f32>(sqrt(p.base * 0.2), select(0.0, 1.0, p.ground));
     g.normal = vec4<f32>(p.n * 0.5 + 0.5, p.water);
     g.post1 = vec4<f32>(sqrt(p.c1), p.k1);
     g.post2 = vec4<f32>(sqrt(p.c2), p.k2);
@@ -588,7 +589,7 @@ fn fs_relight(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     let nw = textureLoad(g_normal, xy, 0);
     let p1 = textureLoad(g_post1, xy, 0);
     let p2 = textureLoad(g_post2, xy, 0);
-    let rgb = shade(b.rgb * b.rgb * 4.0, b.a > 0.5, normalize(nw.xyz * 2.0 - 1.0), p1.a, p1.rgb * p1.rgb, nw.w, p2.a, p2.rgb * p2.rgb);
+    let rgb = shade(b.rgb * b.rgb * 5.0, b.a > 0.5, normalize(nw.xyz * 2.0 - 1.0), p1.a, p1.rgb * p1.rgb, nw.w, p2.a, p2.rgb * p2.rgb);
     return vec4<f32>(to_display(rgb) / 255.0, 1.0);
 }
 

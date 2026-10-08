@@ -552,7 +552,8 @@ fn compose_rgb(dem: &DemRef, vec: &VecRef, pool: &Pool, diamond: u8, uq: i64, vq
                     // Irradiance from the environment: ten multiply-adds per channel on the world normal.
                     const K: f32 = 1.0 / 32767.0;
                     let e = luts.light.eval(nx * K, ny * K, nz * K);
-                    light = [e[0].clamp(0.0, 1.3), e[1].clamp(0.0, 1.3), e[2].clamp(0.0, 1.3)];
+                    // No cap: the display's highlight curve is the only place light meets white; the floor is physics, not a clip.
+                    light = [e[0].max(0.0), e[1].max(0.0), e[2].max(0.0)];
                     let sea = (eq as f32 * 0.25 - 500.0).abs() < 0.75 && nz > 0.9995 * 32767.0;
                     tint = if sea {
                         lin(st.sea)
@@ -879,7 +880,7 @@ mod tests {
         let f = luts.style.land[5];
         let e = luts.light.eval(0.0, 0.0, 1.0);
         let (tl, fl) = (lin(t), lin(f));
-        let mix = |c: usize| (tl[c] + (fl[c] - tl[c]) * 0.85) * e[c].clamp(0.0, 1.3);
+        let mix = |c: usize| (tl[c] + (fl[c] - tl[c]) * 0.85) * e[c].max(0.0);
         let expect = pack(&luts, [mix(0), mix(1), mix(2)]);
         let center = canvas[(h / 2) * w + w / 2];
         assert_eq!(center, expect, "center {center:#08x} vs expected {expect:#08x}");
@@ -890,7 +891,7 @@ mod tests {
         render_frame(&mut canvas, w, h, &cam, &pool, &luts, 12, 13);
         let t = luts.hypso[375];
         let tl = lin(t);
-        let expect = pack(&luts, [tl[0] * e[0].clamp(0.0, 1.3), tl[1] * e[1].clamp(0.0, 1.3), tl[2] * e[2].clamp(0.0, 1.3)]);
+        let expect = pack(&luts, [tl[0] * e[0].max(0.0), tl[1] * e[1].max(0.0), tl[2] * e[2].max(0.0)]);
         assert_eq!(canvas[(h / 2) * w + w / 2], expect);
     }
 }
