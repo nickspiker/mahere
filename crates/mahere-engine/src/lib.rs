@@ -2,6 +2,7 @@
 
 pub mod colour;
 pub mod plan;
+pub mod probe;
 pub mod raster;
 pub mod residency;
 pub mod sh;
@@ -98,6 +99,9 @@ pub struct MapCore {
     pub device_rot: [f32; 9],
     /// Light the terrain by where the sun actually is, from the clock and the position.
     pub real_sun: bool,
+    /// The front camera is the light: its latest frame, projected, replaces the sun and sky while it is on.
+    pub real_light: bool,
+    probe: Option<sh::Sh9>,
     /// Turn the map with the device so screen-up is the way the phone points.
     pub follow_heading: bool,
     /// Magnetic declination at the position, degrees, east positive: true heading = the sensor's magnetic heading + this.
@@ -162,6 +166,8 @@ impl MapCore {
             device_heading: 0.0,
             device_rot: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
             real_sun: false,
+            real_light: false,
+            probe: None,
             follow_heading: false,
             declination_deg: 0.0,
             have_rotation: false,
@@ -354,6 +360,25 @@ impl MapCore {
         self.dirty = true;
     }
 
+    pub fn set_real_light(&mut self, on: bool) {
+        self.real_light = on;
+        if !on {
+            self.probe = None;
+        }
+        self.luts_sun = (f32::NAN, f32::NAN, f64::NAN);
+        self.dirty = true;
+    }
+
+    /// A new frame from the front camera, already projected: the light until the next one.
+    pub fn set_probe(&mut self, env: sh::Sh9) {
+        if !self.real_light {
+            return;
+        }
+        self.probe = Some(env);
+        self.luts_sun = (f32::NAN, f32::NAN, f64::NAN);
+        self.dirty = true;
+    }
+
     pub fn set_follow_heading(&mut self, on: bool) {
         self.follow_heading = on;
         if on {
@@ -536,7 +561,13 @@ impl MapCore {
                 (az.cos() * alt.cos()) as f32,
                 alt.sin() as f32,
             ];
-            if self.real_sun {
+            if let (true, Some(env)) = (self.real_light, self.probe.as_ref()) {
+                // The camera's environment is already in the device frame; the bearing conjugates it onto world normals as for the sun and sky.
+                let (sb, cb) = self.cam.bearing.sin_cos();
+                self.luts.light = env.quadratic((sb as f32, cb as f32));
+                self.luts_sun = (self.sun_az, self.sun_alt, self.cam.bearing);
+                self.light_version += 1;
+            } else if self.real_sun {
                 // The real sun alone, in the device frame: the landscape is lit exactly as the phone is held, by max(0, n·sun) and nothing else. No sky, no fading: at night the sun is under the landscape and it renders black; turn the phone over and the sun lights it from below (Nick 2026-10-06).
                 let (lat, lon) = self.gps.map_or((self.cam.lat, self.cam.lon), |g| (g.lat, g.lon));
                 let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0.0, |d| d.as_secs_f64());

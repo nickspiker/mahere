@@ -37,6 +37,7 @@ class MahereActivity : Activity(), SurfaceHolder.Callback, Choreographer.FrameCa
             System.loadLibrary("mahere_android")
         }
         private const val LOCATION_PERMISSION_REQUEST = 1
+        private const val CAMERA_PERMISSION_REQUEST = 2
     }
 
     private external fun nativeInit(width: Int, height: Int, dataDir: String): Long
@@ -50,6 +51,21 @@ class MahereActivity : Activity(), SurfaceHolder.Callback, Choreographer.FrameCa
     private external fun nativeOnDeclination(ptr: Long, declinationDeg: Float)
     private external fun nativeOnOrientation(ptr: Long, r0: Float, r1: Float, r2: Float, r3: Float, r4: Float, r5: Float, r6: Float, r7: Float, r8: Float)
     private external fun nativeOnPause(ptr: Long)
+    private external fun nativeProbeWanted(ptr: Long): Boolean
+    private external fun nativeProbeDenied(ptr: Long)
+    private external fun nativeOnProbe(
+        ptr: Long, buffer: java.nio.ByteBuffer, width: Int, height: Int, rowStride: Int,
+        cfa: Int, black: FloatArray, white: Int, orientation: Int, tanW: Float, tanH: Float, xyzToCam: FloatArray, stats: FloatArray,
+    )
+
+    // The front camera as the light, opened when the engine asks for it (the Real light row) and closed when it stops asking.
+    private val probe by lazy {
+        Probe(this) { f, stats ->
+            val p = nativePtr
+            if (p != 0L) nativeOnProbe(p, f.buffer, f.width, f.height, f.rowStride, f.cfa, f.black, f.white, f.orientation, f.tanW, f.tanH, f.xyzToCam, stats)
+        }
+    }
+    private var cameraAsked = false
 
     private lateinit var surfaceView: SurfaceView
     @Volatile private var nativePtr = 0L
@@ -162,7 +178,25 @@ class MahereActivity : Activity(), SurfaceHolder.Callback, Choreographer.FrameCa
     override fun doFrame(frameTimeNanos: Long) {
         if (nativePtr != 0L && surfaceReady) {
             nativeDraw(nativePtr, surfaceView.holder.surface)
+            syncProbe()
             Choreographer.getInstance().postFrameCallback(this)
+        }
+    }
+
+    /// Open or close the front camera to match the engine's wish; the first wish asks for the permission, and a refusal turns the mode off.
+    private fun syncProbe() {
+        val want = nativeProbeWanted(nativePtr)
+        if (want && !probe.running) {
+            if (checkSelfPermission(Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
+                if (!cameraAsked) {
+                    cameraAsked = true
+                    requestPermissions(arrayOf(Manifest.permission.CAMERA), CAMERA_PERMISSION_REQUEST)
+                }
+                return
+            }
+            if (!probe.start()) nativeProbeDenied(nativePtr)
+        } else if (!want && probe.running) {
+            probe.stop()
         }
     }
 
@@ -176,6 +210,7 @@ class MahereActivity : Activity(), SurfaceHolder.Callback, Choreographer.FrameCa
     override fun onPause() {
         super.onPause()
         stopHeading()
+        probe.stop()
         Choreographer.getInstance().removeFrameCallback(this)
         if (nativePtr != 0L) nativeOnPause(nativePtr)
     }
@@ -244,6 +279,10 @@ class MahereActivity : Activity(), SurfaceHolder.Callback, Choreographer.FrameCa
             grantResults.firstOrNull() == PackageManager.PERMISSION_GRANTED
         ) {
             startLocation()
+        }
+        if (requestCode == CAMERA_PERMISSION_REQUEST) {
+            cameraAsked = false
+            if (grantResults.firstOrNull() != PackageManager.PERMISSION_GRANTED && nativePtr != 0L) nativeProbeDenied(nativePtr)
         }
     }
 }

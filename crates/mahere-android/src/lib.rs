@@ -12,7 +12,7 @@ use fluor::host::android::shell::AndroidShell;
 use fluor::host::app::{Context, FluorApp};
 use fluor::paint::pack_argb;
 use jni::JNIEnv;
-use jni::objects::{JClass, JObject, JString};
+use jni::objects::{JByteBuffer, JClass, JFloatArray, JObject, JString};
 use jni::sys::{jboolean, jdouble, jfloat, jint, jlong};
 use mahere_engine::residency::{CellStore, DirStore, HttpStore, TieredStore, DEFAULT_CELLS_URL};
 use mahere_engine::{Camera, GpsFix, MapCore};
@@ -117,7 +117,7 @@ fn free_bytes(dir: &str) -> Option<u64> {
 
 impl AndroidApp {
     fn controls(&self) -> Controls {
-        Controls { real_sun: self.map.real_sun, follow_heading: self.map.follow_heading, lock_to_fix: self.map.lock_to_fix, cache_budget: self.cache_budget, theme: self.map.theme, compressed: self.map.compressed() }
+        Controls { real_sun: self.map.real_sun, real_light: self.map.real_light, follow_heading: self.map.follow_heading, lock_to_fix: self.map.lock_to_fix, cache_budget: self.cache_budget, theme: self.map.theme, compressed: self.map.compressed() }
     }
 
     /// Apply what the panel changed and keep it.
@@ -125,6 +125,9 @@ impl AndroidApp {
         self.map.set_layers(mask);
         if ctl.real_sun != self.map.real_sun {
             self.map.set_real_sun(ctl.real_sun);
+        }
+        if ctl.real_light != self.map.real_light {
+            self.map.set_real_light(ctl.real_light);
         }
         if ctl.compressed != self.map.compressed() {
             self.map.set_compressed(ctl.compressed);
@@ -144,7 +147,7 @@ impl AndroidApp {
 
     fn save_settings(&self) {
         if let Some(store) = &self.store {
-            let s = mahere_store::Settings { cache_budget: self.cache_budget, layer_bits: self.map.layers().bits() as u64, real_sun: self.map.real_sun, follow_heading: self.map.follow_heading, lock_to_fix: self.map.lock_to_fix, theme: self.map.theme as u64, compressed: self.map.compressed() };
+            let s = mahere_store::Settings { cache_budget: self.cache_budget, layer_bits: self.map.layers().bits() as u64, real_sun: self.map.real_sun, real_light: self.map.real_light, follow_heading: self.map.follow_heading, lock_to_fix: self.map.lock_to_fix, theme: self.map.theme as u64, compressed: self.map.compressed() };
             self.persist.settings(store.clone(), s);
         }
     }
@@ -423,6 +426,7 @@ pub extern "system" fn Java_nz_mahere_app_MahereActivity_nativeInit(
         map.set_theme(s.theme as usize);
         map.set_layers(mahere_engine::LayerMask::from_bits(s.layer_bits as u32));
         map.set_real_sun(s.real_sun);
+        map.set_real_light(s.real_light);
         map.set_compressed(s.compressed);
         map.set_follow_heading(s.follow_heading);
         map.set_lock_to_fix(s.lock_to_fix);
@@ -629,4 +633,76 @@ pub extern "system" fn Java_nz_mahere_app_MahereActivity_nativeOnLocation(
     if ptr != 0 {
         shell(ptr).app().on_gps(GpsFix { lat, lon, accuracy_m: accuracy });
     }
+}
+
+/// Whether the engine wants the front camera: the Activity polls this every frame and opens or closes the camera to match.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_nz_mahere_app_MahereActivity_nativeProbeWanted(_env: JNIEnv, _class: JClass, ptr: jlong) -> jboolean {
+    (ptr != 0 && shell(ptr).app().map.real_light) as jboolean
+}
+
+/// The camera could not be had (permission refused, no raw front camera): the mode turns itself off and the setting follows.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_nz_mahere_app_MahereActivity_nativeProbeDenied(_env: JNIEnv, _class: JClass, ptr: jlong) {
+    if ptr != 0 {
+        let app = shell(ptr).app();
+        app.map.set_real_light(false);
+        app.save_settings();
+    }
+}
+
+/// A raw front-camera frame: 16-bit samples in `buf` (`w × h`, `row_stride` bytes a row, Bayer order `cfa` as Android numbers it, the sensor's four `black` pedestals and its `white`), the sensor's `orientation`, the lens half-angle tangents across and down the sensor, and Android's row-major XYZ→camera matrix. Binned, converted to VSF RGB, turned upright and projected into the light. `stats` gets the clipped fraction and the 99.9th percentile level, which the Activity's exposure loop steers on.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_nz_mahere_app_MahereActivity_nativeOnProbe(
+    mut env: JNIEnv,
+    _class: JClass,
+    ptr: jlong,
+    buf: JByteBuffer,
+    w: jint,
+    h: jint,
+    row_stride: jint,
+    cfa: jint,
+    black: JFloatArray,
+    white: jint,
+    orientation: jint,
+    tan_w: jfloat,
+    tan_h: jfloat,
+    xyz_to_cam: JFloatArray,
+    stats: JFloatArray,
+) {
+    use mahere_engine::probe::{Cfa, Raw, bin, to_vsf, upright};
+    if ptr == 0 {
+        return;
+    }
+    let Some(cfa) = Cfa::from_android(cfa) else { return };
+    let (Ok(addr), Ok(len)) = (env.get_direct_buffer_address(&buf), env.get_direct_buffer_capacity(&buf)) else { return };
+    if addr.is_null() || (row_stride as usize) * (h as usize) > len {
+        return;
+    }
+    let data = unsafe { std::slice::from_raw_parts(addr, len) };
+    let mut pedestal = [0f32; 4];
+    let _ = env.get_float_array_region(&black, 0, &mut pedestal);
+    let raw = Raw { data, w: w as usize, h: h as usize, row_stride: row_stride as usize, cfa, black: pedestal.map(|b| b as u16), white: white as u16 };
+    let (bw, bh, mut rgb, st) = bin(&raw, 48);
+    let _ = env.set_float_array_region(&stats, 0, &[st.clipped, st.p999]);
+    let mean = |v: &[[f32; 3]]| {
+        let n = v.len().max(1) as f32;
+        v.iter().fold([0f32; 3], |a, p| [a[0] + p[0] / n, a[1] + p[1] / n, a[2] + p[2] / n])
+    };
+    let cam_mean = mean(&rgb);
+    let mut m = [0f32; 9];
+    if env.get_float_array_region(&xyz_to_cam, 0, &mut m).is_ok() && m.iter().any(|&v| v != 0.0) {
+        to_vsf(&mut rgb, &m);
+    }
+    let vsf_mean = mean(&rgb);
+    let probe = upright(bw, bh, &rgb, tan_w, tan_h, orientation);
+    let sh = mahere_engine::sh::Sh9::from_probe(&probe);
+    // Once a second or so: what the camera saw, as the exposure loop and the colour path are tuned.
+    static LAST: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+    let mut last = LAST.lock().unwrap();
+    if last.is_none_or(|t| t.elapsed().as_secs_f32() > 1.0) {
+        *last = Some(std::time::Instant::now());
+        eprintln!("probe: clipped {:.5} p999 {:.3} cam {cam_mean:?} vsf {vsf_mean:?} screen {:?}", st.clipped, st.p999, sh.irradiance([0.0, 0.0, 1.0]));
+    }
+    shell(ptr).app().map.set_probe(sh);
 }

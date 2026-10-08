@@ -45,7 +45,7 @@ pub struct Sh9 {
 
 /// Real SH basis up to l=2 at a unit direction.
 #[inline(always)]
-fn basis(d: [f32; 3]) -> [f32; 9] {
+pub(crate) fn basis(d: [f32; 3]) -> [f32; 9] {
     let (x, y, z) = (d[0], d[1], d[2]);
     [
         0.282095,

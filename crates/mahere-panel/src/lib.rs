@@ -14,6 +14,8 @@ use mahere_engine::{LayerMask, MeasureView};
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Controls {
     pub real_sun: bool,
+    /// The front camera lights the map.
+    pub real_light: bool,
     pub follow_heading: bool,
     /// Measure from the fix rather than the screen centre.
     pub lock_to_fix: bool,
@@ -21,7 +23,7 @@ pub struct Controls {
     pub cache_budget: u64,
     /// The theme, an index into the engine's themes.
     pub theme: usize,
-    /// Highlights compressed into white (exposure 2/3 into Opsin's rail); off, linear: the stored range straight, 2.3 stops darker.
+    /// Highlights compressed into white (exposure 2/3 into Opsin's rail); off, linear: the stored range straight, 2.3 stops darker. The row shows it the other way up, as "Linear highlights".
     pub compressed: bool,
 }
 
@@ -46,7 +48,8 @@ pub struct Readouts {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Layer {
     RealSun,
-    Compressed,
+    RealLight,
+    Linear,
     FollowHeading,
     LockToFix,
     Dem,
@@ -62,7 +65,7 @@ enum Layer {
     Debug,
 }
 
-const LAYERS: [(Layer, &str); 15] = [
+const LAYERS: [(Layer, &str); 16] = [
     (Layer::Dem, "Terrain"),
     (Layer::Hypso, "Elevation tint"),
     (Layer::Land, "Land cover"),
@@ -75,7 +78,8 @@ const LAYERS: [(Layer, &str); 15] = [
     (Layer::Infrared, "Infrared"),
     (Layer::Debug, "Residency"),
     (Layer::RealSun, "Real sun"),
-    (Layer::Compressed, "Compressed highlights"),
+    (Layer::RealLight, "Real light"),
+    (Layer::Linear, "Linear highlights"),
     (Layer::FollowHeading, "Follow heading"),
     (Layer::LockToFix, "Measure from me"),
 ];
@@ -83,7 +87,8 @@ const LAYERS: [(Layer, &str); 15] = [
 fn get(mask: &LayerMask, ctl: &Controls, l: Layer) -> bool {
     match l {
         Layer::RealSun => ctl.real_sun,
-        Layer::Compressed => ctl.compressed,
+        Layer::RealLight => ctl.real_light,
+        Layer::Linear => !ctl.compressed,
         Layer::FollowHeading => ctl.follow_heading,
         Layer::LockToFix => ctl.lock_to_fix,
         Layer::Dem => mask.dem,
@@ -103,7 +108,8 @@ fn get(mask: &LayerMask, ctl: &Controls, l: Layer) -> bool {
 fn set(mask: &mut LayerMask, ctl: &mut Controls, l: Layer, v: bool) {
     match l {
         Layer::RealSun => ctl.real_sun = v,
-        Layer::Compressed => ctl.compressed = v,
+        Layer::RealLight => ctl.real_light = v,
+        Layer::Linear => ctl.compressed = !v,
         Layer::FollowHeading => ctl.follow_heading = v,
         Layer::LockToFix => ctl.lock_to_fix = v,
         Layer::Dem => mask.dem = v,
@@ -222,7 +228,7 @@ impl Panel {
         let mut last = top;
         for (i, (l, cb)) in self.checks.iter_mut().enumerate() {
             // The modes sit a little apart from the layers.
-            let gap = if matches!(l, Layer::RealSun | Layer::Compressed | Layer::FollowHeading | Layer::LockToFix) { row * 0.5 } else { 0.0 };
+            let gap = if matches!(l, Layer::RealSun | Layer::RealLight | Layer::Linear | Layer::FollowHeading | Layer::LockToFix) { row * 0.5 } else { 0.0 };
             let cy = top + row * (i as f32 + 0.5) + gap;
             cb.set_font_size(self.font);
             cb.set_rect(x0 + (self.panel_w - x0 * 1.5) * 0.5, cy, self.panel_w - x0 * 1.5, row);
