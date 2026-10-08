@@ -7,7 +7,7 @@ use fluor::paint::{self, HitId, HIT_NONE};
 use fluor::text::{TextRenderer, TextStyle};
 use fluor::theme;
 use fluor::widgets::{Checkbox, Slider};
-use mahere_engine::theme::{CLASS_NAMES, Field, LAND_NAMES, Theme};
+use mahere_engine::theme::{Field, Theme};
 use mahere_engine::{LayerMask, MeasureView};
 
 /// The two modes the panel switches besides the layers.
@@ -196,8 +196,11 @@ pub struct Panel {
     stack: Vec<Page>,
     /// The theme page's rows: the back row, then one per theme, then the edit row, as (centre y, half height) in screen pixels.
     theme_rows: Vec<(f32, f32)>,
-    /// The editor's rows: (centre y, half height, the field).
-    edit_rows: Vec<(f32, f32, Field)>,
+    /// The editor's rows: (centre y, half height, the field, its values).
+    edit_rows: Vec<(f32, f32, Field, [f32; 4])>,
+    /// How far the editor's list is scrolled, and a press on it: where it started, the row under it, and whether it has moved (a scroll, not a choice).
+    edit_scroll: f32,
+    press: Option<(f32, f32, Option<(Field, [f32; 4])>, bool)>,
     /// The open field's sliders and the values they hold, and which slider a finger is on.
     sliders: Vec<Slider>,
     field_vals: [f32; 4],
@@ -233,7 +236,7 @@ impl Panel {
     pub fn new() -> Panel {
         let mut hits: HitId = HIT_NONE;
         let checks = LAYERS.iter().map(|&(l, label)| (l, Checkbox::new(&mut hits, label, 0.0, 0.0, 10.0, 10.0, 10.0, false))).collect();
-        Panel { open: false, dirty: true, ru: 1.0, stack: vec![Page::Layers], theme_rows: Vec::new(), edit_rows: Vec::new(), sliders: Vec::new(), field_vals: [0.0; 4], held: None, edits: Vec::new(), hits, checks, text: TextRenderer::new(), buf: Vec::new(), w: 0, h: 0, font: 16.0, gear: (0.0, 0.0, 0.0), panel_w: 0.0, theme_row: (0.0, 0.0, 0.0), slider: (0.0, 0.0, 0.0), slider_held: false, cache_max: CACHE_MIN + 1, strip_close: None, clear_measure: false }
+        Panel { open: false, dirty: true, ru: 1.0, stack: vec![Page::Layers], theme_rows: Vec::new(), edit_rows: Vec::new(), edit_scroll: 0.0, press: None, sliders: Vec::new(), field_vals: [0.0; 4], held: None, edits: Vec::new(), hits, checks, text: TextRenderer::new(), buf: Vec::new(), w: 0, h: 0, font: 16.0, gear: (0.0, 0.0, 0.0), panel_w: 0.0, theme_row: (0.0, 0.0, 0.0), slider: (0.0, 0.0, 0.0), slider_held: false, cache_max: CACHE_MIN + 1, strip_close: None, clear_measure: false }
     }
 
     pub fn is_open(&self) -> bool {
@@ -280,8 +283,8 @@ impl Panel {
     }
 
     /// Open a field's page: one slider per value, from the theme's own bytes.
-    fn open_field(&mut self, f: Field, t: &Theme) {
-        self.field_vals = t.get(f);
+    fn open_field(&mut self, f: Field, vals: [f32; 4]) {
+        self.field_vals = vals;
         let n = match f {
             Field::Hypso(_) => 4,
             Field::ContourAlpha(_) => 1,
@@ -369,7 +372,7 @@ impl Panel {
     }
 
     /// A tap at screen (x, y): true if the panel took it. The gear toggles the panel; a row flips its layer in `mask`.
-    pub fn tap(&mut self, x: f32, y: f32, w: usize, h: usize, mask: &mut LayerMask, ctl: &mut Controls, themes: &[Theme]) -> bool {
+    pub fn tap(&mut self, x: f32, y: f32, w: usize, h: usize, mask: &mut LayerMask, ctl: &mut Controls, _themes: &[Theme]) -> bool {
         self.layout(w, h);
         if let Some((cx, cy, cr)) = self.strip_close {
             if (x - cx).powi(2) + (y - cy).powi(2) <= (cr * 1.4).powi(2) {
@@ -415,11 +418,9 @@ impl Panel {
                 return true;
             }
             Page::Edit => {
-                if let Some(&(_, _, f)) = self.edit_rows.iter().find(|&&(cy, hh, _)| (y - cy).abs() <= hh) {
-                    if let Some(t) = themes.get(ctl.theme) {
-                        self.open_field(f, t);
-                    }
-                }
+                // The row opens on release, so a drag scrolls the list instead.
+                let under = self.edit_rows.iter().find(|&&(cy, hh, _, _)| (y - cy).abs() <= hh).map(|&(_, _, f, v)| (f, v));
+                self.press = Some((x, y, under, false));
                 return true;
             }
             Page::Field(f) => {
@@ -535,7 +536,7 @@ impl Panel {
                 Page::Themes => self.theme_rows = Self::paint_themes(&mut canvas, &mut self.text, font, rail, cw, self.gear, h, themes, ctl.theme),
                 Page::Edit => {
                     if let Some(t) = current {
-                        self.edit_rows = Self::paint_edit(&mut canvas, &mut self.text, font, rail, cw, self.gear, h, t);
+                        self.edit_rows = Self::paint_edit(&mut canvas, &mut self.text, font, rail, cw, self.gear, h, t, self.edit_scroll);
                     }
                 }
                 Page::Field(f) => Self::paint_field(&mut canvas, &mut self.text, font, rail, cw, self.gear, f, &mut self.sliders, self.field_vals, current),
@@ -551,7 +552,7 @@ impl Panel {
                     }
                     Page::Edit => {
                         if let Some(t) = current {
-                            Self::paint_edit(&mut canvas, &mut self.text, small, 0.0, rail, self.gear, h, t);
+                            Self::paint_edit(&mut canvas, &mut self.text, small, 0.0, rail, self.gear, h, t, 0.0);
                         }
                     }
                     _ => {
@@ -763,7 +764,16 @@ impl Panel {
     }
 
     /// A move while the slider is held: the budget follows the finger. True while it does.
-    pub fn drag(&mut self, x: f32, ctl: &mut Controls) -> bool {
+    pub fn drag(&mut self, x: f32, y: f32, ctl: &mut Controls) -> bool {
+        if let (Some((px, py, under, moved)), Page::Edit) = (self.press, self.page()) {
+            let moved = moved || (y - py).abs() + (x - px).abs() > 12.0;
+            if moved {
+                self.edit_scroll = (self.edit_scroll - (y - py)).max(0.0);
+                self.dirty = true;
+            }
+            self.press = Some((x, y, under, moved));
+            return true;
+        }
         if let (Some(i), Page::Field(f)) = (self.held, self.page()) {
             if let Some(sl) = self.sliders.get_mut(i) {
                 sl.set_value_from_x(x);
@@ -783,6 +793,9 @@ impl Panel {
     pub fn release(&mut self) {
         self.slider_held = false;
         self.held = None;
+        if let Some((_, _, Some((f, v)), false)) = self.press.take() {
+            self.open_field(f, v);
+        }
     }
 
     fn paint_slider(canvas: &mut Canvas, text: &mut TextRenderer, font: f32, slider: (f32, f32, f32), ctl: &Controls, r: &Readouts) {
@@ -811,8 +824,6 @@ impl Panel {
         let mut y = gear.1 + gear.2 + font * 0.9 + row * 0.5;
         let mut rows = Vec::new();
         let title = TextStyle::new(font, theme::TEXTBOX_TEXT);
-        let small = TextStyle::new(font * 0.8, READOUT);
-        let dim = TextStyle::new(font * 0.72, READOUT_DIM);
         text.draw_text_left(canvas, "\u{2039}  Layers", x0, y, &title, None, None);
         rows.push((y, row * 0.5));
         y += row * 1.2;
@@ -830,89 +841,26 @@ impl Panel {
         };
         text.draw_text_left(canvas, &edit_label, x0, y, &title, None, None);
         rows.push((y, row * 0.5));
-        y += row;
-        let Some(t) = themes.get(current) else { return rows };
-        // Legend: the ramp as a bar from sea to summit.
-        y += font * 0.5;
-        text.draw_text_left(canvas, "terrain", x0, y, &dim, None, None);
-        y += font * 0.9;
-        let lut = t.hypso_lut();
-        let bar_w = panel_w - x0 * 2.0;
-        let bar_h = font * 0.7;
-        let cols = bar_w.max(1.0) as usize;
-        for i in 0..cols {
-            // 0 to 3200 m across the bar.
-            let eq = ((i as f32 / cols as f32) * 3200.0 + 500.0) * 4.0;
-            let c = lut[((eq as usize) >> 4).min(4094)];
-            paint::fill_rect(canvas, (x0 + i as f32) as isize, y as isize, 1, bar_h as isize, swatch(c), None, None);
-        }
-        y += bar_h + font * 0.5;
-        // Land cover: swatch and name, two to a line.
-        text.draw_text_left(canvas, "land cover", x0, y, &dim, None, None);
-        y += font * 0.9;
-        let half = (panel_w - x0 * 2.0) * 0.5;
-        for (name, c) in LAND_NAMES.iter().zip(t.land.iter()).skip(1) {
-            let col = ((name_index(name, &LAND_NAMES) - 1) % 2) as f32;
-            let x = x0 + col * half;
-            paint::fill_rect(canvas, x as isize, (y - font * 0.3) as isize, (font * 0.8) as isize, (font * 0.6) as isize, swatch(*c), None, None);
-            text.draw_text_left(canvas, name, x + font * 1.1, y, &small, None, None);
-            if col == 1.0 {
-                y += font * 0.95;
-            }
-            if y > h as f32 - font * 2.0 {
-                return rows;
-            }
-        }
-        if LAND_NAMES.len() % 2 == 0 {
-            y += font * 0.95;
-        }
-        // Lines: a short stroke and the name, two to a line.
-        y += font * 0.4;
-        text.draw_text_left(canvas, "lines", x0, y, &dim, None, None);
-        y += font * 0.9;
-        for (name, c) in CLASS_NAMES.iter().zip(t.line.iter()).skip(1) {
-            let col = ((name_index(name, &CLASS_NAMES) - 1) % 2) as f32;
-            let x = x0 + col * half;
-            paint::fill_rect(canvas, x as isize, (y - font * 0.08) as isize, (font * 0.8) as isize, (font * 0.16).max(2.0) as isize, swatch(*c), None, None);
-            text.draw_text_left(canvas, name, x + font * 1.1, y, &small, None, None);
-            if col == 1.0 {
-                y += font * 0.95;
-            }
-            if y > h as f32 - font * 2.0 {
-                return rows;
-            }
-        }
-        y += font * 1.3;
-        text.draw_text_left(canvas, "inks", x0, y, &dim, None, None);
-        y += font * 0.9;
-        for (i, (name, c)) in [("water", t.water), ("contour", t.contour), ("index contour", t.contour_index), ("flat ground", t.flat)].iter().enumerate() {
-            let col = (i % 2) as f32;
-            let x = x0 + col * half;
-            paint::fill_rect(canvas, x as isize, (y - font * 0.3) as isize, (font * 0.8) as isize, (font * 0.6) as isize, swatch(*c), None, None);
-            text.draw_text_left(canvas, name, x + font * 1.1, y, &small, None, None);
-            if col == 1.0 {
-                y += font * 0.95;
-            }
-        }
+        let _ = (y, panel_w, h);
         rows
     }
 }
 
 impl Panel {
-    /// The editor: the back row, then every field of the theme as a row with its swatch (a number for the numbers), two to a line for the tables. Returns the rows for hit testing.
-    fn paint_edit(canvas: &mut Canvas, text: &mut TextRenderer, font: f32, ox: f32, cw: f32, gear: (f32, f32, f32), h: usize, t: &Theme) -> Vec<(f32, f32, Field)> {
+    /// The editor: the back row, then every field of the theme as a row with its swatch (a number for the numbers), one to a line, scrolled by `scroll`. Returns the rows on screen for hit testing, with their values.
+    #[allow(clippy::too_many_arguments)]
+    fn paint_edit(canvas: &mut Canvas, text: &mut TextRenderer, font: f32, ox: f32, cw: f32, gear: (f32, f32, f32), h: usize, t: &Theme, scroll: f32) -> Vec<(f32, f32, Field, [f32; 4])> {
         let x0 = ox + font * 0.9;
-        let row = font * 1.25;
-        let mut y = gear.1 + gear.2 + font * 0.9 + font * 0.8;
+        let row = font * 1.15;
+        let top = gear.1 + gear.2 + font * 0.9 + font * 0.8;
         let title = TextStyle::new(font, theme::TEXTBOX_TEXT);
         let small = TextStyle::new(font * 0.8, READOUT);
         let dim = TextStyle::new(font * 0.72, READOUT_DIM);
-        text.draw_text_left(canvas, &format!("\u{2039}  {}", t.name), x0, y, &title, None, None);
-        y += row * 1.3;
+        text.draw_text_left(canvas, &format!("\u{2039}  {}", t.name), x0, top, &title, None, None);
+        let mut y = top + row * 1.3 - scroll;
         let mut rows = Vec::new();
-        let half = (cw - font * 1.8) * 0.5;
-        let mut col = 0usize;
         let mut section = "";
+        let _ = cw;
         for f in Field::all() {
             let sec = match f {
                 Field::Hypso(_) => "terrain",
@@ -923,44 +871,40 @@ impl Panel {
                 Field::Sun | Field::Sky => "light",
             };
             if sec != section {
-                if col == 1 {
-                    y += row;
-                    col = 0;
-                }
                 section = sec;
                 y += font * 0.3;
-                text.draw_text_left(canvas, sec, x0, y, &dim, None, None);
+                if y > top + row && y < h as f32 {
+                    text.draw_text_left(canvas, sec, x0, y, &dim, None, None);
+                }
                 y += font * 0.9;
             }
-            if y > h as f32 - font {
+            if y > h as f32 + row {
                 break;
             }
-            let x = x0 + col as f32 * half;
             let v = t.get(f);
-            if f.is_colour() {
-                let c = [v[0] as u8, v[1] as u8, v[2] as u8];
-                let (sw, sh) = if matches!(f, Field::Line(_)) { (font * 0.8, (font * 0.16).max(2.0)) } else { (font * 0.8, font * 0.6) };
-                paint::fill_rect(canvas, x as isize, (y - sh * 0.5) as isize, sw as isize, sh as isize, swatch(c), None, None);
-            } else {
-                let label = match f {
-                    Field::ContourAlpha(_) => format!("{:.2}", v[0]),
-                    _ => format!("{:.1}", 0.3 * v[0] + 0.6 * v[1] + 0.1 * v[2]),
+            // Rows scrolled under the title are skipped, not drawn over it.
+            if y > top + row {
+                if f.is_colour() {
+                    let c = [v[0] as u8, v[1] as u8, v[2] as u8];
+                    let (sw, sh) = if matches!(f, Field::Line(_)) { (font * 0.8, (font * 0.16).max(2.0)) } else { (font * 0.8, font * 0.6) };
+                    paint::fill_rect(canvas, x0 as isize, (y - sh * 0.5) as isize, sw as isize, sh as isize, swatch(c), None, None);
+                } else {
+                    let label = match f {
+                        Field::ContourAlpha(_) => format!("{:.2}", v[0]),
+                        _ => format!("{:.1}", 0.3 * v[0] + 0.6 * v[1] + 0.1 * v[2]),
+                    };
+                    text.draw_text_left(canvas, &label, x0, y, &small, None, None);
+                }
+                let name = match f {
+                    Field::Hypso(i) => format!("{} m", t.hypso[i as usize].0.round() as i64),
+                    _ => f.name(),
                 };
-                text.draw_text_left(canvas, &label, x, y, &small, None, None);
+                // A number is wider than a swatch: its name sits further along.
+                let name_x = x0 + if f.is_colour() { font * 1.1 } else { font * 2.6 };
+                text.draw_text_left(canvas, &name, name_x, y, &small, None, None);
+                rows.push((y, row * 0.5, f, v));
             }
-            let name = match f {
-                Field::Hypso(i) => format!("{} m", t.hypso[i as usize].0.round() as i64),
-                _ => f.name(),
-            };
-            text.draw_text_left(canvas, &name, x + font * 1.1, y, &small, None, None);
-            rows.push((y, row * 0.5, f));
-            let two = matches!(f, Field::Land(_) | Field::Line(_));
-            if two && col == 0 {
-                col = 1;
-            } else {
-                col = 0;
-                y += row;
-            }
+            y += row;
         }
         rows
     }
@@ -1004,10 +948,6 @@ impl Panel {
             y += font * 1.7;
         }
     }
-}
-
-fn name_index(name: &str, names: &[&str]) -> usize {
-    names.iter().position(|n| *n == name).unwrap_or(0)
 }
 
 /// A legend swatch of an authored theme colour, as the map shows it unlit (through the same display encode), opaque, in fluor's stored form.

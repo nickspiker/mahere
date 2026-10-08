@@ -231,7 +231,7 @@ impl FluorApp for MahereApp {
                 }
                 let (x, y) = (hx as f64, hy as f64);
                 let mut ctl = Controls { real_sun: self.map.real_sun, real_light: self.map.real_light, follow_heading: self.map.follow_heading, lock_to_fix: self.map.lock_to_fix, cache_budget: self.cache_budget, theme: self.map.theme, compressed: self.map.compressed() };
-                if self.panel.drag(hx, &mut ctl) {
+                if self.panel.drag(hx, hy, &mut ctl) {
                     self.cache_budget = ctl.cache_budget;
                     self.apply_theme_edits();
                     ctx.window.request_redraw();

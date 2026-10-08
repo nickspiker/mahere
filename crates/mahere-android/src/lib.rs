@@ -324,7 +324,7 @@ impl FluorApp for AndroidApp {
             FEvent::CursorMoved { .. } => {
                 let (x, y) = (ctx.cursor_x as f64, ctx.cursor_y as f64);
                 let mut ctl = self.controls();
-                if self.panel.drag(x as f32, &mut ctl) {
+                if self.panel.drag(x as f32, y as f32, &mut ctl) {
                     let mask = self.map.layers();
                     self.apply_controls(ctl, mask);
                     self.apply_theme_edits();
