@@ -402,7 +402,7 @@ impl MapCore {
         self.dirty = true;
     }
 
-    /// The light as a ball the size of the gear, `size × size` display RGBA, oriented to the screen (x right, y up, z out): with real light, the painted sphere itself, every visible point the radiance in that direction and the unpainted left clear; with the real sun, a white ball lit by it with the sun as a point where it stands. None when neither mode is on.
+    /// The light as a ball the size of the gear, `size × size` display RGBA, oriented to the screen (x right, y up, z out): with real light, the painted sphere itself, every visible point the radiance in that direction; with the real sun, a white ball lit by it with the sun as a point where it stands. None when neither mode is on.
     pub fn orb(&self, size: usize) -> Option<Vec<[u8; 4]>> {
         if !(self.real_light || self.real_sun) || size == 0 {
             return None;
@@ -420,7 +420,7 @@ impl MapCore {
                 }
                 let d = [x, y, (1.0 - rr).sqrt()];
                 let lit: Option<[f32; 3]> = if self.real_light {
-                    self.sphere.as_ref().and_then(|s| {
+                    self.sphere.as_ref().map(|s| {
                         let rot = &self.device_rot;
                         s.radiance([rot[0] * d[0] + rot[1] * d[1] + rot[2] * d[2], rot[3] * d[0] + rot[4] * d[1] + rot[5] * d[2], rot[6] * d[0] + rot[7] * d[1] + rot[8] * d[2]])
                     })
@@ -439,9 +439,9 @@ impl MapCore {
         Some(out)
     }
 
-    /// How much of the sphere the camera has painted, 0..1.
+    /// How much of the sphere the camera has painted, 0..1: the triangles no longer black.
     pub fn probe_coverage(&self) -> f32 {
-        self.sphere.as_ref().map_or(0.0, |s| s.seen.iter().filter(|&&v| v).count() as f32 / probe::TRIS as f32)
+        self.sphere.as_ref().map_or(0.0, |s| s.tris.iter().filter(|&&v| v != [0; 3]).count() as f32 / probe::TRIS as f32)
     }
 
     pub fn set_follow_heading(&mut self, on: bool) {

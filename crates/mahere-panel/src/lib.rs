@@ -345,7 +345,7 @@ impl Panel {
             }
             paint::circle_filled(&mut canvas, gx as isize, gy as isize, gr as isize, GEAR_BG, None, None);
         }
-        // The ball's display pixels straight into the buffer over the disc; where nothing is painted the disc shows.
+        // The ball's display pixels straight into the buffer over the disc.
         if let Some((size, img)) = &ball {
             let (x0, y0) = ((gx - gr) as isize, (gy - gr) as isize);
             for py in 0..*size {

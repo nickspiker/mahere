@@ -1,4 +1,4 @@
-//! The real light: the front camera painting a sphere around the phone. The camera looks out of the screen; the orientation sensor says where the screen points; so every camera frame paints its patch of a world-fixed sphere, and turning the phone paints the rest. The sphere is the icosahedron at two subdivisions, 320 triangles of about 16°, which is finer than the nine harmonics the renderer lights by can tell apart, so the sun lands where it is. Unpainted triangles stay dark until the camera gets there: honest at every moment (Nick 2026-10-08).
+//! The real light: the front camera painting a sphere around the phone. The camera looks out of the screen; the orientation sensor says where the screen points; so every camera frame paints its patch of a world-fixed sphere, and turning the phone paints the rest. The sphere is the icosahedron at two subdivisions, 320 triangles of about 16°, which is finer than the nine harmonics the renderer lights by can tell apart, so the sun lands where it is. The sphere starts black and a triangle stays black until the camera gets there: honest at every moment, and nothing to mark (Nick 2026-10-08).
 //!
 //! Units are integer and absolute: raw sensor counts above black, shifted up by the frame's stop (the exposure ladder is powers of two of one base), so frames at any exposure paint the same sphere. The level is set by the sphere itself, the brightest a normal can be lit, so walking indoors and painting over the sun brings the level down with it.
 //!
@@ -277,10 +277,9 @@ impl Lens {
 /// The icosahedron at two subdivisions: dymaxion depth 2, 160 diamond cells of two triangles each.
 pub const TRIS: usize = 320;
 
-/// The sphere of light around the phone, world-fixed (east, north, up): the radiance painted on each triangle in absolute integer units, and which have been painted.
+/// The sphere of light around the phone, world-fixed (east, north, up): the radiance painted on each triangle in absolute integer units, zero until painted.
 pub struct Sphere {
     pub tris: Vec<[u32; 3]>,
-    pub seen: Vec<bool>,
     /// Unit direction of each triangle's centre, in the world frame.
     pub centres: Vec<[f32; 3]>,
     /// The level the last light was held to: the brightest irradiance any normal sees, in the sphere's units.
@@ -319,7 +318,7 @@ impl Sphere {
                 }
             }
         }
-        Sphere { tris: vec![[0; 3]; TRIS], seen: vec![false; TRIS], centres, level: 0.0 }
+        Sphere { tris: vec![[0; 3]; TRIS], centres, level: 0.0 }
     }
 
     /// Paint a frame: every bin's direction taken through the device's rotation `rot` (row-major, world = rot · device) into the world, the bins landing in a triangle averaged and written over it.
@@ -337,22 +336,19 @@ impl Sphere {
         for t in 0..TRIS {
             if counts[t] > 0 {
                 self.tris[t] = [(sums[t][0] / counts[t] as u64) as u32, (sums[t][1] / counts[t] as u64) as u32, (sums[t][2] / counts[t] as u64) as u32];
-                self.seen[t] = true;
             }
         }
     }
 
-    /// The painted sphere as the light, projected in the device frame for `rot` and held to its own level: the brightest a normal can be lit by it is one. None until something is painted.
+    /// The painted sphere as the light, projected in the device frame for `rot` and held to its own level: the brightest a normal can be lit by it is one. None while the sphere is all black.
     pub fn light(&mut self, rot: &[f32; 9]) -> Option<Sh9> {
         let omega = 4.0 * std::f32::consts::PI / TRIS as f32;
         let mut world = Sh9::ZERO;
         let mut device = Sh9::ZERO;
-        let mut any = false;
         for t in 0..TRIS {
-            if !self.seen[t] {
+            if self.tris[t] == [0; 3] {
                 continue;
             }
-            any = true;
             let c = self.centres[t];
             // Device = rotᵀ · world.
             let dd = [rot[0] * c[0] + rot[3] * c[1] + rot[6] * c[2], rot[1] * c[0] + rot[4] * c[1] + rot[7] * c[2], rot[2] * c[0] + rot[5] * c[1] + rot[8] * c[2]];
@@ -364,9 +360,6 @@ impl Sphere {
                     device.l[ch][k] += v * bd[k];
                 }
             }
-        }
-        if !any {
-            return None;
         }
         // The level: the brightest irradiance any normal sees, sampled at the triangle centres.
         let mut peak = 0f32;
@@ -381,18 +374,11 @@ impl Sphere {
         Some(device.scaled(1.0 / peak))
     }
 
-    /// The radiance painted in a world direction as light on the map's scale (a sphere of this radiance everywhere would light every normal to one), or None where nothing is painted yet.
-    pub fn radiance(&self, world: [f32; 3]) -> Option<[f32; 3]> {
-        if self.level <= 0.0 {
-            return None;
-        }
-        let t = tri_of(world);
-        if !self.seen[t] {
-            return None;
-        }
-        let k = std::f32::consts::PI / self.level;
-        let r = self.tris[t];
-        Some([r[0] as f32 * k, r[1] as f32 * k, r[2] as f32 * k])
+    /// The radiance painted in a world direction as light on the map's scale: a sphere of this radiance everywhere would light every normal to one. Black where nothing has been painted.
+    pub fn radiance(&self, world: [f32; 3]) -> [f32; 3] {
+        let k = if self.level > 0.0 { std::f32::consts::PI / self.level } else { 0.0 };
+        let r = self.tris[tri_of(world)];
+        [r[0] as f32 * k, r[1] as f32 * k, r[2] as f32 * k]
     }
 }
 
@@ -436,14 +422,14 @@ mod tests {
         let frame = vec![[1000u32; 3]; 32 * 24];
         let mut s = Sphere::new();
         s.paint(&frame, &lens, &IDENTITY);
-        let seen = s.seen.iter().filter(|&&v| v).count();
+        let seen = s.tris.iter().filter(|&&v| v != [0; 3]).count();
         // A 57° × 75° field covers around a tenth of the sphere.
         assert!((15..=60).contains(&seen), "{seen} triangles painted");
         let sh = s.light(&IDENTITY).unwrap();
         // On the map's scale a sphere of radiance one lights every normal to one, so a patch a tenth of the sphere that lights its own direction to one is brighter than one.
-        let r = s.radiance([0.0, 0.0, 1.0]).unwrap();
+        let r = s.radiance([0.0, 0.0, 1.0]);
         assert!(r[1] > 1.0 && r[1] < 4.0, "{r:?}");
-        assert!(s.radiance([0.0, 0.0, -1.0]).is_none());
+        assert_eq!(s.radiance([0.0, 0.0, -1.0]), [0.0; 3]);
         let out = sh.irradiance([0.0, 0.0, 1.0]);
         let back = sh.irradiance([0.0, 0.0, -1.0]);
         assert!(out[1] > 0.9 && out[1] <= 1.01, "{out:?}");
@@ -478,7 +464,7 @@ mod tests {
         let quarter = [0.0, -1.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0];
         let mut b = Sphere::new();
         b.paint(&frame, &lens, &quarter);
-        assert_ne!(a.seen, b.seen);
+        assert_ne!(a.tris, b.tris);
         // And the light it gives, seen from the turned phone, is the same light turned back, to within the triangles' 16°.
         let la = a.light(&IDENTITY).unwrap();
         let lb = b.light(&quarter).unwrap();
