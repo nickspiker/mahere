@@ -81,64 +81,66 @@ pub fn bin(raw: &Raw, cols: usize) -> Binned {
     let (qw, qh) = (raw.w / 2, raw.h / 2);
     let f = (qw / cols.max(1)).max(1);
     let (w, h) = (qw / f, qh / f);
-    let black_mean = raw.black.iter().map(|&b| b as u32).sum::<u32>() / 4;
-    let scale = 1.0 / (raw.white as u32).saturating_sub(black_mean).max(1) as f32;
-    let mut hist = [0u32; 256];
-    let hist_scale = 255.0 / raw.white.max(1) as f32;
-    let sample = |x: usize, y: usize| -> u16 {
-        let i = y * raw.row_stride + x * 2;
-        u16::from_le_bytes([raw.data[i], raw.data[i + 1]])
-    };
-    // Where red and blue sit in the quad; green is the other two.
-    let (rx, ry, bx, by) = match raw.cfa {
-        Cfa::Rggb => (0, 0, 1, 1),
-        Cfa::Grbg => (1, 0, 0, 1),
-        Cfa::Gbrg => (0, 1, 1, 0),
-        Cfa::Bggr => (1, 1, 0, 0),
+    // Where red and blue sit in the quad, as positions 0..4 row-major; green is the other two.
+    let (rp, bp) = match raw.cfa {
+        Cfa::Rggb => (0usize, 3usize),
+        Cfa::Grbg => (1, 2),
+        Cfa::Gbrg => (2, 1),
+        Cfa::Bggr => (3, 0),
     };
     let clip_at = raw.white.saturating_sub(2);
-    let n = (f * f) as f32;
-    // A row of bins per task: eight million samples a frame at thirty frames a second wants every core.
+    // The histogram bins the sensor's own bits: a shift takes a sample to 0..255.
+    let shift = (16 - raw.white.leading_zeros()).saturating_sub(8);
+    // Integers all the way through the samples: per bin, the sum of each Bayer position, its black taken off once by the count, and the floats only at the end for the 1,700 bins.
     use rayon::prelude::*;
-    let rows: Vec<(Vec<[f32; 3]>, Vec<u16>, [u32; 256])> = (0..h)
+    let rows: Vec<(Vec<[u32; 4]>, Vec<u16>, [u32; 256])> = (0..h)
         .into_par_iter()
         .map(|y| {
-            let mut out = vec![[0f32; 3]; w];
+            let mut sums = vec![[0u32; 4]; w];
             let mut clipped = vec![0u16; w];
             let mut hist = [0u32; 256];
-            for x in 0..w {
-                let mut acc = [0f32; 3];
-                for j in 0..f {
+            for j in 0..f {
+                let qy = (y * f + j) * 2;
+                let row0 = &raw.data[qy * raw.row_stride..][..raw.w * 2];
+                let row1 = &raw.data[(qy + 1) * raw.row_stride..][..raw.w * 2];
+                for x in 0..w {
+                    let (mut acc, mut clip) = ([0u32; 4], 0u16);
+                    let x0 = x * f * 4;
+                    let (r0, r1) = (&row0[x0..x0 + f * 4], &row1[x0..x0 + f * 4]);
                     for i in 0..f {
-                        let (qx, qy) = ((x * f + i) * 2, (y * f + j) * 2);
-                        let mut g = 0f32;
-                        for (dx, dy) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
-                            let v = sample(qx + dx, qy + dy);
-                            hist[((v as f32 * hist_scale) as usize).min(255)] += 1;
-                            if v >= clip_at {
-                                clipped[x] = clipped[x].saturating_add(1);
-                            }
-                            let lin = (v.saturating_sub(raw.black[dy * 2 + dx])) as f32 * scale;
-                            if (dx, dy) == (rx, ry) {
-                                acc[0] += lin;
-                            } else if (dx, dy) == (bx, by) {
-                                acc[2] += lin;
-                            } else {
-                                g += lin;
-                            }
+                        let q = [
+                            u16::from_le_bytes([r0[4 * i], r0[4 * i + 1]]),
+                            u16::from_le_bytes([r0[4 * i + 2], r0[4 * i + 3]]),
+                            u16::from_le_bytes([r1[4 * i], r1[4 * i + 1]]),
+                            u16::from_le_bytes([r1[4 * i + 2], r1[4 * i + 3]]),
+                        ];
+                        for (k, &v) in q.iter().enumerate() {
+                            hist[((v >> shift) as usize).min(255)] += 1;
+                            clip += (v >= clip_at) as u16;
+                            acc[k] += v as u32;
                         }
-                        acc[1] += g * 0.5;
                     }
+                    for k in 0..4 {
+                        sums[x][k] += acc[k];
+                    }
+                    clipped[x] = clipped[x].saturating_add(clip);
                 }
-                out[x] = [acc[0] / n, acc[1] / n, acc[2] / n];
             }
-            (out, clipped, hist)
+            (sums, clipped, hist)
         })
         .collect();
+    let count = (f * f) as u32;
+    let black_mean = raw.black.iter().map(|&b| b as u32).sum::<u32>() / 4;
+    let scale = 1.0 / ((raw.white as u32).saturating_sub(black_mean).max(1) as f32 * count as f32);
     let mut out = Vec::with_capacity(w * h);
     let mut clipped = Vec::with_capacity(w * h);
-    for (o, c, hh) in rows {
-        out.extend(o);
+    let mut hist = [0u32; 256];
+    for (sums, c, hh) in rows {
+        for s in sums {
+            let lin = |k: usize| s[k].saturating_sub(count * raw.black[k] as u32) as f32 * scale;
+            let g = (lin(0) + lin(1) + lin(2) + lin(3) - lin(rp) - lin(bp)) * 0.5;
+            out.push([lin(rp), g, lin(bp)]);
+        }
         clipped.extend(c);
         for k in 0..256 {
             hist[k] += hh[k];
@@ -146,11 +148,11 @@ pub fn bin(raw: &Raw, cols: usize) -> Binned {
     }
     let total: u32 = hist.iter().sum();
     let clipped_frac = hist[255] as f32 / total.max(1) as f32;
-    let mut seen = 0u32;
+    let mut seen = 0u64;
     let mut p999 = 1.0;
     for (i, &c) in hist.iter().enumerate() {
-        seen += c;
-        if seen as f32 >= total as f32 * 0.999 {
+        seen += c as u64;
+        if seen * 1000 >= total as u64 * 999 {
             p999 = i as f32 / 255.0;
             break;
         }
