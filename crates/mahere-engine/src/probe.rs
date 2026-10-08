@@ -63,7 +63,8 @@ impl Binned {
             return;
         }
         for i in 0..self.rgb.len() {
-            if self.clipped[i] > 0 {
+            // Only where the bracket saw something: a bin it read as nothing keeps the clipped value, a floor, rather than going black (Nick 2026-10-08).
+            if self.clipped[i] > 0 && short.rgb[i] != [0; 3] {
                 let s = short.rgb[i];
                 self.rgb[i] = [s[0] << short_stop >> stop, s[1] << short_stop >> stop, s[2] << short_stop >> stop];
             }
