@@ -328,6 +328,9 @@ pub struct ImgTile {
 
 pub struct ImgStore {
     tiles: Vec<ImgTile>,
+    /// Geographic tiles by the one-degree squares they overlap, so a store of dozens of tiles samples without scanning them all; tiles in other grids are always scanned.
+    by_square: std::collections::HashMap<(i32, i32), Vec<usize>>,
+    others: Vec<usize>,
 }
 
 impl ImgTile {
@@ -349,10 +352,17 @@ impl ImgTile {
             eprintln!("img tile {path}: {w}x{h} x1 (15-bit) {grid:?}");
             return Ok(ImgTile { width: w as usize, height: h as usize, bands: 1, grid, origin, step: (scale[0], scale[1]), data });
         }
+        // GDAL metadata names the reflectance offset when the producer removed it (the ESA WorldCover composite: offset 0); a bare Sentinel-2 L2A band from processing baseline 4 on carries the 1000 offset in its samples.
+        let meta = dec.get_tag_ascii_string(Tag::Unknown(42112)).unwrap_or_default();
+        let offset: u16 = if meta.contains("role=\"offset\">0<") { 0 } else { 1000 };
         let data = match dec.read_image().map_err(|e| format!("{path}: {e}"))? {
             DecodingResult::U8(v) => v,
-            // Sixteen-bit reflectance (Sentinel-2 L2A: 10000 per unit, offset by 1000 since processing baseline 4): reflectance 0 to 0.45 onto 1 to 255, 0 kept for no data.
-            DecodingResult::U16(v) => v.into_iter().map(|d| if d == 0 { 0 } else { (d.saturating_sub(1000) / 18).clamp(1, 255) as u8 }).collect(),
+            // Sixteen-bit reflectance (Sentinel-2 L2A: 10000 per unit), every fourth sample near-infrared when there are four bands.
+            DecodingResult::U16(v) => {
+                let bands = v.len() / (w as usize * h as usize).max(1);
+                let (vis, nir) = (reflectance_lut(offset, VISIBLE_WHITE), reflectance_lut(offset, NIR_WHITE));
+                v.into_iter().enumerate().map(|(i, d)| if bands == 4 && i % 4 == 3 { nir[d as usize] } else { vis[d as usize] }).collect()
+            }
             other => return Err(format!("{path}: expected U8 or U16 samples, got {}", sample_kind(&other))),
         };
         let px = w as usize * h as usize;
@@ -379,21 +389,43 @@ impl ImgTile {
 }
 
 impl ImgStore {
+    /// Tiles decode in parallel, kept in the order given: a sample takes the first tile with data, so earlier paths win.
     pub fn load(paths: &[String]) -> Result<ImgStore, String> {
-        let mut tiles = Vec::new();
-        for p in paths {
-            tiles.push(ImgTile::load(p)?);
+        use rayon::prelude::*;
+        let tiles: Vec<ImgTile> = paths.par_iter().map(|p| ImgTile::load(p)).collect::<Result<_, _>>()?;
+        let mut by_square: std::collections::HashMap<(i32, i32), Vec<usize>> = std::collections::HashMap::new();
+        let mut others = Vec::new();
+        for (i, t) in tiles.iter().enumerate() {
+            match t.grid {
+                Grid::Geographic => {
+                    let (lon0, lat1) = t.origin;
+                    let (lon1, lat0) = (lon0 + t.width as f64 * t.step.0, lat1 - t.height as f64 * t.step.1);
+                    for la in lat0.floor() as i32..lat1.ceil() as i32 {
+                        for lo in lon0.floor() as i32..lon1.ceil() as i32 {
+                            by_square.entry((la, lo)).or_default().push(i);
+                        }
+                    }
+                }
+                _ => others.push(i),
+            }
         }
-        Ok(ImgStore { tiles })
+        Ok(ImgStore { tiles, by_square, others })
     }
 
     pub fn tile_count(&self) -> usize {
         self.tiles.len()
     }
 
+    /// [`ImgStore::sample`] at a (lat, lon) pair, longitude wrapped into -180..180 as the source tiles are.
+    pub fn sample_lat_lon(&self, p: (f64, f64)) -> Option<[u8; 4]> {
+        self.sample(p.0, (p.1 + 180.0).rem_euclid(360.0) - 180.0)
+    }
+
     /// Nearest-pixel sample of up to four bands at (lat, lon): None outside coverage or where every band is 0 (NAIP's no-data collar).
     pub fn sample(&self, lat: f64, lon: f64) -> Option<[u8; 4]> {
-        for t in &self.tiles {
+        let near = self.by_square.get(&(lat.floor() as i32, lon.floor() as i32)).map_or(&[][..], |v| &v[..]);
+        for &ti in near.iter().chain(&self.others) {
+            let t = &self.tiles[ti];
             if let Some((px, py)) = t.pixel_at(lat, lon) {
                 let i = (py * t.width + px) * t.bands;
                 let mut out = [0u8; 4];
@@ -573,9 +605,21 @@ impl IntensityStore {
     }
 }
 
-/// A tiled, deflate-compressed, single-band TIFF of 15-bit samples (no predictor), read tile by tile and mapped like 16-bit reflectance: 10000 per unit with a 1000 offset, reflectance 0 to 0.45 onto 1 to 255, 0 kept for no data.
+/// Reflectance shown as white: 30% for the visible bands (bright soil and concrete near the top, snow and cloud clipped), 50% for the near-infrared (where leaves are bright).
+const VISIBLE_WHITE: f32 = 0.30;
+const NIR_WHITE: f32 = 0.50;
+
+/// Sixteen-bit reflectance samples (10000 per unit, less `offset`) to display bytes: exposed so `white` reflectance is full scale, then encoded at gamma 2 as every colour in the house is, so the linear light the renderer recovers is proportional to the reflectance. 0 stays 0 (no data); anything else is at least 1.
+fn reflectance_lut(offset: u16, white: f32) -> Vec<u8> {
+    (0..=u16::MAX)
+        .map(|d| if d == 0 { 0 } else { (255.0 * ((d.saturating_sub(offset) as f32 / 10000.0) / white).sqrt()).round().clamp(1.0, 255.0) as u8 })
+        .collect()
+}
+
+/// A tiled, deflate-compressed, single-band TIFF of 15-bit samples (no predictor), read tile by tile and mapped as near-infrared reflectance (10000 per unit with a 1000 offset) by [`reflectance_lut`], 0 kept for no data.
 fn read_tiled_u15<R: std::io::Read + std::io::Seek>(path: &str, dec: &mut Decoder<R>, w: usize, h: usize) -> Result<Vec<u8>, String> {
     use std::io::{Read, Seek, SeekFrom};
+    let lut = reflectance_lut(1000, NIR_WHITE);
     let get = |dec: &mut Decoder<R>, t: Tag| dec.get_tag_u32_vec(t).ok().and_then(|v| v.first().copied());
     let (tw, th) = (get(dec, Tag::TileWidth).ok_or("no TileWidth")? as usize, get(dec, Tag::TileLength).ok_or("no TileLength")? as usize);
     if get(dec, Tag::Compression) != Some(8) || get(dec, Tag::Predictor).unwrap_or(1) != 1 {
@@ -612,7 +656,7 @@ fn read_tiled_u15<R: std::io::Read + std::io::Seek>(path: &str, dec: &mut Decode
                 let d = ((acc >> nbits) & 0x7FFF) as u16;
                 let x = x0 + rx;
                 if x < w {
-                    out[y * w + x] = if d == 0 { 0 } else { (d.saturating_sub(1000) / 18).clamp(1, 255) as u8 };
+                    out[y * w + x] = lut[d as usize];
                 }
             }
         }

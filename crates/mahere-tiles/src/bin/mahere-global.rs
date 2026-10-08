@@ -3,6 +3,8 @@
 //!
 //! Each region is a depth-`region` cell. Its depth-`depth` cells are box-filtered from the source tiles the region touches (four samples per triangle, so a 108 m triangle reads 54 m data), their aprons sampled from the source, then its pyramid built down to the region cell itself. A region whose tiles have not all downloaded yet is skipped and picked up by the next run; a region over open sea writes only its region cell, at sea level, which every deeper view falls back to. Finished regions are listed in `<out>/.global-done`, so a run can stop and resume anywhere.
 //! `--top` builds the depths above the regions from the region cells already written, once every region is done.
+//!
+//! Imagery: `--img <tile dir> --img-index <tile list>` bakes the imagery layer instead, into the same cells (their terrain carried over untouched), from one-degree four-band tiles (the ESA WorldCover Sentinel-2 composite's 37 m level, pulled by `cog-level`): every texel box-filtered from sixteen samples, regions over open sea skipped, finished regions in `<out>/.global-img-done`; with `--top` it builds the imagery above the regions. `--img-loss` sets the codec's loss (default 16 levels).
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -14,9 +16,17 @@ fn arg(args: &[String], name: &str) -> Option<String> {
     args.iter().position(|a| a == name).map(|i| args[i + 1].clone())
 }
 
-/// A tile name's one-degree square: `Copernicus_DSM_COG_10_N47_00_W121_00_DEM` → (47, -121).
+/// A tile name's one-degree square: `Copernicus_DSM_COG_10_N47_00_W121_00_DEM` → (47, -121), and `ESA_WorldCover_10m_2021_v200_N47W121_S2RGBNIR.tif` → (47, -121).
 fn square_of(name: &str) -> Option<(i32, i32)> {
-    let parts: Vec<&str> = name.trim_end_matches('/').split('_').collect();
+    let name = name.trim_end_matches('/');
+    let name = name.rsplit('/').next().unwrap_or(name);
+    let parts: Vec<&str> = name.split('_').collect();
+    // WorldCover packs both into one part: N47W121.
+    if let Some(p) = parts.iter().find(|p| p.len() == 7 && (p.starts_with('N') || p.starts_with('S')) && (p.as_bytes()[3] == b'E' || p.as_bytes()[3] == b'W')) {
+        let lat: i32 = p[1..3].parse().ok()?;
+        let lon: i32 = p[4..7].parse().ok()?;
+        return Some((if p.starts_with('S') { -lat } else { lat }, if p.as_bytes()[3] == b'W' { -lon } else { lon }));
+    }
     let lat_s = parts.iter().find(|p| p.starts_with('N') || p.starts_with('S'))?;
     let lon_s = parts.iter().find(|p| (p.starts_with('E') || p.starts_with('W')) && p.len() == 4)?;
     let lat: i32 = lat_s[1..].parse().ok()?;
@@ -63,6 +73,15 @@ fn main() {
     let loss = Loss { dem_m: arg(&args, "--dem-loss").map_or(1.0, |v| v.parse().unwrap()), img: 0 };
     std::fs::create_dir_all(&out).unwrap();
 
+    if let Some(img_dir) = arg(&args, "--img") {
+        let loss = Loss { dem_m: 0.0, img: arg(&args, "--img-loss").map_or(16, |v| v.parse().unwrap()) };
+        if args.iter().any(|a| a == "--top") {
+            top_img(&out, region_depth, &loss);
+        } else {
+            imagery(&out, &img_dir, &arg(&args, "--img-index").expect("--img-index"), depth, region_depth, &loss);
+        }
+        return;
+    }
     if args.iter().any(|a| a == "--top") {
         top(&out, region_depth, &loss);
         return;
@@ -174,5 +193,97 @@ fn top(out: &Path, region_depth: u8, loss: &Loss) {
     eprintln!("{} cells above the regions", upper.len());
     for (k, c) in upper {
         write(out, k, c, loss);
+    }
+}
+
+/// The regions in diamond order, as (diamond, cu, cv, key).
+fn regions(region_depth: u8) -> impl Iterator<Item = (u8, u64, u64, CellKey)> {
+    let per_side = 1u64 << region_depth;
+    (0..10u8).flat_map(move |d| (0..per_side).flat_map(move |cu| (0..per_side).map(move |cv| (d, cu, cv, CellKey::from_grid(d, region_depth, cu, cv)))))
+}
+
+fn done_list(path: &Path) -> HashSet<(u8, u64)> {
+    std::fs::read_to_string(path)
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| {
+            let mut it = l.split_whitespace();
+            Some((it.next()?.parse().ok()?, it.next()?.parse().ok()?))
+        })
+        .collect()
+}
+
+/// The imagery bake, region by region, like the terrain's.
+fn imagery(out: &Path, dir: &str, index: &str, depth: u8, region_depth: u8, loss: &Loss) {
+    let published: HashSet<(i32, i32)> = std::fs::read_to_string(index).unwrap().lines().filter_map(square_of).collect();
+    let mut local: HashMap<(i32, i32), String> = HashMap::new();
+    for e in std::fs::read_dir(dir).unwrap().flatten() {
+        let name = e.file_name().to_string_lossy().to_string();
+        if name.ends_with(".tif") {
+            if let Some(sq) = square_of(&name) {
+                local.insert(sq, e.path().to_string_lossy().to_string());
+            }
+        }
+    }
+    eprintln!("imagery: {} squares published, {} pulled", published.len(), local.len());
+    let done_path = out.join(".global-img-done");
+    let done = done_list(&done_path);
+    let mut done_file = std::fs::OpenOptions::new().create(true).append(true).open(&done_path).unwrap();
+    let (mut baked, mut sea, mut waiting) = (0, 0, 0);
+    let t_all = std::time::Instant::now();
+    for (diamond, cu, cv, region) in regions(region_depth) {
+        if done.contains(&(region.depth, region.prefix)) {
+            continue;
+        }
+        let land: Vec<(i32, i32)> = squares_of_region(region).into_iter().filter(|s| published.contains(s)).collect();
+        if land.iter().any(|s| !local.contains_key(s)) {
+            waiting += 1;
+            continue;
+        }
+        let t = std::time::Instant::now();
+        if land.is_empty() {
+            sea += 1;
+        } else {
+            let paths: Vec<String> = land.iter().map(|s| local[s].clone()).collect();
+            let store = mahere_dem::ImgStore::load(&paths).expect("load tiles");
+            let shift = depth - region_depth;
+            let keys: Vec<CellKey> = (0..1u64 << shift)
+                .flat_map(|i| (0..1u64 << shift).map(move |j| (i, j)))
+                .map(|(i, j)| CellKey::from_grid(diamond, depth, (cu << shift) + i, (cv << shift) + j))
+                .collect();
+            let base = mahere_tiles::bake_img_filtered(&store, &keys);
+            drop(store);
+            let pyramid = mahere_tiles::img_pyramid(&base, region_depth);
+            let n = base.len() + pyramid.len();
+            use rayon::prelude::*;
+            base.into_par_iter().chain(pyramid.into_par_iter()).for_each(|(k, c)| {
+                let cell = Cell { img: Some(c), ..Default::default() };
+                mahere_tiles::write_cell(out, k, &cell, loss).expect("write cell");
+            });
+            baked += 1;
+            eprintln!("img region {baked} {diamond}/{cu}/{cv}: {} tiles, {n} cells, {:.1}s", paths.len(), t.elapsed().as_secs_f32());
+        }
+        writeln!(done_file, "{} {}", region.depth, region.prefix).unwrap();
+    }
+    eprintln!("imagery pass: {baked} regions baked, {sea} sea, {waiting} waiting for tiles; {:.0}s", t_all.elapsed().as_secs_f32());
+}
+
+/// The imagery above the regions, from the region cells' imagery on disk.
+fn top_img(out: &Path, region_depth: u8, loss: &Loss) {
+    let mut cells: Vec<(CellKey, mahere_tiles::ImgCell)> = Vec::new();
+    for (_, _, _, k) in regions(region_depth) {
+        let Ok(bytes) = std::fs::read(out.join(k.path())) else { continue };
+        if let Ok(p) = mahere_tiles::decode_cell(&bytes) {
+            if let Some(im) = p.img {
+                cells.push((k, im));
+            }
+        }
+    }
+    eprintln!("{} region cells with imagery", cells.len());
+    let upper = mahere_tiles::img_pyramid(&cells, 0);
+    eprintln!("{} cells above the regions", upper.len());
+    for (k, c) in upper {
+        let cell = Cell { img: Some(c), ..Default::default() };
+        mahere_tiles::write_cell(out, k, &cell, loss).expect("write cell");
     }
 }

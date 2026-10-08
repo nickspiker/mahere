@@ -1582,6 +1582,7 @@ version = "0.1.0"
 name = "mahere-dem"
 version = "0.1.0"
 dependencies = [
+ "flate2",
  "las",
  "rayon",
  "tiff",
@@ -1651,6 +1652,7 @@ dependencies = [
  "mahere-osm",
  "png",
  "rayon",
+ "ureq",
  "vsf",
  "zstd",
 ]

@@ -11,6 +11,7 @@ mahere-coord = { path = "../mahere-coord" }
 mahere-dem = { path = "../mahere-dem" }
 mahere-osm = { path = "../mahere-osm" }
 rayon = "1"
+ureq = "2"
 zstd = "0.13"
 vsf = { git = "https://github.com/nickspiker/vsf", rev = "5f2bb06c8d96ee417a2571944882ef36d6c9ca8f" }
 

@@ -856,6 +856,46 @@ pub fn bake_img(naip: Option<&mahere_dem::ImgStore>, nir: Option<&mahere_dem::Im
         .collect()
 }
 
+/// The global imagery bake: every texel the mean of sixteen samples at the centroids of its grandchild triangles (no data ignored), so the source is read at four times the texel's resolution and a 108 m triangle box-filters the 37 m pixels under it instead of point-picking a few. Cells with nothing are dropped.
+pub fn bake_img_filtered(img: &mahere_dem::ImgStore, keys: &[CellKey]) -> Vec<(CellKey, ImgCell)> {
+    keys.par_iter()
+        .map(|&key| {
+            let (u0, v0, size) = key.uv_rect();
+            let d = key.diamond();
+            let step = size / TEX as f64;
+            let mut cell = ImgCell::new();
+            for ty in 0..TEX {
+                for tx in 0..TEX {
+                    for half in 0..2 {
+                        let (mut acc, mut hits) = ([0u32; 4], 0u32);
+                        for (cx, cy, ch) in tri_children(0, 0, half) {
+                            for (gx, gy, gh) in tri_children(cx, cy, ch) {
+                                let off = tri_off(gh);
+                                let u = u0 + (tx as f64 + (gx as f64 + off) * 0.25) * step;
+                                let v = v0 + (ty as f64 + (gy as f64 + off) * 0.25) * step;
+                                if let Some(px) = img.sample_lat_lon(uv_to_lat_lon(d, u, v)) {
+                                    for b in 0..4 {
+                                        acc[b] += px[b] as u32;
+                                    }
+                                    hits += 1;
+                                }
+                            }
+                        }
+                        if hits > 0 {
+                            let i = tri_idx(tx, ty, half);
+                            for (b, plane) in cell.bands_mut().into_iter().enumerate() {
+                                plane[i] = ((acc[b] + hits / 2) / hits).clamp(1, 255) as u8;
+                            }
+                        }
+                    }
+                }
+            }
+            (key, cell)
+        })
+        .filter(|(_, c)| !c.is_empty())
+        .collect()
+}
+
 /// Parent texel = mean of the lit children per band (0 = no data, ignored).
 pub fn img_pyramid(base: &[(CellKey, ImgCell)], min_depth: u8) -> Vec<(CellKey, ImgCell)> {
     let mut out: Vec<(CellKey, ImgCell)> = Vec::new();
@@ -1367,8 +1407,15 @@ impl CellPlanes {
     }
 
     pub fn encode(&self, loss: &Loss) -> Result<Vec<u8>, String> {
+        self.encode_with(loss, None, None)
+    }
+
+    /// Encode, with already-encoded terrain and imagery sections in place of `self.dem` and `self.img` when given.
+    fn encode_with(&self, loss: &Loss, dem_raw: Option<vsf::VsfSection>, img_raw: Option<vsf::VsfSection>) -> Result<Vec<u8>, String> {
         let mut b = VsfBuilder::new();
-        if let Some(d) = &self.dem {
+        if let Some(raw) = dem_raw {
+            b = b.add_section_direct(raw);
+        } else if let Some(d) = &self.dem {
             b = b.add_section_direct(dem_section(d, loss));
         }
         for (name, planes) in [("line", &self.line), ("land", &self.land)] {
@@ -1392,7 +1439,9 @@ impl CellPlanes {
                 vec![("cov".to_string(), VsfType::t_u3(Tensor::new(vec![2, TEX * TEX], mem_to_disk(&w.cov))))],
             );
         }
-        if let Some(im) = &self.img {
+        if let Some(raw) = img_raw {
+            b = b.add_section_direct(raw);
+        } else if let Some(im) = &self.img {
             b = b.add_section_direct(img_section(im, loss));
         }
         b.build().map_err(|e| format!("cell build: {e:?}"))
@@ -1403,13 +1452,39 @@ impl CellPlanes {
 pub fn write_cell(out: &Path, key: CellKey, cell: &Cell, loss: &Loss) -> Result<(), String> {
     let path = out.join(key.path());
     let mut planes = cell.quantize();
+    // A lossy layer the new bake does not have (terrain under an imagery bake, imagery under a terrain bake) carries its old section over as it is: decoding and re-quantising lossy planes is not idempotent and would add a second generation of error.
+    let (mut kept_dem, mut kept_img) = (None, None);
     if let Ok(existing) = std::fs::read(&path) {
         if let Ok(old) = decode_cell(&existing) {
+            if planes.dem.is_none() && old.dem.is_some() {
+                kept_dem = raw_section(&existing, "dem");
+            }
+            if planes.img.is_none() && old.img.is_some() {
+                kept_img = raw_section(&existing, "img");
+            }
             planes = planes.merge_over(old);
         }
     }
-    let bytes = planes.encode(loss)?;
-    write_file(&path, &bytes)
+    if kept_dem.is_some() {
+        planes.dem = None;
+    }
+    if kept_img.is_some() {
+        planes.img = None;
+    }
+    write_file(&path, &planes.encode_with(loss, kept_dem, kept_img)?)
+}
+
+/// One section of a cell file as stored, for carrying over unchanged.
+fn raw_section(data: &[u8], name: &str) -> Option<vsf::VsfSection> {
+    let plain: Vec<u8>;
+    let data = if data.starts_with(&[0x28, 0xB5, 0x2F, 0xFD]) {
+        plain = zstd::decode_all(data).ok()?;
+        &plain[..]
+    } else {
+        data
+    };
+    let (header, end) = vsf::VsfHeader::decode(data).ok()?;
+    header.sections(data, end).ok()?.into_iter().find(|s| s.name == name)
 }
 
 fn write_file(path: &Path, bytes: &[u8]) -> Result<(), String> {
