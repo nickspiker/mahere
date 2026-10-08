@@ -1,4 +1,4 @@
-//! The real light: a front-camera frame as the lighting environment. The camera looks out of the screen, so its pixels are radiance samples in the device frame, the frame the light already lives in; each one, weighted by its solid angle, projects straight into the nine harmonics the renderer evaluates. Nothing is invented for the directions the lens does not see: they stay black, as if the map sat in a box with one window, which is honest (Nick 2026-10-08). The level is normalised, the ratios and the colour are the camera's.
+//! The real light: a front-camera frame as the lighting environment. The camera looks out of the screen, so its pixels are radiance samples in the device frame, the frame the light already lives in; each one, weighted by its solid angle, projects straight into the nine harmonics the renderer evaluates. The frame is in absolute units (raw fraction of white per second of exposure), so frames at different exposures agree; the level is anchored by the map core to the brightest light seen (Nick 2026-10-08: absolute, adapting only to a brighter light, so turning away from the light does not brighten the map back up).
 //!
 //! Colour: the sensor's raw samples through Android's `SENSOR_COLOR_TRANSFORM` (XYZ to camera, a 1931 characterisation under the reference illuminant) inverted, then XYZ to VSF RGB with no adaptation: a blue sky lights the shadows blue, a tungsten lamp lights the map orange. The light's colour is the point.
 
@@ -186,7 +186,7 @@ pub fn upright(w: usize, h: usize, rgb: &[[f32; 3]], tan_w: f32, tan_h: f32, ori
 }
 
 impl Sh9 {
-    /// The environment a probe frame saw, in the device frame (x right, y up the screen, z out of it). The largest circle that fits the frame is taken as the whole sphere: its centre is straight out of the screen, its rim is straight into the back, and every direction between is stretched in angle to match (Nick 2026-10-08: no corners, no interpolation, pretend the camera is a full sphere). The corners outside the circle are dropped. The front camera faces the user, so what it sees on its image-right lies to the device's left: image x maps to −x. The level is normalised so the light falling on the screen's own normal has unit luminance.
+    /// The environment a probe frame saw, in the device frame (x right, y up the screen, z out of it), in the frame's own units. The largest circle that fits the frame is taken as the whole sphere: its centre is straight out of the screen, its rim is straight into the back, and every direction between is stretched in angle to match (Nick 2026-10-08: no corners, no interpolation, pretend the camera is a full sphere). The corners outside the circle are dropped. The front camera faces the user, so what it sees on its image-right lies to the device's left: image x maps to −x.
     pub fn from_probe(p: &Probe) -> Sh9 {
         let mut sh = Sh9::ZERO;
         let (dw, dh) = (2.0 * p.tan_w / p.w as f32, 2.0 * p.tan_h / p.h as f32);
@@ -219,17 +219,23 @@ impl Sh9 {
                 }
             }
         }
-        let e = sh.irradiance([0.0, 0.0, 1.0]);
-        let lum = 0.3 * e[0] + 0.6 * e[1] + 0.1 * e[2];
-        if lum > 1e-6 {
-            let k = 1.0 / lum;
-            for ch in 0..3 {
-                for v in sh.l[ch].iter_mut() {
-                    *v *= k;
-                }
+        sh
+    }
+
+    /// The luminance of the irradiance on the screen's own normal: what the probe says falls on the phone.
+    pub fn screen_luminance(&self) -> f32 {
+        let e = self.irradiance([0.0, 0.0, 1.0]);
+        0.3 * e[0] + 0.6 * e[1] + 0.1 * e[2]
+    }
+
+    pub fn scaled(&self, k: f32) -> Sh9 {
+        let mut out = *self;
+        for ch in 0..3 {
+            for v in out.l[ch].iter_mut() {
+                *v *= k;
             }
         }
-        sh
+        out
     }
 }
 
@@ -241,15 +247,14 @@ mod tests {
     fn a_flat_frame_is_a_uniform_sphere() {
         let p = Probe { w: 64, h: 48, rgb: vec![[1.0; 3]; 64 * 48], tan_w: 1.0, tan_h: 0.75 };
         let sh = Sh9::from_probe(&p);
+        // A unit sphere of radiance delivers π to every normal.
         let front = sh.irradiance([0.0, 0.0, 1.0]);
-        assert!((front[1] - 1.0).abs() < 1e-3, "{front:?}");
-        // Stretched over the whole sphere, a flat frame lights every normal alike.
+        assert!((front[1] - std::f32::consts::PI).abs() < 0.05, "{front:?}");
         for n in [[0.0, 0.0, -1.0], [1.0, 0.0, 0.0], [0.0, -1.0, 0.0]] {
             let e = sh.irradiance(n);
-            assert!((e[1] - 1.0).abs() < 0.05, "{n:?} {e:?}");
+            assert!((e[1] - std::f32::consts::PI).abs() < 0.15, "{n:?} {e:?}");
         }
-        // The stretched circle covers the sphere: its total solid angle is 4π, so the mean radiance coefficient is that of a unit sphere.
-        assert!((sh.l[1][0] - 4.0 * std::f32::consts::PI * 0.282095 / (0.886227 * 4.0 * std::f32::consts::PI * 0.282095)).abs() < 0.05, "{}", sh.l[1][0]);
+        assert!((sh.scaled(1.0 / sh.screen_luminance()).screen_luminance() - 1.0).abs() < 1e-4);
     }
 
     #[test]

@@ -703,6 +703,11 @@ pub extern "system" fn Java_nz_mahere_app_MahereActivity_nativeOnProbe(
         b.fill_clipped(short, long_ns as f32 / (*short_ns).max(1) as f32);
     }
     let (bw, bh, mut rgb) = (b.w, b.h, b.rgb);
+    // Absolute: per second of exposure, so every frame is on one scale whatever the loop chose.
+    let per_second = 1e9 / (long_ns.max(1) as f32);
+    for p in rgb.iter_mut() {
+        *p = [p[0] * per_second, p[1] * per_second, p[2] * per_second];
+    }
     let mean = |v: &[[f32; 3]]| {
         let n = v.len().max(1) as f32;
         v.iter().fold([0f32; 3], |a, p| [a[0] + p[0] / n, a[1] + p[1] / n, a[2] + p[2] / n])
@@ -720,7 +725,7 @@ pub extern "system" fn Java_nz_mahere_app_MahereActivity_nativeOnProbe(
     let mut last = LAST.lock().unwrap();
     if last.is_none_or(|t| t.elapsed().as_secs_f32() > 1.0) {
         *last = Some(std::time::Instant::now());
-        eprintln!("probe: clipped {:.5} p999 {:.3} filled {filled} bins from the bracket; cam {cam_mean:?} vsf {vsf_mean:?} screen {:?}", st.clipped, st.p999, sh.irradiance([0.0, 0.0, 1.0]));
+        eprintln!("probe: clipped {:.5} p999 {:.3} filled {filled} bins from the bracket; {:.1} ms; cam {cam_mean:?} vsf {vsf_mean:?} screen {:?} ({:.3}/s)", st.clipped, st.p999, long_ns as f32 * 1e-6, sh.irradiance([0.0, 0.0, 1.0]), sh.screen_luminance());
     }
     app.map.set_probe(sh);
 }

@@ -102,6 +102,8 @@ pub struct MapCore {
     /// The front camera is the light: its latest frame, projected, replaces the sun and sky while it is on.
     pub real_light: bool,
     probe: Option<sh::Sh9>,
+    /// The brightest light the camera has seen since real light went on, as the luminance falling on the screen: the level every frame is held to. It only rises.
+    probe_ref: f32,
     /// Turn the map with the device so screen-up is the way the phone points.
     pub follow_heading: bool,
     /// Magnetic declination at the position, degrees, east positive: true heading = the sensor's magnetic heading + this.
@@ -168,6 +170,7 @@ impl MapCore {
             real_sun: false,
             real_light: false,
             probe: None,
+            probe_ref: 0.0,
             follow_heading: false,
             declination_deg: 0.0,
             have_rotation: false,
@@ -362,19 +365,22 @@ impl MapCore {
 
     pub fn set_real_light(&mut self, on: bool) {
         self.real_light = on;
-        if !on {
-            self.probe = None;
-        }
+        self.probe = None;
+        self.probe_ref = 0.0;
         self.luts_sun = (f32::NAN, f32::NAN, f64::NAN);
         self.dirty = true;
     }
 
-    /// A new frame from the front camera, already projected: the light until the next one.
+    /// A new frame from the front camera, projected in absolute units: the light until the next one, held to the brightest seen so far (which this frame may become).
     pub fn set_probe(&mut self, env: sh::Sh9) {
         if !self.real_light {
             return;
         }
-        self.probe = Some(env);
+        self.probe_ref = self.probe_ref.max(env.screen_luminance());
+        if self.probe_ref <= 0.0 {
+            return;
+        }
+        self.probe = Some(env.scaled(1.0 / self.probe_ref));
         self.luts_sun = (f32::NAN, f32::NAN, f64::NAN);
         self.dirty = true;
     }
