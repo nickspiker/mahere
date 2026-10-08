@@ -151,6 +151,7 @@ impl FluorApp for MahereApp {
                 }
                 let mut mask = self.map.layers();
                 let mut ctl = Controls { real_sun: self.map.real_sun, real_light: self.map.real_light, follow_heading: self.map.follow_heading, lock_to_fix: self.map.lock_to_fix, cache_budget: self.cache_budget, theme: self.map.theme, compressed: self.map.compressed() };
+                let was_open = self.panel.is_open();
                 if self.panel.tap(cx as f32, cy as f32, w, h, &mut mask, &mut ctl) {
                     self.cache_budget = ctl.cache_budget;
                     if ctl.theme != self.map.theme {
@@ -175,6 +176,12 @@ impl FluorApp for MahereApp {
                     if ctl.lock_to_fix != self.map.lock_to_fix {
                         self.map.set_lock_to_fix(ctl.lock_to_fix);
                     }
+                    ctx.window.request_redraw();
+                    return EventResponse::Handled;
+                }
+                // With the panel open the map takes no gesture: a click on it closes the panel and nothing else.
+                if was_open {
+                    self.panel.close();
                     ctx.window.request_redraw();
                     return EventResponse::Handled;
                 }
@@ -380,6 +387,7 @@ impl FluorApp for MahereApp {
         let readouts = Readouts { lat: c.lat, lon: c.lon, elev: self.map.elevation_at(c.lat, c.lon), heading_deg: heading, m_per_px: 111_320.0 / c.ppd, frame_ms: self.map.last_frame_ms, resident: self.map.pool().map.len(), phone_heading: None, cache_used: used, cache_max: used + (8u64 << 30) };
         let measure = self.map.measure_view(w, h, Panel::strip_samples(w));
         let themes = self.map.themes.clone();
+        self.panel.set_ru(ctx.viewport.ru);
         self.panel.paint(w, h, self.map.layers(), Controls { real_sun: self.map.real_sun, real_light: self.map.real_light, follow_heading: self.map.follow_heading, lock_to_fix: self.map.lock_to_fix, cache_budget: self.cache_budget, theme: self.map.theme, compressed: self.map.compressed() }, &readouts, measure.as_ref(), &themes, Some(&|n: usize| self.map.orb(n)));
         let mut map = self.map.canvas.clone();
         self.panel.composite_rgb(&mut map, w, h);

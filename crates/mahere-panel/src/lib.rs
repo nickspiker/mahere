@@ -141,6 +141,16 @@ const fn ink(rgb: u32, alpha: u8) -> u32 {
     (theme::dark(theme::fmt(theme::vsf(rgb))) & 0x00FF_FFFF) | ((alpha as u32) << 24)
 }
 
+/// Fluor's production zoom bounds, 12.5% to 300%.
+pub const RU_MIN: f32 = 0.125;
+pub const RU_MAX: f32 = 3.0;
+
+/// Harmonic mean, the smooth blend of two size candidates (no kink where they cross); zero if either is.
+fn hm(a: f32, b: f32) -> f32 {
+    let sum = a + b;
+    if sum <= 0.0 { 0.0 } else { 2.0 * a * b / sum }
+}
+
 const PANEL_BG: u32 = ink(0x0E_12_1A, 222);
 const GEAR_BG: u32 = ink(0x14_18_22, 230);
 const PANEL_DIM: u32 = ink(0x0E_12_1A, 170);
@@ -163,6 +173,8 @@ enum Page {
 pub struct Panel {
     open: bool,
     dirty: bool,
+    /// The UI's scale, fluor's RU multiplier: 1 is the default size, pinched while the panel is open and kept in the settings.
+    ru: f32,
     page: Page,
     /// The theme page's rows: the back row, then one per theme, as (centre y, half height) in screen pixels.
     theme_rows: Vec<(f32, f32)>,
@@ -196,7 +208,7 @@ impl Panel {
     pub fn new() -> Panel {
         let mut hits: HitId = HIT_NONE;
         let checks = LAYERS.iter().map(|&(l, label)| (l, Checkbox::new(&mut hits, label, 0.0, 0.0, 10.0, 10.0, 10.0, false))).collect();
-        Panel { open: false, dirty: true, page: Page::Layers, theme_rows: Vec::new(), hits, checks, text: TextRenderer::new(), buf: Vec::new(), w: 0, h: 0, font: 16.0, gear: (0.0, 0.0, 0.0), panel_w: 0.0, theme_row: (0.0, 0.0, 0.0), slider: (0.0, 0.0, 0.0), slider_held: false, cache_max: CACHE_MIN + 1, strip_close: None, clear_measure: false }
+        Panel { open: false, dirty: true, ru: 1.0, page: Page::Layers, theme_rows: Vec::new(), hits, checks, text: TextRenderer::new(), buf: Vec::new(), w: 0, h: 0, font: 16.0, gear: (0.0, 0.0, 0.0), panel_w: 0.0, theme_row: (0.0, 0.0, 0.0), slider: (0.0, 0.0, 0.0), slider_held: false, cache_max: CACHE_MIN + 1, strip_close: None, clear_measure: false }
     }
 
     pub fn is_open(&self) -> bool {
@@ -220,11 +232,34 @@ impl Panel {
         std::mem::take(&mut self.dirty)
     }
 
-    /// Sizes for a screen: the font from the short side, the gear in the top-left corner, the column's width.
+    /// The UI's scale (fluor's RU multiplier), clamped as fluor clamps it. Relayout follows on the next paint.
+    pub fn set_ru(&mut self, ru: f32) {
+        let ru = ru.clamp(RU_MIN, RU_MAX);
+        if (ru - self.ru).abs() > 1e-4 {
+            self.ru = ru;
+            self.dirty = true;
+        }
+    }
+
+    pub fn ru(&self) -> f32 {
+        self.ru
+    }
+
+    pub fn close(&mut self) {
+        if self.open {
+            self.open = false;
+            self.dirty = true;
+        }
+    }
+
+    /// Sizes for a screen, every one a multiple of one unit, Photon's: the harmonic mean of the span (the screen's own harmonic mean of width and height) over 32 times the RU scale, and a thirteenth of the height, so the panel scales with the screen's shape, with the pinch, and never past what a short screen can hold. No clamps on the unit itself.
     fn layout(&mut self, w: usize, h: usize) {
         self.w = w;
         self.h = h;
-        self.font = (w.min(h) as f32 / 26.0).clamp(14.0, 36.0);
+        let (wf, hf) = (w as f32, h as f32);
+        let span = if w + h > 0 { 2.0 * wf * hf / (wf + hf) } else { 0.0 };
+        let unit = hm(span / 32.0 * self.ru, hf / 13.0);
+        self.font = (unit * 0.5).max(6.0);
         let r = self.font * 1.15;
         let pad = self.font * 0.6;
         self.gear = (pad + r, pad + r, r);

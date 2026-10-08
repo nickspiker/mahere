@@ -120,7 +120,7 @@ pub fn load_session(store: &FlatStorage) -> Option<Session> {
 }
 
 /// The app's settings: the cache budget in bytes, the layer mask as bits, and the mode flags, as one tensor of integers in the vault under `d` settings.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Settings {
     pub cache_budget: u64,
     pub layer_bits: u64,
@@ -132,6 +132,8 @@ pub struct Settings {
     pub theme: u64,
     /// Highlights compressed rather than linear; stored as its absence (flag 8 = linear) so settings from before it load compressed.
     pub compressed: bool,
+    /// The UI's scale, fluor's RU multiplier, kept to a thousandth; 1 when the settings predate it.
+    pub ui_ru: f32,
 }
 
 fn settings_key() -> String {
@@ -140,7 +142,7 @@ fn settings_key() -> String {
 
 pub fn save_settings(store: &FlatStorage, s: &Settings) -> Result<(), StorageError> {
     let flags = (s.real_sun as u64) | (s.follow_heading as u64) << 1 | (s.lock_to_fix as u64) << 2 | (!s.compressed as u64) << 3 | (s.real_light as u64) << 4;
-    let t = VsfType::t_u6(Tensor::new(vec![4], vec![s.cache_budget, s.layer_bits, flags, s.theme]));
+    let t = VsfType::t_u6(Tensor::new(vec![5], vec![s.cache_budget, s.layer_bits, flags, s.theme, (s.ui_ru * 1000.0).round() as u64]));
     store.write_device(&settings_key(), &t.flatten())
 }
 
@@ -155,7 +157,7 @@ pub fn load_settings(store: &FlatStorage) -> Option<Settings> {
     if d.len() < 3 {
         return None;
     }
-    Some(Settings { cache_budget: d[0], layer_bits: d[1], real_sun: d[2] & 1 != 0, follow_heading: d[2] & 2 != 0, lock_to_fix: d[2] & 4 != 0, theme: d.get(3).copied().unwrap_or(0), compressed: d[2] & 8 == 0, real_light: d[2] & 16 != 0 })
+    Some(Settings { cache_budget: d[0], layer_bits: d[1], real_sun: d[2] & 1 != 0, follow_heading: d[2] & 2 != 0, lock_to_fix: d[2] & 4 != 0, theme: d.get(3).copied().unwrap_or(0), compressed: d[2] & 8 == 0, real_light: d[2] & 16 != 0, ui_ru: d.get(4).map_or(1.0, |&v| v as f32 / 1000.0) })
 }
 
 /// Width-agnostic float-array read, per VSF doctrine.

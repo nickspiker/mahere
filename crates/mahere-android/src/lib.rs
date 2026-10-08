@@ -59,6 +59,9 @@ pub struct AndroidApp {
     gpu_failed: bool,
     /// The latest short bracket from the front camera (its stop, the binned frame): the long frame's clipped bins take their light from it.
     probe_short: Option<(u32, mahere_engine::probe::Binned)>,
+    /// The UI's scale, pinched while the panel is open; the last finger distance of such a pinch.
+    ui_ru: f32,
+    ui_pinch: Option<f64>,
     panel: Panel,
     /// Bytes the cell cache may hold; purged to it at the pause moment.
     cache_budget: u64,
@@ -122,6 +125,16 @@ impl AndroidApp {
         Controls { real_sun: self.map.real_sun, real_light: self.map.real_light, follow_heading: self.map.follow_heading, lock_to_fix: self.map.lock_to_fix, cache_budget: self.cache_budget, theme: self.map.theme, compressed: self.map.compressed() }
     }
 
+    /// A pinch with the panel open: the finger distance's ratio to the last event's scales the UI.
+    fn ui_pinch(&mut self, x0: f64, y0: f64, x1: f64, y1: f64) {
+        let d = ((x1 - x0).powi(2) + (y1 - y0).powi(2)).sqrt().max(1.0);
+        if let Some(prev) = self.ui_pinch {
+            self.ui_ru = (self.ui_ru * (d / prev) as f32).clamp(mahere_panel::RU_MIN, mahere_panel::RU_MAX);
+            self.panel.set_ru(self.ui_ru);
+        }
+        self.ui_pinch = Some(d);
+    }
+
     /// Apply what the panel changed and keep it.
     fn apply_controls(&mut self, ctl: Controls, mask: mahere_engine::LayerMask) {
         self.map.set_layers(mask);
@@ -149,7 +162,7 @@ impl AndroidApp {
 
     fn save_settings(&self) {
         if let Some(store) = &self.store {
-            let s = mahere_store::Settings { cache_budget: self.cache_budget, layer_bits: self.map.layers().bits() as u64, real_sun: self.map.real_sun, real_light: self.map.real_light, follow_heading: self.map.follow_heading, lock_to_fix: self.map.lock_to_fix, theme: self.map.theme as u64, compressed: self.map.compressed() };
+            let s = mahere_store::Settings { cache_budget: self.cache_budget, layer_bits: self.map.layers().bits() as u64, real_sun: self.map.real_sun, real_light: self.map.real_light, follow_heading: self.map.follow_heading, lock_to_fix: self.map.lock_to_fix, theme: self.map.theme as u64, compressed: self.map.compressed(), ui_ru: self.ui_ru };
             self.persist.settings(store.clone(), s);
         }
     }
@@ -253,11 +266,19 @@ impl FluorApp for AndroidApp {
                 // The panel first: the gear and its rows take the tap; the map gets the rest.
                 let mut mask = self.map.layers();
                 let mut ctl = self.controls();
+                let was_open = self.panel.is_open();
                 if self.panel.tap(ctx.cursor_x as f32, ctx.cursor_y as f32, self.w, self.h, &mut mask, &mut ctl) {
                     self.apply_controls(ctl, mask);
                     if self.panel.take_clear_measure() {
                         self.map.clear_measure();
                     }
+                    self.dragging = false;
+                    return EventResponse::Handled;
+                }
+                // With the panel open the map takes no gesture: a tap on it closes the panel and nothing else.
+                if was_open {
+                    self.panel.close();
+                    self.save_settings();
                     self.dragging = false;
                     return EventResponse::Handled;
                 }
@@ -289,7 +310,7 @@ impl FluorApp for AndroidApp {
                 }
                 if self.suppress_move {
                     self.suppress_move = false;
-                } else if self.dragging && self.two.is_none() {
+                } else if self.dragging && self.two.is_none() && !self.panel.is_open() {
                     let (dx, dy) = (x - self.last_cursor.0, y - self.last_cursor.1);
                     self.travel += dx.abs() + dy.abs();
                     if self.travel >= 12.0 {
@@ -424,17 +445,19 @@ pub extern "system" fn Java_nz_mahere_app_MahereActivity_nativeInit(
     if let Some(v) = &store {
         map.set_themes(mahere_store::themes::load_all(v));
     }
+    let mut ui_ru = 1.0f32;
     if let Some(s) = settings {
         map.set_theme(s.theme as usize);
         map.set_layers(mahere_engine::LayerMask::from_bits(s.layer_bits as u32));
         map.set_real_sun(s.real_sun);
         map.set_real_light(s.real_light);
+        ui_ru = s.ui_ru;
         map.set_compressed(s.compressed);
         map.set_follow_heading(s.follow_heading);
         map.set_lock_to_fix(s.lock_to_fix);
     }
     let recorder = store.clone().map(|s| std::sync::Arc::new(std::sync::Mutex::new(mahere_store::TrackRecorder::new(s))));
-    let app = AndroidApp {
+    let mut app = AndroidApp {
         map,
         w: width as usize,
         h: height as usize,
@@ -454,10 +477,13 @@ pub extern "system" fn Java_nz_mahere_app_MahereActivity_nativeInit(
         gpu: None,
         gpu_failed: false,
             probe_short: None,
+            ui_ru,
+            ui_pinch: None,
         panel: Panel::new(),
         cache_budget: settings.map_or(DEFAULT_CACHE_BUDGET, |s| if s.cache_budget == 0 { DEFAULT_CACHE_BUDGET } else { s.cache_budget }),
         data_dir: Some(dir.clone()),
     };
+    app.panel.set_ru(ui_ru);
     Box::into_raw(Box::new(AndroidShell::new(app, width as u32, height as u32))) as jlong
 }
 
@@ -533,6 +559,19 @@ pub extern "system" fn Java_nz_mahere_app_MahereActivity_nativeOnTouch(
         return 0;
     }
     let s = shell(ptr);
+    // With the panel open, two fingers scale the UI (fluor's RU), not the map.
+    if s.app().panel.is_open() {
+        if count >= 2 && action != ACTION_POINTER_UP {
+            s.app().ui_pinch(x0 as f64, y0 as f64, x1 as f64, y1 as f64);
+            return 0;
+        }
+        if count >= 2 || s.app().ui_pinch.is_some() {
+            s.app().ui_pinch = None;
+            s.app().save_settings();
+            return 0;
+        }
+        return s.on_touch(action, x0, y0);
+    }
     if count >= 2 {
         if action == ACTION_POINTER_UP {
             s.app().two_end();

@@ -39,7 +39,7 @@ pub struct GpuHost {
 const MOVING_SCALE: u32 = 1;
 const STILL_SCALE: u32 = 3;
 
-type OverlayStamp = (u64, u64, u64, u64, Option<(u64, u64, u32)>, u32, u32, bool, u32, u64);
+type OverlayStamp = (u64, u64, u64, u64, Option<(u64, u64, u32)>, u32, u32, bool, u32, u64, u32);
 
 impl GpuHost {
     pub fn new(window: &NativeWindow) -> Option<GpuHost> {
@@ -190,11 +190,11 @@ impl GpuHost {
             self.overlay_stamp = None;
         }
         // The light version is in the stamp for the ball in the gear's place: it follows the sun, the camera and the phone's turning.
-        let stamp: OverlayStamp = (cam_part.0, cam_part.1, cam_part.2, c.bearing.to_bits(), measure_part, w, h, panel.is_open(), mask_bits | (map.real_sun as u32) << 20 | (map.follow_heading as u32) << 21 | (map.real_light as u32) << 31 | if panel.is_open() && map.have_rotation { (map.true_heading().round() as u32) << 22 } else { 0 }, if map.real_sun || map.real_light { map.light_version() } else { 0 });
+        let stamp: OverlayStamp = (cam_part.0, cam_part.1, cam_part.2, c.bearing.to_bits(), measure_part, w, h, panel.is_open(), mask_bits | (map.real_sun as u32) << 20 | (map.follow_heading as u32) << 21 | (map.real_light as u32) << 31 | if panel.is_open() && map.have_rotation { (map.true_heading().round() as u32) << 22 } else { 0 }, if map.real_sun || map.real_light { map.light_version() } else { 0 }, panel.ru().to_bits());
         self.map.pin = map.gps_screen(w as usize, h as usize);
         self.map.measure = map.measure_view(w as usize, h as usize, 2).map(|m| (m.origin_px.0, m.origin_px.1, m.target_px.0, m.target_px.1));
         // A bearing or readout change repaints at most a few times a second (the orientation sensor would otherwise repaint the panel's text every frame); the panel opening, closing or a row flipping repaints at once.
-        let structural = self.overlay_stamp.is_none_or(|s| (s.5, s.6, s.7, s.8) != (w, h, panel.is_open(), stamp.8));
+        let structural = self.overlay_stamp.is_none_or(|s| (s.5, s.6, s.7, s.8, s.10) != (w, h, panel.is_open(), stamp.8, stamp.10));
         if self.overlay_stamp != Some(stamp) && (structural || self.overlay_at.elapsed().as_millis() >= 150) {
             self.overlay_at = std::time::Instant::now();
             let mut heading = c.bearing.to_degrees().rem_euclid(360.0);
