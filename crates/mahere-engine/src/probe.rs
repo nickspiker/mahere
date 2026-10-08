@@ -47,7 +47,7 @@ pub struct Stats {
     pub p999: f32,
 }
 
-/// A binned frame: camera RGB per bin as raw counts above black (mean over the bin), how many of each bin's raw samples were at white, and the frame's exposure statistics.
+/// A binned frame: camera RGB per bin as raw counts above black, the mean over the bin with six fractional bits (a lamp a few pixels wide in the short bracket averages to well under one count, and as a whole number it was zero, which then painted the brightest spots black), how many of each bin's raw samples were at white, and the frame's exposure statistics.
 pub struct Binned {
     pub w: usize,
     pub h: usize,
@@ -169,9 +169,9 @@ pub fn bin(raw: &Raw, cols: usize) -> Binned {
     for (sums, c, hh) in rows {
         for s in sums {
             // Each position's black off its own sum, then the mean over the bin; the greens together are two positions.
-            let lin = |k: usize| s[k].saturating_sub(count * raw.black[k] as u32);
+            let lin = |k: usize| s[k].saturating_sub(count * raw.black[k] as u32) as u64;
             let g = (lin(0) + lin(1) + lin(2) + lin(3) - lin(rp) - lin(bp)) / 2;
-            out.push([lin(rp) / count, g / count, lin(bp) / count]);
+            out.push([(lin(rp) * 64 / count as u64) as u32, (g * 64 / count as u64) as u32, (lin(bp) * 64 / count as u64) as u32]);
         }
         clipped.extend(c);
         for k in 0..256 {
@@ -495,7 +495,7 @@ mod tests {
         let raw = Raw { data: &data, w, h, row_stride: w * 2, packed10: false, cfa: Cfa::Rggb, black: [64; 4], white: 1023 };
         let b = bin(&raw, 2);
         assert_eq!((b.w, b.h), (2, 1));
-        assert_eq!(b.rgb[0], [300, 200, 100]);
+        assert_eq!(b.rgb[0], [300 * 64, 200 * 64, 100 * 64]);
         assert!((b.stats.clipped - 1.0 / 32.0).abs() < 1e-6, "{:?}", b.stats);
         assert_eq!(b.clipped, vec![0, 1]);
         // A short bracket three stops down fills that bin, in absolute units.
