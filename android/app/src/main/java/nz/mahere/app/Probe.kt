@@ -16,7 +16,21 @@ import android.util.Log
 /**
  * The front camera as a light meter: the widest raw-capable front lens, fully manual (no auto-exposure, ISO at the floor), its exposure on a ladder of stops, powers of two of one base (so Rust brings a frame to absolute units by a shift), stepped shorter until almost nothing clips and longer when the frame is dim. Frames alternate the long exposure with a bracket six stops shorter, so a lamp that is white in the long frame has a real brightness in the short one. Every frame goes to Rust as the raw Bayer samples with the sensor's colour matrix and lens geometry; nothing is kept or shown.
  */
-class Probe(private val context: Context, private val onFrame: (RawFrame, FloatArray) -> Unit) {
+class Probe(private val context: Context, private val onFrame: (RawFrame, FloatArray) -> Unit, private val onFailed: () -> Unit) {
+
+    /// Set once the packed stream has failed to configure: the next start takes the 16-bit one. A camera service left in a bad state refuses a stream with "Function not implemented", and the exception comes on the camera thread, where nothing else would catch it.
+    private var preferWide = false
+
+    /** The camera refused something: close it, and either try once more with the 16-bit stream or give the mode up. */
+    private fun fail(what: String, e: Throwable?) {
+        Log.w("mahere", "probe: $what: ${e?.message}")
+        stop()
+        if (!preferWide) {
+            preferWide = true
+        } else {
+            onFailed()
+        }
+    }
 
     class RawFrame(
         val buffer: java.nio.ByteBuffer, val width: Int, val height: Int, val rowStride: Int, val packed10: Boolean,
@@ -94,7 +108,7 @@ class Probe(private val context: Context, private val onFrame: (RawFrame, FloatA
         val c = cm.getCameraCharacteristics(id)
         val map = c.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP) ?: return false
         // Packed 10-bit when the sensor offers it: five eighths of the bytes of the 16-bit stream, and the read is most of the cost.
-        val format = if (map.getOutputSizes(ImageFormat.RAW10)?.isNotEmpty() == true) ImageFormat.RAW10 else ImageFormat.RAW_SENSOR
+        val format = if (!preferWide && map.getOutputSizes(ImageFormat.RAW10)?.isNotEmpty() == true) ImageFormat.RAW10 else ImageFormat.RAW_SENSOR
         val sizes = map.getOutputSizes(format) ?: return false
         val physical = c.get(CameraCharacteristics.SENSOR_INFO_PHYSICAL_SIZE) ?: return false
         val array = c.get(CameraCharacteristics.SENSOR_INFO_PIXEL_ARRAY_SIZE) ?: return false
@@ -151,25 +165,28 @@ class Probe(private val context: Context, private val onFrame: (RawFrame, FloatA
             cm.openCamera(id, object : CameraDevice.StateCallback() {
                 override fun onOpened(d: CameraDevice) {
                     device = d
-                    val b = d.createCaptureRequest(CameraDevice.TEMPLATE_MANUAL)
-                    b.addTarget(r.surface)
-                    b.set(CaptureRequest.CONTROL_MODE, CameraMetadata.CONTROL_MODE_AUTO)
-                    b.set(CaptureRequest.CONTROL_AE_MODE, CameraMetadata.CONTROL_AE_MODE_OFF)
-                    b.set(CaptureRequest.SENSOR_SENSITIVITY, iso)
-                    b.set(CaptureRequest.SENSOR_EXPOSURE_TIME, exposureOf(stop))
-                    b.set(CaptureRequest.SENSOR_FRAME_DURATION, frameNs)
-                    request = b
-                    @Suppress("DEPRECATION")
-                    d.createCaptureSession(listOf(r.surface), object : CameraCaptureSession.StateCallback() {
-                        override fun onConfigured(s: CameraCaptureSession) {
-                            session = s
-                            burst()
-                        }
-                        override fun onConfigureFailed(s: CameraCaptureSession) {
-                            Log.w("mahere", "probe: session failed")
-                            stop()
-                        }
-                    }, h)
+                    try {
+                        val b = d.createCaptureRequest(CameraDevice.TEMPLATE_MANUAL)
+                        b.addTarget(r.surface)
+                        b.set(CaptureRequest.CONTROL_MODE, CameraMetadata.CONTROL_MODE_AUTO)
+                        b.set(CaptureRequest.CONTROL_AE_MODE, CameraMetadata.CONTROL_AE_MODE_OFF)
+                        b.set(CaptureRequest.SENSOR_SENSITIVITY, iso)
+                        b.set(CaptureRequest.SENSOR_EXPOSURE_TIME, exposureOf(stop))
+                        b.set(CaptureRequest.SENSOR_FRAME_DURATION, frameNs)
+                        request = b
+                        @Suppress("DEPRECATION")
+                        d.createCaptureSession(listOf(r.surface), object : CameraCaptureSession.StateCallback() {
+                            override fun onConfigured(s: CameraCaptureSession) {
+                                session = s
+                                burst()
+                            }
+                            override fun onConfigureFailed(s: CameraCaptureSession) {
+                                fail("session not configured", null)
+                            }
+                        }, h)
+                    } catch (e: Exception) {
+                        fail("session", e)
+                    }
                 }
                 override fun onDisconnected(d: CameraDevice) { stop() }
                 override fun onError(d: CameraDevice, error: Int) {
@@ -177,8 +194,8 @@ class Probe(private val context: Context, private val onFrame: (RawFrame, FloatA
                     stop()
                 }
             }, h)
-        } catch (e: SecurityException) {
-            Log.w("mahere", "probe: no permission")
+        } catch (e: Exception) {
+            Log.w("mahere", "probe: open: ${e.message}")
             stop()
             return false
         }

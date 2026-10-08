@@ -61,9 +61,12 @@ class MahereActivity : Activity(), SurfaceHolder.Callback, Choreographer.FrameCa
 
     // The front camera as the light, opened when the engine asks for it (the Real light row) and closed when it stops asking.
     private val probe by lazy {
-        Probe(this) { f, stats ->
+        Probe(this, { f, stats ->
             val p = nativePtr
             if (p != 0L) nativeOnProbe(p, f.buffer, f.width, f.height, f.rowStride, f.packed10, f.cfa, f.black, f.white, f.orientation, f.tanW, f.tanH, f.xyzToCam, stats, f.stop, f.longStop)
+        }) {
+            // The camera gave up: the mode turns itself off, on the UI thread where the engine lives.
+            runOnUiThread { if (nativePtr != 0L) nativeProbeDenied(nativePtr) }
         }
     }
     private var cameraAsked = false
