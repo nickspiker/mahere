@@ -18,6 +18,7 @@ jni = "0.21"
 ndk = { version = "0.9", features = ["api-level-26"] }
 ndk-sys = "0.6"
 libc = "0.2"
+rayon = "1"
 mahere-gpu = { path = "../mahere-gpu" }
 wgpu = { version = "28", default-features = false, features = ["wgsl", "vulkan"] }
 raw-window-handle = "0.6"

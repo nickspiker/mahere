@@ -691,6 +691,7 @@ pub extern "system" fn Java_nz_mahere_app_MahereActivity_nativeOnProbe(
     let t0 = std::time::Instant::now();
     let mut b = bin(&raw, 48);
     let bin_ms = t0.elapsed().as_secs_f32() * 1e3;
+
     let app = shell(ptr).app();
     // The short bracket: kept for the next long frame, which fills what it clipped from it.
     if exposure_ns < long_ns {
@@ -727,7 +728,7 @@ pub extern "system" fn Java_nz_mahere_app_MahereActivity_nativeOnProbe(
     let mut last = LAST.lock().unwrap();
     if last.is_none_or(|t| t.elapsed().as_secs_f32() > 1.0) {
         *last = Some(std::time::Instant::now());
-        eprintln!("probe: clipped {:.5} p999 {:.3} filled {filled} bins from the bracket; exposure {:.1} ms, bin {bin_ms:.1} ms; cam {cam_mean:?} vsf {vsf_mean:?} screen {:?} ({:.3}/s)", st.clipped, st.p999, long_ns as f32 * 1e-6, sh.irradiance([0.0, 0.0, 1.0]), sh.screen_luminance());
+        eprintln!("probe: clipped {:.5} p999 {:.3} filled {filled} bins from the bracket; exposure {:.1} ms, bin {bin_ms:.1} ms on {} threads; cam {cam_mean:?} vsf {vsf_mean:?} screen {:?} ({:.3}/s)", st.clipped, st.p999, long_ns as f32 * 1e-6, rayon::current_num_threads(), sh.irradiance([0.0, 0.0, 1.0]), sh.screen_luminance());
     }
     app.map.set_probe(sh);
 }
