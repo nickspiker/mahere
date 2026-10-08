@@ -101,9 +101,11 @@ pub struct MapCore {
     pub real_sun: bool,
     /// The front camera is the light: its latest frame, projected, replaces the sun and sky while it is on.
     pub real_light: bool,
+    /// The camera's light, in the device frame at the latest rotation, held to the sphere's own level.
     probe: Option<sh::Sh9>,
-    /// The brightest light the camera has seen since real light went on, as the luminance falling on the screen: the level every frame is held to. It only rises.
-    probe_ref: f32,
+    /// The world-fixed sphere the camera paints, and the lens its frames come through.
+    sphere: Option<Box<probe::Sphere>>,
+    lens: Option<probe::Lens>,
     /// Turn the map with the device so screen-up is the way the phone points.
     pub follow_heading: bool,
     /// Magnetic declination at the position, degrees, east positive: true heading = the sensor's magnetic heading + this.
@@ -170,7 +172,8 @@ impl MapCore {
             real_sun: false,
             real_light: false,
             probe: None,
-            probe_ref: 0.0,
+            sphere: None,
+            lens: None,
             follow_heading: false,
             declination_deg: 0.0,
             have_rotation: false,
@@ -330,12 +333,16 @@ impl MapCore {
         self.device_rot = r;
         self.have_rotation = true;
         // Nothing on screen depends on the orientation unless a mode uses it: no frame for a phone merely being held.
-        if !self.real_sun && !self.follow_heading {
+        if !self.real_sun && !self.follow_heading && !self.real_light {
             return;
         }
         let heading = r[1].atan2(r[4]).to_degrees().rem_euclid(360.0);
         self.set_device_heading(heading);
         if changed {
+            // The painted sphere is world-fixed: the phone turning under it is a new light.
+            if self.real_light {
+                self.relight_probe();
+            }
             self.luts_sun = (f32::NAN, f32::NAN, f64::NAN);
             self.dirty = true;
         }
@@ -366,23 +373,35 @@ impl MapCore {
     pub fn set_real_light(&mut self, on: bool) {
         self.real_light = on;
         self.probe = None;
-        self.probe_ref = 0.0;
+        self.sphere = None;
         self.luts_sun = (f32::NAN, f32::NAN, f64::NAN);
         self.dirty = true;
     }
 
-    /// A new frame from the front camera, projected in absolute units: the light until the next one, held to the brightest seen so far (which this frame may become).
-    pub fn set_probe(&mut self, env: sh::Sh9) {
-        if !self.real_light {
+    /// A new frame from the front camera, upright, in absolute units: painted onto the sphere where the phone points, and the light taken from the sphere.
+    pub fn paint_probe(&mut self, w: usize, h: usize, tan_w: f32, tan_h: f32, rgb: &[[u32; 3]]) {
+        if !self.real_light || rgb.len() != w * h {
             return;
         }
-        self.probe_ref = self.probe_ref.max(env.screen_luminance());
-        if self.probe_ref <= 0.0 {
-            return;
+        if self.lens.as_ref().is_none_or(|l| !l.fits(w, h, tan_w, tan_h)) {
+            self.lens = Some(probe::Lens::new(w, h, tan_w, tan_h));
         }
-        self.probe = Some(env.scaled(1.0 / self.probe_ref));
+        let sphere = self.sphere.get_or_insert_with(|| Box::new(probe::Sphere::new()));
+        sphere.paint(rgb, self.lens.as_ref().unwrap(), &self.device_rot);
+        self.relight_probe();
+    }
+
+    /// The sphere's light at the current rotation.
+    fn relight_probe(&mut self) {
+        let Some(sphere) = &self.sphere else { return };
+        self.probe = sphere.light(&self.device_rot);
         self.luts_sun = (f32::NAN, f32::NAN, f64::NAN);
         self.dirty = true;
+    }
+
+    /// How much of the sphere the camera has painted, 0..1.
+    pub fn probe_coverage(&self) -> f32 {
+        self.sphere.as_ref().map_or(0.0, |s| s.seen.iter().filter(|&&v| v).count() as f32 / probe::TRIS as f32)
     }
 
     pub fn set_follow_heading(&mut self, on: bool) {

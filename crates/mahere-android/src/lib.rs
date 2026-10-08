@@ -57,8 +57,8 @@ pub struct AndroidApp {
     /// The GPU path, created on the first draw; None after a failure means the CPU present is in use.
     gpu: Option<GpuHost>,
     gpu_failed: bool,
-    /// The latest short bracket from the front camera (its exposure in ns, the binned frame): the long frame's clipped bins take their light from it.
-    probe_short: Option<(i64, mahere_engine::probe::Binned)>,
+    /// The latest short bracket from the front camera (its stop, the binned frame): the long frame's clipped bins take their light from it.
+    probe_short: Option<(u32, mahere_engine::probe::Binned)>,
     panel: Panel,
     /// Bytes the cell cache may hold; purged to it at the pause moment.
     cache_budget: u64,
@@ -654,7 +654,7 @@ pub extern "system" fn Java_nz_mahere_app_MahereActivity_nativeProbeDenied(_env:
     }
 }
 
-/// A raw front-camera frame: 16-bit samples in `buf` (`w × h`, `row_stride` bytes a row, Bayer order `cfa` as Android numbers it, the sensor's four `black` pedestals and its `white`), the sensor's `orientation`, the lens half-angle tangents across and down the sensor, and Android's row-major XYZ→camera matrix. Binned, converted to VSF RGB, turned upright and projected into the light. `stats` gets the clipped fraction and the 99.9th percentile level, which the Activity's exposure loop steers on.
+/// A raw front-camera frame: samples in `buf` (`w × h`, `row_stride` bytes a row, packed 10-bit or 16-bit, Bayer order `cfa` as Android numbers it, the sensor's four `black` pedestals and its `white`), the sensor's `orientation`, the lens half-angle tangents across and down the sensor, Android's row-major XYZ→camera matrix, and the frame's `stop` on the exposure ladder (0 the base exposure, each step one stop shorter) with the long frame's. Binned, brought to absolute units by its stop, converted to VSF RGB, turned upright and painted onto the sphere. `stats` gets the clipped fraction and the 99.9th percentile level, which the Activity's exposure loop steers on.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_nz_mahere_app_MahereActivity_nativeOnProbe(
     mut env: JNIEnv,
@@ -673,8 +673,8 @@ pub extern "system" fn Java_nz_mahere_app_MahereActivity_nativeOnProbe(
     tan_h: jfloat,
     xyz_to_cam: JFloatArray,
     stats: JFloatArray,
-    exposure_ns: jlong,
-    long_ns: jlong,
+    stop: jint,
+    long_stop: jint,
 ) {
     use mahere_engine::probe::{Cfa, Raw, bin, to_vsf, upright};
     if ptr == 0 {
@@ -692,44 +692,37 @@ pub extern "system" fn Java_nz_mahere_app_MahereActivity_nativeOnProbe(
     let t0 = std::time::Instant::now();
     let mut b = bin(&raw, 48);
     let bin_ms = t0.elapsed().as_secs_f32() * 1e3;
-
     let app = shell(ptr).app();
+    let (stop, long_stop) = (stop.max(0) as u32, long_stop.max(0) as u32);
     // The short bracket: kept for the next long frame, which fills what it clipped from it.
-    if exposure_ns < long_ns {
-        app.probe_short = Some((exposure_ns, b));
+    if stop > long_stop {
+        app.probe_short = Some((stop, b));
         return;
     }
     let st = b.stats;
     let _ = env.set_float_array_region(&stats, 0, &[st.clipped, st.p999]);
     let mut filled = 0usize;
-    if let Some((short_ns, short)) = &app.probe_short {
+    if let Some((short_stop, short)) = &app.probe_short {
         filled = b.clipped.iter().filter(|&&c| c > 0).count();
-        b.fill_clipped(short, long_ns as f32 / (*short_ns).max(1) as f32);
+        b.fill_clipped(short, stop, *short_stop);
     }
-    let (bw, bh, mut rgb) = (b.w, b.h, b.rgb);
-    // Absolute: per second of exposure, so every frame is on one scale whatever the loop chose.
-    let per_second = 1e9 / (long_ns.max(1) as f32);
-    for p in rgb.iter_mut() {
-        *p = [p[0] * per_second, p[1] * per_second, p[2] * per_second];
-    }
-    let mean = |v: &[[f32; 3]]| {
-        let n = v.len().max(1) as f32;
-        v.iter().fold([0f32; 3], |a, p| [a[0] + p[0] / n, a[1] + p[1] / n, a[2] + p[2] / n])
-    };
-    let cam_mean = mean(&rgb);
+    b.shift(stop);
     let mut m = [0f32; 9];
     if env.get_float_array_region(&xyz_to_cam, 0, &mut m).is_ok() && m.iter().any(|&v| v != 0.0) {
-        to_vsf(&mut rgb, &m);
+        to_vsf(&mut b.rgb, &m);
     }
-    let vsf_mean = mean(&rgb);
-    let probe = upright(bw, bh, &rgb, tan_w, tan_h, orientation);
-    let sh = mahere_engine::sh::Sh9::from_probe(&probe);
+    let (uw, uh, rgb) = upright(b.w, b.h, &b.rgb, orientation);
+    // Upright: the tangents turn with the frame.
+    let (tw, th) = if matches!(orientation.rem_euclid(360), 90 | 270) { (tan_h, tan_w) } else { (tan_w, tan_h) };
+    app.map.paint_probe(uw, uh, tw, th, &rgb);
     // Once a second or so: what the camera saw, as the exposure loop and the colour path are tuned.
     static LAST: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
     let mut last = LAST.lock().unwrap();
     if last.is_none_or(|t| t.elapsed().as_secs_f32() > 1.0) {
         *last = Some(std::time::Instant::now());
-        eprintln!("probe: clipped {:.5} p999 {:.3} filled {filled} bins from the bracket; exposure {:.1} ms, bin {bin_ms:.1} ms on {} threads; cam {cam_mean:?} vsf {vsf_mean:?} screen {:?} ({:.3}/s)", st.clipped, st.p999, long_ns as f32 * 1e-6, rayon::current_num_threads(), sh.irradiance([0.0, 0.0, 1.0]), sh.screen_luminance());
+        let n = rgb.len().max(1) as u64;
+        let sum = rgb.iter().fold([0u64; 3], |a, p| [a[0] + p[0] as u64, a[1] + p[1] as u64, a[2] + p[2] as u64]);
+        let mean = [sum[0] / n, sum[1] / n, sum[2] / n];
+        eprintln!("probe: clipped {:.5} p999 {:.3} filled {filled} bins from the bracket; stop {stop} (short {}), bin {bin_ms:.1} ms; mean {mean:?}; sphere {:.0}% painted", st.clipped, st.p999, app.probe_short.as_ref().map_or(0, |s| s.0), app.map.probe_coverage() * 100.0);
     }
-    app.map.set_probe(sh);
 }
