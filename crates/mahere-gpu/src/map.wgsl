@@ -3,7 +3,8 @@
 const NONE: u32 = 0xFFFFFFFFu;
 // A cell the loader confirmed absent at the wanted depth: found by lookup, never referred to.
 const ABSENT: u32 = 0xFFFFFFFEu;
-const MIN_DEPTH: u32 = 6u;
+// The coarsest depth a cell exists at (the global bake's root), the same as the planner's. A walk below it must stop: a fragment loop that never ends hangs the GPU and the driver resets it for every process on the device (2026-10-09, the phone's SystemUI went down with mahere).
+const MIN_DEPTH: u32 = 0u;
 const TABLE_N: u32 = 16384u;
 const ELEV_NODATA: u32 = 0xFFFFu;
 
@@ -118,14 +119,15 @@ fn lookup(d: u32, depth: u32, u: u32, v: u32) -> u32 {
 }
 
 // The probe: the cell at `want` or the nearest parent carrying any of `need`.
+// Bounded by the depth count rather than open: no loop in this shader may run unbounded.
 fn find(d: u32, want: u32, u: u32, v: u32, need: u32) -> u32 {
     var depth = want;
-    loop {
+    for (var k = 0u; k <= 30u; k++) {
         let r = lookup(d, depth, u, v);
         if (r != NONE && r != ABSENT && (refs[r].c.x & need) != 0u) {
             return r;
         }
-        if (depth == MIN_DEPTH) {
+        if (depth <= MIN_DEPTH) {
             return NONE;
         }
         depth = depth - 1u;
@@ -199,7 +201,7 @@ fn sample_dem(d: u32, u: u32, v: u32) -> Dem {
             out.step = step;
             return out;
         }
-        if (rd == MIN_DEPTH) {
+        if (rd <= MIN_DEPTH) {
             return out;
         }
         depth = rd - 1u;
