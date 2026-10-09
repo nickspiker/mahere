@@ -35,7 +35,7 @@ impl CellStore for DirStore {
 }
 
 /// Decoded dem planes packed one u64 per triangle texel for the hot loop (memory order `((ty << 8 | tx) << 1) | half`):
-/// `[elev_q u16 | nx i16 | ny i16 | nz i16]`, elev_q = (elev + 500) * 4 (0.25 m steps), 0xFFFF = no data.
+/// `[elev_q u16 | nx i16 | ny i16 | nz i16]`, elev_q = (elev + 11000) * 2 (half-metre steps), 0xFFFF = no data.
 pub struct DemPacked {
     pub texel: Box<[u64]>,
 }
@@ -113,7 +113,7 @@ pub struct Entry {
 }
 
 impl Entry {
-    /// Quantised elevation (0.25 m steps from -500 m, ELEV_NODATA for none) at a memory-order texel, from whichever dem form is held.
+    /// Quantised elevation (half-metre steps from -11000 m, ELEV_NODATA for none) at a memory-order texel, from whichever dem form is held.
     pub fn elev_q_at(&self, i: usize) -> Option<u16> {
         if let Some(p) = &self.dem {
             return Some((p.texel[i] & 0xFFFF) as u16);

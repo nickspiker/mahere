@@ -47,13 +47,15 @@ pub const TEX_BITS: u8 = 8;
 /// Texels per cell: two triangles per UV square.
 pub const TRI: usize = 2 * TEX * TEX;
 
-/// Elevation quantization: 0.25 m steps from -500 m; 0xFFFF = no data.
+/// The renderer's elevation quantum: half-metre steps from 11 km below the sea, so the deepest trench and the highest summit both fit sixteen bits (the cells on disk keep their own, finer, per-cell step); 0xFFFF = no data.
 pub const ELEV_NODATA: u16 = 0xFFFF;
+pub const ELEV_OFFSET: f32 = 11000.0;
+pub const ELEV_STEP: f32 = 0.5;
 pub fn quantize_elev(e: f32) -> u16 {
-    if e.is_nan() { ELEV_NODATA } else { ((e + 500.0) * 4.0).clamp(0.0, 65534.0) as u16 }
+    if e.is_nan() { ELEV_NODATA } else { ((e + ELEV_OFFSET) / ELEV_STEP).clamp(0.0, 65534.0) as u16 }
 }
 pub fn dequantize_elev(q: u16) -> f32 {
-    q as f32 / 4.0 - 500.0
+    q as f32 * ELEV_STEP - ELEV_OFFSET
 }
 
 /// A cell address: dymaxion Morton prefix (diamond in the top 4 bits of the full-resolution coordinate, right-aligned here) at `depth`.
@@ -1356,7 +1358,7 @@ fn decode_img(fields: &HashMap<String, Vec<VsfType>>) -> Option<ImgCell> {
 }
 
 impl DemPlanes {
-    /// Pack for the renderer: `[elev_q u16 | nx i16 | ny i16 | nz i16]` per texel (0.25 m steps from -500 m, 0xFFFF no data). Normals come from central differences over the half-plane (apron at the edges, one- sided next to no-data) mapped through the cell's UV→east/north Jacobian — snorm16, not u8, because u8 bands on gentle slopes.
+    /// Pack for the renderer: `[elev_q u16 | nx i16 | ny i16 | nz i16]` per texel (half-metre steps from -11000 m, 0xFFFF no data). Normals come from central differences over the half-plane (apron at the edges, one- sided next to no-data) mapped through the cell's UV→east/north Jacobian — snorm16, not u8, because u8 bands on gentle slopes.
     pub fn pack_texels(&self, key: CellKey) -> Vec<u64> {
         // Jacobian: metres east/north per texel step in u and in v.
         let (u0, v0, size) = key.uv_rect();

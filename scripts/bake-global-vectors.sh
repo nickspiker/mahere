@@ -23,7 +23,20 @@ done
 if [ ! -f "$SRC/osm/regions/.cut-done" ]; then
     echo "$(date +%T) cutting the planet into $(grep -c '"output"' "$REGIONS_JSON") extracts"
     mkdir -p "$SRC/osm/regions"
-    osmium extract -c "$REGIONS_JSON" -s simple --overwrite "$SRC/osm/planet-latest.osm.pbf"
+    # osmium takes at most 500 extracts per run, so the config is split into runs of 500, each a pass over the planet.
+    python3 - "$REGIONS_JSON" <<'PY'
+import json, sys
+r = json.load(open(sys.argv[1]))
+ex = r['extracts']
+for i in range(0, len(ex), 500):
+    part = dict(r)
+    part['extracts'] = ex[i:i + 500]
+    json.dump(part, open(f"{sys.argv[1]}.part{i // 500}", 'w'))
+PY
+    for part in "$REGIONS_JSON".part*; do
+        echo "$(date +%T) extracting $part"
+        osmium extract -c "$part" -s simple --overwrite "$SRC/osm/planet-latest.osm.pbf"
+    done
     for a in "$SRC"/osm/regions/*-a.osm.pbf; do
         [ -f "$a" ] || continue
         b="${a%-a.osm.pbf}-b.osm.pbf"

@@ -65,10 +65,14 @@ impl DemTile {
         eprintln!("dem tile {path}: {w}x{h} {grid:?}");
         // Tiepoint maps raster (i, j) -> world (x, y); USGS ties pixel (0, 0) to the top-left corner.
         let origin = (tie[3] - tie[0] * scale[0], tie[4] + tie[1] * scale[1]);
+        // Float tiles as they are; integer tiles (GEBCO's 16-bit metres) widened.
         let data = match dec.read_image().map_err(|e| format!("{path}: {e}"))? {
             DecodingResult::F32(v) => v,
+            DecodingResult::I16(v) => v.into_iter().map(|x| x as f32).collect(),
+            DecodingResult::U16(v) => v.into_iter().map(|x| x as f32).collect(),
+            DecodingResult::I32(v) => v.into_iter().map(|x| x as f32).collect(),
             other => {
-                return Err(format!("{path}: expected F32 samples, got {:?} variant", sample_kind(&other)))
+                return Err(format!("{path}: expected float or integer samples, got {:?} variant", sample_kind(&other)))
             }
         };
         if data.len() != w as usize * h as usize {

@@ -4,6 +4,7 @@
 //! Each region is a depth-`region` cell. Its depth-`depth` cells are box-filtered from the source tiles the region touches (four samples per triangle, so a 108 m triangle reads 54 m data), their aprons sampled from the source, then its pyramid built down to the region cell itself. A region whose tiles have not all downloaded yet is skipped and picked up by the next run; a region over open sea writes only its region cell, at sea level, which every deeper view falls back to. Finished regions are listed in `<out>/.global-done`, so a run can stop and resume anywhere.
 //! `--top` builds the depths above the regions from the region cells already written, once every region is done.
 //!
+//! Bathymetry: `--bathy <dir of GEBCO GeoTIFFs>` (see `bathymetry`).
 //! Imagery: `--img <tile dir> --img-index <tile list>` bakes the imagery layer instead, into the same cells (their terrain carried over untouched), from one-degree four-band tiles (the ESA WorldCover Sentinel-2 composite's 37 m level, pulled by `cog-level`): every texel box-filtered from sixteen samples, regions over open sea skipped, finished regions in `<out>/.global-img-done`; with `--top` it builds the imagery above the regions. `--img-loss` sets the codec's loss (default 16 levels).
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
@@ -74,6 +75,10 @@ fn main() {
     std::fs::create_dir_all(&out).unwrap();
 
     // Land cover from a class raster (ESA WorldCover's 37 m level), rivers from HydroRIVERS, and the rest of the lines from OSM region extracts, each into the same cells.
+    if let Some(dir) = arg(&args, "--bathy") {
+        bathymetry(&out, &dir, depth, region_depth, bbox_arg(&args), &loss);
+        return;
+    }
     if let Some(dir) = arg(&args, "--land") {
         if args.iter().any(|a| a == "--top") {
             top_vectors(&out, region_depth);
@@ -215,6 +220,152 @@ fn top(out: &Path, region_depth: u8, loss: &Loss) {
     for (k, c) in upper {
         write(out, k, c, loss);
     }
+}
+
+
+/// The depth of the open sea's cells: 430 m triangles from GEBCO's 460 m grid, two levels above the land, the first use of a coarser level under a finer one.
+const BATHY_DEPTH: u8 = 6;
+/// A land-source texel this close to zero is the sea it wrote there.
+const SEA_EPS: f32 = 0.75;
+
+/// The seabed from GEBCO's global grid. Every region gets the seabed at [`BATHY_DEPTH`], wet wherever it is below zero, and the pyramid above it to the region cell; a land region's depth-`depth` cells (the ones with land, the only ones there are) have the sea texels the land source wrote as zero replaced by the seabed and marked wet, the land untouched, and their pyramid lies over the seabed level where they reach. Every level written replaces the old one (imagery carried over raw). Resumable through `<out>/.global-bathy-done`; a `--top` run afterwards rebuilds the levels above the regions.
+fn bathymetry(out: &Path, dir: &str, depth: u8, region_depth: u8, bbox: Option<Vec<f64>>, loss: &Loss) {
+    use rayon::prelude::*;
+    let mut paths: Vec<String> = Vec::new();
+    for e in std::fs::read_dir(dir).unwrap().flatten() {
+        let name = e.file_name().to_string_lossy().to_string();
+        if !name.ends_with(".tif") {
+            continue;
+        }
+        if let (Some((n, s, w, ea)), Some(b)) = (gebco_bounds(&name), &bbox) {
+            if !(n > b[0] && s < b[2] && w < b[3] && ea > b[1]) {
+                continue;
+            }
+        }
+        paths.push(e.path().to_string_lossy().to_string());
+    }
+    eprintln!("bathymetry: {} GEBCO tiles", paths.len());
+    let store = mahere_dem::DemStore::load(&paths).expect("gebco tiles");
+    let done_path = out.join(".global-bathy-done");
+    let done = done_list(&done_path);
+    let mut done_file = std::fs::OpenOptions::new().create(true).append(true).open(&done_path).unwrap();
+    let (mut land, mut sea) = (0, 0);
+    let t_all = std::time::Instant::now();
+    for (diamond, cu, cv, region) in regions(region_depth) {
+        if done.contains(&(region.depth, region.prefix)) || !region_in_box(&squares_of_region(region), &bbox) {
+            continue;
+        }
+        let t = std::time::Instant::now();
+        let keys = region_keys(diamond, depth, region_depth, cu, cv);
+        let existing: Vec<(CellKey, mahere_tiles::CellPlanes)> = keys
+            .par_iter()
+            .filter_map(|k| std::fs::read(out.join(k.path())).ok().and_then(|b| mahere_tiles::decode_cell(&b).ok()).map(|p| (*k, p)))
+            .collect();
+        let with_dem: Vec<(CellKey, mahere_tiles::DemPlanes, Option<mahere_tiles::CovCell>)> =
+            existing.into_iter().filter_map(|(k, p)| p.dem.map(|d| (k, d, p.water))).collect();
+        // The land cells, their sea texels patched.
+        let mut base8: Vec<(CellKey, DemCell)> = Vec::new();
+        let mut water8: HashMap<CellKey, mahere_tiles::CovCell> = HashMap::new();
+        if !with_dem.is_empty() {
+            land += 1;
+            let seabed: HashMap<CellKey, DemCell> = mahere_tiles::bake_dem_filtered(&store, &with_dem.iter().map(|(k, _, _)| *k).collect::<Vec<_>>()).into_iter().collect();
+            let mut patched: Vec<(CellKey, Cell)> = Vec::new();
+            for (k, old, old_water) in with_dem {
+                let mut merged = DemCell { elev: old.elev.clone(), apron: old.apron.clone() };
+                let mut w = old_water.unwrap_or_else(mahere_tiles::CovCell::new);
+                if let Some(g) = seabed.get(&k) {
+                    let mut patch = DemCell::empty();
+                    let mut n = 0;
+                    for i in 0..merged.elev.len() {
+                        if old.elev[i].abs() <= SEA_EPS && g.elev[i] < 0.0 {
+                            patch.elev[i] = g.elev[i];
+                            merged.elev[i] = g.elev[i];
+                            w.cov[i] = 255;
+                            n += 1;
+                        }
+                    }
+                    for i in 0..merged.apron.len() {
+                        if old.apron[i].abs() <= SEA_EPS && g.apron[i] < 0.0 {
+                            patch.apron[i] = g.apron[i];
+                            merged.apron[i] = g.apron[i];
+                        }
+                    }
+                    if n > 0 {
+                        patched.push((k, Cell { dem: Some(patch), water: Some(w.clone()), ..Default::default() }));
+                    }
+                }
+                water8.insert(k, w);
+                base8.push((k, merged));
+            }
+            patched.into_par_iter().for_each(|(k, c)| mahere_tiles::write_cell(out, k, &c, loss).expect("write cell"));
+        } else {
+            sea += 1;
+        }
+        // The whole region's seabed at the bathymetry depth, the land pyramid laid over it where the land cells reach: a texel with land children takes their mean, every other the seabed.
+        let keys6 = region_keys(diamond, BATHY_DEPTH, region_depth, cu, cv);
+        let mut level6: HashMap<CellKey, DemCell> = mahere_tiles::bake_dem_filtered(&store, &keys6).into_iter().collect();
+        let mut water6: HashMap<CellKey, mahere_tiles::CovCell> = level6
+            .iter()
+            .map(|(k, c)| {
+                let mut w = mahere_tiles::CovCell::new();
+                for i in 0..c.elev.len() {
+                    if c.elev[i] < 0.0 {
+                        w.cov[i] = 255;
+                    }
+                }
+                (*k, w)
+            })
+            .collect();
+        let from_land = mahere_tiles::dem_pyramid(&base8, BATHY_DEPTH);
+        let wfrom_land = mahere_tiles::pyramid_cov(water8, depth, BATHY_DEPTH);
+        let mut level7: Vec<(CellKey, Cell)> = Vec::new();
+        for (k, c) in from_land {
+            if k.depth > BATHY_DEPTH {
+                level7.push((k, Cell { dem: Some(c), water: wfrom_land.get(&k).cloned(), ..Default::default() }));
+                continue;
+            }
+            let g = level6.entry(k).or_insert_with(DemCell::empty);
+            let w = water6.entry(k).or_insert_with(mahere_tiles::CovCell::new);
+            let lw = wfrom_land.get(&k);
+            for i in 0..c.elev.len() {
+                if !c.elev[i].is_nan() {
+                    g.elev[i] = c.elev[i];
+                    w.cov[i] = lw.map_or(0, |l| l.cov[i]);
+                }
+            }
+        }
+        level7.into_par_iter().for_each(|(k, c)| mahere_tiles::write_cell(out, k, &c, loss).expect("write cell"));
+        let base6: Vec<(CellKey, DemCell)> = mahere_tiles::fill_aprons(level6.into_iter().collect());
+        let upper = mahere_tiles::fill_aprons(mahere_tiles::dem_pyramid(&base6, region_depth));
+        let wupper = mahere_tiles::pyramid_cov(water6.clone(), BATHY_DEPTH, region_depth);
+        let n = base6.len() + upper.len();
+        base6.into_par_iter().chain(upper.into_par_iter()).for_each(|(k, c)| {
+            let w = if k.depth == BATHY_DEPTH { water6.get(&k).cloned() } else { wupper.get(&k).cloned() };
+            let cell = Cell { dem: Some(c), water: w, ..Default::default() };
+            mahere_tiles::write_cell(out, k, &cell, loss).expect("write cell");
+        });
+        writeln!(done_file, "{} {}", region.depth, region.prefix).unwrap();
+        eprintln!("bathy region {}/{}/{}: {} land cells, {n} seabed cells from depth {BATHY_DEPTH} up, {:.1}s", diamond, cu, cv, base8.len(), t.elapsed().as_secs_f32());
+    }
+    eprintln!("bathymetry pass: {land} land regions patched, {sea} sea regions baked; {:.0}s", t_all.elapsed().as_secs_f32());
+}
+
+/// The bounds (north, south, west, east) in a GEBCO tile's name, `gebco_2024_n90.0_s0.0_w-180.0_e-90.0.tif`.
+fn gebco_bounds(name: &str) -> Option<(f64, f64, f64, f64)> {
+    let stem = name.strip_suffix(".tif")?;
+    let (mut n, mut s, mut w, mut e) = (None, None, None, None);
+    for part in stem.split('_') {
+        let (k, v) = part.split_at(1);
+        let Ok(v) = v.parse::<f64>() else { continue };
+        match k {
+            "n" => n = Some(v),
+            "s" => s = Some(v),
+            "w" => w = Some(v),
+            "e" => e = Some(v),
+            _ => {}
+        }
+    }
+    Some((n?, s?, w?, e?))
 }
 
 /// The regions in diamond order, as (diamond, cu, cv, key).

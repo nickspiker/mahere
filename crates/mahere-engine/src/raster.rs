@@ -4,7 +4,7 @@
 
 use crate::colour::lin;
 use mahere_coord::Coord;
-use mahere_tiles::{CellKey, ClassCell, CovCell, ELEV_NODATA};
+use mahere_tiles::{ELEV_OFFSET, ELEV_STEP, CellKey, ClassCell, CovCell, ELEV_NODATA};
 use rayon::prelude::*;
 use rustc_hash::FxHashSet;
 
@@ -16,6 +16,20 @@ pub const BLOCK: usize = 32;
 pub const VEC_BASE_DEPTH: u8 = 14;
 pub const DEM_BASE_DEPTH: u8 = 14;
 pub const MIN_DEPTH: u8 = 0;
+/// The seabed: the theme's sea colour darkening with depth, full dark at this depth and by this much of its light, under the water fill thinned to a glaze so the relief shows (Nick 2026-10-09, ocean elevation).
+pub const SEABED_FULL_DEPTH: f32 = 6000.0;
+pub const SEABED_DARK: f32 = 0.64;
+pub const SEABED_GLAZE: f32 = 0.35;
+
+/// The seabed's ground colour at a depth, linear: the sea colour, darker the deeper.
+#[inline]
+pub fn seabed_tint(sea: [u8; 3], elev_m: f32) -> [f32; 3] {
+    let t = (-elev_m / SEABED_FULL_DEPTH).clamp(0.0, 1.0);
+    let k = 1.0 - SEABED_DARK * t;
+    let s = lin(sea);
+    [s[0] * k, s[1] * k, s[2] * k]
+}
+
 /// How strongly the loading mesh tints a coarser stand-in.
 pub const LOADING_TINT: f32 = 0.35;
 
@@ -195,7 +209,7 @@ fn build_hypso_lut_old() -> Box<[[u8; 3]; 4096]> {
     ];
     let mut lut = Box::new([[0u8; 3]; 4096]);
     for (i, out) in lut.iter_mut().enumerate() {
-        let elev = (i as f32 * 16.0) / 4.0 - 500.0; // bucket -> meters
+        let elev = i as f32 * 16.0 * ELEV_STEP - ELEV_OFFSET; // bucket -> meters
         if elev < 0.5 {
             *out = WATER_RGB; // the sea
             continue;
@@ -567,6 +581,12 @@ fn compose_rgb(dem: &DemRef, vec: &VecRef, pool: &Pool, diamond: u8, uq: i64, vq
     let mut light = [1.0f32; 3];
     let mut have_ground = false;
     let mut is_sea = false;
+    // A wet texel below sea level is seabed: the water coverage read ahead of the vector pass, the ground tinted by depth, the water a glaze over it, imagery left off it as off the sea.
+    let wet = match vec {
+        VecRef::Cell { water: Some(w), shift, .. } => w.cov[tri_index(uq, vq, *shift)],
+        _ => 0,
+    };
+    let mut seabed = false;
     let mut contour = (0.0f32, false);
     let mut slope_band: Option<[u8; 3]> = None;
     // The terrain sample feeds the tint and light (terrain on), and the contours and slope bands on their own.
@@ -585,10 +605,14 @@ fn compose_rgb(dem: &DemRef, vec: &VecRef, pool: &Pool, diamond: u8, uq: i64, vq
                     let e = luts.light.eval(nx * K, ny * K, nz * K);
                     // No cap: the display's highlight curve is the only place light meets white; the floor is physics, not a clip.
                     light = [e[0].max(0.0), e[1].max(0.0), e[2].max(0.0)];
-                    let sea = (eq as f32 * 0.25 - 500.0).abs() < 0.75 && nz > 0.9995 * 32767.0;
+                    let elev_m = eq as f32 * ELEV_STEP - ELEV_OFFSET;
+                    let sea = elev_m.abs() < 0.75 && nz > 0.9995 * 32767.0;
                     is_sea = sea;
+                    seabed = !sea && elev_m < 0.0 && wet != 0;
                     tint = if sea {
                         lin(st.sea)
+                    } else if seabed {
+                        seabed_tint(st.sea, elev_m)
                     } else if mask.hypso {
                         lin(luts.hypso[(eq >> 4) as usize])
                     } else {
@@ -599,7 +623,7 @@ fn compose_rgb(dem: &DemRef, vec: &VecRef, pool: &Pool, diamond: u8, uq: i64, vq
                 let nzn = (nz / 32767.0).max(1e-4);
                 let slope = (1.0 - nzn * nzn).max(0.0).sqrt() / nzn;
                 if mask.contours {
-                    contour = contour_cov(eq as f32 * 0.25 - 500.0, slope, &luts.contours);
+                    contour = contour_cov(eq as f32 * ELEV_STEP - ELEV_OFFSET, slope, &luts.contours);
                 }
                 if mask.slope {
                     let deg = slope.atan().to_degrees();
@@ -618,7 +642,7 @@ fn compose_rgb(dem: &DemRef, vec: &VecRef, pool: &Pool, diamond: u8, uq: i64, vq
     let mut rgb = tint;
     // Imagery has its own depth (a global 10 m layer sits several levels above the vector cells), so it is found on its own: the finest resident cell carrying any.
     // Imagery stands in for the lit ground where it has data and the terrain is not sea: the composite's own ocean pixels and the tiles' edges never show, the terrain's coastline does.
-    let imagery = if mask.imagery && !is_sea { img_texel(pool, diamond, uq, vq) } else { None };
+    let imagery = if mask.imagery && !is_sea && !seabed { img_texel(pool, diamond, uq, vq) } else { None };
     let mut imaged = false;
     if let Some(px) = imagery {
         // Stored rolled; unrolled to scene light before anything mixes with it.
@@ -642,7 +666,7 @@ fn compose_rgb(dem: &DemRef, vec: &VecRef, pool: &Pool, diamond: u8, uq: i64, vq
                 if let Some(water) = water {
                     let wc = water.cov[i];
                     if wc != 0 {
-                        let t = wc as f32 / 255.0;
+                        let t = wc as f32 / 255.0 * if seabed { SEABED_GLAZE } else { 1.0 };
                         let w = lin(st.water);
                         for c in 0..3 {
                             rgb[c] = (rgb[c] - t * IMG_WATER).max(0.0) + t * w[c];
@@ -691,7 +715,7 @@ fn compose_rgb(dem: &DemRef, vec: &VecRef, pool: &Pool, diamond: u8, uq: i64, vq
                     let s = 0.85 + 0.15 * diffuse;
                     let w = lin(st.water);
                     let wr = [w[0] * s, w[1] * s, w[2] * s];
-                    let t = wc as f32 / 255.0;
+                    let t = wc as f32 / 255.0 * if seabed { SEABED_GLAZE } else { 1.0 };
                     rgb = [rgb[0] + (wr[0] - rgb[0]) * t, rgb[1] + (wr[1] - rgb[1]) * t, rgb[2] + (wr[2] - rgb[2]) * t];
                 }
             }

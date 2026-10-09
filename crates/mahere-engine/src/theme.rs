@@ -625,11 +625,11 @@ pub fn builtin() -> Vec<Theme> {
 }
 
 impl Theme {
-    /// The hypsometric table indexed by elevation quantum >> 4 (4 m buckets); the sea below half a metre, the background in the last row for no data.
+    /// The hypsometric table indexed by elevation quantum >> 4 (8 m buckets); the sea below half a metre, the background in the last row for no data.
     pub fn hypso_lut(&self) -> Box<[[u8; 3]; 4096]> {
         let mut lut = Box::new([[0u8; 3]; 4096]);
         for (i, out) in lut.iter_mut().enumerate() {
-            let elev = (i as f32 * 16.0) / 4.0 - 500.0;
+            let elev = i as f32 * 16.0 * mahere_tiles::ELEV_STEP - mahere_tiles::ELEV_OFFSET;
             // Below the first stop (land under sea level, the Dead Sea, a polder) takes the first stop; the sea itself is told apart at draw time, where elevation is exactly zero and the ground dead flat.
             let _ = self.sea;
             let last = self.hypso[self.hypso.len() - 1].1;

@@ -7,6 +7,10 @@ const ABSENT: u32 = 0xFFFFFFFEu;
 const MIN_DEPTH: u32 = 0u;
 const IMG_WATER: f32 = 0.03;
 const LOADING_TINT: f32 = 0.35;
+// The seabed, as the CPU's: the sea colour darkening to this much less light at this depth, the water a glaze over it.
+const SEABED_FULL_DEPTH: f32 = 6000.0;
+const SEABED_DARK: f32 = 0.64;
+const SEABED_GLAZE: f32 = 0.35;
 const TABLE_N: u32 = 16384u;
 const ELEV_NODATA: u32 = 0xFFFFu;
 
@@ -383,13 +387,16 @@ fn compose(d: u32, u: u32, v: u32) -> Composed {
     var have_band = false;
     var found_depth = NONE;
     var is_sea = false;
+    var elev_m = 0.0;
     // The terrain sample feeds the tint and light (terrain on), and the contours and slope bands on their own.
     let want_dem = (mask & (M_DEM | M_CONTOURS | M_SLOPE)) != 0u;
     if (want_dem) {
         let s = sample_dem(d, u, v);
         if (s.ok) {
             found_depth = s.depth;
-            let eq = u32(clamp((s.elev + 500.0) * 4.0, 0.0, 65534.0));
+            elev_m = s.elev;
+            // The renderer's quantum: half-metre steps from 11 km below the sea (the CPU's ELEV_OFFSET and ELEV_STEP).
+            let eq = u32(clamp((s.elev + 11000.0) * 2.0, 0.0, 65534.0));
             if ((mask & M_DEM) != 0u) {
                 out.n = s.n;
                 // The open sea: exactly zero and dead flat, which is how a global DEM writes the ocean (below-sea-level land keeps its colour).
@@ -438,10 +445,33 @@ fn compose(d: u32, u: u32, v: u32) -> Composed {
             out.base = U.style_bg.rgb;
         }
     }
+    // The vector cell first, for its water: a wet texel below sea level is seabed, tinted by depth, which the imagery leaves alone as it does the sea.
+    let vi = find(d, U.depths.y, u, v, FLAG_VEC);
+    var line = vec4<u32>(0u);
+    var lw = vec4<u32>(0u);
+    var vflags = 0u;
+    if (vi != NONE) {
+        let r = refs[vi];
+        vflags = r.c.x;
+        let t = tri(u, v, r.a.y);
+        let xy = vec2<i32>(i32(2u * t.x + t.z), i32(t.y));
+        if ((vflags & FLAG_LINE) != 0u) {
+            line = textureLoad(line_tex, xy, i32(r.b.y), 0);
+        }
+        if ((vflags & (FLAG_LAND | FLAG_WATER)) != 0u) {
+            lw = textureLoad(lw_tex, xy, i32(r.b.z), 0);
+        }
+    }
+    var seabed = false;
+    if (out.ground && !is_sea && elev_m < 0.0 && lw.z != 0u) {
+        seabed = true;
+        let t = clamp(-elev_m / SEABED_FULL_DEPTH, 0.0, 1.0);
+        out.base = U.style_sea.rgb * (1.0 - SEABED_DARK * t);
+    }
     // Imagery has its own depth (a global 10 m layer sits several levels above the vector cells), so it is found on its own: the finest cell at or above the vector depth that carries any.
     // Imagery stands in for the lit ground where it has data and the terrain is not sea: the composite's own ocean pixels and the tiles' edges never show, the terrain's coastline does.
     var im = vec4<u32>(0u);
-    if ((mask & (M_IMAGERY | M_INFRARED)) != 0u && !is_sea) {
+    if ((mask & (M_IMAGERY | M_INFRARED)) != 0u && !is_sea && !seabed) {
         let ii = find(d, U.depths.y, u, v, FLAG_IMG);
         if (ii != NONE) {
             let ri = refs[ii];
@@ -449,25 +479,13 @@ fn compose(d: u32, u: u32, v: u32) -> Composed {
             im = textureLoad(img_tex, vec2<i32>(i32(2u * ti.x + ti.z), i32(ti.y)), i32(ri.b.w), 0);
         }
     }
-    let vi = find(d, U.depths.y, u, v, FLAG_VEC);
     if (vi == NONE && (mask & M_IMAGERY) != 0u && (im.x != 0u || im.y != 0u || im.z != 0u)) {
         out.ground = false;
         out.base = select(vec3<f32>(img_light(im.x), img_light(im.y), img_light(im.z)), vec3<f32>(img_light(im.w)), (mask & M_INFRARED) != 0u);
         return out;
     }
     if (vi != NONE) {
-        let r = refs[vi];
-        let flags = r.c.x;
-        let t = tri(u, v, r.a.y);
-        let xy = vec2<i32>(i32(2u * t.x + t.z), i32(t.y));
-        var line = vec4<u32>(0u);
-        var lw = vec4<u32>(0u);
-        if ((flags & FLAG_LINE) != 0u) {
-            line = textureLoad(line_tex, xy, i32(r.b.y), 0);
-        }
-        if ((flags & (FLAG_LAND | FLAG_WATER)) != 0u) {
-            lw = textureLoad(lw_tex, xy, i32(r.b.z), 0);
-        }
+        let flags = vflags;
         let draw_line = (mask & M_LINE) != 0u && line.y != 0u && (line.x < BOUNDARY_FIRST || (mask & M_BOUND) != 0u);
         if ((mask & M_IMAGERY) != 0u && (im.x != 0u || im.y != 0u || im.z != 0u)) {
             // Imagery stands in for the ground: nothing lights it. True colour, or the near-infrared band as grey, unrolled to scene light.
@@ -479,7 +497,7 @@ fn compose(d: u32, u: u32, v: u32) -> Composed {
             }
             // The water fill paints over imagery as it does over the ground, so a lake or a coast texel that is water in part matches the sea instead of showing the composite's own dark water: the composite's water taken out at the coverage, the theme's put in (the CPU's IMG_WATER).
             if ((mask & M_WATER) != 0u && lw.z != 0u) {
-                let t = f32(lw.z) / 255.0;
+                let t = f32(lw.z) / 255.0 * select(1.0, SEABED_GLAZE, seabed);
                 out.base = max(out.base - vec3<f32>(t * IMG_WATER), vec3<f32>(0.0)) + t * U.style_water.rgb;
             }
             if (draw_line) {
@@ -502,7 +520,7 @@ fn compose(d: u32, u: u32, v: u32) -> Composed {
             { let f = fold(Fold(out.k1, out.c1), line_colour(line.x, line.z), line_alpha(line.x, line.y, line.z)); out.k1 = f.k; out.c1 = f.c; }
         }
         if ((mask & M_WATER) != 0u && lw.z != 0u) {
-            out.water = f32(lw.z) / 255.0;
+            out.water = f32(lw.z) / 255.0 * select(1.0, SEABED_GLAZE, seabed);
         }
         if (draw_line && line.x != WATERWAY_CLASS) {
             { let f = fold(Fold(out.k2, out.c2), line_colour(line.x, line.z), line_alpha(line.x, line.y, line.z)); out.k2 = f.k; out.c2 = f.c; }
