@@ -671,6 +671,13 @@ fn compose_rgb(dem: &DemRef, vec: &VecRef, pool: &Pool, diamond: u8, uq: i64, vq
             rgb = lerp3(rgb, lin(if contour.1 { st.contour_index } else { st.contour }), contour.0 * st.contour_alpha[contour.1 as usize]);
         }
     }
+    // Where the wanted terrain cell has not arrived, the edges of the wanted lattice show faintly, so a loading view keeps its bearings.
+    if (mask.dem || mask.contours || mask.slope) && dem_ref_depth(dem) != Some(luts.dem_depth) {
+        let shift = 16 + 22 - luts.dem_depth as u32;
+        if (uq >> shift) & 255 == 0 || (vq >> shift) & 255 == 0 {
+            rgb = lerp3(rgb, lin(luts.style.contour), 0.45);
+        }
+    }
     pack(luts, rgb)
 }
 
@@ -873,7 +880,7 @@ mod tests {
             style: Style::default(),
             sun: [0.0, 0.0, 1.0],
             mask: LayerMask { contours: false, ..LayerMask::default() }.effective(),
-            dem_depth: 12,
+            dem_depth: 6,
             contours: Contours { interval: 0.0, index_every: 5, m_per_px: 1.0 },
             light: crate::sh::Sh9::sun_and_sky(315.0, 40.0).quadratic((0.0, 1.0)),
             display: crate::colour::Display::default(),
@@ -881,7 +888,7 @@ mod tests {
         };
         let (w, h) = (64usize, 64usize);
         let mut canvas = vec![0u32; w * h];
-        let (stats, _want) = render_frame(&mut canvas, w, h, &cam, &pool, &luts, 12, 13);
+        let (stats, _want) = render_frame(&mut canvas, w, h, &cam, &pool, &luts, 6, 13);
         assert_eq!(stats.straddle_blocks, 0);
         // Expected: the flat white (land cover makes the elevation tint inert) lerped 85% to forest, lit by the SH irradiance at a flat normal in the device frame.
         let t = luts.style.flat;
@@ -892,11 +899,12 @@ mod tests {
         let expect = pack(&luts, [mix(0), mix(1), mix(2)]);
         let center = canvas[(h / 2) * w + w / 2];
         assert_eq!(center, expect, "center {center:#08x} vs expected {expect:#08x}");
-        assert!(canvas.iter().all(|&p| p == expect), "unresolved pixels in frame");
+        let bad: Vec<(usize, u32)> = canvas.iter().enumerate().filter(|(_, p)| **p != expect).map(|(i, p)| (i, *p)).collect();
+        assert!(bad.is_empty(), "{} unresolved pixels in frame, first {:?} (x {}, y {}) vs {expect:#08x}", bad.len(), bad.first(), bad.first().map_or(0, |b| b.0 % w), bad.first().map_or(0, |b| b.0 / w));
 
         // Mask off land: pure hypso.
         let luts = FrameLuts { mask: LayerMask { land: false, contours: false, ..LayerMask::default() }.effective(), ..luts };
-        render_frame(&mut canvas, w, h, &cam, &pool, &luts, 12, 13);
+        render_frame(&mut canvas, w, h, &cam, &pool, &luts, 6, 13);
         let t = luts.hypso[375];
         let tl = lin(t);
         let expect = pack(&luts, [tl[0] * e[0].max(0.0), tl[1] * e[1].max(0.0), tl[2] * e[2].max(0.0)]);

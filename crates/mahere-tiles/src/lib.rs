@@ -125,6 +125,33 @@ impl CellKey {
         format!("{}.vsf.zst", self.name())
     }
 
+    /// The key back from its file name (with or without the extension): the base64url undone, the depth and world cell parsed.
+    pub fn from_name(name: &str) -> Option<CellKey> {
+        let name = name.trim_end_matches(".vsf.zst");
+        const A: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+        let mut bytes = Vec::with_capacity(name.len() * 3 / 4);
+        for chunk in name.as_bytes().chunks(4) {
+            let mut n = 0u32;
+            for (i, &c) in chunk.iter().enumerate() {
+                n |= (A.iter().position(|&a| a == c)? as u32) << (18 - 6 * i);
+            }
+            for i in 0..chunk.len() - 1 {
+                bytes.push((n >> (16 - 8 * i)) as u8);
+            }
+        }
+        let mut ptr = 0usize;
+        let depth = match vsf::parse(&bytes, &mut ptr).ok()? {
+            VsfType::u(d, _) => d as u8,
+            VsfType::u3(d) => d,
+            _ => return None,
+        };
+        let raw = match vsf::parse(&bytes, &mut ptr).ok()? {
+            VsfType::wm(c) => c.raw(),
+            _ => return None,
+        };
+        Some(CellKey { depth, prefix: raw >> (60 - 2 * depth as u32) })
+    }
+
     /// Diamond-UV rectangle covered by this cell.
     pub fn uv_rect(self) -> (f64, f64, f64) {
         let (cu, cv) = self.grid();
@@ -1688,6 +1715,21 @@ pub fn plane_u8_mem(v: &VsfType) -> Option<Vec<u8>> {
         _ => return None,
     };
     (disk.len() == TRI).then(|| disk_to_mem(&disk))
+}
+
+#[cfg(test)]
+mod name_tests {
+    use super::CellKey;
+
+    #[test]
+    fn a_name_comes_back_as_its_key() {
+        for (d, cu, cv) in [(0u8, 0u64, 0u64), (4, 7, 4), (8, 200, 13), (14, 9000, 12345)] {
+            for diamond in [0u8, 3, 9] {
+                let k = CellKey::from_grid(diamond, d, cu, cv);
+                assert_eq!(CellKey::from_name(&k.path()), Some(k), "{diamond} {d} {cu} {cv}");
+            }
+        }
+    }
 }
 
 #[cfg(test)]

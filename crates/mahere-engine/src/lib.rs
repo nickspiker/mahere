@@ -216,9 +216,14 @@ impl MapCore {
     }
 
     /// Exact geo-anchored zoom: the geography under (ax, ay) stays there.
+    /// The least pixels per degree a screen may show: the longer side never spans more than 170° of the planar projection, which has no meaning past a hemisphere (a globe view is the honest answer there and is not built yet).
+    pub fn ppd_floor(w: usize, h: usize) -> f64 {
+        (w.max(h) as f64 / 170.0).max(6.0)
+    }
+
     pub fn zoom_about(&mut self, factor: f64, ax: f64, ay: f64, w: usize, h: usize) {
         let (alat, alon) = self.cam.screen_to_geo(ax, ay, w, h);
-        self.cam.ppd = (self.cam.ppd * factor).clamp(6., 4_000_000.);
+        self.cam.ppd = (self.cam.ppd * factor).clamp(Self::ppd_floor(w, h), 4_000_000.);
         self.place_anchor(alat, alon, ax, ay, w, h);
     }
 

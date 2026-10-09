@@ -68,6 +68,16 @@ fn main() {
         }
     }
     eprintln!("resident: {} cells in {:.1}s", map.pool().map.len(), t.elapsed().as_secs_f32());
+    // MAHERE_NO_GPU=1 stops here, after the residency and the CPU reference: for finding where memory goes without touching the GPU.
+    if std::env::var("MAHERE_NO_GPU").as_deref() == Ok("1") {
+        let cpu0 = std::time::Instant::now();
+        map.render(w, h);
+        eprintln!("cpu render {:.1} ms, plan {} refs {} blocks", cpu0.elapsed().as_secs_f32() * 1e3, map.plan(w, h).refs.len(), map.plan(w, h).blocks.len());
+        let cpu = map.canvas.clone();
+        write_png(&format!("{out}_cpu.png"), w, h, |i| [(cpu[i] >> 16) as u8, (cpu[i] >> 8) as u8, cpu[i] as u8]);
+        println!("wrote {out}_cpu.png");
+        return;
+    }
 
     // The plan first, then the CPU frame: both then fit the contour interval to the same range.
     let plan = map.plan(w, h);

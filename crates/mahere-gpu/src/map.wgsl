@@ -399,11 +399,8 @@ fn compose(d: u32, u: u32, v: u32) -> Composed {
             let slope = sqrt(max(1.0 - nzn * nzn, 0.0)) / nzn;
             if ((mask & M_CONTOURS) != 0u && slope >= 0.02 && U.contour.x > 0.0) {
                 let interval = U.contour.x;
-                // Magnified: the interpolated, unquantised elevation; at the base and below, the texel's.
-                var elev_m = f32(eq) * 0.25 - 500.0;
-                if (U.depths.z != 0u) {
-                    elev_m = dem_smooth(s, u, v);
-                }
+                // Always the interpolated elevation, at every zoom: from the texels' own values a contour is a chain of triangle facets (Nick 2026-10-09).
+                let elev_m = dem_smooth(s, u, v);
                 let level = round(elev_m / interval);
                 let d_m = abs(elev_m - level * interval);
                 let d_px = d_m / (slope * U.contour.z);
@@ -504,6 +501,15 @@ fn compose(d: u32, u: u32, v: u32) -> Composed {
         if (contour_cov > 0.0) {
             let ink = select(U.style_contour, U.style_contour_index, contour_index);
             { let f = fold(Fold(out.k2, out.c2), ink.rgb, contour_cov * ink.a); out.k2 = f.k; out.c2 = f.c; }
+        }
+    }
+    // Where the wanted terrain cell has not arrived (a coarser one or nothing stands in), the edges of the wanted lattice show faintly, so a loading view keeps its bearings (Nick 2026-10-09).
+    if (want_dem && found_depth != U.depths.x) {
+        let s = 30u - U.depths.x - 8u;
+        let tx = (u >> s) & 255u;
+        let ty = (v >> s) & 255u;
+        if (tx == 0u || ty == 0u) {
+            { let f = fold(Fold(out.k2, out.c2), U.style_contour.rgb, 0.45); out.k2 = f.k; out.c2 = f.c; }
         }
     }
     if ((mask & M_DEBUG) != 0u) {

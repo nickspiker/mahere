@@ -60,6 +60,7 @@ impl GpuHost {
             .ok()?;
         // A validation error logs instead of killing the app: the map goes wrong on screen, the phone stays usable, logcat says why.
         device.on_uncaptured_error(std::sync::Arc::new(|e: wgpu::Error| eprintln!("gpu: {e}")));
+        device.set_device_lost_callback(|reason, msg| eprintln!("gpu: device lost ({reason:?}): {msg}"));
         let caps = surface.get_capabilities(&adapter);
         // A linear 8-bit format: the shader writes display values, not scene-linear ones.
         let format = caps.formats.iter().copied().find(|f| !f.is_srgb()).unwrap_or(caps.formats[0]);

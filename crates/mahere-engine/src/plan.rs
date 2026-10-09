@@ -211,11 +211,15 @@ pub fn plan_frame(w: usize, h: usize, cam: &Camera, pool: &Pool, dem_depth: u8, 
         }
     }
 
-    // References: every resident cell with a plane, and the table over them.
-    let mut refs: Vec<PlanRef> = Vec::with_capacity(pool.map.len());
+    // References: every resident cell with a plane, and the table over them. The table is a quarter full at most: a resident set past that (a far zoom over the globe) refers the cells this frame wants first and leaves the rest, so the probes stay short and the insert can never spin.
+    let mut refs: Vec<PlanRef> = Vec::with_capacity(pool.map.len().min(TABLE_N / 4));
     let mut table = vec![TableSlot { tag: 0, cu: 0, cv: 0, index: NONE }; TABLE_N];
     let mut keys: Vec<&CellKey> = pool.map.keys().collect();
     keys.sort();
+    if keys.len() > TABLE_N / 4 {
+        keys.sort_by_key(|k| !desired.contains(k));
+        keys.truncate(TABLE_N / 4);
+    }
     for key in keys {
         let e = &pool.map[key];
         // From the presence bits, not the planes: a GPU host may have released the CPU copies.

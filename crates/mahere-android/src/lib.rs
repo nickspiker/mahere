@@ -57,6 +57,8 @@ pub struct AndroidApp {
     /// The GPU path, created on the first draw; None after a failure means the CPU present is in use.
     gpu: Option<GpuHost>,
     gpu_failed: bool,
+    /// Draws that panicked inside wgpu; the host is remade each time, until a few in a row.
+    gpu_panics: u32,
     /// The latest short bracket from the front camera (its stop, the binned frame): the long frame's clipped bins take their light from it.
     probe_short: Option<(u32, mahere_engine::probe::Binned)>,
     /// The UI's scale, pinched while the panel is open; the last finger distance of such a pinch.
@@ -513,6 +515,7 @@ pub extern "system" fn Java_nz_mahere_app_MahereActivity_nativeInit(
         persist: Persist::new(),
         gpu: None,
         gpu_failed: false,
+        gpu_panics: 0,
             probe_short: None,
             ui_ru,
             ui_pinch: None,
@@ -574,7 +577,22 @@ pub extern "system" fn Java_nz_mahere_app_MahereActivity_nativeDraw(
             return shell(ptr).draw(&window) as jboolean;
         };
         if g.ensure_window(&window) {
-            return g.draw(map, panel, ctl, stats, *w as u32, *h as u32) as jboolean;
+            // A fatal error inside wgpu panics; across the JNI boundary that is an abort. Caught here, the GPU host is dropped and made again on the next frame (a lost device comes back that way); after a few in a row the CPU present takes over.
+            let (w, h) = (*w as u32, *h as u32);
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| g.draw(map, panel, ctl, stats, w, h))) {
+                Ok(drawn) => return drawn as jboolean,
+                Err(e) => {
+                    let msg = e.downcast_ref::<String>().cloned().or_else(|| e.downcast_ref::<&str>().map(|s| s.to_string())).unwrap_or_default();
+                    eprintln!("gpu: draw panicked: {msg}");
+                    app.gpu = None;
+                    app.gpu_panics += 1;
+                    if app.gpu_panics >= 3 {
+                        app.gpu_failed = true;
+                        eprintln!("gpu: giving up after {} panics, CPU present", app.gpu_panics);
+                    }
+                    return 0;
+                }
+            }
         }
     }
     shell(ptr).draw(&window) as jboolean
