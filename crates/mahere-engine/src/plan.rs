@@ -12,6 +12,8 @@ use crate::raster::{BLOCK, CornerPt, ElevRange, MIN_DEPTH, corner, raw_of};
 use crate::residency::Pool;
 
 pub const NONE: u32 = u32::MAX;
+/// A table slot for a cell the loader confirmed does not exist, at the frame's terrain depth: the renderer tells "not there" from "not here yet" and draws the loading lattice only for the latter.
+pub const ABSENT: u32 = u32::MAX - 1;
 
 /// Side of a straddle sub-block, pixels.
 pub const SUB: usize = 4;
@@ -240,15 +242,26 @@ pub fn plan_frame(w: usize, h: usize, cam: &Camera, pool: &Pool, dem_depth: u8, 
         if p & crate::residency::PRESENT_IMG != 0 {
             flags |= FLAG_IMG;
         }
+        let (cu, cv) = key.grid();
         if flags == 0 {
+            // Confirmed absent at the wanted depth: a marker in the table and nothing to refer to.
+            if e.is_absent() && key.depth == dem_depth {
+                let mut h = table_hash(key.diamond() as u32, key.depth as u32, cu as u32, cv as u32) as usize;
+                for _ in 0..TABLE_N {
+                    if table[h].index == NONE {
+                        table[h] = TableSlot { tag: key.diamond() as u32 | ((key.depth as u32) << 8), cu: cu as u32, cv: cv as u32, index: ABSENT };
+                        break;
+                    }
+                    h = (h + 1) & (TABLE_N - 1);
+                }
+            }
             continue;
         }
-        let (cu, cv) = key.grid();
         let diamond = key.diamond();
         let index = refs.len() as u32;
         refs.push(PlanRef { key: *key, diamond, cu: cu as u32, cv: cv as u32, flags, jac: if flags & FLAG_DEM != 0 { jacobian(*key) } else { [0.0; 5] } });
         let mut h = table_hash(diamond as u32, key.depth as u32, cu as u32, cv as u32) as usize;
-        loop {
+        for _ in 0..TABLE_N {
             if table[h].index == NONE {
                 table[h] = TableSlot { tag: diamond as u32 | ((key.depth as u32) << 8), cu: cu as u32, cv: cv as u32, index };
                 break;

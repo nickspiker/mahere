@@ -672,7 +672,11 @@ fn compose_rgb(dem: &DemRef, vec: &VecRef, pool: &Pool, diamond: u8, uq: i64, vq
         }
     }
     // Where the wanted terrain cell has not arrived, the edges of the wanted lattice show faintly, so a loading view keeps its bearings.
-    if (mask.dem || mask.contours || mask.slope) && dem_ref_depth(dem) != Some(luts.dem_depth) {
+    let wanted_absent = || {
+        let key = CellKey { depth: luts.dem_depth, prefix: raw_of(diamond, uq, vq) >> (60 - 2 * luts.dem_depth as u32) };
+        pool.map.get(&key).is_some_and(|e| e.is_absent())
+    };
+    if (mask.dem || mask.contours || mask.slope) && dem_ref_depth(dem) != Some(luts.dem_depth) && !wanted_absent() {
         let shift = 16 + 22 - luts.dem_depth as u32;
         if (uq >> shift) & 255 == 0 || (vq >> shift) & 255 == 0 {
             rgb = lerp3(rgb, lin(luts.style.contour), 0.45);

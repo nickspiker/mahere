@@ -1,6 +1,8 @@
 // The #pagetable compositor on the GPU. One instance per screen block: the vertex stage places the block's quad and hands the fragment its position inside the block; the fragment walks position → diamond UV → page table → texel → the same compose the CPU loop does, per supersample. A second pass bins the supersampled image down 2×2 and lays the screen-space marks over it.
 
 const NONE: u32 = 0xFFFFFFFFu;
+// A cell the loader confirmed absent at the wanted depth: found by lookup, never referred to.
+const ABSENT: u32 = 0xFFFFFFFEu;
 const MIN_DEPTH: u32 = 6u;
 const TABLE_N: u32 = 16384u;
 const ELEV_NODATA: u32 = 0xFFFFu;
@@ -120,7 +122,7 @@ fn find(d: u32, want: u32, u: u32, v: u32, need: u32) -> u32 {
     var depth = want;
     loop {
         let r = lookup(d, depth, u, v);
-        if (r != NONE && (refs[r].c.x & need) != 0u) {
+        if (r != NONE && r != ABSENT && (refs[r].c.x & need) != 0u) {
             return r;
         }
         if (depth == MIN_DEPTH) {
@@ -504,7 +506,7 @@ fn compose(d: u32, u: u32, v: u32) -> Composed {
         }
     }
     // Where the wanted terrain cell has not arrived (a coarser one or nothing stands in), the edges of the wanted lattice show faintly, so a loading view keeps its bearings (Nick 2026-10-09).
-    if (want_dem && found_depth != U.depths.x) {
+    if (want_dem && found_depth != U.depths.x && lookup(d, U.depths.x, u, v) != ABSENT) {
         let s = 30u - U.depths.x - 8u;
         let tx = (u >> s) & 255u;
         let ty = (v >> s) & 255u;
