@@ -2,7 +2,7 @@
 //!
 //! Every byte of colour is VSF RGB at gamma 2, quantised ×256 by truncation: a byte `b` is the light `(b/256)²`, a light `x` is the byte `⌊√x·256⌋`. No rounding anywhere.
 //!
-//! Imagery has more range than a byte holds at paper white (sunlit snow, glint), so it is stored rolled: scene light `x` (paper white 1) becomes `curve(x/n)` at headroom `n`, then gamma 2. The agreed tone for every imagery cell is [`IMG_TAG`], Opsin's cubic rail at five times paper white; each cell carries its tag, so a reader knows exactly what went in and unrolls it before anything is mixed.
+//! Imagery has more range than a byte holds at paper white (sunlit snow, glint), so it is stored rolled: scene light `x` (paper white 1) becomes `curve(x/n)` at headroom `n`, then gamma 2. The agreed tone for every imagery cell is [`IMG_TAG`], tanh at 1:1 then the square root (Nick 2026-10-09): paper white lands at byte 223, everything from 2.8 times white up is 255, and below white the codes are spent nearly as a plain gamma-2 image. Each cell carries its tag, so a reader knows exactly what went in and unrolls it before anything is mixed.
 
 /// The light of a gamma-2 byte.
 #[inline]
@@ -29,7 +29,7 @@ pub fn rail(x: f32) -> f32 {
 pub enum Tone {
     /// Opsin's rail: a fixed clip at the headroom, exactly invertible, `u = 2·sin(asin(y)/3)`.
     Cubic,
-    /// `tanh u`: no clip, but at 8 bits the top byte holds everything past about 2.8, so only that much unrolls distinctly.
+    /// `tanh u`: no clip, but at 8 bits (after the square root) the top byte holds everything past about 2.8, so only that much unrolls distinctly.
     Tanh,
 }
 
@@ -59,8 +59,11 @@ pub fn tag(curve: Tone, headroom: u8) -> u8 {
     (c << 4) | headroom.clamp(1, 15)
 }
 
-/// The agreed imagery tone: the cubic rail at five times paper white. Paper white is reflectance 0.3 for a reflectance source, byte 255 for a display-referred one; reflectance against a flat white diffuser passes 1 on sunlit slopes and snow (the 2021 Sentinel-2 composite's Rainier square: 0.08% above 0.9, the brightest 1.65), and five times 0.3 holds up to 1.5.
-pub const IMG_TAG: u8 = (1 << 4) | 5;
+/// The agreed imagery tone: tanh at 1:1, then gamma 2. Paper white (reflectance 0.3 for a reflectance source, byte 255 for a display-referred one) is byte 223; 2× white is 251; from 2.8× up it is 255. Reflectance against a flat white diffuser passes 1 on sunlit slopes and snow (the 2021 Sentinel-2 composite's Rainier square: 0.08% above 0.9, the brightest 1.65 = 5.5× white), so the brightest ice shares the top code, and snow at 1.2 to 1.65× white keeps fourteen codes of texture. The cubic rail at a headroom remains a valid tag for cells that carry it.
+pub const IMG_TAG: u8 = (2 << 4) | 1;
+
+/// The most scene light [`IMG_TAG`] tells apart: the top byte's lower edge, atanh((255/256)²), in units of paper white. The linear display view is exposed by its reciprocal so the data's whole range reaches white unclipped.
+pub const IMG_CEILING: f32 = 2.8;
 
 fn parts(t: u8) -> (Option<Tone>, f32) {
     let curve = match t >> 4 {
@@ -122,7 +125,10 @@ mod tests {
         for b in 1..=255u8 {
             assert_eq!(roll(IMG_TAG, unroll(IMG_TAG, b)), b, "byte {b}");
         }
-        assert_eq!(roll(IMG_TAG, 5.0), 255);
+        assert_eq!(roll(IMG_TAG, 1.0), 223);
+        assert_eq!(roll(IMG_TAG, 2.8), 255);
         assert_eq!(roll(IMG_TAG, 50.0), 255);
+        // Just under the ceiling still tells apart from it.
+        assert!(roll(IMG_TAG, 2.0) < 255);
     }
 }

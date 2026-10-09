@@ -2,15 +2,15 @@
 //!
 //! Light is mixed and shaded linear. There is one display encode, at the very end: exposure, VSF RGB to the display's primaries, the clamp, the highlight curve if compressed, the square root.
 //!
-//! Compressed (the default): exposure 2/3 into Opsin's rail `(3x − x³)/2`, slope 3/2 at black and flat at white, so shadows and mid-tones pass at unity and everything up to 1.5 rolls smoothly into white instead of clipping. Linear: the stored range shown straight, exposure 1/5 so imagery's full headroom (five times paper white) reaches white without clipping, everything 2.3 stops darker than compressed.
+//! Compressed (the default): exposure 2/3 into Opsin's rail `(3x − x³)/2`, slope 3/2 at black and flat at white, so shadows and mid-tones pass at unity and everything up to 1.5 rolls smoothly into white instead of clipping. Linear: the stored range shown straight, exposure 1/2.8 so imagery's whole range (its tone's ceiling, 2.8 times paper white) reaches white without clipping, 0.9 of a stop darker than compressed.
 //!
-//! Data with more range than a byte holds (imagery: snow, glint, concrete) is stored rolled through a tagged tone ([`mahere_tiles::tone`]) and unrolled to scene light (a 256-entry table) before anything is mixed.
+//! Data with more range than a byte holds (imagery: snow, glint, concrete) is stored rolled through a tagged tone ([`mahere_tiles::tone`], tanh then gamma 2 for everything baked from now) and unrolled to scene light (a 256-entry table) before anything is mixed.
 
 /// Compressed highlights: the exposure before the rail, 2/3, cancels the rail's slope at black, so dark and mid colours land where they were authored.
 pub const EXPOSURE: f32 = 2.0 / 3.0;
 
-/// Linear highlights: the exposure that brings the widest stored range (imagery's headroom, five times paper white) to white, so nothing in the data clips.
-pub const LINEAR_EXPOSURE: f32 = 1.0 / 5.0;
+/// Linear highlights: the exposure that brings the widest stored range (imagery's tone ceiling) to white, so nothing in the data clips.
+pub const LINEAR_EXPOSURE: f32 = 1.0 / mahere_tiles::tone::IMG_CEILING;
 
 pub use mahere_tiles::tone::{dec, enc, rail};
 
@@ -49,7 +49,7 @@ impl Display {
         [[m[0], m[3], m[6], 0.0], [m[1], m[4], m[7], 0.0], [m[2], m[5], m[8], 0.0]]
     }
 
-    /// Compressed: exposure 2/3 into the rail. Linear: exposure 1/5 straight.
+    /// Compressed: exposure 2/3 into the rail. Linear: exposure 1/2.8 straight.
     pub fn encode(&self, x: [f32; 3], compressed: bool) -> [u8; 3] {
         let m = &self.m;
         let d = [m[0] * x[0] + m[3] * x[1] + m[6] * x[2], m[1] * x[0] + m[4] * x[1] + m[7] * x[2], m[2] * x[0] + m[5] * x[1] + m[8] * x[2]];

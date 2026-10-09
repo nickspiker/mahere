@@ -300,10 +300,10 @@ fn rail(x: vec3<f32>) -> vec3<f32> {
     return (3.0 * c - c * c * c) * 0.5;
 }
 
-// The one display encode: linear VSF RGB to the display's gamma-2 code values 0..255, truncated. Compressed: exposure 2/3 into the rail. Linear: exposure 1/5 straight, so the widest stored range (imagery at five times paper white) reaches white unclipped. Then the square root.
+// The one display encode: linear VSF RGB to the display's gamma-2 code values 0..255, truncated. Compressed: exposure 2/3 into the rail. Linear: exposure 1/2.8 straight, so the widest stored range (imagery's tone ceiling, 2.8 times paper white) reaches white unclipped. Then the square root.
 fn to_display(x: vec3<f32>) -> vec3<f32> {
     let d = vec3<f32>(dot(U.display[0].xyz, x), dot(U.display[1].xyz, x), dot(U.display[2].xyz, x));
-    let t = select(clamp(d * (1.0 / 5.0), vec3<f32>(0.0), vec3<f32>(1.0)), rail(d * (2.0 / 3.0)), U.tone.x > 0.5);
+    let t = select(clamp(d * (1.0 / 2.8), vec3<f32>(0.0), vec3<f32>(1.0)), rail(d * (2.0 / 3.0)), U.tone.x > 0.5);
     return min(floor(sqrt(t) * 256.0), vec3<f32>(255.0));
 }
 
@@ -567,8 +567,8 @@ fn fs_map_g(in: VOut) -> GOut {
     let s = sample_uv(in);
     let p = compose(s.x, s.y, s.z);
     var g: GOut;
-    // Linear light kept at gamma 2 so 8 bits hold the shadows; the base with five times headroom, the most unrolled imagery carries.
-    g.base = vec4<f32>(sqrt(p.base * 0.2), select(0.0, 1.0, p.ground));
+    // Linear light kept at gamma 2 so 8 bits hold the shadows; the base with 2.8 times headroom, the most unrolled imagery carries.
+    g.base = vec4<f32>(sqrt(p.base / 2.8), select(0.0, 1.0, p.ground));
     g.normal = vec4<f32>(p.n * 0.5 + 0.5, p.water);
     g.post1 = vec4<f32>(sqrt(p.c1), p.k1);
     g.post2 = vec4<f32>(sqrt(p.c2), p.k2);
@@ -589,7 +589,7 @@ fn fs_relight(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     let nw = textureLoad(g_normal, xy, 0);
     let p1 = textureLoad(g_post1, xy, 0);
     let p2 = textureLoad(g_post2, xy, 0);
-    let rgb = shade(b.rgb * b.rgb * 5.0, b.a > 0.5, normalize(nw.xyz * 2.0 - 1.0), p1.a, p1.rgb * p1.rgb, nw.w, p2.a, p2.rgb * p2.rgb);
+    let rgb = shade(b.rgb * b.rgb * 2.8, b.a > 0.5, normalize(nw.xyz * 2.0 - 1.0), p1.a, p1.rgb * p1.rgb, nw.w, p2.a, p2.rgb * p2.rgb);
     return vec4<f32>(to_display(rgb) / 255.0, 1.0);
 }
 
