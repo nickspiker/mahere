@@ -20,7 +20,7 @@ use residency::{CellStore, Residency};
 pub const PPD_REF: f64 = 6000.;
 pub const BG_RGB: u32 = 0x12141A;
 
-/// View state in absolute WGS84 degrees; ppd = pixels per degree latitude; bearing = radians the view is rotated (0 = north-up).
+/// View state: the globe seen from far off, the camera pointed at (lat, lon), which sits at the screen's centre; ppd = pixels per degree of arc there, so the whole globe is a disk of radius ppd·180/π pixels; bearing = radians the view is rotated (0 = north-up at the centre). The projection is orthographic, so the near ground is the plain map it always was and zooming out flattens the globe into a circle (Nick 2026-10-09).
 #[derive(Clone, Copy)]
 pub struct Camera {
     pub lat: f64,
@@ -34,10 +34,32 @@ impl Camera {
         self.lat.to_radians().cos()
     }
 
-    /// Screen basis in local east/north: up = (sin B, cos B), right = (cos B, −sin B). B = 0 is north-up.
+    /// The globe's radius on the screen, in pixels: pixels per radian of arc.
+    pub fn radius(&self) -> f64 {
+        self.ppd * 180.0 / core::f64::consts::PI
+    }
+
+    /// Screen basis in local east/north at the centre: up = (sin B, cos B), right = (cos B, −sin B). B = 0 is north-up. A point on the far side of the globe is pushed well outside the disk, so a mark there draws nowhere.
     pub fn geo_to_screen(&self, lat: f64, lon: f64, w: usize, h: usize) -> (f64, f64) {
-        let e = (lon - self.lon) * self.ppd * self.coslat();
-        let n = (lat - self.lat) * self.ppd;
+        let (sl0, cl0) = self.lat.to_radians().sin_cos();
+        let (sl, cl) = lat.to_radians().sin_cos();
+        let (sd, cd) = (lon - self.lon).to_radians().sin_cos();
+        let r = self.radius();
+        let mut e = cl * sd * r;
+        let mut n = (cl0 * sl - sl0 * cl * cd) * r;
+        let cosc = sl0 * sl + cl0 * cl * cd;
+        if cosc < 0.0 {
+            let rho = (e * e + n * n).sqrt();
+            if rho < 1e-6 {
+                // The antipode itself has no direction: straight up and away.
+                e = 0.0;
+                n = r * 4.0;
+            } else {
+                let k = r * 4.0 / rho;
+                e *= k;
+                n *= k;
+            }
+        }
         let (sb, cb) = self.bearing.sin_cos();
         (
             w as f64 * 0.5 + e * cb - n * sb,
@@ -45,16 +67,45 @@ impl Camera {
         )
     }
 
+    /// The ground under a screen point. Past the limb the point is taken at the limb, so a corner off the globe still names ground (the renderers paint the background there).
     pub fn screen_to_geo(&self, px: f64, py: f64, w: usize, h: usize) -> (f64, f64) {
         let sx = px - w as f64 * 0.5;
         let sy = h as f64 * 0.5 - py; // screen-up positive
         let (sb, cb) = self.bearing.sin_cos();
-        let e = sx * cb + sy * sb;
-        let n = -sx * sb + sy * cb;
-        (
-            self.lat + n / self.ppd,
-            self.lon + e / (self.ppd * self.coslat()),
-        )
+        let mut e = sx * cb + sy * sb;
+        let mut n = -sx * sb + sy * cb;
+        let r = self.radius();
+        let mut rho = (e * e + n * n).sqrt();
+        if rho < 1e-9 {
+            return (self.lat, self.lon);
+        }
+        let limb = r * (1.0 - 1e-9);
+        if rho > limb {
+            let k = limb / rho;
+            e *= k;
+            n *= k;
+            rho = limb;
+        }
+        let c = (rho / r).asin();
+        let (sc, cc) = c.sin_cos();
+        let (sl0, cl0) = self.lat.to_radians().sin_cos();
+        let lat = (cc * sl0 + n * sc * cl0 / rho).clamp(-1.0, 1.0).asin();
+        let lon = self.lon + (e * sc).atan2(rho * cc * cl0 - n * sc * sl0).to_degrees();
+        (lat.to_degrees(), (lon + 180.0).rem_euclid(360.0) - 180.0)
+    }
+
+    /// Whether a screen point lies on the globe.
+    pub fn on_globe(&self, px: f64, py: f64, w: usize, h: usize) -> bool {
+        let sx = px - w as f64 * 0.5;
+        let sy = py - h as f64 * 0.5;
+        let r = self.radius();
+        sx * sx + sy * sy <= r * r
+    }
+
+    /// Whether any of the screen lies off the globe.
+    pub fn limb_visible(&self, w: usize, h: usize) -> bool {
+        let r = self.radius();
+        (w * w + h * h) as f64 * 0.25 > r * r
     }
 }
 
@@ -196,7 +247,7 @@ impl MapCore {
     // ==================== INPUT ====================
 
     pub fn clamp_camera(&mut self) {
-        self.cam.lat = self.cam.lat.clamp(-85.0, 85.0);
+        self.cam.lat = self.cam.lat.clamp(-89.9, 89.9);
         if self.cam.lon > 180.0 {
             self.cam.lon -= 360.0;
         } else if self.cam.lon < -180.0 {
@@ -204,22 +255,21 @@ impl MapCore {
         }
     }
 
-    /// Pan by a screen-pixel delta (bearing-aware).
+    /// Pan by a screen-pixel delta: the globe turns under the camera so the ground that was that far from the centre comes to it.
     pub fn pan(&mut self, dx: f64, dy: f64, w: usize, h: usize) {
-        let (sb, cb) = self.cam.bearing.sin_cos();
-        let de = -dx * cb + dy * sb;
-        let dn = dx * sb + dy * cb;
-        self.cam.lat += dn / self.cam.ppd;
-        self.cam.lon += de / (self.cam.ppd * self.cam.coslat());
+        let (lat, lon) = self.cam.screen_to_geo(w as f64 * 0.5 - dx, h as f64 * 0.5 - dy, w, h);
+        self.cam.lat = lat;
+        self.cam.lon = lon;
         self.clamp_camera();
         self.camera_moved(w, h);
     }
 
-    /// Exact geo-anchored zoom: the geography under (ax, ay) stays there.
-    /// The least pixels per degree a screen may show: the longer side never spans more than 170° of the planar projection, which has no meaning past a hemisphere (a globe view is the honest answer there and is not built yet).
+    /// The least pixels per degree a screen may show: the whole globe as a disk filling 94% of the shorter side.
     pub fn ppd_floor(w: usize, h: usize) -> f64 {
-        (w.max(h) as f64 / 170.0).max(6.0)
+        (0.47 * w.min(h) as f64 * core::f64::consts::PI / 180.0).max(1.0)
     }
+
+    /// Exact geo-anchored zoom: the geography under (ax, ay) stays there.
 
     pub fn zoom_about(&mut self, factor: f64, ax: f64, ay: f64, w: usize, h: usize) {
         let (alat, alon) = self.cam.screen_to_geo(ax, ay, w, h);
@@ -227,16 +277,19 @@ impl MapCore {
         self.place_anchor(alat, alon, ax, ay, w, h);
     }
 
-    /// Re-solve the camera so (alat, alon) sits at screen (ax, ay).
+    /// Re-solve the camera so (alat, alon) sits at screen (ax, ay): the globe is turned by the anchor's screen error, a few times over, since on a sphere the turn that fixes the error is not quite the error itself.
     pub fn place_anchor(&mut self, alat: f64, alon: f64, ax: f64, ay: f64, w: usize, h: usize) {
-        let sx = ax - w as f64 * 0.5;
-        let sy = h as f64 * 0.5 - ay;
-        let (sb, cb) = self.cam.bearing.sin_cos();
-        let e = sx * cb + sy * sb;
-        let n = -sx * sb + sy * cb;
-        self.cam.lat = alat - n / self.cam.ppd;
-        self.cam.lon = alon - e / (self.cam.ppd * alat.to_radians().cos());
-        self.clamp_camera();
+        for _ in 0..4 {
+            let (px, py) = self.cam.geo_to_screen(alat, alon, w, h);
+            let (ex, ey) = (ax - px, ay - py);
+            if ex.abs() < 1e-3 && ey.abs() < 1e-3 {
+                break;
+            }
+            let (lat, lon) = self.cam.screen_to_geo(w as f64 * 0.5 - ex, h as f64 * 0.5 - ey, w, h);
+            self.cam.lat = lat;
+            self.cam.lon = lon;
+            self.clamp_camera();
+        }
         self.camera_moved(w, h);
     }
 
@@ -1154,5 +1207,37 @@ impl MapCore {
 
     pub fn has_measure(&self) -> bool {
         self.measure.is_some()
+    }
+}
+
+#[cfg(test)]
+mod globe_tests {
+    use super::Camera;
+
+    /// The projection inverts itself across the visible hemisphere, and the far side lands off the disk.
+    #[test]
+    fn the_globe_projection_round_trips() {
+        let cam = Camera { lat: 47.0, lon: -121.0, ppd: 20.0, bearing: 0.7 };
+        let (w, h) = (1200, 800);
+        for &(lat, lon) in &[(47.0, -121.0), (21.3, -157.8), (64.0, -150.0), (10.0, -80.0), (47.1, -120.9), (-20.0, -170.0)] {
+            let (px, py) = cam.geo_to_screen(lat, lon, w, h);
+            assert!(cam.on_globe(px, py, w, h), "{lat},{lon} on the near side");
+            let (la, lo) = cam.screen_to_geo(px, py, w, h);
+            assert!((la - lat).abs() < 1e-6 && (lo - lon).abs() < 1e-6, "{lat},{lon} came back as {la},{lo}");
+        }
+        let (px, py) = cam.geo_to_screen(-47.0, 59.0, w, h);
+        assert!(!cam.on_globe(px, py, w, h), "the antipode is off the disk");
+        assert!((cam.radius() - 20.0 * 180.0 / core::f64::consts::PI).abs() < 1e-9);
+    }
+
+    /// A screen corner off the globe still names ground, at the limb.
+    #[test]
+    fn a_corner_off_the_globe_names_the_limb() {
+        let cam = Camera { lat: 0.0, lon: 0.0, ppd: 6.0, bearing: 0.0 };
+        let (lat, lon) = cam.screen_to_geo(0.0, 0.0, 1024, 768);
+        assert!(lat.is_finite() && lon.is_finite());
+        let (px, py) = cam.geo_to_screen(lat, lon, 1024, 768);
+        let (dx, dy) = (px - 512.0, py - 384.0);
+        assert!(((dx * dx + dy * dy).sqrt() - cam.radius()).abs() < 1e-3, "at the limb");
     }
 }

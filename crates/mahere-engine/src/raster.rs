@@ -333,7 +333,7 @@ pub(crate) struct CornerPt {
 }
 
 pub(crate) fn corner(cam: &Camera, px: f64, py: f64, w: usize, h: usize) -> CornerPt {
-    // Zoomed far out the screen reaches past a pole; hold it at the pole rather than wrap onto the far side.
+    // A corner off the globe names the limb; the ground at the very pole is held a hair short of it for the encoder.
     let (lat, lon) = cam.screen_to_geo(px, py, w, h);
     let lat = lat.clamp(-89.999, 89.999);
     let c = Coord::from_lat_lon(lat, lon);
@@ -398,6 +398,21 @@ pub fn render_frame(
         }
         range
     }).reduce(|| ElevRange::EMPTY, ElevRange::merge);
+    // Off the globe: the background. Only when the limb is on the screen.
+    if cam.limb_visible(w, h) {
+        let bg = pack(luts, lin(luts.style.bg));
+        let r2 = cam.radius() * cam.radius();
+        let (cx, cy) = (w as f64 * 0.5, h as f64 * 0.5);
+        canvas.par_chunks_mut(w).enumerate().for_each(|(y, row)| {
+            let dy = y as f64 + 0.5 - cy;
+            for (x, px) in row.iter_mut().enumerate() {
+                let dx = x as f64 + 0.5 - cx;
+                if dx * dx + dy * dy > r2 {
+                    *px = bg;
+                }
+            }
+        });
+    }
 
     (FrameStats { blocks: bw * bh, straddle_blocks: straddle_count.into_inner(), elev }, want)
 }

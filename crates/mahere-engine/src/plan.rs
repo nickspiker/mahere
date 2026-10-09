@@ -81,6 +81,8 @@ pub struct FramePlan {
     pub magnified: bool,
     /// The largest magnitude per line class among the cells in view: every line is drawn on a linear scale up to its class's, so a view of creeks still has a brightest creek and a view of lanes a boldest lane.
     pub line_mag_hi: [u8; 32],
+    /// The globe's disk on the screen: centre x, y and radius in screen pixels, and whether the limb is on the screen at all (else the shader skips the test).
+    pub globe: [f32; 4],
 }
 
 /// The hash every lookup agrees on, CPU and shader.
@@ -295,7 +297,8 @@ pub fn plan_frame(w: usize, h: usize, cam: &Camera, pool: &Pool, dem_depth: u8, 
             *hi = (*hi).max(m);
         }
     }
-    FramePlan { blocks, refs, table, want: desired.into_iter().collect(), elev, straddle_blocks, dem_depth, vec_depth, magnified, line_mag_hi }
+    let globe = [w as f32 * 0.5, h as f32 * 0.5, cam.radius() as f32, cam.limb_visible(w, h) as u32 as f32];
+    FramePlan { blocks, refs, table, want: desired.into_iter().collect(), elev, straddle_blocks, dem_depth, vec_depth, magnified, line_mag_hi, globe }
 }
 
 #[cfg(test)]

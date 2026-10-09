@@ -59,6 +59,8 @@ struct Uniforms {
     tone: vec4<f32>,
     // Stored imagery byte to scene light (the cells' tone unrolled), 256 entries.
     img_table: array<vec4<f32>, 64>,
+    // The globe's disk in render-target pixels: centre x, y, radius squared, and 1 when the limb is on the screen.
+    globe: vec4<f32>,
 };
 
 // a: diamond, depth, cu, cv. b: dem slot, line slot, land+water slot, img slot. c: flags. d: base, step, eu, nu. e: ev, nv, inv det.
@@ -572,8 +574,17 @@ fn sample_uv(in: VOut) -> vec3<u32> {
     return vec3<u32>(b.a.w, u32(i32(b.b.x) + i32(round(ou))), u32(i32(b.b.y) + i32(round(ov))));
 }
 
+// Off the globe, when its limb is on the screen.
+fn off_globe(pos: vec2<f32>) -> bool {
+    let d = pos - U.globe.xy;
+    return U.globe.w > 0.5 && dot(d, d) > U.globe.z;
+}
+
 @fragment
 fn fs_map(in: VOut) -> @location(0) vec4<f32> {
+    if (off_globe(in.pos.xy)) {
+        return vec4<f32>(to_display(U.style_bg.rgb) / 255.0, 1.0);
+    }
     let s = sample_uv(in);
     let p = compose(s.x, s.y, s.z);
     return vec4<f32>(to_display(shade(p.base, p.ground, p.n, p.k1, p.c1, p.water, p.k2, p.c2)) / 255.0, 1.0);
@@ -590,7 +601,17 @@ struct GOut {
 @fragment
 fn fs_map_g(in: VOut) -> GOut {
     let s = sample_uv(in);
-    let p = compose(s.x, s.y, s.z);
+    var p = compose(s.x, s.y, s.z);
+    if (off_globe(in.pos.xy)) {
+        p.base = U.style_bg.rgb;
+        p.ground = false;
+        p.n = vec3<f32>(0.0, 0.0, 1.0);
+        p.k1 = 1.0;
+        p.c1 = vec3<f32>(0.0);
+        p.water = 0.0;
+        p.k2 = 1.0;
+        p.c2 = vec3<f32>(0.0);
+    }
     var g: GOut;
     // Linear light kept at gamma 2 so 8 bits hold the shadows; the base with 2.8 times headroom, the most unrolled imagery carries.
     g.base = vec4<f32>(sqrt(p.base / 2.8), select(0.0, 1.0, p.ground));

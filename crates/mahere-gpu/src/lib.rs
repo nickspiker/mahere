@@ -86,6 +86,8 @@ struct Uniforms {
     display: [[f32; 4]; 3],
     tone: [f32; 4],
     img_table: [[f32; 4]; 64],
+    // The globe's disk in render-target pixels: centre x, y, radius squared, and 1 when the limb is on the screen.
+    globe: [f32; 4],
 }
 
 /// The layer mask as the shader's bits.
@@ -696,7 +698,9 @@ impl GpuMap {
                 light[k / 4][k % 4] = luts.light.k[c][i];
             }
         }
+        let sc = self.scale.max(1) as f32;
         let u = Uniforms {
+            globe: [plan.globe[0] * sc, plan.globe[1] * sc, plan.globe[2] * plan.globe[2] * sc * sc, plan.globe[3]],
             size: [(w * self.scale.max(1)) as f32, (h * self.scale.max(1)) as f32],
             scale: self.scale.max(1) as f32,
             mask: mask_bits(luts.mask),
