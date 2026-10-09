@@ -16,6 +16,8 @@ pub const BLOCK: usize = 32;
 pub const VEC_BASE_DEPTH: u8 = 14;
 pub const DEM_BASE_DEPTH: u8 = 14;
 pub const MIN_DEPTH: u8 = 0;
+/// The composite's own water, in units of paper white: what a coast texel's pixel holds per unit of water coverage, taken out before the theme's water goes in. Sentinel-2's sea reflectance is about 0.01, a thirtieth of paper white 0.3.
+pub const IMG_WATER: f32 = 0.03;
 
 /// texel/pixel ratio constant: diamond edge 7054 km, 111320 m/deg, 256 texels/cell. ratio r(d) = ppd * K / 2^d; pick d so r ∈ (0.5, 1].
 const K: f64 = 7_054_000.0 / (111_320.0 * 256.0);
@@ -65,11 +67,11 @@ impl Default for LayerMask {
 }
 
 impl LayerMask {
-    /// Which rows a dominating layer makes inert: imagery replaces everything but lines, land cover and a terrain that is off make the elevation tint moot. The panel greys these; the renderer treats them as off through [`LayerMask::effective`].
-    /// Imagery stands in for the ground where it exists, so land cover, water fills, contours and slope bands are inert under it; the terrain stays live as what shows where the imagery runs out, and the sea comes from it everywhere.
+    /// Which rows a dominating layer makes inert: imagery replaces everything but lines and the water fill, land cover and a terrain that is off make the elevation tint moot. The panel greys these; the renderer treats them as off through [`LayerMask::effective`].
+    /// Imagery stands in for the ground where it exists, so land cover, contours and slope bands are inert under it; the water fill still paints over it, the terrain stays live as what shows where the imagery runs out, and the sea comes from it everywhere.
     pub fn inert(self) -> LayerMask {
         let im = self.imagery;
-        LayerMask { dem: false, land: im, water: im, line: false, debug: false, imagery: false, contours: im, slope: im, infrared: !im, hypso: self.land || !self.dem, boundaries: !self.line }
+        LayerMask { dem: false, land: im, water: false, line: false, debug: false, imagery: false, contours: im, slope: im, infrared: !im, hypso: self.land || !self.dem, boundaries: !self.line }
     }
 
     /// The mask as bits, one per field in declaration order, for a shader or a settings document.
@@ -607,6 +609,20 @@ fn compose_rgb(dem: &DemRef, vec: &VecRef, pool: &Pool, diamond: u8, uq: i64, vq
     if let VecRef::Cell { line, land, water, shift, .. } = vec {
         let i = tri_index(uq, vq, *shift);
         if mask.imagery && imaged {
+            // The water fill paints over imagery as it does over the ground: the sea is the theme's water wherever the terrain says so, and a lake or a coast texel WorldCover says is water, wholly or in part, matches it instead of showing the composite's own dark water (Nick 2026-10-09: the water/land border).
+            // A coast texel's pixel is itself that much dark water mixed into the land, so the water is unmixed first: the composite's water (about 0.03 of paper white) taken out at the coverage, the theme's water put in at the coverage. The land part keeps its brightness and a lake brighter than dark water (a reef lagoon) shows through.
+            if mask.water {
+                if let Some(water) = water {
+                    let wc = water.cov[i];
+                    if wc != 0 {
+                        let t = wc as f32 / 255.0;
+                        let w = lin(st.water);
+                        for c in 0..3 {
+                            rgb[c] = (rgb[c] - t * IMG_WATER).max(0.0) + t * w[c];
+                        }
+                    }
+                }
+            }
             if mask.line {
                 if let Some(line) = line {
                     let cov = line.cov[i];

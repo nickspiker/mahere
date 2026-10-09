@@ -17,6 +17,12 @@ fn main() {
                 }
             }
             println!("line {} land {} water {}", p.line.is_some(), p.land.is_some(), p.water.is_some());
+            // The water plane's coverage spread: full, part and none, which says whether a coast is antialiased or hard.
+            if let Some(w) = &p.water {
+                let full = w.cov.iter().filter(|&&c| c == 255).count();
+                let part = w.cov.iter().filter(|&&c| c != 0 && c != 255).count();
+                println!("water texels: {full} full, {part} part, {} none", w.cov.len() - full - part);
+            }
         }
     }
 }

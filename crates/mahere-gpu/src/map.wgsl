@@ -5,6 +5,7 @@ const NONE: u32 = 0xFFFFFFFFu;
 const ABSENT: u32 = 0xFFFFFFFEu;
 // The coarsest depth a cell exists at (the global bake's root), the same as the planner's. A walk below it must stop: a fragment loop that never ends hangs the GPU and the driver resets it for every process on the device (2026-10-09, the phone's SystemUI went down with mahere).
 const MIN_DEPTH: u32 = 0u;
+const IMG_WATER: f32 = 0.03;
 const TABLE_N: u32 = 16384u;
 const ELEV_NODATA: u32 = 0xFFFFu;
 
@@ -472,6 +473,11 @@ fn compose(d: u32, u: u32, v: u32) -> Composed {
                 out.base = vec3<f32>(img_light(im.w));
             } else {
                 out.base = vec3<f32>(img_light(im.x), img_light(im.y), img_light(im.z));
+            }
+            // The water fill paints over imagery as it does over the ground, so a lake or a coast texel that is water in part matches the sea instead of showing the composite's own dark water: the composite's water taken out at the coverage, the theme's put in (the CPU's IMG_WATER).
+            if ((mask & M_WATER) != 0u && lw.z != 0u) {
+                let t = f32(lw.z) / 255.0;
+                out.base = max(out.base - vec3<f32>(t * IMG_WATER), vec3<f32>(0.0)) + t * U.style_water.rgb;
             }
             if (draw_line) {
                 { let f = fold(Fold(out.k2, out.c2), line_colour(line.x, line.z), line_alpha(line.x, line.y, line.z)); out.k2 = f.k; out.c2 = f.c; }
