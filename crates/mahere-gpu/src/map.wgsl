@@ -513,15 +513,22 @@ fn compose(d: u32, u: u32, v: u32) -> Composed {
             { let f = fold(Fold(out.k2, out.c2), ink.rgb, contour_cov * ink.a); out.k2 = f.k; out.c2 = f.c; }
         }
     }
-    // Where the wanted terrain cell has not arrived (a coarser one or nothing stands in), the edges of the wanted lattice show faintly, so a loading view keeps its bearings (Nick 2026-10-09).
-    if (want_dem && found_depth != U.depths.x && lookup(d, U.depths.x, u, v) != ABSENT) {
+    // Where the wanted terrain cell has not arrived at all (no reference and no absent marker), the texel is a random dark colour of its own, the CPU's loading_noise: a loading view shows the wanted triangles as a dark mesh.
+    if (want_dem && found_depth != U.depths.x && lookup(d, U.depths.x, u, v) == NONE) {
         let s = 30u - U.depths.x - 8u;
-        let tx = (u >> s) & 255u;
-        let ty = (v >> s) & 255u;
-        // The cell's two edges and the diagonal between its two triangles (Nick: the triangles too).
-        if (tx == 0u || ty == 0u || tx + ty == 255u) {
-            { let f = fold(Fold(out.k2, out.c2), U.style_contour.rgb, 0.45); out.k2 = f.k; out.c2 = f.c; }
-        }
+        let m = (1u << s) - 1u;
+        let half = (((u & m) + (v & m)) >> s) & 1u;
+        var h = (d * 0x27D4EB2Fu) ^ (U.depths.x * 0xC2B2AE3Du) ^ ((u >> s) * 0x9E3779B1u) ^ ((v >> s) * 0x85EBCA77u) ^ (half * 0x165667B1u);
+        h = h ^ (h >> 15u);
+        h = h * 0x2C1B3C6Du;
+        h = h ^ (h >> 12u);
+        out.base = dec(vec3<f32>(f32((h & 255u) >> 2u), f32(((h >> 8u) & 255u) >> 2u), f32(((h >> 16u) & 255u) >> 2u)));
+        out.ground = false;
+        out.k1 = 1.0;
+        out.c1 = vec3<f32>(0.0);
+        out.water = 0.0;
+        out.k2 = 1.0;
+        out.c2 = vec3<f32>(0.0);
     }
     if ((mask & M_DEBUG) != 0u) {
         var tintd = vec3<f32>(-1.0);

@@ -16,6 +16,15 @@ pub const BLOCK: usize = 32;
 pub const VEC_BASE_DEPTH: u8 = 14;
 pub const DEM_BASE_DEPTH: u8 = 14;
 pub const MIN_DEPTH: u8 = 0;
+/// The colour of a triangle no cell has arrived for: a hash of the triangle's place (diamond, depth, texel across the diamond, which half), each channel a gamma-2 byte in 0..64 (a byte shifted down two), so the loading mesh is dark and every triangle its own colour. The GPU shader computes the same.
+pub fn loading_noise(d: u32, depth: u32, cu: u32, cv: u32, half: u32) -> [u8; 3] {
+    let mut h = d.wrapping_mul(0x27D4EB2F) ^ depth.wrapping_mul(0xC2B2AE3D) ^ cu.wrapping_mul(0x9E3779B1) ^ cv.wrapping_mul(0x85EBCA77) ^ half.wrapping_mul(0x165667B1);
+    h ^= h >> 15;
+    h = h.wrapping_mul(0x2C1B3C6D);
+    h ^= h >> 12;
+    [((h & 255) >> 2) as u8, (((h >> 8) & 255) >> 2) as u8, (((h >> 16) & 255) >> 2) as u8]
+}
+
 /// The composite's own water, in units of paper white: what a coast texel's pixel holds per unit of water coverage, taken out before the theme's water goes in. Sentinel-2's sea reflectance is about 0.01, a thirtieth of paper white 0.3.
 pub const IMG_WATER: f32 = 0.03;
 
@@ -687,17 +696,14 @@ fn compose_rgb(dem: &DemRef, vec: &VecRef, pool: &Pool, diamond: u8, uq: i64, vq
             rgb = lerp3(rgb, lin(if contour.1 { st.contour_index } else { st.contour }), contour.0 * st.contour_alpha[contour.1 as usize]);
         }
     }
-    // Where the wanted terrain cell has not arrived, the edges of the wanted lattice show faintly, so a loading view keeps its bearings.
-    let wanted_absent = || {
+    // Where the wanted terrain cell has not arrived at all (no entry yet, loaded or confirmed absent), the texel is a random dark colour of its own: a loading view shows the wanted triangles as a dark mesh and nothing is drawn as lines (Nick 2026-10-09).
+    if (mask.dem || mask.contours || mask.slope) && dem_ref_depth(dem) != Some(luts.dem_depth) {
         let key = CellKey { depth: luts.dem_depth, prefix: raw_of(diamond, uq, vq) >> (60 - 2 * luts.dem_depth as u32) };
-        pool.map.get(&key).is_some_and(|e| e.is_absent())
-    };
-    if (mask.dem || mask.contours || mask.slope) && dem_ref_depth(dem) != Some(luts.dem_depth) && !wanted_absent() {
-        let shift = 16 + 22 - luts.dem_depth as u32;
-        let (tx, ty) = ((uq >> shift) & 255, (vq >> shift) & 255);
-        // The cell's two edges and the diagonal between its two triangles.
-        if tx == 0 || ty == 0 || tx + ty == 255 {
-            rgb = lerp3(rgb, lin(luts.style.contour), 0.45);
+        if !pool.map.contains_key(&key) {
+            let shift = 16 + 22 - luts.dem_depth as u32;
+            let m = (1i64 << shift) - 1;
+            let half = (((uq & m) + (vq & m)) >> shift) & 1;
+            rgb = lin(loading_noise(diamond as u32, luts.dem_depth as u32, (uq >> shift) as u32, (vq >> shift) as u32, half as u32));
         }
     }
     pack(luts, rgb)
