@@ -5,7 +5,7 @@
 use crate::raster::{LayerMask, Style};
 
 /// Bumped whenever the built-ins change, so a vault holding an older copy of one is refreshed.
-pub const BUILTIN_REVISION: u32 = 4;
+pub const BUILTIN_REVISION: u32 = 5;
 
 #[derive(Clone, Debug)]
 pub struct Theme {
@@ -413,12 +413,12 @@ pub fn neon() -> Theme {
         name: "Neon".to_string(),
         revision: BUILTIN_REVISION,
         edited: false,
-        hypso: [(0.0, [22, 12, 40]), (600.0, [44, 18, 70]), (1200.0, [90, 28, 110]), (1900.0, [160, 40, 150]), (2600.0, [240, 90, 200])],
-        sea: [6, 30, 50],
-        flat: [36, 20, 56],
-        bg: [6, 4, 14],
-        no_dem: [30, 18, 48],
-        land: [[0, 0, 0], [30, 60, 60], [56, 40, 70], [34, 62, 64], [44, 46, 70], [18, 54, 60], [20, 60, 80], [70, 54, 70], [50, 44, 66], [110, 110, 160], [58, 40, 60], [60, 36, 80], [66, 44, 84], [6, 30, 50]],
+        hypso: [(0.0, [48, 30, 76]), (600.0, [74, 40, 108]), (1200.0, [118, 50, 144]), (1900.0, [180, 64, 170]), (2600.0, [244, 110, 210])],
+        sea: [12, 44, 72],
+        flat: [60, 40, 90],
+        bg: [8, 6, 18],
+        no_dem: [52, 36, 80],
+        land: [[0, 0, 0], [52, 90, 90], [84, 64, 104], [56, 92, 94], [70, 72, 104], [36, 82, 90], [38, 90, 116], [104, 84, 104], [78, 70, 100], [140, 140, 190], [88, 64, 92], [90, 60, 116], [98, 70, 122], [12, 44, 72]],
         line: [[0, 0, 0], [255, 90, 220], [240, 110, 230], [220, 130, 240], [180, 140, 240], [150, 150, 230], [130, 140, 210], [110, 110, 170], [200, 120, 160], [240, 255, 60], [120, 120, 180], [150, 110, 220], [40, 220, 255], [60, 240, 180], [80, 240, 140], [120, 230, 120], [60, 230, 220], [220, 120, 255]],
         water: [20, 160, 220],
         contour: [70, 100, 200],
@@ -453,11 +453,175 @@ pub fn dawn() -> Theme {
     }
 }
 
-pub const BUILTIN_NAMES: [&str; 13] = ["Trail", "Topo", "Night", "Alpine", "Desert", "Ink", "Blueprint", "Atlas", "Ember", "Monsoon", "Chart", "Neon", "Dawn"];
+
+// The seven after Nick's ratings (2026-10-09): three natural landscapes dark enough to read like imagery, a candy one, and three darker paper maps whose road and trail colours come in families.
+
+/// Natural ground as a satellite sees it: dark forest, straw grass, tan farmland, grey-brown rock, snow; lowlands olive darkening through earth to a pale summit. Lines light against the dark ground, highways in amber, trails in hot orange. A high sun and a modest sky, so relief reads as it does from orbit.
+pub fn terra() -> Theme {
+    Theme {
+        name: "Terra".to_string(),
+        revision: BUILTIN_REVISION,
+        edited: false,
+        hypso: [(0.0, [92, 108, 60]), (600.0, [118, 112, 68]), (1200.0, [138, 120, 88]), (1900.0, [152, 142, 126]), (2600.0, [234, 236, 240])],
+        sea: [34, 62, 92],
+        flat: [120, 116, 92],
+        bg: [14, 16, 20],
+        no_dem: [104, 104, 88],
+        land: [[0, 0, 0], [122, 132, 72], [154, 142, 88], [92, 114, 60], [110, 112, 68], [56, 84, 46], [70, 96, 80], [192, 178, 140], [128, 118, 104], [230, 234, 240], [150, 136, 120], [130, 126, 124], [140, 134, 130], [34, 62, 92]],
+        line: [[0, 0, 0], [244, 190, 88], [236, 172, 80], [224, 160, 82], [206, 194, 152], [192, 186, 160], [172, 172, 166], [150, 150, 146], [204, 150, 90], [255, 122, 56], [92, 92, 96], [170, 150, 190], [92, 160, 220], [120, 200, 120], [140, 210, 110], [160, 190, 90], [110, 200, 170], [200, 150, 220]],
+        water: [40, 76, 110],
+        contour: [220, 200, 160],
+        contour_index: [240, 226, 190],
+        contour_alpha: [0.28, 0.50],
+        sun: [1.16, 1.08, 0.96],
+        sky: [0.84, 0.90, 1.04],
+        layers: ALL,
+    }
+}
+
+/// The far north from above: moss and lichen lowlands, grey scree, long snowfields, a steel sea; forest a dark blue-green, wetland rust. Lines in cool whites and sky blue, trails in coral. A low cold sun under a bright sky.
+pub fn tundra() -> Theme {
+    Theme {
+        name: "Tundra".to_string(),
+        revision: BUILTIN_REVISION,
+        edited: false,
+        hypso: [(0.0, [96, 112, 84]), (400.0, [118, 122, 96]), (800.0, [128, 126, 112]), (1300.0, [150, 152, 150]), (1800.0, [226, 232, 238])],
+        sea: [52, 76, 96],
+        flat: [120, 124, 108],
+        bg: [16, 18, 22],
+        no_dem: [110, 114, 104],
+        land: [[0, 0, 0], [120, 134, 90], [140, 138, 100], [96, 118, 84], [112, 118, 92], [52, 78, 66], [128, 94, 64], [172, 166, 142], [134, 134, 130], [228, 234, 240], [150, 146, 136], [128, 130, 132], [140, 140, 142], [52, 76, 96]],
+        line: [[0, 0, 0], [236, 222, 180], [232, 214, 170], [226, 206, 160], [206, 206, 196], [190, 194, 190], [172, 176, 176], [150, 154, 156], [196, 170, 120], [255, 128, 100], [84, 88, 96], [160, 150, 190], [120, 190, 236], [120, 200, 150], [140, 210, 130], [160, 200, 100], [110, 200, 190], [190, 150, 220]],
+        water: [64, 96, 122],
+        contour: [210, 214, 206],
+        contour_index: [236, 238, 232],
+        contour_alpha: [0.26, 0.48],
+        sun: [1.00, 0.98, 0.96],
+        sky: [1.00, 1.06, 1.18],
+        layers: ALL,
+    }
+}
+
+/// Dry country from above: red earth, ochre grass, dark gallery forest along the water, salt-pale sand, basalt rock; lowlands rust rising through ochre to a bleached summit. Lines in cream and chalk, highways in pale gold, trails in bright cyan so they stand off the red. A hot white sun.
+pub fn savanna() -> Theme {
+    Theme {
+        name: "Savanna".to_string(),
+        revision: BUILTIN_REVISION,
+        edited: false,
+        hypso: [(0.0, [134, 84, 54]), (400.0, [150, 108, 62]), (900.0, [164, 130, 76]), (1500.0, [176, 150, 104]), (2200.0, [222, 212, 190])],
+        sea: [40, 72, 96],
+        flat: [146, 104, 66],
+        bg: [18, 12, 10],
+        no_dem: [130, 98, 70],
+        land: [[0, 0, 0], [160, 136, 76], [172, 150, 92], [96, 108, 54], [128, 112, 62], [62, 82, 42], [84, 100, 70], [212, 194, 150], [112, 92, 80], [236, 236, 236], [160, 130, 108], [136, 120, 112], [150, 130, 118], [40, 72, 96]],
+        line: [[0, 0, 0], [250, 214, 110], [244, 206, 110], [236, 198, 112], [230, 220, 190], [216, 208, 186], [196, 190, 176], [172, 166, 156], [220, 180, 120], [60, 230, 240], [70, 60, 56], [180, 150, 190], [100, 180, 230], [150, 210, 110], [170, 220, 100], [190, 200, 80], [120, 210, 170], [210, 150, 220]],
+        water: [52, 90, 118],
+        contour: [240, 214, 170],
+        contour_index: [250, 234, 200],
+        contour_alpha: [0.28, 0.50],
+        sun: [1.20, 1.14, 1.02],
+        sky: [0.86, 0.90, 1.02],
+        layers: ALL,
+    }
+}
+
+/// Candy: lowlands in strawberry milk rising through mint and lemon to lavender and sugar-white summits, a bubblegum sea, forest in spearmint, farmland in banana. Roads in grape, cherry and cotton candy, trails in hot pink, contours in lilac. A bright sweet sun.
+pub fn candy() -> Theme {
+    Theme {
+        name: "Candy".to_string(),
+        revision: BUILTIN_REVISION,
+        edited: false,
+        hypso: [(0.0, [250, 206, 220]), (500.0, [206, 244, 220]), (1000.0, [252, 246, 190]), (1700.0, [222, 206, 250]), (2400.0, [255, 252, 255])],
+        sea: [180, 226, 250],
+        flat: [250, 220, 232],
+        bg: [70, 40, 80],
+        no_dem: [244, 222, 236],
+        land: [[0, 0, 0], [204, 246, 196], [252, 238, 170], [190, 244, 210], [222, 240, 190], [150, 230, 190], [190, 236, 240], [255, 236, 200], [230, 214, 230], [255, 255, 255], [240, 210, 220], [230, 206, 240], [240, 212, 240], [180, 226, 250]],
+        line: [[0, 0, 0], [160, 60, 200], [190, 70, 200], [220, 80, 190], [240, 100, 150], [250, 130, 170], [250, 160, 200], [240, 180, 210], [230, 150, 90], [255, 40, 140], [120, 90, 160], [200, 160, 240], [80, 170, 250], [90, 210, 160], [120, 220, 140], [170, 220, 110], [90, 210, 210], [220, 140, 240]],
+        water: [150, 212, 250],
+        contour: [200, 160, 230],
+        contour_index: [170, 120, 220],
+        contour_alpha: [0.40, 0.66],
+        sun: [1.04, 1.00, 1.00],
+        sky: [1.10, 1.08, 1.16],
+        layers: ALL,
+    }
+}
+
+/// A survey sheet on kraft paper: a darker tan base than Atlas, relief in warm browns, forest in dull olive, water a slate blue. Lines by family: the highways a brick family from dark to light, the local roads a brown family, the trails a red family, rail and power in near-black, the boundaries a green family. Brown contours.
+pub fn survey() -> Theme {
+    Theme {
+        name: "Survey".to_string(),
+        revision: BUILTIN_REVISION,
+        edited: false,
+        hypso: [(0.0, [200, 182, 142]), (600.0, [194, 170, 128]), (1200.0, [184, 156, 114]), (1900.0, [170, 140, 102]), (2600.0, [156, 126, 92])],
+        sea: [142, 164, 170],
+        flat: [202, 186, 148],
+        bg: [40, 32, 24],
+        no_dem: [190, 176, 142],
+        land: [[0, 0, 0], [178, 182, 128], [196, 184, 132], [170, 178, 122], [180, 172, 124], [138, 152, 104], [160, 176, 154], [206, 192, 146], [174, 164, 142], [224, 222, 206], [172, 158, 132], [180, 168, 150], [186, 172, 150], [142, 164, 170]],
+        line: [[0, 0, 0], [104, 24, 22], [126, 34, 28], [148, 48, 36], [96, 60, 36], [112, 76, 48], [124, 92, 62], [138, 110, 82], [110, 70, 40], [168, 30, 44], [36, 30, 26], [60, 52, 48], [60, 100, 130], [58, 104, 62], [74, 118, 66], [92, 112, 54], [66, 112, 96], [84, 92, 60]],
+        water: [120, 148, 160],
+        contour: [120, 86, 50],
+        contour_index: [90, 60, 30],
+        contour_alpha: [0.48, 0.74],
+        sun: [1.02, 0.96, 0.86],
+        sky: [1.04, 1.06, 1.08],
+        layers: ALL,
+    }
+}
+
+/// A woodcut print: grey-cream stock a shade darker than a page, relief in cool greys, forest in a soft grey-green, water a pale slate. Lines in one family of blacks: highways solid black, roads greys lightening as they shrink, trails in sepia red, boundaries in grey-green. Grey contours.
+pub fn woodcut() -> Theme {
+    Theme {
+        name: "Woodcut".to_string(),
+        revision: BUILTIN_REVISION,
+        edited: false,
+        hypso: [(0.0, [204, 198, 184]), (600.0, [196, 190, 176]), (1200.0, [186, 180, 168]), (1900.0, [174, 168, 158]), (2600.0, [160, 156, 150])],
+        sea: [160, 170, 174],
+        flat: [206, 200, 186],
+        bg: [30, 30, 30],
+        no_dem: [196, 192, 182],
+        land: [[0, 0, 0], [190, 192, 170], [200, 194, 176], [182, 188, 168], [188, 186, 170], [156, 166, 148], [176, 186, 178], [206, 200, 180], [180, 178, 170], [226, 226, 222], [180, 176, 166], [184, 182, 176], [190, 188, 182], [160, 170, 174]],
+        line: [[0, 0, 0], [20, 18, 16], [34, 32, 30], [50, 48, 44], [72, 70, 66], [92, 90, 86], [112, 110, 106], [132, 130, 126], [96, 76, 60], [150, 50, 36], [24, 22, 20], [70, 66, 70], [90, 104, 112], [96, 112, 92], [108, 122, 94], [116, 118, 84], [100, 118, 108], [110, 100, 110]],
+        water: [140, 152, 158],
+        contour: [110, 106, 100],
+        contour_index: [70, 66, 62],
+        contour_alpha: [0.42, 0.70],
+        sun: [1.00, 1.00, 1.00],
+        sky: [1.04, 1.04, 1.06],
+        layers: ALL,
+    }
+}
+
+/// A gazetteer on sage paper: a grey-green base darker than a page, relief in muted greens to a dun summit, forest a deeper green, water a dusty blue. Lines by family: the highways an indigo family, the local roads a slate family, the trails a burgundy family, boundaries in olive. Green-grey contours.
+pub fn gazetteer() -> Theme {
+    Theme {
+        name: "Gazetteer".to_string(),
+        revision: BUILTIN_REVISION,
+        edited: false,
+        hypso: [(0.0, [184, 192, 166]), (600.0, [178, 184, 156]), (1200.0, [176, 176, 146]), (1900.0, [172, 166, 138]), (2600.0, [166, 156, 132])],
+        sea: [146, 166, 176],
+        flat: [186, 194, 168],
+        bg: [28, 34, 30],
+        no_dem: [178, 186, 164],
+        land: [[0, 0, 0], [172, 190, 150], [190, 190, 150], [160, 184, 146], [170, 180, 146], [128, 158, 118], [152, 180, 166], [200, 194, 160], [170, 170, 156], [222, 226, 220], [168, 162, 144], [172, 172, 164], [178, 178, 168], [146, 166, 176]],
+        line: [[0, 0, 0], [44, 40, 110], [58, 54, 128], [76, 72, 146], [78, 86, 104], [94, 102, 118], [110, 118, 132], [128, 134, 146], [104, 86, 64], [138, 32, 64], [40, 42, 48], [84, 78, 96], [70, 112, 140], [96, 112, 60], [110, 124, 66], [122, 128, 56], [92, 120, 92], [112, 104, 70]],
+        water: [122, 150, 164],
+        contour: [104, 112, 88],
+        contour_index: [70, 78, 56],
+        contour_alpha: [0.46, 0.72],
+        sun: [1.00, 0.98, 0.92],
+        sky: [1.04, 1.06, 1.10],
+        layers: ALL,
+    }
+}
+
+pub const BUILTIN_NAMES: [&str; 20] = ["Trail", "Topo", "Night", "Alpine", "Desert", "Ink", "Blueprint", "Atlas", "Ember", "Monsoon", "Chart", "Neon", "Dawn", "Terra", "Tundra", "Savanna", "Candy", "Survey", "Woodcut", "Gazetteer"];
 
 /// The built-in themes, as authored: VSF RGB, gamma 2. The renderers convert to the display at their one encode.
 pub fn builtin() -> Vec<Theme> {
-    vec![trail(), topo(), night(), alpine(), desert(), ink(), blueprint(), atlas(), ember(), monsoon(), chart(), neon(), dawn()]
+    vec![trail(), topo(), night(), alpine(), desert(), ink(), blueprint(), atlas(), ember(), monsoon(), chart(), neon(), dawn(), terra(), tundra(), savanna(), candy(), survey(), woodcut(), gazetteer()]
 }
 
 impl Theme {
