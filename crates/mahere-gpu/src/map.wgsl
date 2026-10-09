@@ -6,6 +6,7 @@ const ABSENT: u32 = 0xFFFFFFFEu;
 // The coarsest depth a cell exists at (the global bake's root), the same as the planner's. A walk below it must stop: a fragment loop that never ends hangs the GPU and the driver resets it for every process on the device (2026-10-09, the phone's SystemUI went down with mahere).
 const MIN_DEPTH: u32 = 0u;
 const IMG_WATER: f32 = 0.03;
+const LOADING_TINT: f32 = 0.35;
 const TABLE_N: u32 = 16384u;
 const ELEV_NODATA: u32 = 0xFFFFu;
 
@@ -515,22 +516,27 @@ fn compose(d: u32, u: u32, v: u32) -> Composed {
             { let f = fold(Fold(out.k2, out.c2), ink.rgb, contour_cov * ink.a); out.k2 = f.k; out.c2 = f.c; }
         }
     }
-    // Where the wanted terrain cell has not arrived at all (no reference and no absent marker), the texel is a random dark colour of its own, the CPU's loading_noise: a loading view shows the wanted triangles as a dark mesh.
+    // Where the wanted terrain cell has not arrived at all (no reference and no absent marker), the cell's two triangles each take a random dark colour of their own, the CPU's loading_noise: outright where nothing at any depth stands in, a tint over a coarser stand-in.
     if (want_dem && found_depth != U.depths.x && lookup(d, U.depths.x, u, v) == NONE) {
-        let s = 30u - U.depths.x - 8u;
+        let s = 30u - U.depths.x;
         let m = (1u << s) - 1u;
         let half = (((u & m) + (v & m)) >> s) & 1u;
         var h = (d * 0x27D4EB2Fu) ^ (U.depths.x * 0xC2B2AE3Du) ^ ((u >> s) * 0x9E3779B1u) ^ ((v >> s) * 0x85EBCA77u) ^ (half * 0x165667B1u);
         h = h ^ (h >> 15u);
         h = h * 0x2C1B3C6Du;
         h = h ^ (h >> 12u);
-        out.base = dec(vec3<f32>(f32((h & 255u) >> 2u), f32(((h >> 8u) & 255u) >> 2u), f32(((h >> 16u) & 255u) >> 2u)));
-        out.ground = false;
-        out.k1 = 1.0;
-        out.c1 = vec3<f32>(0.0);
-        out.water = 0.0;
-        out.k2 = 1.0;
-        out.c2 = vec3<f32>(0.0);
+        let noise = dec(vec3<f32>(f32((h & 255u) >> 2u), f32(((h >> 8u) & 255u) >> 2u), f32(((h >> 16u) & 255u) >> 2u)));
+        if (found_depth == NONE) {
+            out.base = noise;
+            out.ground = false;
+            out.k1 = 1.0;
+            out.c1 = vec3<f32>(0.0);
+            out.water = 0.0;
+            out.k2 = 1.0;
+            out.c2 = vec3<f32>(0.0);
+        } else {
+            { let f = fold(Fold(out.k2, out.c2), noise, LOADING_TINT); out.k2 = f.k; out.c2 = f.c; }
+        }
     }
     if ((mask & M_DEBUG) != 0u) {
         var tintd = vec3<f32>(-1.0);

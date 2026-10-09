@@ -257,11 +257,23 @@ impl MapCore {
 
     /// Pan by a screen-pixel delta: the globe turns under the camera so the ground that was that far from the centre comes to it.
     pub fn pan(&mut self, dx: f64, dy: f64, w: usize, h: usize) {
-        let (lat, lon) = self.cam.screen_to_geo(w as f64 * 0.5 - dx, h as f64 * 0.5 - dy, w, h);
+        self.centre_on_screen(w as f64 * 0.5 - dx, h as f64 * 0.5 - dy, w, h);
+        self.camera_moved(w, h);
+    }
+
+    /// Bring the ground at screen (sx, sy) to the centre, keeping the view's orientation there: the ground a little above that point ends straight above the centre, so the bearing follows the great circle and a pan near or across a pole does not spin the map (Nick 2026-10-09).
+    fn centre_on_screen(&mut self, sx: f64, sy: f64, w: usize, h: usize) {
+        let up = (self.cam.radius() * 0.25).min(64.0).max(1.0);
+        let (lat, lon) = self.cam.screen_to_geo(sx, sy, w, h);
+        let (ulat, ulon) = self.cam.screen_to_geo(sx, sy - up, w, h);
         self.cam.lat = lat;
         self.cam.lon = lon;
         self.clamp_camera();
-        self.camera_moved(w, h);
+        let (px, py) = self.cam.geo_to_screen(ulat, ulon, w, h);
+        let (dx, dy) = (px - w as f64 * 0.5, h as f64 * 0.5 - py);
+        if dx * dx + dy * dy > 1e-12 {
+            self.cam.bearing = (self.cam.bearing + dx.atan2(dy)).rem_euclid(core::f64::consts::TAU);
+        }
     }
 
     /// The least pixels per degree a screen may show: the whole globe as a disk filling 94% of the shorter side.
@@ -285,10 +297,7 @@ impl MapCore {
             if ex.abs() < 1e-3 && ey.abs() < 1e-3 {
                 break;
             }
-            let (lat, lon) = self.cam.screen_to_geo(w as f64 * 0.5 - ex, h as f64 * 0.5 - ey, w, h);
-            self.cam.lat = lat;
-            self.cam.lon = lon;
-            self.clamp_camera();
+            self.centre_on_screen(w as f64 * 0.5 - ex, h as f64 * 0.5 - ey, w, h);
         }
         self.camera_moved(w, h);
     }
@@ -1228,6 +1237,29 @@ mod globe_tests {
         let (px, py) = cam.geo_to_screen(-47.0, 59.0, w, h);
         assert!(!cam.on_globe(px, py, w, h), "the antipode is off the disk");
         assert!((cam.radius() - 20.0 * 180.0 / core::f64::consts::PI).abs() < 1e-9);
+    }
+
+    /// A pan is a rigid slide of the map on the screen, even near a pole: the ground above the drag target ends the same distance above the centre, the bearing having followed the great circle.
+    #[test]
+    fn a_pan_near_the_pole_does_not_spin() {
+        use super::MapCore;
+        let (w, h) = (1000, 800);
+        struct Nothing;
+        impl crate::residency::CellStore for Nothing {
+            fn get(&self, _key: mahere_tiles::CellKey) -> crate::residency::Fetch {
+                crate::residency::Fetch::Absent
+            }
+        }
+        let mut map = MapCore::new(std::sync::Arc::new(Nothing), Camera { lat: 84.0, lon: 30.0, ppd: 20.0, bearing: 0.4 });
+        for _ in 0..6 {
+            let (dx, dy) = (120.0, -260.0);
+            let target = (w as f64 * 0.5 - dx, h as f64 * 0.5 - dy);
+            let above = map.cam.screen_to_geo(target.0, target.1 - 100.0, w, h);
+            map.pan(dx, dy, w, h);
+            let (px, py) = map.cam.geo_to_screen(above.0, above.1, w, h);
+            // A sphere's pan is not quite a rigid slide: a screen-vertical line through the target is a great circle only through the centre, so a point 100 px up lands within a couple of pixels, never spun away.
+            assert!((px - w as f64 * 0.5).abs() < 3.0 && (py - (h as f64 * 0.5 - 100.0)).abs() < 3.0, "the ground above the target drifted to {px},{py}");
+        }
     }
 
     /// A screen corner off the globe still names ground, at the limb.

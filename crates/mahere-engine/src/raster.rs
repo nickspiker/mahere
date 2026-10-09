@@ -16,7 +16,10 @@ pub const BLOCK: usize = 32;
 pub const VEC_BASE_DEPTH: u8 = 14;
 pub const DEM_BASE_DEPTH: u8 = 14;
 pub const MIN_DEPTH: u8 = 0;
-/// The colour of a triangle no cell has arrived for: a hash of the triangle's place (diamond, depth, texel across the diamond, which half), each channel a gamma-2 byte in 0..64 (a byte shifted down two), so the loading mesh is dark and every triangle its own colour. The GPU shader computes the same.
+/// How strongly the loading mesh tints a coarser stand-in.
+pub const LOADING_TINT: f32 = 0.35;
+
+/// The colour of a cell triangle no cell has arrived for: a hash of its place (diamond, depth, cell across the diamond, which half), each channel a gamma-2 byte in 0..64 (a byte shifted down two), so the loading mesh is dark and every triangle its own colour. The GPU shader computes the same.
 pub fn loading_noise(d: u32, depth: u32, cu: u32, cv: u32, half: u32) -> [u8; 3] {
     let mut h = d.wrapping_mul(0x27D4EB2F) ^ depth.wrapping_mul(0xC2B2AE3D) ^ cu.wrapping_mul(0x9E3779B1) ^ cv.wrapping_mul(0x85EBCA77) ^ half.wrapping_mul(0x165667B1);
     h ^= h >> 15;
@@ -711,14 +714,15 @@ fn compose_rgb(dem: &DemRef, vec: &VecRef, pool: &Pool, diamond: u8, uq: i64, vq
             rgb = lerp3(rgb, lin(if contour.1 { st.contour_index } else { st.contour }), contour.0 * st.contour_alpha[contour.1 as usize]);
         }
     }
-    // Where the wanted terrain cell has not arrived at all (no entry yet, loaded or confirmed absent), the texel is a random dark colour of its own: a loading view shows the wanted triangles as a dark mesh and nothing is drawn as lines (Nick 2026-10-09).
+    // Where the wanted terrain cell has not arrived at all (no entry yet, loaded or confirmed absent), the cell's two triangles each take a random dark colour of their own: where nothing at any depth stands in it is the colour outright, over a coarser stand-in it is a tint, so a loading view shows the wanted cells as a dark mesh and never loses the coarse ground beneath (Nick 2026-10-09: per cell triangle, not per texel, and never only the noise).
     if (mask.dem || mask.contours || mask.slope) && dem_ref_depth(dem) != Some(luts.dem_depth) {
         let key = CellKey { depth: luts.dem_depth, prefix: raw_of(diamond, uq, vq) >> (60 - 2 * luts.dem_depth as u32) };
         if !pool.map.contains_key(&key) {
-            let shift = 16 + 22 - luts.dem_depth as u32;
+            let shift = 16 + 30 - luts.dem_depth as u32;
             let m = (1i64 << shift) - 1;
             let half = (((uq & m) + (vq & m)) >> shift) & 1;
-            rgb = lin(loading_noise(diamond as u32, luts.dem_depth as u32, (uq >> shift) as u32, (vq >> shift) as u32, half as u32));
+            let noise = lin(loading_noise(diamond as u32, luts.dem_depth as u32, (uq >> shift) as u32, (vq >> shift) as u32, half as u32));
+            rgb = if dem_ref_depth(dem).is_none() { noise } else { lerp3(rgb, noise, LOADING_TINT) };
         }
     }
     pack(luts, rgb)
