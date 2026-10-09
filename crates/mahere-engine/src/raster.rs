@@ -678,7 +678,9 @@ fn compose_rgb(dem: &DemRef, vec: &VecRef, pool: &Pool, diamond: u8, uq: i64, vq
     };
     if (mask.dem || mask.contours || mask.slope) && dem_ref_depth(dem) != Some(luts.dem_depth) && !wanted_absent() {
         let shift = 16 + 22 - luts.dem_depth as u32;
-        if (uq >> shift) & 255 == 0 || (vq >> shift) & 255 == 0 {
+        let (tx, ty) = ((uq >> shift) & 255, (vq >> shift) & 255);
+        // The cell's two edges and the diagonal between its two triangles.
+        if tx == 0 || ty == 0 || tx + ty == 255 {
             rgb = lerp3(rgb, lin(luts.style.contour), 0.45);
         }
     }

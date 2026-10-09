@@ -510,7 +510,8 @@ fn compose(d: u32, u: u32, v: u32) -> Composed {
         let s = 30u - U.depths.x - 8u;
         let tx = (u >> s) & 255u;
         let ty = (v >> s) & 255u;
-        if (tx == 0u || ty == 0u) {
+        // The cell's two edges and the diagonal between its two triangles (Nick: the triangles too).
+        if (tx == 0u || ty == 0u || tx + ty == 255u) {
             { let f = fold(Fold(out.k2, out.c2), U.style_contour.rgb, 0.45); out.k2 = f.k; out.c2 = f.c; }
         }
     }
