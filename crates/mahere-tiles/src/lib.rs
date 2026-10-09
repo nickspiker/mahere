@@ -912,6 +912,69 @@ pub fn bake_img_filtered(img: &mahere_dem::ImgStore, keys: &[CellKey]) -> Vec<(C
         .collect()
 }
 
+/// What a class raster's byte means to the map: a land cover class (the land table's id), open water, or nothing.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Cover {
+    None,
+    Land(u8),
+    Water,
+}
+
+/// The global land cover bake from a class raster: every texel sampled sixteen times at its grandchild centroids (as the imagery is), the land class with the most samples kept with its share as the coverage, and the water share as the water layer. `map` says what a raster byte is. Cells with nothing are dropped.
+pub fn bake_cover_filtered(store: &mahere_dem::ImgStore, keys: &[CellKey], map: &(dyn Fn(u8) -> Cover + Sync)) -> (Vec<(CellKey, ClassCell)>, Vec<(CellKey, CovCell)>) {
+    let cells: Vec<(CellKey, ClassCell, CovCell)> = keys
+        .par_iter()
+        .map(|&key| {
+            let (u0, v0, size) = key.uv_rect();
+            let d = key.diamond();
+            let step = size / TEX as f64;
+            let mut land = ClassCell::new();
+            let mut water = CovCell::new();
+            for ty in 0..TEX {
+                for tx in 0..TEX {
+                    for half in 0..2 {
+                        let mut counts = [0u8; 16];
+                        let mut wet = 0u8;
+                        for (cx, cy, ch) in tri_children(0, 0, half) {
+                            for (gx, gy, gh) in tri_children(cx, cy, ch) {
+                                let off = tri_off(gh);
+                                let u = u0 + (tx as f64 + (gx as f64 + off) * 0.25) * step;
+                                let v = v0 + (ty as f64 + (gy as f64 + off) * 0.25) * step;
+                                let (lat, lon) = uv_to_lat_lon(d, u, v);
+                                match store.class_at(lat, lon).map_or(Cover::None, map) {
+                                    Cover::Land(c) => counts[(c as usize).min(15)] += 1,
+                                    Cover::Water => wet += 1,
+                                    Cover::None => {}
+                                }
+                            }
+                        }
+                        let i = tri_idx(tx, ty, half);
+                        if let Some((c, n)) = counts.iter().enumerate().skip(1).max_by_key(|(_, n)| **n) {
+                            if *n > 0 {
+                                land.class[i] = c as u8;
+                                land.cov[i] = (*n as u32 * 255 / 16) as u8;
+                            }
+                        }
+                        water.cov[i] = (wet as u32 * 255 / 16) as u8;
+                    }
+                }
+            }
+            (key, land, water)
+        })
+        .collect();
+    let mut lands = Vec::new();
+    let mut waters = Vec::new();
+    for (k, l, w) in cells {
+        if !l.is_empty() {
+            lands.push((k, l));
+        }
+        if !w.is_empty() {
+            waters.push((k, w));
+        }
+    }
+    (lands, waters)
+}
+
 /// Parent texel = mean of the lit children per band (0 = no data, ignored), averaged as scene light and rolled again in the agreed tone.
 pub fn img_pyramid(base: &[(CellKey, ImgCell)], min_depth: u8) -> Vec<(CellKey, ImgCell)> {
     let mut out: Vec<(CellKey, ImgCell)> = Vec::new();
@@ -1416,6 +1479,33 @@ impl CellPlanes {
                 }
                 (n @ None, Some(o)) => *n = Some(o),
                 _ => {}
+            }
+        }
+        // Without a terrain footprint, a layer both bakes have is filled texel by texel: the new where it has anything, the old elsewhere (rivers from one source and roads from another share the line plane).
+        if mask.is_none() {
+            fn fill_class(new: &mut Option<ClassCell>, old: Option<ClassCell>) {
+                if let (Some(n), Some(o)) = (new, old) {
+                    let attrs = n.mag.len() == TRI && o.mag.len() == TRI;
+                    for i in 0..TRI {
+                        if n.cov[i] == 0 && o.cov[i] != 0 {
+                            n.class[i] = o.class[i];
+                            n.cov[i] = o.cov[i];
+                            if attrs {
+                                n.mag[i] = o.mag[i];
+                                n.uses[i] = o.uses[i];
+                            }
+                        }
+                    }
+                }
+            }
+            fill_class(&mut out.line, old_line.clone());
+            fill_class(&mut out.land, old_land.clone());
+            if let (Some(n), Some(o)) = (&mut out.water, &old_water) {
+                for i in 0..TRI {
+                    if n.cov[i] == 0 {
+                        n.cov[i] = o.cov[i];
+                    }
+                }
             }
         }
         if out.line.is_none() {

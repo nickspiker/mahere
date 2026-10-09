@@ -9,4 +9,5 @@ description = "mahere's OSM ingest boundary: .osm.pbf dies here, mahere coordina
 [dependencies]
 mahere-coord = { path = "../mahere-coord" }
 osmpbf = "0.3"
+shapefile = "0.9"
 vsf = { git = "https://github.com/nickspiker/vsf", rev = "5f2bb06c8d96ee417a2571944882ef36d6c9ca8f" }

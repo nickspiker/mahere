@@ -2,6 +2,7 @@
 //!
 //! Three parallel passes over the extract: relations (multipolygon areas), ways (lines, closed-way areas, relation members), then only the referenced nodes. Waterways get a weight from their upstream network length — the catchment proxy OSM can give — so a map can draw the Waikato and a headwater trickle differently without a styling table.
 
+pub mod hydro;
 use std::collections::HashMap;
 
 use mahere_coord::Coord;
@@ -213,6 +214,7 @@ impl AreaClass {
 }
 
 /// One drawable way. Points are (lat, lon) degrees, already quantized by a round trip through the mahere coordinate codec. `weight` is 0..1: for waterways, log-scaled upstream network length (a catchment proxy) set after the network pass; for other classes a log-scaled magnitude from tags (power: voltage; roads: lanes until traffic counts exist; rail: usage). `uses` are the [`use_bits`].
+#[derive(Clone)]
 pub struct Road {
     pub class: RoadClass,
     pub pts: Vec<(f32, f32)>,
