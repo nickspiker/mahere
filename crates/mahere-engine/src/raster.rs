@@ -66,9 +66,10 @@ impl Default for LayerMask {
 
 impl LayerMask {
     /// Which rows a dominating layer makes inert: imagery replaces everything but lines, land cover and a terrain that is off make the elevation tint moot. The panel greys these; the renderer treats them as off through [`LayerMask::effective`].
+    /// Imagery stands in for the ground where it exists, so land cover, water fills, contours and slope bands are inert under it; the terrain stays live as what shows where the imagery runs out, and the sea comes from it everywhere.
     pub fn inert(self) -> LayerMask {
         let im = self.imagery;
-        LayerMask { dem: im, land: im, water: im, line: false, debug: false, imagery: false, contours: im, slope: im, infrared: !im, hypso: im || self.land || !self.dem, boundaries: !self.line }
+        LayerMask { dem: false, land: im, water: im, line: false, debug: false, imagery: false, contours: im, slope: im, infrared: !im, hypso: self.land || !self.dem, boundaries: !self.line }
     }
 
     /// The mask as bits, one per field in declaration order, for a shader or a settings document.
@@ -536,6 +537,7 @@ fn compose_rgb(dem: &DemRef, vec: &VecRef, pool: &Pool, diamond: u8, uq: i64, vq
     let mut diffuse = 1.0f32;
     let mut light = [1.0f32; 3];
     let mut have_ground = false;
+    let mut is_sea = false;
     let mut contour = (0.0f32, false);
     let mut slope_band: Option<[u8; 3]> = None;
     // The terrain sample feeds the tint and light (terrain on), and the contours and slope bands on their own.
@@ -555,6 +557,7 @@ fn compose_rgb(dem: &DemRef, vec: &VecRef, pool: &Pool, diamond: u8, uq: i64, vq
                     // No cap: the display's highlight curve is the only place light meets white; the floor is physics, not a clip.
                     light = [e[0].max(0.0), e[1].max(0.0), e[2].max(0.0)];
                     let sea = (eq as f32 * 0.25 - 500.0).abs() < 0.75 && nz > 0.9995 * 32767.0;
+                    is_sea = sea;
                     tint = if sea {
                         lin(st.sea)
                     } else if mask.hypso {
@@ -585,20 +588,25 @@ fn compose_rgb(dem: &DemRef, vec: &VecRef, pool: &Pool, diamond: u8, uq: i64, vq
     }
     let mut rgb = tint;
     // Imagery has its own depth (a global 10 m layer sits several levels above the vector cells), so it is found on its own: the finest resident cell carrying any.
-    let imagery = if mask.imagery { img_texel(pool, diamond, uq, vq) } else { None };
-    if mask.imagery {
-        if let Some(px) = imagery {
-            // Stored rolled; unrolled to scene light before anything mixes with it.
-            let t = crate::colour::img_table();
-            rgb = if mask.infrared { [t[px[3] as usize]; 3] } else { [t[px[0] as usize], t[px[1] as usize], t[px[2] as usize]] };
-        }
+    // Imagery stands in for the lit ground where it has data and the terrain is not sea: the composite's own ocean pixels and the tiles' edges never show, the terrain's coastline does.
+    let imagery = if mask.imagery && !is_sea { img_texel(pool, diamond, uq, vq) } else { None };
+    let mut imaged = false;
+    if let Some(px) = imagery {
+        // Stored rolled; unrolled to scene light before anything mixes with it.
+        let t = crate::colour::img_table();
+        rgb = if mask.infrared { [t[px[3] as usize]; 3] } else { [t[px[0] as usize], t[px[1] as usize], t[px[2] as usize]] };
+        have_ground = false;
+        imaged = true;
     }
     if mask.imagery && matches!(vec, VecRef::None) {
+        if have_ground {
+            rgb = [rgb[0] * light[0], rgb[1] * light[1], rgb[2] * light[2]];
+        }
         return pack(luts, rgb);
     }
     if let VecRef::Cell { line, land, water, shift, .. } = vec {
         let i = tri_index(uq, vq, *shift);
-        if mask.imagery {
+        if mask.imagery && imaged {
             if mask.line {
                 if let Some(line) = line {
                     let cov = line.cov[i];

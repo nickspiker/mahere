@@ -374,6 +374,7 @@ fn compose(d: u32, u: u32, v: u32) -> Composed {
     var band = vec3<f32>(0.0);
     var have_band = false;
     var found_depth = NONE;
+    var is_sea = false;
     // The terrain sample feeds the tint and light (terrain on), and the contours and slope bands on their own.
     let want_dem = (mask & (M_DEM | M_CONTOURS | M_SLOPE)) != 0u;
     if (want_dem) {
@@ -385,6 +386,7 @@ fn compose(d: u32, u: u32, v: u32) -> Composed {
                 out.n = s.n;
                 // The open sea: exactly zero and dead flat, which is how a global DEM writes the ocean (below-sea-level land keeps its colour).
                 if (abs(s.elev) < 0.75 && s.n.z > 0.9995) {
+                    is_sea = true;
                     out.base = U.style_sea.rgb;
                 } else if ((mask & M_HYPSO) != 0u) {
                     out.base = unpack_rgb(lut[eq >> 4u]);
@@ -432,8 +434,9 @@ fn compose(d: u32, u: u32, v: u32) -> Composed {
         }
     }
     // Imagery has its own depth (a global 10 m layer sits several levels above the vector cells), so it is found on its own: the finest cell at or above the vector depth that carries any.
+    // Imagery stands in for the lit ground where it has data and the terrain is not sea: the composite's own ocean pixels and the tiles' edges never show, the terrain's coastline does.
     var im = vec4<u32>(0u);
-    if ((mask & (M_IMAGERY | M_INFRARED)) != 0u) {
+    if ((mask & (M_IMAGERY | M_INFRARED)) != 0u && !is_sea) {
         let ii = find(d, U.depths.y, u, v, FLAG_IMG);
         if (ii != NONE) {
             let ri = refs[ii];
@@ -461,15 +464,13 @@ fn compose(d: u32, u: u32, v: u32) -> Composed {
             lw = textureLoad(lw_tex, xy, i32(r.b.z), 0);
         }
         let draw_line = (mask & M_LINE) != 0u && line.y != 0u && (line.x < BOUNDARY_FIRST || (mask & M_BOUND) != 0u);
-        if ((mask & M_IMAGERY) != 0u) {
+        if ((mask & M_IMAGERY) != 0u && (im.x != 0u || im.y != 0u || im.z != 0u)) {
             // Imagery stands in for the ground: nothing lights it. True colour, or the near-infrared band as grey, unrolled to scene light.
             out.ground = false;
-            if (im.x != 0u || im.y != 0u || im.z != 0u) {
-                if ((mask & M_INFRARED) != 0u) {
-                    out.base = vec3<f32>(img_light(im.w));
-                } else {
-                    out.base = vec3<f32>(img_light(im.x), img_light(im.y), img_light(im.z));
-                }
+            if ((mask & M_INFRARED) != 0u) {
+                out.base = vec3<f32>(img_light(im.w));
+            } else {
+                out.base = vec3<f32>(img_light(im.x), img_light(im.y), img_light(im.z));
             }
             if (draw_line) {
                 { let f = fold(Fold(out.k2, out.c2), line_colour(line.x, line.z), line_alpha(line.x, line.y, line.z)); out.k2 = f.k; out.c2 = f.c; }
