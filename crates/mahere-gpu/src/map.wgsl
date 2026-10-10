@@ -498,17 +498,21 @@ fn compose(d: u32, u: u32, v: u32) -> Composed {
             } else {
                 out.base = vec3<f32>(img_light(im.x), img_light(im.y), img_light(im.z));
             }
+            // Under the water, as over the ground: the waterway lines, into the base itself, so a lake covers the river running into it.
+            if (draw_line && line.x == WATERWAY_CLASS) {
+                out.base = lerp3(out.base, line_colour(line.x, line.z), line_alpha(line.x, line.y, line.z));
+            }
             // The water fill paints over imagery as it does over the ground, so a lake or a coast texel that is water in part matches the sea instead of showing the composite's own dark water: the composite's water taken out at the coverage, the theme's put in (the CPU's IMG_WATER).
             if ((mask & M_WATER) != 0u && lw.z != 0u) {
                 let t = f32(lw.z) / 255.0 * select(1.0, SEABED_GLAZE, seabed);
                 out.base = max(out.base - vec3<f32>(t * IMG_WATER), vec3<f32>(0.0)) + t * U.style_water.rgb;
             }
-            // Contours over the imagery, under the lines.
+            // Contours over the imagery and the water, under the other lines.
             if (contour_cov > 0.0) {
                 let ink = select(U.style_contour, U.style_contour_index, contour_index);
                 { let f = fold(Fold(out.k2, out.c2), ink.rgb, contour_cov * ink.a); out.k2 = f.k; out.c2 = f.c; }
             }
-            if (draw_line) {
+            if (draw_line && line.x != WATERWAY_CLASS) {
                 { let f = fold(Fold(out.k2, out.c2), line_colour(line.x, line.z), line_alpha(line.x, line.y, line.z)); out.k2 = f.k; out.c2 = f.c; }
             }
             return out;

@@ -660,6 +660,13 @@ fn compose_rgb(dem: &DemRef, vec: &VecRef, pool: &Pool, diamond: u8, uq: i64, vq
     if let VecRef::Cell { line, land, water, shift, .. } = vec {
         let i = tri_index(uq, vq, *shift);
         if mask.imagery && imaged {
+            let line_cov = |line: &ClassCell| -> u8 { if mask.line && (mask.boundaries || (line.class[i] as usize) < BOUNDARY_FIRST) { line.cov[i] } else { 0 } };
+            // Under the water, as over the ground: the waterway lines, so a lake covers the river running into it (Nick 2026-10-10).
+            if let Some(line) = line {
+                if line_cov(line) != 0 && line.class[i] as usize == WATERWAY_CLASS {
+                    rgb = lerp3(rgb, line_colour(line, i, &luts.style), line_cov(line) as f32 / 255.0);
+                }
+            }
             // The water fill paints over imagery as it does over the ground: the sea is the theme's water wherever the terrain says so, and a lake or a coast texel WorldCover says is water, wholly or in part, matches it instead of showing the composite's own dark water (Nick 2026-10-09: the water/land border).
             // A coast texel's pixel is itself that much dark water mixed into the land, so the water is unmixed first: the composite's water (about 0.03 of paper white) taken out at the coverage, the theme's water put in at the coverage. The land part keeps its brightness and a lake brighter than dark water (a reef lagoon) shows through.
             if mask.water {
@@ -674,16 +681,13 @@ fn compose_rgb(dem: &DemRef, vec: &VecRef, pool: &Pool, diamond: u8, uq: i64, vq
                     }
                 }
             }
-            // Contours over the imagery, under the lines (Nick 2026-10-10).
+            // Contours over the imagery and the water, under the other lines (Nick 2026-10-10).
             if contour.0 > 0.0 {
                 rgb = lerp3(rgb, lin(if contour.1 { st.contour_index } else { st.contour }), contour.0 * st.contour_alpha[contour.1 as usize]);
             }
-            if mask.line {
-                if let Some(line) = line {
-                    let cov = line.cov[i];
-                    if cov != 0 && (mask.boundaries || (line.class[i] as usize) < BOUNDARY_FIRST) {
-                        rgb = lerp3(rgb, line_colour(line, i, &luts.style), cov as f32 / 255.0);
-                    }
+            if let Some(line) = line {
+                if line_cov(line) != 0 && line.class[i] as usize != WATERWAY_CLASS {
+                    rgb = lerp3(rgb, line_colour(line, i, &luts.style), line_cov(line) as f32 / 255.0);
                 }
             }
             return pack(luts, rgb);
