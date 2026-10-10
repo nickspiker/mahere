@@ -21,6 +21,22 @@ pub const SEL_ALPHA: f32 = 0.35;
 /// How far above a drawn depth the parents are kept.
 pub const USER_MIN_DEPTH: u8 = 0;
 
+/// What a single touch on the map does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum Tool {
+    #[default]
+    None,
+    Pen,
+    Select,
+}
+
+/// Where the user's cells live between runs: the phone's vault, a directory on a desktop.
+pub trait UserStore: Send + Sync {
+    fn put(&self, key: CellKey, bytes: &[u8]);
+    fn delete(&self, key: CellKey);
+    fn load_all(&self) -> Vec<(CellKey, Vec<u8>)>;
+}
+
 #[derive(Clone, Default)]
 pub struct UserCell {
     pub ink: Option<ClassCell>,
@@ -34,7 +50,7 @@ impl UserCell {
 }
 
 /// Every user cell, drawn or built above a drawn one, at every depth, with what has changed since the last save.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct UserLayer {
     pub cells: FxHashMap<CellKey, UserCell>,
     /// The depths cells were drawn at (not built), so the pyramid above them is rebuilt from the right places.
@@ -58,16 +74,17 @@ fn texel_at(cam: &Camera, depth: u8, px: f64, py: f64, w: usize, h: usize) -> Op
 }
 
 impl UserLayer {
-    /// A stroke of the pen along screen points, `width` pixels wide, in pen `pen` (an index into [`PENS`]): every pixel within half the width of the path, stamped into the cells at `depth`.
-    pub fn stroke(&mut self, cam: &Camera, w: usize, h: usize, depth: u8, pts: &[(f64, f64)], width: f64, pen: u8) {
-        let r = (width * 0.5).max(0.5);
+    /// A stroke of the pen along screen points, each with its width in pixels (the pen's pressure), in pen `pen` (an index into [`PENS`]): every pixel within half the width of the path, stamped into the cells at `depth`.
+    pub fn stroke(&mut self, cam: &Camera, w: usize, h: usize, depth: u8, pts: &[(f64, f64, f64)], pen: u8) {
         let mut touched: FxHashSet<CellKey> = FxHashSet::default();
-        let mut stamp = |x: f64, y: f64| {
-            let (x0, x1) = ((x - r).floor() as i64, (x + r).ceil() as i64);
-            let (y0, y1) = ((y - r).floor() as i64, (y + r).ceil() as i64);
+        // Sampled every half pixel: a texel at the drawing depth is one to two pixels wide, so every texel under the brush is hit and the renderer, reading one texel a pixel, finds no gaps.
+        let mut stamp = |x: f64, y: f64, width: f64| {
+            let r = (width * 0.5).max(0.5);
+            let (x0, x1) = (((x - r) * 2.0).floor() as i64, ((x + r) * 2.0).ceil() as i64);
+            let (y0, y1) = (((y - r) * 2.0).floor() as i64, ((y + r) * 2.0).ceil() as i64);
             for py in y0..=y1 {
                 for px in x0..=x1 {
-                    let (cx, cy) = (px as f64 + 0.5, py as f64 + 0.5);
+                    let (cx, cy) = (px as f64 * 0.5 + 0.25, py as f64 * 0.5 + 0.25);
                     if (cx - x) * (cx - x) + (cy - y) * (cy - y) > r * r {
                         continue;
                     }
@@ -83,14 +100,14 @@ impl UserLayer {
         };
         match pts {
             [] => {}
-            [p] => stamp(p.0, p.1),
+            [p] => stamp(p.0, p.1, p.2),
             _ => {
                 for s in pts.windows(2) {
                     let (ax, ay, bx, by) = (s[0].0, s[0].1, s[1].0, s[1].1);
                     let n = ((bx - ax).hypot(by - ay) * 2.0).ceil().max(1.0) as usize;
                     for k in 0..=n {
                         let t = k as f64 / n as f64;
-                        stamp(ax + (bx - ax) * t, ay + (by - ay) * t);
+                        stamp(ax + (bx - ax) * t, ay + (by - ay) * t, s[0].2 + (s[1].2 - s[0].2) * t);
                     }
                 }
             }
@@ -132,8 +149,9 @@ impl UserLayer {
         let y1 = y1.ceil().min(h as f64 - 1.0) as i64;
         let mut touched: FxHashSet<CellKey> = FxHashSet::default();
         let mut xs: Vec<f64> = Vec::new();
-        for py in y0..=y1 {
-            let yc = py as f64 + 0.5;
+        // Every half pixel, as a stroke is stamped, so no texel inside the shape is missed.
+        for py2 in (y0 * 2)..=(y1 * 2 + 1) {
+            let yc = py2 as f64 * 0.5 + 0.25;
             xs.clear();
             for s in 0..poly.len() {
                 let (a, b) = (poly[s], poly[(s + 1) % poly.len()]);
@@ -146,9 +164,9 @@ impl UserLayer {
                 if pair.len() < 2 {
                     break;
                 }
-                let (x0, x1) = (pair[0].round().max(0.0) as i64, pair[1].round().min(w as f64) as i64);
-                for px in x0..x1 {
-                    if let Some((key, i)) = texel_at(cam, depth, px as f64 + 0.5, yc, w, h) {
+                let (x0, x1) = ((pair[0] * 2.0).round().max(0.0) as i64, (pair[1] * 2.0).round().min(w as f64 * 2.0) as i64);
+                for px2 in x0..x1 {
+                    if let Some((key, i)) = texel_at(cam, depth, px2 as f64 * 0.5 + 0.25, yc, w, h) {
                         let cell = self.cells.entry(key).or_default();
                         let sel = cell.sel.get_or_insert_with(CovCell::new);
                         sel.cov[i] = if add { 255 } else { 0 };
@@ -387,7 +405,7 @@ mod tests {
     fn a_stroke_lands_where_it_was_drawn_and_above() {
         let mut u = UserLayer::default();
         let (w, h) = (800, 600);
-        u.stroke(&cam(), w, h, 12, &[(100.0, 100.0), (300.0, 250.0)], 6.0, 2);
+        u.stroke(&cam(), w, h, 12, &[(100.0, 100.0, 6.0), (300.0, 250.0, 6.0)], 2);
         let drawn: Vec<&CellKey> = u.cells.keys().filter(|k| k.depth == 12).collect();
         assert!(!drawn.is_empty());
         let (lat, lon) = cam().screen_to_geo(200.0, 175.0, w, h);

@@ -29,6 +29,9 @@ pub const FLAG_LINE: u32 = 2;
 pub const FLAG_LAND: u32 = 4;
 pub const FLAG_WATER: u32 = 8;
 pub const FLAG_IMG: u32 = 16;
+/// A user cell (ink and selection), its own plane; tagged in the table at its depth plus 64 so it never collides with the map's cell at the same key.
+pub const FLAG_INK: u32 = 32;
+pub const INK_TAG_DEPTH: u32 = 64;
 
 /// A resident cell as the shader sees it: where it is, what it carries, and the metres-per-texel Jacobian a normal needs.
 #[derive(Clone, Copy, Debug)]
@@ -130,7 +133,7 @@ fn block_of(x: usize, y: usize, size: usize, c00: CornerPt, c10: CornerPt, c01: 
 }
 
 /// Plan a frame: the lattice, the references, the table, the desired set and the lattice's elevation range.
-pub fn plan_frame(w: usize, h: usize, cam: &Camera, pool: &Pool, dem_depth: u8, vec_depth: u8) -> FramePlan {
+pub fn plan_frame(w: usize, h: usize, cam: &Camera, pool: &Pool, dem_depth: u8, vec_depth: u8, user: &crate::ink::UserLayer) -> FramePlan {
     let bw = w.div_ceil(BLOCK);
     let bh = h.div_ceil(BLOCK);
     let corners: Vec<CornerPt> = (0..(bw + 1) * (bh + 1))
@@ -299,6 +302,24 @@ pub fn plan_frame(w: usize, h: usize, cam: &Camera, pool: &Pool, dem_depth: u8, 
             *hi = (*hi).max(m);
         }
     }
+    // The user's cells, every one (they are few), as references of their own under the ink tag.
+    for key in user.cells.keys() {
+        if refs.len() >= TABLE_N / 4 {
+            break;
+        }
+        let (cu, cv) = key.grid();
+        let diamond = key.diamond();
+        let index = refs.len() as u32;
+        refs.push(PlanRef { key: *key, diamond, cu: cu as u32, cv: cv as u32, flags: FLAG_INK, jac: [0.0; 5] });
+        let mut h = table_hash(diamond as u32, key.depth as u32 + INK_TAG_DEPTH, cu as u32, cv as u32) as usize;
+        for _ in 0..TABLE_N {
+            if table[h].index == NONE {
+                table[h] = TableSlot { tag: diamond as u32 | ((key.depth as u32 + INK_TAG_DEPTH) << 8), cu: cu as u32, cv: cv as u32, index };
+                break;
+            }
+            h = (h + 1) & (TABLE_N - 1);
+        }
+    }
     let globe = [w as f32 * 0.5, h as f32 * 0.5, cam.radius() as f32, cam.limb_visible(w, h) as u32 as f32];
     let b = cam.basis();
     let pole = [b[0][2] as f32, b[1][2] as f32, b[2][2] as f32, 0.0];
@@ -318,7 +339,7 @@ mod tests {
             pool.map.insert(key, crate::residency::Entry { present: crate::residency::PRESENT_WATER, water: Some(mahere_tiles::CovCell::new()), ..Default::default() });
         }
         let cam = Camera::new(46.2, -122.19, 6000.0, 0.3);
-        let plan = plan_frame(256, 128, &cam, &pool, 12, 12);
+        let plan = plan_frame(256, 128, &cam, &pool, 12, 12, &crate::ink::UserLayer::default());
         assert_eq!(plan.refs.len(), (12 - MIN_DEPTH + 1) as usize);
         for (i, r) in plan.refs.iter().enumerate() {
             let mut h = table_hash(r.diamond as u32, r.key.depth as u32, r.cu, r.cv) as usize;

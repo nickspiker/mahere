@@ -17,6 +17,8 @@ struct MahereApp {
     map: MapCore,
     chrome: DefaultChrome,
     dragging: bool,
+    /// A stroke of the pen or a selection in progress.
+    drawing: bool,
     /// Pixels the cursor travelled since the press: a few at release is a click on the map, a measurement.
     travel: f64,
     /// Right-button drag: rotate about the screen centre.
@@ -70,6 +72,7 @@ impl MahereApp {
             map,
             chrome,
             dragging: false,
+            drawing: false,
             travel: 0.0,
             rotating: false,
             last_cursor: (0., 0.),
@@ -175,7 +178,7 @@ impl FluorApp for MahereApp {
                     return EventResponse::StartWindowDrag;
                 }
                 let mut mask = self.map.layers();
-                let mut ctl = Controls { real_sun: self.map.real_sun, real_light: self.map.real_light, follow_heading: self.map.follow_heading, lock_to_fix: self.map.lock_to_fix, cache_budget: self.cache_budget, theme: self.map.theme, compressed: self.map.compressed() };
+                let mut ctl = Controls { real_sun: self.map.real_sun, real_light: self.map.real_light, follow_heading: self.map.follow_heading, lock_to_fix: self.map.lock_to_fix, cache_budget: self.cache_budget, theme: self.map.theme, compressed: self.map.compressed(), tool: self.map.tool as u8, pen: self.map.pen, clear_ink: false, clear_sel: false };
                 let was_open = self.panel.is_open();
                 if self.panel.tap(cx as f32, cy as f32, w, h, &mut mask, &mut ctl, &self.map.themes) {
                     self.cache_budget = ctl.cache_budget;
@@ -202,6 +205,18 @@ impl FluorApp for MahereApp {
                     if ctl.lock_to_fix != self.map.lock_to_fix {
                         self.map.set_lock_to_fix(ctl.lock_to_fix);
                     }
+                    self.map.set_tool(match ctl.tool {
+                        1 => mahere_engine::ink::Tool::Pen,
+                        2 => mahere_engine::ink::Tool::Select,
+                        _ => mahere_engine::ink::Tool::None,
+                    });
+                    self.map.set_pen(ctl.pen);
+                    if ctl.clear_ink {
+                        self.map.clear_ink();
+                    }
+                    if ctl.clear_sel {
+                        self.map.clear_selection();
+                    }
                     ctx.window.request_redraw();
                     return EventResponse::Handled;
                 }
@@ -213,10 +228,23 @@ impl FluorApp for MahereApp {
                 }
                 self.dragging = true;
                 self.travel = 0.0;
+                // With a tool on, the left button draws (the right button still turns the map).
+                if self.map.tool != mahere_engine::ink::Tool::None {
+                    self.map.begin_stroke(cx as f64, cy as f64, 0.5, w, h);
+                    self.drawing = true;
+                    ctx.window.request_redraw();
+                }
                 EventResponse::Handled
             }
             FEvent::MouseInput { state: ElementState::Released, button: MouseButton::Left } => {
                 self.panel.release();
+                if self.drawing {
+                    self.map.end_stroke(w, h);
+                    self.drawing = false;
+                    self.dragging = false;
+                    ctx.window.request_redraw();
+                    return EventResponse::Handled;
+                }
                 // A click that never travelled is a tap: a new measurement to that point.
                 if self.dragging && self.travel < 6.0 {
                     self.map.tap(ctx.cursor_x as f64, ctx.cursor_y as f64, w, h);
@@ -236,7 +264,7 @@ impl FluorApp for MahereApp {
                     ctx.window.request_redraw();
                 }
                 let (x, y) = (hx as f64, hy as f64);
-                let mut ctl = Controls { real_sun: self.map.real_sun, real_light: self.map.real_light, follow_heading: self.map.follow_heading, lock_to_fix: self.map.lock_to_fix, cache_budget: self.cache_budget, theme: self.map.theme, compressed: self.map.compressed() };
+                let mut ctl = Controls { real_sun: self.map.real_sun, real_light: self.map.real_light, follow_heading: self.map.follow_heading, lock_to_fix: self.map.lock_to_fix, cache_budget: self.cache_budget, theme: self.map.theme, compressed: self.map.compressed(), tool: self.map.tool as u8, pen: self.map.pen, clear_ink: false, clear_sel: false };
                 if self.panel.drag(hx, hy, &mut ctl) {
                     self.cache_budget = ctl.cache_budget;
                     self.apply_theme_edits();
@@ -244,7 +272,10 @@ impl FluorApp for MahereApp {
                     self.last_cursor = (x, y);
                     return EventResponse::Handled;
                 }
-                if self.dragging {
+                if self.drawing {
+                    self.map.extend_stroke(x, y, 0.5, w, h);
+                    ctx.window.request_redraw();
+                } else if self.dragging {
                     let (dx, dy) = (x - self.last_cursor.0, y - self.last_cursor.1);
                     self.travel += dx.abs() + dy.abs();
                     self.map.pan(dx, dy, w, h);
@@ -415,7 +446,7 @@ impl FluorApp for MahereApp {
         let measure = self.map.measure_view(w, h, Panel::strip_samples(w));
         let themes = self.map.themes.clone();
         self.panel.set_ru(ctx.viewport.ru);
-        self.panel.paint(w, h, self.map.layers(), Controls { real_sun: self.map.real_sun, real_light: self.map.real_light, follow_heading: self.map.follow_heading, lock_to_fix: self.map.lock_to_fix, cache_budget: self.cache_budget, theme: self.map.theme, compressed: self.map.compressed() }, &readouts, measure.as_ref(), &themes, Some(&|n: usize| self.map.orb(n)));
+        self.panel.paint(w, h, self.map.layers(), Controls { real_sun: self.map.real_sun, real_light: self.map.real_light, follow_heading: self.map.follow_heading, lock_to_fix: self.map.lock_to_fix, cache_budget: self.cache_budget, theme: self.map.theme, compressed: self.map.compressed(), tool: self.map.tool as u8, pen: self.map.pen, clear_ink: false, clear_sel: false }, &readouts, measure.as_ref(), &themes, Some(&|n: usize| self.map.orb(n)));
         let mut map = self.map.canvas.clone();
         self.panel.composite_rgb(&mut map, w, h);
         self.chrome.rasterize_bg(ctx.damage, |c| {
@@ -472,6 +503,10 @@ fn main() {
         None => Camera::new(46.2000, -122.1900, 12_000.0, 0.0),
     };
     let mut map = MapCore::new(store, cam);
+    // The user's own cells, as files beside the data.
+    let user_dir = std::path::PathBuf::from("data/user");
+    let _ = std::fs::create_dir_all(&user_dir);
+    map.set_user_store(std::sync::Arc::new(DirUser(user_dir)));
     if let Some(s) = session {
         map.sun_az = s.sun_az as f32;
         map.sun_alt = s.sun_alt as f32;
@@ -483,4 +518,29 @@ fn main() {
     app.store = vault;
     app.cells = cells;
     run_app(app).expect("fluor event loop failed");
+}
+
+/// The user's cells as files in a directory, one per cell by its name.
+struct DirUser(std::path::PathBuf);
+
+impl mahere_engine::ink::UserStore for DirUser {
+    fn put(&self, key: mahere_tiles::CellKey, bytes: &[u8]) {
+        let _ = std::fs::write(self.0.join(key.path()), bytes);
+    }
+
+    fn delete(&self, key: mahere_tiles::CellKey) {
+        let _ = std::fs::remove_file(self.0.join(key.path()));
+    }
+
+    fn load_all(&self) -> Vec<(mahere_tiles::CellKey, Vec<u8>)> {
+        let Ok(dir) = std::fs::read_dir(&self.0) else { return Vec::new() };
+        dir.flatten()
+            .filter_map(|e| {
+                let name = e.file_name().to_string_lossy().to_string();
+                let key = mahere_tiles::CellKey::from_name(&name)?;
+                let bytes = std::fs::read(e.path()).ok()?;
+                Some((key, bytes))
+            })
+            .collect()
+    }
 }

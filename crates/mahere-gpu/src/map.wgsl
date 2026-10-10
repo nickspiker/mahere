@@ -6,6 +6,22 @@ const ABSENT: u32 = 0xFFFFFFFEu;
 // The coarsest depth a cell exists at (the global bake's root), the same as the planner's. A walk below it must stop: a fragment loop that never ends hangs the GPU and the driver resets it for every process on the device (2026-10-09, the phone's SystemUI went down with mahere).
 const MIN_DEPTH: u32 = 0u;
 const IMG_WATER: f32 = 0.03;
+const INK_TAG_DEPTH: u32 = 64u;
+// The pens (the CPU's PENS, gamma 2) and the selection's wash.
+const SEL_TINT: vec3<f32> = vec3<f32>(0.35, 0.6, 1.0);
+const SEL_ALPHA: f32 = 0.35;
+fn pen_colour(i: u32) -> vec3<f32> {
+    switch i {
+        case 0u: { return dec(vec3<f32>(230.0, 40.0, 40.0)); }
+        case 1u: { return dec(vec3<f32>(240.0, 140.0, 30.0)); }
+        case 2u: { return dec(vec3<f32>(240.0, 220.0, 40.0)); }
+        case 3u: { return dec(vec3<f32>(60.0, 200.0, 70.0)); }
+        case 4u: { return dec(vec3<f32>(40.0, 210.0, 220.0)); }
+        case 5u: { return dec(vec3<f32>(50.0, 110.0, 240.0)); }
+        case 6u: { return dec(vec3<f32>(220.0, 60.0, 220.0)); }
+        default: { return dec(vec3<f32>(16.0, 16.0, 16.0)); }
+    }
+}
 // The seabed, as the CPU's: the sea colour darkening to this much less light at this depth, the water a glaze over it.
 const SEABED_FULL_DEPTH: f32 = 6000.0;
 const SEABED_DARK: f32 = 0.64;
@@ -84,6 +100,7 @@ struct Slot { tag: u32, cu: u32, cv: u32, index: u32 };
 @group(0) @binding(6) var line_tex: texture_2d_array<u32>;
 @group(0) @binding(7) var lw_tex: texture_2d_array<u32>;
 @group(0) @binding(8) var img_tex: texture_2d_array<u32>;
+@group(0) @binding(9) var ink_tex: texture_2d_array<u32>;
 
 struct VOut {
     @builtin(position) pos: vec4<f32>,
@@ -109,7 +126,8 @@ fn vs_map(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> V
 
 // The page table: a cell at (diamond, depth, grid) → its reference, or NONE. Linear probing over the same hash the planner used.
 fn lookup(d: u32, depth: u32, u: u32, v: u32) -> u32 {
-    let s = 30u - depth;
+    // A user cell's tag carries its depth plus INK_TAG_DEPTH; the grid is at the depth itself.
+    let s = 30u - (depth % INK_TAG_DEPTH);
     let cu = u >> s;
     let cv = v >> s;
     var h = (cu * 0x9E3779B1u) ^ (cv * 0x85EBCA77u) ^ (depth * 0xC2B2AE3Du) ^ (d * 0x27D4EB2Fu);
@@ -128,6 +146,22 @@ fn lookup(d: u32, depth: u32, u: u32, v: u32) -> u32 {
 }
 
 // The probe: the cell at `want` or the nearest parent carrying any of `need`.
+// The user's cell for this texel: the finest at or above `want` (user cells sit in the table under their depth plus INK_TAG_DEPTH).
+fn find_user(d: u32, want: u32, u: u32, v: u32) -> u32 {
+    var depth = want;
+    for (var k = 0u; k <= 30u; k++) {
+        let r = lookup(d, depth + INK_TAG_DEPTH, u, v);
+        if (r != NONE && r != ABSENT) {
+            return r;
+        }
+        if (depth == 0u) {
+            return NONE;
+        }
+        depth = depth - 1u;
+    }
+    return NONE;
+}
+
 // Bounded by the depth count rather than open: no loop in this shader may run unbounded.
 fn find(d: u32, want: u32, u: u32, v: u32, need: u32) -> u32 {
     var depth = want;
@@ -616,6 +650,19 @@ fn compose(d: u32, u: u32, v: u32, pos: vec2<f32>) -> Composed {
             out.c2 = vec3<f32>(0.0);
         }
     }
+    // The user's marks over everything: the pen's ink in its colour, the selection as a wash.
+    let ui = find_user(d, U.depths.x, u, v);
+    if (ui != NONE) {
+        let r = refs[ui];
+        let t = tri(u, v, r.a.y);
+        let px = textureLoad(ink_tex, vec2<i32>(i32(2u * t.x + t.z), i32(t.y)), i32(r.b.x), 0);
+        if (px.y != 0u) {
+            { let f = fold(Fold(out.k2, out.c2), pen_colour(px.x - 1u), f32(px.y) / 255.0); out.k2 = f.k; out.c2 = f.c; }
+        }
+        if (px.z != 0u) {
+            { let f = fold(Fold(out.k2, out.c2), SEL_TINT, f32(px.z) / 255.0 * SEL_ALPHA); out.k2 = f.k; out.c2 = f.c; }
+        }
+    }
     if ((mask & M_DEBUG) != 0u) {
         var tintd = vec3<f32>(-1.0);
         if (found_depth == NONE) {
@@ -727,6 +774,7 @@ fn fs_relight(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
 
 @group(1) @binding(0) var map_tex: texture_2d<f32>;
 @group(1) @binding(1) var overlay_tex: texture_2d<f32>;
+@group(1) @binding(2) var preview_tex: texture_2d<f32>;
 
 @vertex
 fn vs_present(@builtin(vertex_index) vi: u32) -> @builtin(position) vec4<f32> {
@@ -773,6 +821,11 @@ fn fs_present(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         let cross = select(0.0, clamp(1.6 - min(abs(dt.x), abs(dt.y)) + 0.5, 0.0, 1.0), max(abs(dt.x), abs(dt.y)) <= 12.0 && min(abs(dt.x), abs(dt.y)) <= 1.6 && length(dt) > 3.0);
         let cov = max(line_cov * 0.85, cross);
         rgb = mix(rgb, vec3<f32>(255.0, 196.0, 64.0) / 256.0, cov);
+    }
+    // The selection being drawn: a wash where its closed curve covers, in display terms.
+    let pv = textureLoad(preview_tex, vec2<i32>(pos.xy), 0).r;
+    if (pv > 0.0) {
+        rgb = mix(rgb, sqrt(SEL_TINT), pv * SEL_ALPHA);
     }
     // Truncated to the code value, written exactly so the hardware's own rounding has nothing to do.
     return vec4<f32>(min(floor(rgb * 256.0), vec3<f32>(255.0)) / 255.0, 1.0);

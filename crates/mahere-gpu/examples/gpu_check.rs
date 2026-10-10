@@ -134,6 +134,7 @@ fn main() {
     let luts = map.luts();
     // Time the second frame: the first pays for pipeline warm-up.
     let mut frame_ms = 0.0;
+    gpu.set_user(&device, &queue, &map.user, &map.preview, map.preview_version, w as u32, h as u32);
     for i in 0..2 {
         let t = std::time::Instant::now();
         let mut enc = device.create_command_encoder(&Default::default());

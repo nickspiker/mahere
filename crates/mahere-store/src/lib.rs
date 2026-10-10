@@ -452,6 +452,62 @@ fn cell_key(key: mahere_tiles::CellKey) -> String {
     ])
 }
 
+// ==================== USER CELLS ====================
+
+/// The user's own cells (ink and selection) in the vault, keyed `d` user, `u` depth, `wm` cell, with an index document (`d` user, `d` index) naming every one, so they all load at start.
+pub struct VaultUser {
+    store: Arc<FlatStorage>,
+    index: std::sync::Mutex<std::collections::HashMap<(u8, u64), (i64, u32)>>,
+}
+
+fn user_key(key: mahere_tiles::CellKey) -> String {
+    vault_key(&[name("user"), VsfType::u(key.depth as usize, false), VsfType::wm(vsf::types::WorldCell::from_raw(key.raw()))])
+}
+
+fn user_index_key() -> String {
+    vault_key(&[name("user"), name("index")])
+}
+
+impl VaultUser {
+    pub fn new(store: Arc<FlatStorage>) -> VaultUser {
+        let index = store.read_device(&user_index_key()).ok().flatten().map(|b| decode_cell_index(&b)).unwrap_or_default();
+        VaultUser { store, index: std::sync::Mutex::new(index) }
+    }
+
+    fn flush(&self) {
+        let bytes = encode_cell_index(&self.index.lock().unwrap());
+        if let Some(b) = bytes {
+            let _ = self.store.write_device(&user_index_key(), &b);
+        }
+    }
+}
+
+impl mahere_engine::ink::UserStore for VaultUser {
+    fn put(&self, key: mahere_tiles::CellKey, bytes: &[u8]) {
+        if self.store.write_device(&user_key(key), bytes).is_ok() {
+            self.index.lock().unwrap().insert((key.depth, key.raw()), (et_now(), bytes.len() as u32));
+            self.flush();
+        }
+    }
+
+    fn delete(&self, key: mahere_tiles::CellKey) {
+        let _ = self.store.write_device(&user_key(key), &[]);
+        self.index.lock().unwrap().remove(&(key.depth, key.raw()));
+        self.flush();
+    }
+
+    fn load_all(&self) -> Vec<(mahere_tiles::CellKey, Vec<u8>)> {
+        let keys: Vec<(u8, u64)> = self.index.lock().unwrap().keys().copied().collect();
+        keys.into_iter()
+            .filter_map(|(depth, raw)| {
+                let key = mahere_tiles::CellKey { depth, prefix: raw >> (60 - 2 * depth as u32) };
+                let bytes = self.store.read_device(&user_key(key)).ok().flatten()?;
+                (!bytes.is_empty()).then_some((key, bytes))
+            })
+            .collect()
+    }
+}
+
 impl mahere_engine::residency::CellStore for VaultCells {
     fn get(&self, key: mahere_tiles::CellKey) -> mahere_engine::residency::Fetch {
         use mahere_engine::residency::Fetch;

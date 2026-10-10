@@ -7,6 +7,7 @@ repository.workspace = true
 description = "mahere desktop app: offline trail map on the fluor compositor"
 
 [dependencies]
+mahere-tiles = { path = "../mahere-tiles" }
 mahere-engine = { path = "../mahere-engine" }
 mahere-store = { path = "../mahere-store" }
 mahere-panel = { path = "../mahere-panel" }
@@ -14,5 +15,4 @@ fluor = { git = "https://github.com/nickspiker/fluor", rev = "d538a0a", features
 
 [dev-dependencies]
 mahere-coord = { path = "../mahere-coord" }
-mahere-tiles = { path = "../mahere-tiles" }
 png = "0.17"

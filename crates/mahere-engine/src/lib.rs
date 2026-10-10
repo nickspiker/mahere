@@ -208,6 +208,15 @@ fn rotate(v: [f64; 3], k: [f64; 3], angle: f64) -> [f64; 3] {
     [v[0] * c + kv[0] * s + k[0] * kd, v[1] * c + kv[1] * s + k[1] * kd, v[2] * c + kv[2] * s + k[2] * kd]
 }
 
+/// A stroke in progress: its screen points, the user layer as it was before it (for a cancel), the depth it draws at, and for a selection whether it adds or takes.
+struct Stroke {
+    /// Screen points with the brush width at each, from the pen's pressure.
+    pts: Vec<(f64, f64, f64)>,
+    before: ink::UserLayer,
+    depth: u8,
+    add: bool,
+}
+
 #[derive(Clone, Copy)]
 pub struct GpsFix {
     pub lat: f64,
@@ -284,6 +293,16 @@ pub struct MapCore {
     light_version: u64,
     /// Measure from the fix rather than the screen centre, until the camera moves.
     pub lock_to_fix: bool,
+    /// The user's own layer: ink and selection (see `ink`), what a touch does, the pen and its width in pixels.
+    pub user: ink::UserLayer,
+    pub tool: ink::Tool,
+    pub pen: u8,
+    pub pen_width: f32,
+    stroke: Option<Stroke>,
+    /// The selection being drawn, as a screen mask (w × h bytes, 255 inside the closed curve), and a version for a renderer to notice a change; empty when none.
+    pub preview: Vec<u8>,
+    pub preview_version: u64,
+    user_store: Option<Arc<dyn ink::UserStore>>,
 }
 
 type PlanKey = (u64, u64, u64, u64, usize, usize, u64, u8, u8);
@@ -345,6 +364,14 @@ impl MapCore {
             style_version: 0,
             light_version: 0,
             lock_to_fix: false,
+            user: ink::UserLayer::default(),
+            tool: ink::Tool::None,
+            pen: 0,
+            pen_width: 6.0,
+            stroke: None,
+            preview: Vec::new(),
+            preview_version: 0,
+            user_store: None,
         }
     }
 
@@ -435,6 +462,172 @@ impl MapCore {
         }
         self.clamp_camera();
         self.camera_moved(w, h);
+    }
+
+    // ==================== INK AND SELECTION ====================
+
+    /// The depth a mark is drawn at: one above what the view wants, so a texel is one to two pixels wide (the view's own depth puts texels under a pixel, for the supersampled render, and a mark there would be a sprinkle).
+    fn draw_depth(&self) -> u8 {
+        select_depth(self.cam.ppd, self.vec_depth, VEC_BASE_DEPTH).saturating_sub(1)
+    }
+
+    pub fn set_tool(&mut self, tool: ink::Tool) {
+        if self.tool != tool {
+            self.cancel_stroke();
+            self.tool = tool;
+            self.dirty = true;
+        }
+    }
+
+    pub fn set_pen(&mut self, pen: u8) {
+        self.pen = pen % ink::PENS.len() as u8;
+    }
+
+    /// Where the user's cells are kept; loading what is there.
+    pub fn set_user_store(&mut self, store: Arc<dyn ink::UserStore>) {
+        for (k, bytes) in store.load_all() {
+            self.user.load(k, &bytes);
+        }
+        self.user.loaded();
+        self.user_store = Some(store);
+        self.dirty = true;
+    }
+
+    fn save_user(&mut self) {
+        let dirty = self.user.take_dirty();
+        if let Some(store) = &self.user_store {
+            for (k, bytes) in dirty {
+                match bytes {
+                    Some(b) => store.put(k, &b),
+                    None => store.delete(k),
+                }
+            }
+        }
+    }
+
+    pub fn stroke_active(&self) -> bool {
+        self.stroke.is_some()
+    }
+
+    /// The brush's width at a pressure: the pen's width at a middle pressure (a finger's), half of it at a touch, over one and a half times it pressed hard (Nick 2026-10-10: a legit brush).
+    fn brush_width(&self, pressure: f64) -> f64 {
+        self.pen_width as f64 * (0.4 + 1.2 * pressure.clamp(0.0, 1.0))
+    }
+
+    /// A touch down with a tool, at a pressure 0..1 (a finger passes 0.5): the pen stamps its first dot; the selection remembers where it started (inside the selection takes, outside adds).
+    pub fn begin_stroke(&mut self, x: f64, y: f64, pressure: f64, w: usize, h: usize) {
+        if self.tool == ink::Tool::None {
+            return;
+        }
+        let depth = self.draw_depth();
+        let add = !self.user.selected_at(&self.cam, w, h, depth, x, y);
+        let width = self.brush_width(pressure);
+        self.stroke = Some(Stroke { pts: vec![(x, y, width)], before: self.user.clone(), depth, add });
+        if self.tool == ink::Tool::Pen {
+            self.user.stroke(&self.cam, w, h, depth, &[(x, y, width)], self.pen);
+        }
+        self.dirty = true;
+    }
+
+    /// The touch moved: the pen stamps the segment, its width following the pressure; the selection grows its curve and the preview closes it.
+    pub fn extend_stroke(&mut self, x: f64, y: f64, pressure: f64, w: usize, h: usize) {
+        let Some(st) = &mut self.stroke else { return };
+        let last = *st.pts.last().unwrap();
+        if (x - last.0).abs() < 0.5 && (y - last.1).abs() < 0.5 {
+            return;
+        }
+        let width = self.pen_width as f64 * (0.4 + 1.2 * pressure.clamp(0.0, 1.0));
+        st.pts.push((x, y, width));
+        let depth = st.depth;
+        match self.tool {
+            ink::Tool::Pen => {
+                let seg = [last, (x, y, width)];
+                self.user.stroke(&self.cam, w, h, depth, &seg, self.pen);
+            }
+            ink::Tool::Select => self.rebuild_preview(w, h),
+            ink::Tool::None => {}
+        }
+        self.dirty = true;
+    }
+
+    /// The touch lifted: the pen's mark stands; the selection's curve is closed and applied. Either is saved.
+    pub fn end_stroke(&mut self, w: usize, h: usize) {
+        let Some(st) = self.stroke.take() else { return };
+        if self.tool == ink::Tool::Select && st.pts.len() >= 3 {
+            let poly: Vec<(f64, f64)> = st.pts.iter().map(|p| (p.0, p.1)).collect();
+            self.user.select(&self.cam, w, h, st.depth, &poly, st.add);
+        }
+        self.preview.clear();
+        self.preview_version += 1;
+        self.save_user();
+        self.dirty = true;
+    }
+
+    /// A second finger, or a tool change, mid-stroke: everything the stroke did is undone.
+    pub fn cancel_stroke(&mut self) {
+        if let Some(st) = self.stroke.take() {
+            self.user = st.before;
+            self.preview.clear();
+            self.preview_version += 1;
+            self.dirty = true;
+        }
+    }
+
+    /// The selection's curve so far, closed back to its start and filled, as the screen mask.
+    fn rebuild_preview(&mut self, w: usize, h: usize) {
+        let Some(st) = &self.stroke else { return };
+        let poly_v: Vec<(f64, f64)> = st.pts.iter().map(|p| (p.0, p.1)).collect();
+        let poly = &poly_v;
+        self.preview.clear();
+        self.preview.resize(w * h, 0);
+        if poly.len() < 3 {
+            self.preview_version += 1;
+            return;
+        }
+        let (mut y0, mut y1) = (f64::MAX, f64::MIN);
+        for p in poly {
+            y0 = y0.min(p.1);
+            y1 = y1.max(p.1);
+        }
+        let y0 = y0.floor().max(0.0) as usize;
+        let y1 = (y1.ceil().max(0.0) as usize).min(h.saturating_sub(1));
+        let mut xs: Vec<f64> = Vec::new();
+        for py in y0..=y1 {
+            let yc = py as f64 + 0.5;
+            xs.clear();
+            for i in 0..poly.len() {
+                let (a, b) = (poly[i], poly[(i + 1) % poly.len()]);
+                if (a.1 <= yc) != (b.1 <= yc) {
+                    xs.push(a.0 + (yc - a.1) / (b.1 - a.1) * (b.0 - a.0));
+                }
+            }
+            xs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            for pair in xs.chunks(2) {
+                if pair.len() < 2 {
+                    break;
+                }
+                let x0 = pair[0].round().max(0.0) as usize;
+                let x1 = (pair[1].round().max(0.0) as usize).min(w);
+                for px in x0..x1 {
+                    self.preview[py * w + px] = 255;
+                }
+            }
+        }
+        self.preview_version += 1;
+    }
+
+    pub fn clear_ink(&mut self) {
+        self.cancel_stroke();
+        self.user.clear_ink();
+        self.save_user();
+        self.dirty = true;
+    }
+
+    pub fn clear_selection(&mut self) {
+        self.cancel_stroke();
+        self.user.clear_selection();
+        self.save_user();
+        self.dirty = true;
     }
 
     pub fn go_home(&mut self, w: usize, h: usize) {
@@ -721,7 +914,7 @@ impl MapCore {
                 return p;
             }
         }
-        let p = Arc::new(plan::plan_frame(w, h, &self.cam, &self.res.pool, self.dem_depth, self.vec_depth));
+        let p = Arc::new(plan::plan_frame(w, h, &self.cam, &self.res.pool, self.dem_depth, self.vec_depth, &self.user));
         self.last_straddle_blocks = p.straddle_blocks;
         self.last_range = p.elev;
         let center = Coord::from_lat_lon(self.cam.lat(), self.cam.lon());
@@ -955,9 +1148,26 @@ impl MapCore {
             &self.luts,
             self.dem_depth,
             self.vec_depth,
+            &self.user,
         );
         self.last_straddle_blocks = stats.straddle_blocks;
         self.last_range = stats.elev;
+        // The selection being drawn, as a wash over the frame.
+        if self.preview.len() == w * h {
+            let tint = colour::Display::default().swatch([
+                (ink::SEL_TINT[0].sqrt() * 255.0) as u8,
+                (ink::SEL_TINT[1].sqrt() * 255.0) as u8,
+                (ink::SEL_TINT[2].sqrt() * 255.0) as u8,
+            ]);
+            for (px, &m) in self.canvas.iter_mut().zip(self.preview.iter()) {
+                if m != 0 {
+                    let (r, g, b) = ((*px >> 16) & 255, (*px >> 8) & 255, *px & 255);
+                    let a = (ink::SEL_ALPHA * 255.0) as u32;
+                    let mix = |c: u32, t: u32| (c * (255 - a) + t * a) / 255;
+                    *px = (mix(r, tint[0] as u32) << 16) | (mix(g, tint[1] as u32) << 8) | mix(b, tint[2] as u32);
+                }
+            }
+        }
 
         // Residency: request what the lattice says we need, nearest-first.
         let center = Coord::from_lat_lon(self.cam.lat(), self.cam.lon());
@@ -1395,6 +1605,50 @@ mod globe_tests {
             // A sphere's pan is not quite a rigid slide: a screen-vertical line through the target is a great circle only through the centre, so a point 100 px up lands within a couple of pixels, never spun away.
             assert!((px - w as f64 * 0.5).abs() < 3.0 && (py - (h as f64 * 0.5 - 100.0)).abs() < 3.0, "the ground above the target drifted to {px},{py}");
         }
+    }
+
+    /// A pen stroke lands on the frame in its colour, a cancelled one leaves nothing, and a selection washes what it encloses.
+    #[test]
+    fn ink_draws_and_a_cancel_undoes() {
+        use super::{MapCore, ink};
+        struct Nothing;
+        impl crate::residency::CellStore for Nothing {
+            fn get(&self, _key: mahere_tiles::CellKey) -> crate::residency::Fetch {
+                crate::residency::Fetch::Absent
+            }
+        }
+        let (w, h) = (256, 192);
+        let mut map = MapCore::new(std::sync::Arc::new(Nothing), Camera::new(46.2, -122.19, 24000.0, 0.0));
+        map.render(w, h);
+        let (bare_on, bare_off) = (map.canvas[100 * w + 120], map.canvas[40 * w + 120]);
+        map.set_tool(ink::Tool::Pen);
+        map.set_pen(0);
+        map.begin_stroke(60.0, 100.0, 0.5, w, h);
+        map.extend_stroke(180.0, 100.0, 0.5, w, h);
+        map.end_stroke(w, h);
+        map.render(w, h);
+        let on = map.canvas[100 * w + 120];
+        assert_ne!(on, bare_on, "the stroke shows");
+        assert!((on >> 16) & 255 > (on & 255), "red ink is red: {on:#08x}");
+        map.begin_stroke(60.0, 40.0, 0.5, w, h);
+        map.extend_stroke(180.0, 40.0, 0.5, w, h);
+        map.cancel_stroke();
+        map.render(w, h);
+        let (lat, lon) = map.cam.screen_to_geo(120.5, 40.5, w, h);
+        let raw = mahere_coord::Coord::from_lat_lon(lat, lon).raw();
+        assert!(map.user.ink_at(raw, 12).is_none(), "a cancelled stroke leaves no ink");
+        let p = map.canvas[40 * w + 120];
+        assert!((p >> 16) & 255 < 150, "nor any red on the frame: {p:#08x} (bare {bare_off:#08x})");
+        map.set_tool(ink::Tool::Select);
+        map.begin_stroke(40.0, 120.0, 0.5, w, h);
+        map.extend_stroke(200.0, 120.0, 0.5, w, h);
+        map.extend_stroke(200.0, 180.0, 0.5, w, h);
+        map.extend_stroke(40.0, 180.0, 0.5, w, h);
+        assert_eq!(map.preview.len(), w * h, "the preview mask is live");
+        assert_eq!(map.preview[150 * w + 120], 255, "inside the curve");
+        map.end_stroke(w, h);
+        assert!(map.preview.is_empty());
+        assert!(map.user.selected_at(&map.cam, w, h, 12, 120.0, 150.0), "selected");
     }
 
     /// Turning at a pole turns about the view axis and nothing else: the camera point stays put and the ball stays a ball.

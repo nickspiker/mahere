@@ -409,6 +409,7 @@ pub fn render_frame(
     luts: &FrameLuts,
     dem_depth: u8,
     vec_depth: u8,
+    user: &crate::ink::UserLayer,
 ) -> (FrameStats, Vec<CellKey>) {
     let bw = w.div_ceil(BLOCK);
     let bh = h.div_ceil(BLOCK);
@@ -447,11 +448,11 @@ pub fn render_frame(
                 straddle_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 render_block_exact(
                     band, w, x0, bweff, band_h, by, cam, pool, luts, dem_depth, vec_depth, h,
-                    &[c00.diamond, c10.diamond, c01.diamond, c11.diamond], &mut range,
+                    &[c00.diamond, c10.diamond, c01.diamond, c11.diamond], &mut range, user,
                 );
                 continue;
             }
-            render_block_interp(band, w, x0, bweff, band_h, by, c00, c10, c01, c11, pool, luts, dem_depth, vec_depth, &mut range);
+            render_block_interp(band, w, x0, bweff, band_h, by, c00, c10, c01, c11, pool, luts, dem_depth, vec_depth, &mut range, user);
         }
         range
     }).reduce(|| ElevRange::EMPTY, ElevRange::merge);
@@ -603,8 +604,8 @@ pub fn view_normal(luts: &FrameLuts, sx: f32, sy: f32, n: [f32; 3]) -> [f32; 3] 
 }
 
 #[inline(always)]
-fn compose(dem: &DemRef, vec: &VecRef, pool: &Pool, diamond: u8, uq: i64, vq: i64, luts: &FrameLuts, range: &mut ElevRange, sx: f32, sy: f32) -> u32 {
-    let rgb = compose_rgb(dem, vec, pool, diamond, uq, vq, luts, range, sx, sy);
+fn compose(dem: &DemRef, vec: &VecRef, pool: &Pool, diamond: u8, uq: i64, vq: i64, luts: &FrameLuts, range: &mut ElevRange, sx: f32, sy: f32, user: &crate::ink::UserLayer) -> u32 {
+    let rgb = compose_rgb(dem, vec, pool, diamond, uq, vq, luts, range, sx, sy, user);
     if !luts.mask.debug {
         return rgb;
     }
@@ -639,8 +640,25 @@ fn contour_cov(elev_m: f32, slope: f32, c: &Contours) -> (f32, bool) {
 }
 
 
+/// The user's marks over everything: the pen's ink in its colour, the selection as a wash.
 #[inline(always)]
-fn compose_rgb(dem: &DemRef, vec: &VecRef, pool: &Pool, diamond: u8, uq: i64, vq: i64, luts: &FrameLuts, range: &mut ElevRange, sx: f32, sy: f32) -> u32 {
+fn user_marks(rgb: [f32; 3], user: &crate::ink::UserLayer, raw: u64, depth: u8) -> [f32; 3] {
+    if user.is_empty() {
+        return rgb;
+    }
+    let mut rgb = rgb;
+    if let Some((pen, cov)) = user.ink_at(raw, depth) {
+        rgb = lerp3(rgb, lin(crate::ink::PENS[pen as usize]), cov as f32 / 255.0);
+    }
+    let sel = user.sel_at(raw, depth);
+    if sel != 0 {
+        rgb = lerp3(rgb, crate::ink::SEL_TINT, sel as f32 / 255.0 * crate::ink::SEL_ALPHA);
+    }
+    rgb
+}
+
+#[inline(always)]
+fn compose_rgb(dem: &DemRef, vec: &VecRef, pool: &Pool, diamond: u8, uq: i64, vq: i64, luts: &FrameLuts, range: &mut ElevRange, sx: f32, sy: f32, user: &crate::ink::UserLayer) -> u32 {
     let mask = luts.mask;
     // Terrain: tint from elevation, shade from the normal.
     let st = &luts.style;
@@ -729,7 +747,7 @@ fn compose_rgb(dem: &DemRef, vec: &VecRef, pool: &Pool, diamond: u8, uq: i64, vq
         if contour.0 > 0.0 {
             rgb = lerp3(rgb, lin(rgb3(if contour.1 { st.contour_index } else { st.contour })), contour.0 * alpha(if contour.1 { st.contour_index } else { st.contour }));
         }
-        return pack(luts, rgb);
+        return pack(luts, user_marks(rgb, user, raw_of(diamond, uq, vq), luts.dem_depth));
     }
     if let VecRef::Cell { line, land, water, shift, .. } = vec {
         let i = tri_index(uq, vq, *shift);
@@ -764,7 +782,7 @@ fn compose_rgb(dem: &DemRef, vec: &VecRef, pool: &Pool, diamond: u8, uq: i64, vq
                     rgb = lerp3(rgb, line_colour(line, i, &luts.style), line_cov(line) as f32 / 255.0 * line_opacity(line, i, &luts.style));
                 }
             }
-            return pack(luts, rgb);
+            return pack(luts, user_marks(rgb, user, raw_of(diamond, uq, vq), luts.dem_depth));
         }
         if mask.land {
             if let Some(land) = land {
@@ -834,7 +852,7 @@ fn compose_rgb(dem: &DemRef, vec: &VecRef, pool: &Pool, diamond: u8, uq: i64, vq
             }
         }
     }
-    pack(luts, rgb)
+    pack(luts, user_marks(rgb, user, raw_of(diamond, uq, vq), luts.dem_depth))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -854,6 +872,7 @@ fn render_block_interp(
     dem_depth: u8,
     vec_depth: u8,
     range: &mut ElevRange,
+    user: &crate::ink::UserLayer,
 ) {
     let d = c00.diamond;
     // Per-block cell resolve from corner prefixes (1-4 per layer).
@@ -905,7 +924,7 @@ fn render_block_interp(
             let dref = &dem_refs[0].1;
             let vref = &vec_refs[0].1;
             for (i, px) in row.iter_mut().enumerate() {
-                *px = compose(dref, vref, pool, d, uq, vq, luts, range, (x0 + i) as f32 + 0.5, sy);
+                *px = compose(dref, vref, pool, d, uq, vq, luts, range, (x0 + i) as f32 + 0.5, sy, user);
                 uq += dux;
                 vq += dvx;
             }
@@ -938,7 +957,7 @@ fn render_block_interp(
                 if matches!(vref, VecRef::None) {
                     vref = resolve_vec(pool, vec_depth, raw);
                 }
-                *px = compose(&dref, &vref, pool, d, uq, vq, luts, range, (x0 + i) as f32 + 0.5, sy);
+                *px = compose(&dref, &vref, pool, d, uq, vq, luts, range, (x0 + i) as f32 + 0.5, sy, user);
                 uq += dux;
                 vq += dvx;
             }
@@ -963,6 +982,7 @@ fn render_block_exact(
     h: usize,
     diamonds: &[u8; 4],
     range: &mut ElevRange,
+    user: &crate::ink::UserLayer,
 ) {
     let mut ds: Vec<u8> = diamonds.to_vec();
     ds.sort_unstable();
@@ -978,7 +998,7 @@ fn render_block_exact(
             let raw = c.raw();
             let dref = resolve_dem(pool, dem_depth, raw);
             let vref = resolve_vec(pool, vec_depth, raw);
-            *px = compose(&dref, &vref, pool, c.diamond(), uq, vq, luts, range, (x0 + i) as f32 + 0.5, gy as f32 + 0.5);
+            *px = compose(&dref, &vref, pool, c.diamond(), uq, vq, luts, range, (x0 + i) as f32 + 0.5, gy as f32 + 0.5, user);
         }
     }
 }
@@ -1048,7 +1068,7 @@ mod tests {
         };
         let (w, h) = (64usize, 64usize);
         let mut canvas = vec![0u32; w * h];
-        let (stats, _want) = render_frame(&mut canvas, w, h, &cam, &pool, &luts, 6, 13);
+        let (stats, _want) = render_frame(&mut canvas, w, h, &cam, &pool, &luts, 6, 13, &crate::ink::UserLayer::default());
         assert_eq!(stats.straddle_blocks, 0);
         // Expected: the flat white (land cover makes the elevation tint inert) lerped to forest by the forest colour's opacity, lit by the SH irradiance at a flat normal in the device frame.
         let t = luts.style.flat;
@@ -1064,7 +1084,7 @@ mod tests {
 
         // Mask off land: pure hypso.
         let luts = FrameLuts { mask: LayerMask { land: false, contours: false, ..LayerMask::default() }.effective(), ..luts };
-        render_frame(&mut canvas, w, h, &cam, &pool, &luts, 6, 13);
+        render_frame(&mut canvas, w, h, &cam, &pool, &luts, 6, 13, &crate::ink::UserLayer::default());
         let t = luts.hypso[375];
         let tl = lin(t);
         let expect = pack(&luts, [tl[0] * e[0].max(0.0), tl[1] * e[1].max(0.0), tl[2] * e[2].max(0.0)]);

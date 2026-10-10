@@ -225,6 +225,7 @@ impl GpuHost {
         };
         let view = frame.texture.create_view(&Default::default());
         let mut enc = self.device.create_command_encoder(&Default::default());
+        self.map.set_user(&self.device, &self.queue, &map.user, &map.preview, map.preview_version, w, h);
         self.map.render(&self.device, &self.queue, &mut enc, &view, &plan, map.luts(), w, h, mode);
         self.queue.submit([enc.finish()]);
         frame.present();

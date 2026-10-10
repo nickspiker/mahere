@@ -1,7 +1,7 @@
 //! The #pagetable compositor on the GPU. The engine still owns residency and the frame plan; this crate mirrors the resident cells into texture arrays (one slot per cell per plane), uploads the plan's blocks, references and page table, and draws every frame in two passes: the map at 2× into an offscreen target, then a 2×2 bin down onto the surface with the screen-space marks laid over. Any host with a wgpu device and a target view can drive it.
 
 use bytemuck::{Pod, Zeroable};
-use mahere_engine::plan::{FLAG_DEM, FLAG_IMG, FLAG_LAND, FLAG_LINE, FLAG_WATER, FramePlan, TABLE_N};
+use mahere_engine::plan::{FLAG_DEM, FLAG_IMG, FLAG_INK, FLAG_LAND, FLAG_LINE, FLAG_WATER, FramePlan, TABLE_N};
 use mahere_engine::raster::{FrameLuts, LayerMask};
 use mahere_engine::residency::{DEMQ_H, DEMQ_W, Pool};
 use mahere_tiles::{CellKey, TEX, TRI};
@@ -256,6 +256,11 @@ pub struct GpuMap {
     offscreen: Vec<(u32, wgpu::Texture, wgpu::TextureView, u32, u32)>,
     present_binds: FxHashMap<u32, wgpu::BindGroup>,
     overlay: Option<(wgpu::Texture, wgpu::TextureView, u32, u32)>,
+    /// The user's cells (ink and selection) as a plane of their own, and the selection being drawn as a screen mask.
+    ink: Plane,
+    user_version: u64,
+    preview: Option<(wgpu::Texture, wgpu::TextureView, u32, u32)>,
+    preview_version: u64,
     pub uploads: usize,
     /// Supersampling factor in use; a change takes effect at the next frame.
     pub scale: u32,
@@ -273,7 +278,7 @@ impl GpuMap {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("mahere map"), source: wgpu::ShaderSource::Wgsl(include_str!("map.wgsl").into()) });
         let uint_array = wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Uint, view_dimension: wgpu::TextureViewDimension::D2Array, multisampled: false };
         let storage = wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: true }, has_dynamic_offset: false, min_binding_size: None };
-        let entries: Vec<wgpu::BindGroupLayoutEntry> = (0..9u32)
+        let entries: Vec<wgpu::BindGroupLayoutEntry> = (0..10u32)
             .map(|i| wgpu::BindGroupLayoutEntry {
                 binding: i,
                 visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
@@ -292,6 +297,7 @@ impl GpuMap {
             entries: &[
                 wgpu::BindGroupLayoutEntry { binding: 0, visibility: wgpu::ShaderStages::FRAGMENT, ty: float_tex, count: None },
                 wgpu::BindGroupLayoutEntry { binding: 1, visibility: wgpu::ShaderStages::FRAGMENT, ty: float_tex, count: None },
+                wgpu::BindGroupLayoutEntry { binding: 2, visibility: wgpu::ShaderStages::FRAGMENT, ty: float_tex, count: None },
             ],
         });
         let relight_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -335,6 +341,7 @@ impl GpuMap {
         let line = Plane::new(device, "line", 2 * TEX as u32, TEX as u32, wgpu::TextureFormat::Rgba8Uint, max_layers);
         let lw = Plane::new(device, "land water", 2 * TEX as u32, TEX as u32, wgpu::TextureFormat::Rgba8Uint, max_layers);
         let img = Plane::new(device, "img", 2 * TEX as u32, TEX as u32, wgpu::TextureFormat::Rgba8Uint, max_layers);
+        let ink = Plane::new(device, "ink", 2 * TEX as u32, TEX as u32, wgpu::TextureFormat::Rgba8Uint, max_layers);
 
         GpuMap {
             map_layout,
@@ -357,6 +364,10 @@ impl GpuMap {
             line,
             lw,
             img,
+            ink,
+            user_version: u64::MAX,
+            preview: None,
+            preview_version: u64::MAX,
             dem_scale: FxHashMap::default(),
             map_bind: None,
             offscreen: Vec::new(),
@@ -372,7 +383,7 @@ impl GpuMap {
     }
 
     fn make_map_bind(&mut self, device: &wgpu::Device) {
-        let (dv, lv, wv, iv) = (self.dem.view(), self.line.view(), self.lw.view(), self.img.view());
+        let (dv, lv, wv, iv, kv) = (self.dem.view(), self.line.view(), self.lw.view(), self.img.view(), self.ink.view());
         self.map_bind = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("map"),
             layout: &self.map_layout,
@@ -386,8 +397,82 @@ impl GpuMap {
                 wgpu::BindGroupEntry { binding: 6, resource: wgpu::BindingResource::TextureView(&lv) },
                 wgpu::BindGroupEntry { binding: 7, resource: wgpu::BindingResource::TextureView(&wv) },
                 wgpu::BindGroupEntry { binding: 8, resource: wgpu::BindingResource::TextureView(&iv) },
+                wgpu::BindGroupEntry { binding: 9, resource: wgpu::BindingResource::TextureView(&kv) },
             ],
         }));
+    }
+
+    /// The user's layer onto the GPU: every user cell's ink and selection into the ink plane (they are few; all of them again whenever the layer changes), and the selection being drawn as a screen mask the present pass washes over the frame.
+    pub fn set_user(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, user: &mahere_engine::ink::UserLayer, preview: &[u8], preview_version: u64, w: u32, h: u32) {
+        if self.user_version != user.version {
+            self.user_version = user.version;
+            let gone: Vec<CellKey> = self.ink.map.keys().filter(|k| !user.cells.contains_key(k)).copied().collect();
+            for k in gone {
+                if let Some(slot) = self.ink.map.remove(&k) {
+                    self.ink.free.push(slot);
+                }
+            }
+            let mut grew = false;
+            let mut scratch = vec![0u8; TRI * 4];
+            for (key, c) in user.cells.iter() {
+                let (slot, g) = self.ink.alloc(device, queue, *key);
+                grew |= g;
+                if let Some((slot, _)) = slot {
+                    for i in 0..TRI {
+                        scratch[4 * i] = c.ink.as_ref().map_or(0, |k| k.class[i]);
+                        scratch[4 * i + 1] = c.ink.as_ref().map_or(0, |k| k.cov[i]);
+                        scratch[4 * i + 2] = c.sel.as_ref().map_or(0, |k| k.cov[i]);
+                        scratch[4 * i + 3] = 0;
+                    }
+                    write_layer(queue, &self.ink.tex, slot, 2 * TEX as u32, TEX as u32, 4, &scratch);
+                }
+            }
+            if grew {
+                self.map_bind = None;
+            }
+        }
+        let fresh = match &self.preview {
+            Some((_, _, pw, ph)) => *pw != w || *ph != h,
+            None => true,
+        };
+        if fresh {
+            let t = device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("preview"),
+                size: wgpu::Extent3d { width: w.max(1), height: h.max(1), depth_or_array_layers: 1 },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::R8Unorm,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            });
+            let v = t.create_view(&Default::default());
+            self.preview = Some((t, v, w, h));
+            self.preview_binds_dirty();
+            self.preview_version = u64::MAX;
+        }
+        if self.preview_version != preview_version {
+            self.preview_version = preview_version;
+            let (t, _, pw, ph) = self.preview.as_ref().unwrap();
+            let n = (*pw as usize) * (*ph as usize);
+            let zeros;
+            let data: &[u8] = if preview.len() == n {
+                preview
+            } else {
+                zeros = vec![0u8; n];
+                &zeros
+            };
+            queue.write_texture(
+                wgpu::TexelCopyTextureInfo { texture: t, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+                data,
+                wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(*pw), rows_per_image: Some(*ph) },
+                wgpu::Extent3d { width: *pw, height: *ph, depth_or_array_layers: 1 },
+            );
+        }
+    }
+
+    fn preview_binds_dirty(&mut self) {
+        self.present_binds.clear();
     }
 
     /// Mirror the pool: a slot per resident plane, uploaded on first sight, freed when the cell leaves the pool.
@@ -554,15 +639,31 @@ impl GpuMap {
             self.overlay = Some((t, v, w, h));
             self.present_binds.clear();
         }
+        if self.preview.is_none() {
+            let t = device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("preview"),
+                size: wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::R8Unorm,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            });
+            let v = t.create_view(&Default::default());
+            self.preview = Some((t, v, 1, 1));
+        }
         if !self.present_binds.contains_key(&scale) {
             let (_, _, mv, _, _) = self.offscreen.iter().find(|(s, ..)| *s == scale).unwrap();
             let (_, ov, _, _) = self.overlay.as_ref().unwrap();
+            let (_, pv, _, _) = self.preview.as_ref().unwrap();
             let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("present"),
                 layout: &self.present_layout,
                 entries: &[
                     wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(mv) },
                     wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(ov) },
+                    wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(pv) },
                 ],
             });
             self.present_binds.insert(scale, bind);
@@ -646,6 +747,10 @@ impl GpuMap {
                 let line = self.line.map.get(&r.key).copied();
                 let lw = self.lw.map.get(&r.key).copied();
                 let img = self.img.map.get(&r.key).copied();
+                if flags & FLAG_INK != 0 {
+                    let ink = self.ink.map.get(&r.key).copied();
+                    return GpuRef { a: [r.diamond as u32, r.key.depth as u32, r.cu, r.cv], b: [ink.unwrap_or(0), 0, 0, 0], c: [if ink.is_some() { FLAG_INK } else { 0 }, 0, 0, 0], d: [0.0; 4], e: [0.0; 4] };
+                }
                 if dem.is_none() {
                     flags &= !FLAG_DEM;
                 }

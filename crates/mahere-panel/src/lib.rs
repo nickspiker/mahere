@@ -25,6 +25,12 @@ pub struct Controls {
     pub theme: usize,
     /// Highlights compressed into white (exposure 2/3 into Opsin's rail); off, linear: the stored range straight, 2.3 stops darker. The row shows it the other way up, as "Linear highlights".
     pub compressed: bool,
+    /// What a touch on the map does: 0 navigates, 1 draws with the pen, 2 draws a selection. The pen's colour, an index into the engine's pens.
+    pub tool: u8,
+    pub pen: u8,
+    /// One-shot asks: the ink or the selection cleared.
+    pub clear_ink: bool,
+    pub clear_sel: bool,
 }
 
 /// What the readouts show.
@@ -63,9 +69,15 @@ enum Layer {
     Infrared,
     Imagery,
     Debug,
+    /// The tools: the pen and the selection as a touch's job, the pen's next colour, and the two clears.
+    Pen,
+    Select,
+    PenColour,
+    ClearInk,
+    ClearSel,
 }
 
-const LAYERS: [(Layer, &str); 16] = [
+const LAYERS: [(Layer, &str); 21] = [
     (Layer::Dem, "Terrain"),
     (Layer::Hypso, "Elevation tint"),
     (Layer::Land, "Land cover"),
@@ -82,6 +94,11 @@ const LAYERS: [(Layer, &str); 16] = [
     (Layer::Linear, "Linear highlights"),
     (Layer::FollowHeading, "Follow heading"),
     (Layer::LockToFix, "Measure from me"),
+    (Layer::Pen, "Pen"),
+    (Layer::PenColour, "Next pen colour"),
+    (Layer::Select, "Select area"),
+    (Layer::ClearInk, "Clear ink"),
+    (Layer::ClearSel, "Clear selection"),
 ];
 
 /// A row that takes a tap but changes nothing: a layer another layer has greyed, or the one of real sun and real light the other has taken (the sun is either the almanac's or the camera's).
@@ -89,7 +106,7 @@ fn inert(mask: &LayerMask, ctl: &Controls, l: Layer) -> bool {
     match l {
         Layer::RealSun => ctl.real_light,
         Layer::RealLight => ctl.real_sun,
-        Layer::Linear | Layer::FollowHeading | Layer::LockToFix => false,
+        Layer::Linear | Layer::FollowHeading | Layer::LockToFix | Layer::Pen | Layer::Select | Layer::PenColour | Layer::ClearInk | Layer::ClearSel => false,
         _ => get(&mask.inert(), &Controls::default(), l),
     }
 }
@@ -112,6 +129,9 @@ fn get(mask: &LayerMask, ctl: &Controls, l: Layer) -> bool {
         Layer::Infrared => mask.infrared,
         Layer::Imagery => mask.imagery,
         Layer::Debug => mask.debug,
+        Layer::Pen => ctl.tool == 1,
+        Layer::Select => ctl.tool == 2,
+        Layer::PenColour | Layer::ClearInk | Layer::ClearSel => false,
     }
 }
 
@@ -133,6 +153,11 @@ fn set(mask: &mut LayerMask, ctl: &mut Controls, l: Layer, v: bool) {
         Layer::Infrared => mask.infrared = v,
         Layer::Imagery => mask.imagery = v,
         Layer::Debug => mask.debug = v,
+        Layer::Pen => ctl.tool = if v { 1 } else { 0 },
+        Layer::Select => ctl.tool = if v { 2 } else { 0 },
+        Layer::PenColour => ctl.pen = (ctl.pen + 1) % 8,
+        Layer::ClearInk => ctl.clear_ink = true,
+        Layer::ClearSel => ctl.clear_sel = true,
     }
 }
 
@@ -464,7 +489,7 @@ impl Panel {
                 }
                 let v = !get(mask, ctl, *l);
                 set(mask, ctl, *l, v);
-                cb.set_checked(v);
+                cb.set_checked(get(mask, ctl, *l));
                 self.dirty = true;
                 return true;
             }

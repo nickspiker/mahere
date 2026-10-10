@@ -42,6 +42,11 @@ pub struct AndroidApp {
     travel: f64,
     /// A second finger touched during this press.
     had_two: bool,
+    /// A stroke of the pen or a selection in progress; the touch that is drawing is a stylus; its pressure; when a stylus last touched, since while the pen is out fingers only navigate.
+    drawing: bool,
+    stylus: bool,
+    pressure: f32,
+    stylus_seen: Option<Instant>,
     last_cursor: (f64, f64),
     two: Option<TwoFinger>,
     /// Re-anchor the next CursorMoved instead of panning (finger handoff after a pinch would otherwise jump by the stale delta).
@@ -123,7 +128,7 @@ fn free_bytes(dir: &str) -> Option<u64> {
 
 impl AndroidApp {
     fn controls(&self) -> Controls {
-        Controls { real_sun: self.map.real_sun, real_light: self.map.real_light, follow_heading: self.map.follow_heading, lock_to_fix: self.map.lock_to_fix, cache_budget: self.cache_budget, theme: self.map.theme, compressed: self.map.compressed() }
+        Controls { real_sun: self.map.real_sun, real_light: self.map.real_light, follow_heading: self.map.follow_heading, lock_to_fix: self.map.lock_to_fix, cache_budget: self.cache_budget, theme: self.map.theme, compressed: self.map.compressed(), tool: self.map.tool as u8, pen: self.map.pen, clear_ink: false, clear_sel: false }
     }
 
     /// A pinch with the panel open: the finger distance's ratio to the last event's scales the UI.
@@ -193,6 +198,18 @@ impl AndroidApp {
         if ctl.theme != self.map.theme {
             self.map.set_theme(ctl.theme);
         }
+        self.map.set_tool(match ctl.tool {
+            1 => mahere_engine::ink::Tool::Pen,
+            2 => mahere_engine::ink::Tool::Select,
+            _ => mahere_engine::ink::Tool::None,
+        });
+        self.map.set_pen(ctl.pen);
+        if ctl.clear_ink {
+            self.map.clear_ink();
+        }
+        if ctl.clear_sel {
+            self.map.clear_selection();
+        }
         self.save_settings();
     }
 
@@ -211,7 +228,11 @@ impl AndroidApp {
     }
 
     fn two_begin(&mut self, x0: f64, y0: f64, x1: f64, y1: f64) {
-        // A second finger means a gesture, never a tap, however little the first one travelled.
+        // A second finger means a gesture, never a tap, however little the first one travelled; a stroke the first finger began is undone, the two fingers navigate, and the one left afterwards keeps navigating.
+        if self.drawing {
+            self.map.cancel_stroke();
+            self.drawing = false;
+        }
         self.had_two = true;
         // The ground under the screen midpoint, which the gesture keeps there: the mean of the two fingers' latitudes and longitudes is nowhere near it at a globe zoom, where the fingers can straddle a pole or the antimeridian (Nick 2026-10-09: the map jumped a region away on the second finger).
         let geo_mid = self.map.cam.screen_to_geo((x0 + x1) * 0.5, (y0 + y1) * 0.5, self.w, self.h);
@@ -323,11 +344,25 @@ impl FluorApp for AndroidApp {
                     self.travel = 0.0;
                     self.had_two = false;
                     self.last_cursor = (ctx.cursor_x as f64, ctx.cursor_y as f64);
+                    // With a tool on, the touch draws: the pen's, always; a finger's unless a pen touched in the last few seconds, which says the pen is out and fingers only navigate (Nick 2026-10-10).
+                    let pen_out = !self.stylus && self.stylus_seen.is_some_and(|t| t.elapsed() < std::time::Duration::from_secs(3));
+                    if self.map.tool != mahere_engine::ink::Tool::None && !pen_out {
+                        self.map.begin_stroke(ctx.cursor_x as f64, ctx.cursor_y as f64, self.pressure as f64, self.w, self.h);
+                        self.drawing = true;
+                        ctx.window.request_redraw();
+                    }
                 }
                 EventResponse::Handled
             }
             FEvent::MouseInput { state: ElementState::Released, button: MouseButton::Left } => {
                 self.panel.release();
+                if self.drawing {
+                    self.map.end_stroke(self.w, self.h);
+                    self.drawing = false;
+                    self.dragging = false;
+                    ctx.window.request_redraw();
+                    return EventResponse::Handled;
+                }
                 // A press and release that never travelled is a tap: a new measurement to that point.
                 if self.dragging && self.two.is_none() && !self.had_two && self.travel < 12.0 {
                     self.map.tap(ctx.cursor_x as f64, ctx.cursor_y as f64, self.w, self.h);
@@ -347,6 +382,9 @@ impl FluorApp for AndroidApp {
                 }
                 if self.suppress_move {
                     self.suppress_move = false;
+                } else if self.drawing {
+                    self.map.extend_stroke(x, y, self.pressure as f64, self.w, self.h);
+                    ctx.window.request_redraw();
                 } else if self.dragging && self.two.is_none() && !self.panel.is_open() {
                     let (dx, dy) = (x - self.last_cursor.0, y - self.last_cursor.1);
                     self.travel += dx.abs() + dy.abs();
@@ -478,6 +516,9 @@ pub extern "system" fn Java_nz_mahere_app_MahereActivity_nativeInit(
     };
     eprintln!("camera: {:.5} {:.5} ppd {:.1} bearing {:.3}", cam.lat(), cam.lon(), cam.ppd, cam.bearing());
     let mut map = MapCore::new(cell_store, cam);
+    if let Some(v) = &store {
+        map.set_user_store(std::sync::Arc::new(mahere_store::VaultUser::new(v.clone())));
+    }
     if let Some(s) = session {
         map.sun_az = s.sun_az as f32;
         map.sun_alt = s.sun_alt as f32;
@@ -505,6 +546,10 @@ pub extern "system" fn Java_nz_mahere_app_MahereActivity_nativeInit(
         dragging: false,
         travel: 0.0,
         had_two: false,
+        drawing: false,
+        stylus: false,
+        pressure: 0.5,
+        stylus_seen: None,
         last_cursor: (0., 0.),
         two: None,
         suppress_move: false,
@@ -611,11 +656,20 @@ pub extern "system" fn Java_nz_mahere_app_MahereActivity_nativeOnTouch(
     y0: jfloat,
     x1: jfloat,
     y1: jfloat,
+    tool: jint,
+    pressure: jfloat,
 ) -> jint {
     if ptr == 0 {
         return 0;
     }
     let s = shell(ptr);
+    // The touch's tool and pressure (Android's TOOL_TYPE_STYLUS is 2): a stylus draws at its pressure, a finger at a middle one.
+    let stylus = tool == 2;
+    s.app().stylus = stylus;
+    s.app().pressure = if stylus { pressure.clamp(0.0, 1.0) } else { 0.5 };
+    if stylus {
+        s.app().stylus_seen = Some(Instant::now());
+    }
     // With the panel open, two fingers scale the UI (fluor's RU), not the map.
     if s.app().panel.is_open() {
         if count >= 2 && action != ACTION_POINTER_UP {
