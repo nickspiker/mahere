@@ -334,9 +334,24 @@ fn bathymetry(out: &Path, dir: &str, depth: u8, region_depth: u8, bbox: Option<V
                 }
             }
         }
+        // No apron may stay unknown: a rewrite keeps the old apron where the new is unknown, and the old one is the sea level the land source wrote, a kilometres-deep step at the region's edge that drew as a line along it. Siblings fill what they can, the seabed grid the rest.
+        let level7: Vec<(CellKey, Cell)> = {
+            let dems: Vec<(CellKey, DemCell)> = mahere_tiles::fill_aprons(level7.iter().map(|(k, c)| (*k, c.dem.clone().unwrap())).collect());
+            let mut by_key: HashMap<CellKey, Cell> = level7.into_iter().collect();
+            dems.into_iter()
+                .map(|(k, mut d)| {
+                    apron_from_seabed(&store, k, &mut d);
+                    let mut c = by_key.remove(&k).unwrap();
+                    c.dem = Some(d);
+                    (k, c)
+                })
+                .collect()
+        };
         level7.into_par_iter().for_each(|(k, c)| mahere_tiles::write_cell(out, k, &c, loss).expect("write cell"));
-        let base6: Vec<(CellKey, DemCell)> = mahere_tiles::fill_aprons(level6.into_iter().collect());
-        let upper = mahere_tiles::fill_aprons(mahere_tiles::dem_pyramid(&base6, region_depth));
+        let mut base6: Vec<(CellKey, DemCell)> = mahere_tiles::fill_aprons(level6.into_iter().collect());
+        base6.par_iter_mut().for_each(|(k, c)| apron_from_seabed(&store, *k, c));
+        let mut upper = mahere_tiles::fill_aprons(mahere_tiles::dem_pyramid(&base6, region_depth));
+        upper.par_iter_mut().for_each(|(k, c)| apron_from_seabed(&store, *k, c));
         let wupper = mahere_tiles::pyramid_cov(water6.clone(), BATHY_DEPTH, region_depth);
         let n = base6.len() + upper.len();
         base6.into_par_iter().chain(upper.into_par_iter()).for_each(|(k, c)| {
@@ -348,6 +363,20 @@ fn bathymetry(out: &Path, dir: &str, depth: u8, region_depth: u8, bbox: Option<V
         eprintln!("bathy region {}/{}/{}: {} land cells, {n} seabed cells from depth {BATHY_DEPTH} up, {:.1}s", diamond, cu, cv, base8.len(), t.elapsed().as_secs_f32());
     }
     eprintln!("bathymetry pass: {land} land regions patched, {sea} sea regions baked; {:.0}s", t_all.elapsed().as_secs_f32());
+}
+
+/// The apron entries still unknown, sampled from the seabed grid (which carries the land too, coarsely: an edge texel's slope, nothing more).
+fn apron_from_seabed(store: &mahere_dem::DemStore, key: CellKey, cell: &mut DemCell) {
+    if cell.apron.iter().all(|a| !a.is_nan()) {
+        return;
+    }
+    let mut fresh = DemCell::empty();
+    mahere_tiles::fill_apron_from_source(store, key, &mut fresh);
+    for (a, f) in cell.apron.iter_mut().zip(fresh.apron.iter()) {
+        if a.is_nan() {
+            *a = *f;
+        }
+    }
 }
 
 /// The bounds (north, south, west, east) in a GEBCO tile's name, `gebco_2024_n90.0_s0.0_w-180.0_e-90.0.tif`.

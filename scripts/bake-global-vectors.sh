@@ -23,7 +23,7 @@ done
 if [ ! -f "$SRC/osm/regions/.cut-done" ]; then
     echo "$(date +%T) cutting the planet into $(grep -c '"output"' "$REGIONS_JSON") extracts"
     mkdir -p "$SRC/osm/regions"
-    # osmium keeps a node id set per extract, so hundreds of extracts over the planet at once run out of memory (and 500 is its limit anyway): the planet is cut first into a few dozen 30°×60° chunks, then each chunk into its regions, in runs of 500 at most.
+    # osmium keeps an id set per extract sized by the planet's largest id, about 1.3 GB each, so a pass may carry twenty extracts at most: the planet is cut into 30°×60° chunks in passes of twenty, then each chunk into its regions in passes of twenty.
     python3 - "$REGIONS_JSON" "$SRC/osm" <<'PY'
 import json, sys, os
 r = json.load(open(sys.argv[1]))
@@ -38,15 +38,18 @@ chunks = []
 for i, (key, ex) in enumerate(sorted(groups.items())):
     bb = {'left': min(e['bbox']['left'] for e in ex), 'bottom': min(e['bbox']['bottom'] for e in ex), 'right': max(e['bbox']['right'] for e in ex), 'top': max(e['bbox']['top'] for e in ex)}
     chunks.append({'output': f"chunk{i}.osm.pbf", 'output_format': 'pbf,add_metadata=false', 'bbox': bb})
-    for j in range(0, len(ex), 500):
+    for j in range(0, len(ex), 20):
         part = dict(r)
-        part['extracts'] = ex[j:j + 500]
-        json.dump(part, open(f"{src}/chunks/chunk{i}.part{j // 500}.json", 'w'))
-json.dump({'directory': f"{src}/chunks", 'extracts': chunks}, open(f"{src}/chunks/chunks.json", 'w'))
+        part['extracts'] = ex[j:j + 20]
+        json.dump(part, open(f"{src}/chunks/chunk{i}.part{j // 20:03}.json", 'w'))
+for j in range(0, len(chunks), 20):
+    json.dump({'directory': f"{src}/chunks", 'extracts': chunks[j:j + 20]}, open(f"{src}/chunks/chunks.pass{j // 20}.json", 'w'))
 print(len(chunks), 'chunks')
 PY
-    echo "$(date +%T) cutting the planet into chunks"
-    osmium extract -c "$SRC/osm/chunks/chunks.json" -s simple --overwrite "$SRC/osm/planet-latest.osm.pbf"
+    for pass in "$SRC"/osm/chunks/chunks.pass*.json; do
+        echo "$(date +%T) cutting the planet: $(basename "$pass")"
+        osmium extract -c "$pass" -s simple --overwrite "$SRC/osm/planet-latest.osm.pbf"
+    done
     for part in "$SRC"/osm/chunks/chunk*.part*.json; do
         chunk="${part%%.part*}.osm.pbf"
         echo "$(date +%T) extracting $(basename "$part") from $(basename "$chunk")"
