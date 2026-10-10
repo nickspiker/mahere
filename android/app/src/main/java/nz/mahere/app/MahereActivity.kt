@@ -15,6 +15,7 @@ import android.hardware.SensorManager
 import android.location.Location
 import android.location.LocationListener
 import android.location.LocationManager
+import android.content.Intent
 import android.os.Bundle
 import android.view.Choreographer
 import android.view.MotionEvent
@@ -48,6 +49,7 @@ class MahereActivity : Activity(), SurfaceHolder.Callback, Choreographer.FrameCa
         x0: Float, y0: Float, x1: Float, y1: Float,
     ): Int
     private external fun nativeOnLocation(ptr: Long, lat: Double, lon: Double, accuracy: Float)
+    private external fun nativeGoTo(ptr: Long, lat: Double, lon: Double, ppd: Double)
     private external fun nativeOnDeclination(ptr: Long, declinationDeg: Float)
     private external fun nativeOnOrientation(ptr: Long, r0: Float, r1: Float, r2: Float, r3: Float, r4: Float, r5: Float, r6: Float, r7: Float, r8: Float)
     private external fun nativeOnPause(ptr: Long)
@@ -77,6 +79,8 @@ class MahereActivity : Activity(), SurfaceHolder.Callback, Choreographer.FrameCa
     private var assetsStaged = false
     private var initInFlight = false
     private var pendingSize: Pair<Int, Int>? = null
+    /// A place from a geo: intent, waiting for the native side to exist: latitude, longitude, pixels per degree (or -1 for the zoom the map has).
+    private var pendingGeo: Triple<Double, Double, Double>? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -86,6 +90,7 @@ class MahereActivity : Activity(), SurfaceHolder.Callback, Choreographer.FrameCa
         surfaceView.holder.addCallback(this)
         setContentView(surfaceView)
         hideSystemBars()
+        takeGeo(intent)
         // The map tags its buffers BT.2020 (gpu_host::tag_bt2020); wide-gamut mode lets the panel show them without an sRGB clamp, and minimal post-processing asks the compositor to skip vendor saturation passes.
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             window.colorMode = ActivityInfo.COLOR_MODE_WIDE_COLOR_GAMUT
@@ -149,6 +154,8 @@ class MahereActivity : Activity(), SurfaceHolder.Callback, Choreographer.FrameCa
                 runOnUiThread {
                     nativePtr = ptr
                     initInFlight = false
+                    pendingGeo?.let { (lat, lon, ppd) -> nativeGoTo(ptr, lat, lon, ppd) }
+                    pendingGeo = null
                     // The surface may have changed size during the long init.
                     pendingSize?.let { (pw, ph) ->
                         if (pw != w || ph != h) nativeResize(ptr, pw, ph)
@@ -202,6 +209,28 @@ class MahereActivity : Activity(), SurfaceHolder.Callback, Choreographer.FrameCa
         } else if (!want && probe.running) {
             probe.stop()
         }
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        takeGeo(intent)
+    }
+
+    /// A geo: URI's place, applied now or once the native side is up. `geo:lat,lon`, `geo:0,0?q=lat,lon`, and `?z=` as a web zoom level (metres per pixel 156543 / 2^z at the equator, so pixels per degree 0.711 · 2^z).
+    private fun takeGeo(intent: Intent?) {
+        val uri = intent?.data ?: return
+        if (uri.scheme != "geo") return
+        val text = uri.schemeSpecificPart ?: return
+        val pair = Regex("(-?\\d+(?:\\.\\d+)?),(-?\\d+(?:\\.\\d+)?)")
+        val q = Regex("[?&]q=([^&]*)").find(text)?.groupValues?.get(1)
+        val m = (q?.let { pair.find(it) }) ?: pair.find(text) ?: return
+        val lat = m.groupValues[1].toDoubleOrNull() ?: return
+        val lon = m.groupValues[2].toDoubleOrNull() ?: return
+        if (lat == 0.0 && lon == 0.0 && q == null) return
+        val z = Regex("[?&]z=(\\d+(?:\\.\\d+)?)").find(text)?.groupValues?.get(1)?.toDoubleOrNull()
+        val ppd = if (z != null) 0.711 * Math.pow(2.0, z) else -1.0
+        val ptr = nativePtr
+        if (ptr != 0L) nativeGoTo(ptr, lat, lon, ppd) else pendingGeo = Triple(lat, lon, ppd)
     }
 
     override fun onResume() {

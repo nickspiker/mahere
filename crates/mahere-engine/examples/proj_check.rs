@@ -40,6 +40,26 @@ fn main() {
     let a = map.cam.geo_to_screen(geo_a.0, geo_a.1, w, h);
     let b = map.cam.geo_to_screen(geo_b.0, geo_b.1, w, h);
     println!("pinch: finger a at ({:.1},{:.1}) wanted ({nx0},{ny0}); b at ({:.1},{:.1}) wanted ({nx1},{ny1})", a.0, a.1, b.0, b.1);
+    // The phone's state in the Arctic, a pinch that barely moves.
+    let (w, h) = (1008, 2244);
+    let cam = Camera { lat: 77.53982, lon: 137.79071, ppd: 44.47, bearing: (-107f64).to_radians().rem_euclid(core::f64::consts::TAU) };
+    let mut map = MapCore::new(Arc::new(Nothing), cam);
+    let (x0, y0, x1, y1) = (400.0, 1000.0, 600.0, 1300.0);
+    let geo_a = map.cam.screen_to_geo(x0, y0, w, h);
+    let geo_b = map.cam.screen_to_geo(x1, y1, w, h);
+    println!("fingers at {:?} and {:?}", geo_a, geo_b);
+    let d0 = ((x1 - x0) as f64).hypot(y1 - y0);
+    let alpha0 = ((y1 - y0) as f64).atan2(x1 - x0);
+    let (ppd0, bearing0) = (map.cam.ppd, map.cam.bearing);
+    let (nx0, ny0, nx1, ny1) = (400.0, 1001.0, 601.0, 1300.0);
+    let d = ((nx1 - nx0) as f64).hypot(ny1 - ny0);
+    let alpha = ((ny1 - ny0) as f64).atan2(nx1 - nx0);
+    map.set_ppd(ppd0 * d / d0);
+    map.set_bearing(bearing0 + (alpha0 - alpha));
+    let (mid_lat, mid_lon) = ((geo_a.0 + geo_b.0) * 0.5, (geo_a.1 + geo_b.1) * 0.5);
+    println!("mid {mid_lat:.4},{mid_lon:.4}");
+    map.place_anchor(mid_lat, mid_lon, (nx0 + nx1) * 0.5, (ny0 + ny1) * 0.5, w, h);
+    println!("camera after: {:.5},{:.5} ppd {:.2} bearing {:.3}", map.cam.lat, map.cam.lon, map.cam.ppd, map.cam.bearing);
 }
 
 #[allow(dead_code)]

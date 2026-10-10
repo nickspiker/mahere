@@ -25,8 +25,7 @@ use gpu_host::GpuHost;
 
 struct TwoFinger {
     /// Geography captured under each finger at gesture start.
-    geo_a: (f64, f64),
-    geo_b: (f64, f64),
+    geo_mid: (f64, f64),
     d0: f64,
     ppd0: f64,
     /// Screen angle of the finger vector at capture, and bearing then.
@@ -214,12 +213,11 @@ impl AndroidApp {
     fn two_begin(&mut self, x0: f64, y0: f64, x1: f64, y1: f64) {
         // A second finger means a gesture, never a tap, however little the first one travelled.
         self.had_two = true;
-        let geo_a = self.map.cam.screen_to_geo(x0, y0, self.w, self.h);
-        let geo_b = self.map.cam.screen_to_geo(x1, y1, self.w, self.h);
+        // The ground under the screen midpoint, which the gesture keeps there: the mean of the two fingers' latitudes and longitudes is nowhere near it at a globe zoom, where the fingers can straddle a pole or the antimeridian (Nick 2026-10-09: the map jumped a region away on the second finger).
+        let geo_mid = self.map.cam.screen_to_geo((x0 + x1) * 0.5, (y0 + y1) * 0.5, self.w, self.h);
         let d0 = ((x1 - x0).powi(2) + (y1 - y0).powi(2)).sqrt().max(1.0);
         self.two = Some(TwoFinger {
-            geo_a,
-            geo_b,
+            geo_mid,
             d0,
             ppd0: self.map.cam.ppd,
             alpha0: (y1 - y0).atan2(x1 - x0),
@@ -228,17 +226,15 @@ impl AndroidApp {
         self.dragging = false;
     }
 
-    /// Full 4-DOF similarity solve: two finger correspondences exactly determine pan+rotate+zoom. Scale from the distance ratio, bearing from the finger-vector angle (screen angle of a fixed geo segment is -(B + its ENU angle), so B = B0 + (alpha0 - alpha)), then the geographic midpoint pinned under the screen midpoint.
+    /// Full 4-DOF similarity solve: two finger correspondences determine pan+rotate+zoom. Scale from the distance ratio, bearing from the finger-vector angle (screen angle of a fixed geo segment is -(B + its ENU angle), so B = B0 + (alpha0 - alpha)), then the ground that was under the screen midpoint pinned under it.
     fn two_update(&mut self, x0: f64, y0: f64, x1: f64, y1: f64) {
         let Some(t) = &self.two else { return };
         let d = ((x1 - x0).powi(2) + (y1 - y0).powi(2)).sqrt().max(1.0);
         let alpha = (y1 - y0).atan2(x1 - x0);
         self.map.set_ppd(t.ppd0 * d / t.d0);
         self.map.set_bearing(t.bearing0 + (t.alpha0 - alpha));
-        let mid_lat = (t.geo_a.0 + t.geo_b.0) * 0.5;
-        let mid_lon = (t.geo_a.1 + t.geo_b.1) * 0.5;
         let (mx, my) = ((x0 + x1) * 0.5, (y0 + y1) * 0.5);
-        self.map.place_anchor(mid_lat, mid_lon, mx, my, self.w, self.h);
+        self.map.place_anchor(t.geo_mid.0, t.geo_mid.1, mx, my, self.w, self.h);
     }
 
     fn two_end(&mut self) {
@@ -470,11 +466,15 @@ pub extern "system" fn Java_nz_mahere_app_MahereActivity_nativeInit(
     };
     let session = store.as_ref().and_then(|s| mahere_store::load_session(s));
     let settings = store.as_ref().and_then(|s| mahere_store::load_settings(s));
+    // Mt St Helens until the first GPS fix recenters us; a saved view only if it is a view (finite, on the globe, at a zoom the map has).
+    let home = Camera { lat: 46.2000, lon: -122.1900, ppd: 12_000.0, bearing: 0.0 };
     let cam = match session {
-        Some(s) => Camera { lat: s.lat, lon: s.lon, ppd: s.ppd, bearing: s.bearing },
-        // Mt St Helens until the first GPS fix recenters us.
-        None => Camera { lat: 46.2000, lon: -122.1900, ppd: 12_000.0, bearing: 0.0 },
+        Some(s) if s.lat.is_finite() && s.lon.is_finite() && s.ppd.is_finite() && s.bearing.is_finite() && s.lat.abs() <= 90.0 && s.lon.abs() <= 360.0 && (1.0..=4_000_000.0).contains(&s.ppd) => {
+            Camera { lat: s.lat, lon: s.lon, ppd: s.ppd, bearing: s.bearing }
+        }
+        _ => home,
     };
+    eprintln!("camera: {:.5} {:.5} ppd {:.1} bearing {:.3}", cam.lat, cam.lon, cam.ppd, cam.bearing);
     let mut map = MapCore::new(cell_store, cam);
     if let Some(s) = session {
         map.sun_az = s.sun_az as f32;
@@ -642,6 +642,23 @@ pub extern "system" fn Java_nz_mahere_app_MahereActivity_nativeOnTouch(
         s.app().two_end();
     }
     s.on_touch(action, x0, y0)
+}
+
+/// A place to look at, from a `geo:` intent (a shared location, or adb): the camera goes there, at the zoom given (pixels per degree) when positive.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_nz_mahere_app_MahereActivity_nativeGoTo(
+    _env: JNIEnv,
+    _class: JClass,
+    ptr: jlong,
+    lat: jdouble,
+    lon: jdouble,
+    ppd: jdouble,
+) {
+    if ptr != 0 && lat.is_finite() && lon.is_finite() {
+        let s = shell(ptr);
+        let (w, h) = (s.app().w, s.app().h);
+        s.app().map.go_to(lat, lon, if ppd > 0.0 { Some(ppd) } else { None }, w, h);
+    }
 }
 
 /// The device heading from the rotation-vector sensor, degrees clockwise from north: the lighting turns against it so the sun stays where it physically is.

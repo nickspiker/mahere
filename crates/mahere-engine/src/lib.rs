@@ -384,6 +384,18 @@ impl MapCore {
         self.dirty = true;
     }
 
+    /// Look at a place: the camera point goes there, north up, at the zoom given or the one it has.
+    pub fn go_to(&mut self, lat: f64, lon: f64, ppd: Option<f64>, w: usize, h: usize) {
+        self.cam.lat = lat;
+        self.cam.lon = lon;
+        self.cam.bearing = 0.0;
+        if let Some(p) = ppd {
+            self.cam.ppd = p.clamp(Self::ppd_floor(w, h), 4_000_000.);
+        }
+        self.clamp_camera();
+        self.camera_moved(w, h);
+    }
+
     pub fn go_home(&mut self, w: usize, h: usize) {
         self.cam = self.home;
         self.camera_moved(w, h);
