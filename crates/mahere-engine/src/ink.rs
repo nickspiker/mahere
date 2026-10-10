@@ -187,12 +187,18 @@ impl UserLayer {
                 let (cu, cv) = key.grid();
                 let (pu, pv) = k.grid();
                 let (ou, ov) = ((cu - (pu << levels)) as usize, (cv - (pv << levels)) as usize);
+                // Each fine triangle takes the ancestor triangle its centroid lies in: the ancestor's texel by shifting, and its lower or upper half by where the centroid falls against that texel's diagonal (a fine texel's own half says nothing about that, and using it dotted every edge).
                 let mut map = vec![0usize; TRI];
+                let p = 1usize << levels;
                 for ty in 0..256 {
                     for tx in 0..256 {
-                        let (sx, sy) = (((ou << 8) + tx) >> levels, ((ov << 8) + ty) >> levels);
+                        let (gx, gy) = ((ou << 8) + tx, (ov << 8) + ty);
+                        let (sx, sy) = (gx >> levels, gy >> levels);
+                        let (fx, fy) = (gx & (p - 1), gy & (p - 1));
                         for half in 0..2 {
-                            map[((ty << 8) | tx) << 1 | half] = ((sy << 8) | sx) << 1 | half;
+                            // Centroid thirds: the lower triangle's at (1/3, 1/3) of the texel, the upper's at (2/3, 2/3); times three to stay in integers.
+                            let upper = 3 * (fx + fy) + 2 + 2 * half >= 3 * p;
+                            map[((ty << 8) | tx) << 1 | half] = ((sy << 8) | sx) << 1 | upper as usize;
                         }
                     }
                 }
@@ -477,6 +483,27 @@ mod tests {
         let (lat, lon) = cam().screen_to_geo(400.0, 200.0, w, h);
         let raw = Coord::from_lat_lon(lat, lon).raw();
         assert_eq!(u.ink_at(raw, 13).map(|(p, _)| p), Some(3), "the second stroke");
+    }
+
+    /// Seeding a fine cell from a coarse one: every fine triangle takes the coarse triangle it lies in, so a coarse texel inked in its lower half only inks the fine triangles under that diagonal.
+    #[test]
+    fn a_seed_follows_the_ancestor_diagonal() {
+        let mut u = UserLayer::default();
+        let parent = CellKey::from_grid(2, 10, 5, 7);
+        let mut ink = ClassCell::new();
+        for ty in 0..256 {
+            for tx in 0..256 {
+                ink.class[((ty << 8) | tx) << 1] = 1;
+                ink.cov[((ty << 8) | tx) << 1] = 255;
+            }
+        }
+        u.cells.insert(parent, UserCell { ink: Some(ink), sel: None });
+        let child = parent.child(0).child(0);
+        let seed = u.ink_from_parents(child).unwrap();
+        // Four fine texels to a coarse one each way: the fine triangles whose centroids lie below the coarse diagonal are inked.
+        let at = |tx: usize, ty: usize, half: usize| seed.cov[((ty << 8) | tx) << 1 | half] != 0;
+        assert!(at(0, 0, 0) && at(0, 0, 1) && at(3, 0, 0) && at(0, 3, 0), "under the diagonal");
+        assert!(!at(3, 3, 0) && !at(3, 3, 1) && !at(3, 0, 1) && !at(2, 2, 1), "over it");
     }
 
     #[test]
