@@ -89,8 +89,7 @@ impl UserLayer {
                         continue;
                     }
                     if let Some((key, i)) = texel_at(cam, depth, cx, cy, w, h) {
-                        let cell = self.cells.entry(key).or_default();
-                        let ink = cell.ink.get_or_insert_with(ClassCell::new);
+                        let ink = self.ink_cell(key);
                         ink.class[i] = pen + 1;
                         ink.cov[i] = 255;
                         touched.insert(key);
@@ -167,25 +166,9 @@ impl UserLayer {
                 let (x0, x1) = ((pair[0] * 2.0).round().max(0.0) as i64, (pair[1] * 2.0).round().min(w as f64 * 2.0) as i64);
                 for px2 in x0..x1 {
                     if let Some((key, i)) = texel_at(cam, depth, px2 as f64 * 0.5 + 0.25, yc, w, h) {
-                        let cell = self.cells.entry(key).or_default();
-                        let sel = cell.sel.get_or_insert_with(CovCell::new);
+                        let sel = self.sel_cell(key);
                         sel.cov[i] = if add { 255 } else { 0 };
                         touched.insert(key);
-                    }
-                }
-            }
-        }
-        // Taking from a selection the parents hold: the finest cell now says so where it was silent.
-        if !add {
-            for key in &touched {
-                let covered_above = self.sel_from_parents(*key);
-                if let Some(cell) = self.cells.get_mut(key) {
-                    if let (Some(sel), Some(above)) = (cell.sel.as_mut(), covered_above) {
-                        for i in 0..TRI {
-                            if sel.cov[i] == 0 && above.cov[i] != 0 && !self.drawn.contains_key(key) {
-                                sel.cov[i] = 0;
-                            }
-                        }
                     }
                 }
             }
@@ -193,30 +176,71 @@ impl UserLayer {
         self.after_change(depth, touched);
     }
 
-    /// What the nearest parent with a selection plane says about this cell's texels, resampled (nearest) into it.
-    fn sel_from_parents(&self, key: CellKey) -> Option<CovCell> {
+    /// The nearest ancestor of `key` that `has` a plane, with the map from this cell's texel index to the ancestor's: a cell drawn at a new depth starts as what was already there, resampled (nearest texel), so a stroke at one zoom never clears a mark made at another (Nick 2026-10-10).
+    fn ancestor_with(&self, key: CellKey, has: impl Fn(&UserCell) -> bool) -> Option<(CellKey, Vec<usize>)> {
         let mut k = key;
         let mut levels = 0u32;
         while k.depth > USER_MIN_DEPTH {
             k = k.parent();
             levels += 1;
-            if let Some(sel) = self.cells.get(&k).and_then(|c| c.sel.as_ref()) {
-                let mut out = CovCell::new();
+            if self.cells.get(&k).is_some_and(&has) {
                 let (cu, cv) = key.grid();
                 let (pu, pv) = k.grid();
                 let (ou, ov) = ((cu - (pu << levels)) as usize, (cv - (pv << levels)) as usize);
+                let mut map = vec![0usize; TRI];
                 for ty in 0..256 {
                     for tx in 0..256 {
                         let (sx, sy) = (((ou << 8) + tx) >> levels, ((ov << 8) + ty) >> levels);
                         for half in 0..2 {
-                            out.cov[((ty << 8) | tx) << 1 | half] = sel.cov[((sy << 8) | sx) << 1 | half];
+                            map[((ty << 8) | tx) << 1 | half] = ((sy << 8) | sx) << 1 | half;
                         }
                     }
                 }
-                return Some(out);
+                return Some((k, map));
             }
         }
         None
+    }
+
+    /// What the nearest ancestor with a selection plane says about this cell's texels, resampled into it.
+    fn sel_from_parents(&self, key: CellKey) -> Option<CovCell> {
+        let (k, map) = self.ancestor_with(key, |c| c.sel.is_some())?;
+        let sel = self.cells[&k].sel.as_ref().unwrap();
+        let mut out = CovCell::new();
+        for (i, &j) in map.iter().enumerate() {
+            out.cov[i] = sel.cov[j];
+        }
+        Some(out)
+    }
+
+    /// What the nearest ancestor with an ink plane says about this cell's texels, resampled into it.
+    fn ink_from_parents(&self, key: CellKey) -> Option<ClassCell> {
+        let (k, map) = self.ancestor_with(key, |c| c.ink.is_some())?;
+        let ink = self.cells[&k].ink.as_ref().unwrap();
+        let mut out = ClassCell::new();
+        for (i, &j) in map.iter().enumerate() {
+            out.cov[i] = ink.cov[j];
+            out.class[i] = ink.class[j];
+        }
+        Some(out)
+    }
+
+    /// The cell at `key` ready for the pen: made if missing, its ink plane seeded from the nearest ancestor's if it had none.
+    fn ink_cell(&mut self, key: CellKey) -> &mut ClassCell {
+        if self.cells.get(&key).is_none_or(|c| c.ink.is_none()) {
+            let seed = self.ink_from_parents(key).unwrap_or_else(ClassCell::new);
+            self.cells.entry(key).or_default().ink = Some(seed);
+        }
+        self.cells.get_mut(&key).unwrap().ink.as_mut().unwrap()
+    }
+
+    /// The cell at `key` ready for a selection: made if missing, its selection plane seeded from the nearest ancestor's if it had none.
+    fn sel_cell(&mut self, key: CellKey) -> &mut CovCell {
+        if self.cells.get(&key).is_none_or(|c| c.sel.is_none()) {
+            let seed = self.sel_from_parents(key).unwrap_or_else(CovCell::new);
+            self.cells.entry(key).or_default().sel = Some(seed);
+        }
+        self.cells.get_mut(&key).unwrap().sel.as_mut().unwrap()
     }
 
     /// Clear the whole selection.
@@ -290,7 +314,16 @@ impl UserLayer {
                 }
             }
             let sel_up = mahere_tiles::pyramid_cov(sel, depth, depth - 1);
-            for (k, c) in ink_up.into_iter().filter(|(k, _)| k.depth == depth - 1) {
+            // A built level is complete: where the pyramid from below has nothing, the nearest drawn ancestor's mark stands (resampled), so a mark made at a coarser zoom is not hidden by a level built from a finer stroke beside it; a drawn cell at this level keeps its own, the louder of the two.
+            for (k, mut c) in ink_up.into_iter().filter(|(k, _)| k.depth == depth - 1) {
+                if let Some(seed) = self.ink_from_parents(k) {
+                    for i in 0..TRI {
+                        if c.cov[i] == 0 && seed.cov[i] != 0 {
+                            c.cov[i] = seed.cov[i];
+                            c.class[i] = seed.class[i];
+                        }
+                    }
+                }
                 let cell = self.cells.entry(k).or_default();
                 match &mut cell.ink {
                     Some(mine) => {
@@ -304,7 +337,14 @@ impl UserLayer {
                     None => cell.ink = Some(c),
                 }
             }
-            for (k, c) in sel_up.into_iter().filter(|(k, _)| k.depth == depth - 1) {
+            for (k, mut c) in sel_up.into_iter().filter(|(k, _)| k.depth == depth - 1) {
+                if let Some(seed) = self.sel_from_parents(k) {
+                    for i in 0..TRI {
+                        if c.cov[i] == 0 {
+                            c.cov[i] = seed.cov[i];
+                        }
+                    }
+                }
                 let cell = self.cells.entry(k).or_default();
                 match &mut cell.sel {
                     Some(mine) => {
@@ -423,6 +463,20 @@ mod tests {
         let (lat, lon) = cam().screen_to_geo(600.0, 500.0, w, h);
         assert_eq!(u.ink_at(Coord::from_lat_lon(lat, lon).raw(), 12), None, "off the stroke");
         assert!(u.cells.keys().any(|k| k.depth == USER_MIN_DEPTH), "built to the top");
+    }
+
+    #[test]
+    fn a_stroke_at_a_new_depth_keeps_what_was_there() {
+        let mut u = UserLayer::default();
+        let (w, h) = (800, 600);
+        u.stroke(&cam(), w, h, 10, &[(100.0, 300.0, 6.0), (700.0, 300.0, 6.0)], 0);
+        u.stroke(&cam(), w, h, 12, &[(400.0, 100.0, 6.0), (400.0, 500.0, 6.0)], 3);
+        let (lat, lon) = cam().screen_to_geo(200.0, 300.0, w, h);
+        let raw = Coord::from_lat_lon(lat, lon).raw();
+        assert_eq!(u.ink_at(raw, 13).map(|(p, _)| p), Some(0), "the first stroke, seen from the finer depth, where the second cut across its cells");
+        let (lat, lon) = cam().screen_to_geo(400.0, 200.0, w, h);
+        let raw = Coord::from_lat_lon(lat, lon).raw();
+        assert_eq!(u.ink_at(raw, 13).map(|(p, _)| p), Some(3), "the second stroke");
     }
 
     #[test]
