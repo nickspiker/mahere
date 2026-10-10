@@ -280,6 +280,22 @@ fn ink_check(device: &wgpu::Device, queue: &wgpu::Queue, gpu: &mut GpuMap, targe
     map.begin_stroke(cx - 100.0, cy, 0.5, w, h);
     map.extend_stroke(cx + 100.0, cy, 0.5, w, h);
     map.end_stroke(w, h);
+    // How long a long scribble takes to draw and to lift: the moves and the lift, in milliseconds.
+    {
+        let t = std::time::Instant::now();
+        map.begin_stroke(20.0, 20.0, 0.5, w, h);
+        let mut n = 0;
+        for i in 1..400 {
+            let x = 20.0 + (i as f64) * (w as f64 - 40.0) / 400.0;
+            let y = cy + ((i as f64) * 0.3).sin() * (h as f64 * 0.4);
+            map.extend_stroke(x, y, 0.5, w, h);
+            n += 1;
+        }
+        let moves_ms = t.elapsed().as_secs_f32() * 1000.0;
+        let t = std::time::Instant::now();
+        map.end_stroke(w, h);
+        eprintln!("scribble: {n} moves in {moves_ms:.1} ms ({:.2} ms each), the lift {:.1} ms, {} user cells", moves_ms / n as f32, t.elapsed().as_secs_f32() * 1000.0, map.user.cells.len());
+    }
     // MAHERE_INK=2: a second, finer stroke beside the first, then the view zoomed in on the first: a magnified mark must keep clean edges where the finer cells cover it.
     if std::env::var("MAHERE_INK").as_deref() == Ok("2") {
         map.zoom_about(8.0, cx, cy, w, h);

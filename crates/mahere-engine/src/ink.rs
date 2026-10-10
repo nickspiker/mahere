@@ -63,6 +63,26 @@ pub struct UserLayer {
     /// The cells a stroke in progress has touched, as they were before it (None: not there), for undoing it; and whether the levels above still wait to be rebuilt (deferred to the stroke's end, since mid-stroke the view reads the drawn cells themselves).
     undo: Option<FxHashMap<CellKey, Option<UserCell>>>,
     stale_above: bool,
+    /// The cells changed since the levels above them were last rebuilt: only their ancestor chains are rebuilt, not every level of every cell.
+    touched_since: FxHashSet<CellKey>,
+}
+
+/// A screen point's place on the diamond grid at full precision: the diamond and (u, v) in Q30.16, or nothing off the globe.
+fn grid_at(cam: &Camera, px: f64, py: f64, w: usize, h: usize) -> Option<(u8, i64, i64)> {
+    if !cam.on_globe(px, py, w, h) {
+        return None;
+    }
+    let (lat, lon) = cam.screen_to_geo(px, py, w, h);
+    let c = Coord::from_lat_lon(lat, lon);
+    let (iu, iv) = c.uv();
+    Some((c.diamond(), (iu as i64) << 16, (iv as i64) << 16))
+}
+
+/// The cell and triangle index of a Q30.16 grid position at `depth`.
+fn texel_of(diamond: u8, uq: i64, vq: i64, depth: u8) -> (CellKey, usize) {
+    let s = 30 - depth as u32;
+    let key = CellKey::from_grid(diamond, depth, (uq >> 16) as u64 >> s, (vq >> 16) as u64 >> s);
+    (key, tri_index(uq, vq, 16 + 22 - depth as u32))
 }
 
 /// The texel a screen point falls in at `depth`: the cell and the triangle index, or nothing off the globe.
@@ -82,18 +102,36 @@ impl UserLayer {
     /// A stroke of the pen along screen points, each with its width in pixels (the pen's pressure), in pen `pen` (an index into [`PENS`]): every pixel within half the width of the path, stamped into the cells at `depth`.
     pub fn stroke(&mut self, cam: &Camera, w: usize, h: usize, depth: u8, pts: &[(f64, f64, f64)], pen: u8) {
         let mut touched: FxHashSet<CellKey> = FxHashSet::default();
-        // Sampled every half pixel: a texel at the drawing depth is one to two pixels wide, so every texel under the brush is hit and the renderer, reading one texel a pixel, finds no gaps.
+        // Sampled every half pixel: a texel at the drawing depth is one to two pixels wide, so every texel under the brush is hit and the renderer, reading one texel a pixel, finds no gaps. The grid position is encoded only at the stamp's four corners and interpolated inside (the footprint is a few pixels, over which the grid is linear to well under a texel), as the renderer does with its blocks; a stamp whose corners straddle two diamonds is encoded sample by sample.
         let mut stamp = |x: f64, y: f64, width: f64| {
             let r = (width * 0.5).max(0.5);
             let (x0, x1) = (((x - r) * 2.0).floor() as i64, ((x + r) * 2.0).ceil() as i64);
             let (y0, y1) = (((y - r) * 2.0).floor() as i64, ((y + r) * 2.0).ceil() as i64);
+            let (sx0, sy0) = (x0 as f64 * 0.5 + 0.25, y0 as f64 * 0.5 + 0.25);
+            let (sx1, sy1) = (x1 as f64 * 0.5 + 0.25, y1 as f64 * 0.5 + 0.25);
+            let corners = [grid_at(cam, sx0, sy0, w, h), grid_at(cam, sx1, sy0, w, h), grid_at(cam, sx0, sy1, w, h), grid_at(cam, sx1, sy1, w, h)];
+            let linear = match corners {
+                [Some(a), Some(b), Some(c), Some(d)] if a.0 == b.0 && a.0 == c.0 && a.0 == d.0 => Some((a, b, c, d)),
+                _ => None,
+            };
+            let (nx, ny) = ((x1 - x0).max(1) as f64, (y1 - y0).max(1) as f64);
             for py in y0..=y1 {
                 for px in x0..=x1 {
                     let (cx, cy) = (px as f64 * 0.5 + 0.25, py as f64 * 0.5 + 0.25);
                     if (cx - x) * (cx - x) + (cy - y) * (cy - y) > r * r {
                         continue;
                     }
-                    if let Some((key, i)) = texel_at(cam, depth, cx, cy, w, h) {
+                    let texel = match linear {
+                        Some((a, b, c, d)) => {
+                            let (fx, fy) = ((px - x0) as f64 / nx, (py - y0) as f64 / ny);
+                            let lerp = |p: i64, q: i64, t: f64| p as f64 + (q - p) as f64 * t;
+                            let u = lerp(a.1, b.1, fx) + (lerp(c.1, d.1, fx) - lerp(a.1, b.1, fx)) * fy;
+                            let v = lerp(a.2, b.2, fx) + (lerp(c.2, d.2, fx) - lerp(a.2, b.2, fx)) * fy;
+                            Some(texel_of(a.0, u.round() as i64, v.round() as i64, depth))
+                        }
+                        None => texel_at(cam, depth, cx, cy, w, h),
+                    };
+                    if let Some((key, i)) = texel {
                         let ink = self.ink_cell(key);
                         ink.class[i] = pen + 1;
                         ink.cov[i] = 255;
@@ -264,8 +302,9 @@ impl UserLayer {
     pub fn commit_undo(&mut self) {
         self.undo = None;
         if self.stale_above {
-            self.rebuild_above();
+            self.rebuild_chains();
             self.stale_above = false;
+            self.touched_since.clear();
             self.version += 1;
         }
     }
@@ -320,22 +359,147 @@ impl UserLayer {
                 self.drawn.insert(*k, ());
             }
         }
+        self.touched_since.extend(touched.iter().copied());
         if self.undo.is_some() {
             self.stale_above = true;
         } else {
-            self.rebuild_above();
+            self.rebuild_chains();
         }
-        self.cells.retain(|k, c| {
-            let keep = !c.is_empty();
-            if !keep {
-                self.drawn.remove(k);
-            }
-            keep
-        });
         for k in touched {
             self.dirty.insert(k);
         }
         self.version += 1;
+    }
+
+    /// The levels above the cells changed since the last rebuild, and only those: each ancestor remade from its children (the box filter), a drawn ancestor keeping its own marks, and completed from the nearest drawn ancestor above where it has nothing. Coarsest last, so each level sees children already current. Empties are dropped on the way.
+    fn rebuild_chains(&mut self) {
+        let touched: Vec<CellKey> = self.touched_since.drain().collect();
+        let mut todo: std::collections::BTreeMap<u8, FxHashSet<CellKey>> = std::collections::BTreeMap::new();
+        for k in &touched {
+            let mut a = *k;
+            while a.depth > USER_MIN_DEPTH {
+                a = a.parent();
+                todo.entry(a.depth).or_default().insert(a);
+            }
+        }
+        for k in &touched {
+            if self.cells.get(k).is_some_and(|c| c.is_empty()) {
+                self.cells.remove(k);
+                self.drawn.remove(k);
+            }
+        }
+        let built_version = self.version + 1;
+        for (&depth, keys) in todo.iter().rev() {
+            for &key in keys {
+                let children: Vec<CellKey> = (0..4).map(|q| key.child(q)).filter(|c| self.cells.contains_key(c)).collect();
+                let mut ink: std::collections::HashMap<CellKey, ClassCell> = std::collections::HashMap::new();
+                let mut sel: std::collections::HashMap<CellKey, CovCell> = std::collections::HashMap::new();
+                for c in &children {
+                    let cell = &self.cells[c];
+                    if let Some(i) = &cell.ink {
+                        ink.insert(*c, i.clone());
+                    }
+                    if let Some(x) = &cell.sel {
+                        sel.insert(*c, x.clone());
+                    }
+                }
+                let mut up_ink = mahere_tiles::pyramid_class(ink, depth + 1, depth, ClassMerge::Dominant).remove(&key);
+                if let Some(c) = &mut up_ink {
+                    for v in c.cov.iter_mut() {
+                        *v = (*v as u32 * 2).min(255) as u8;
+                    }
+                }
+                let up_sel = mahere_tiles::pyramid_cov(sel, depth + 1, depth).remove(&key);
+                let drawn = self.drawn.contains_key(&key);
+                // Completion from the nearest drawn ancestor, where the children gave nothing.
+                let seed_ink = self.ink_from_drawn_ancestor(key);
+                let seed_sel = self.sel_from_drawn_ancestor(key);
+                let mut new_ink = up_ink;
+                if let Some(seed) = seed_ink {
+                    let c = new_ink.get_or_insert_with(ClassCell::new);
+                    for i in 0..TRI {
+                        if c.cov[i] == 0 && seed.cov[i] != 0 {
+                            c.cov[i] = seed.cov[i];
+                            c.class[i] = seed.class[i];
+                        }
+                    }
+                }
+                let mut new_sel = up_sel;
+                if let Some(seed) = seed_sel {
+                    let c = new_sel.get_or_insert_with(CovCell::new);
+                    for i in 0..TRI {
+                        if c.cov[i] == 0 {
+                            c.cov[i] = seed.cov[i];
+                        }
+                    }
+                }
+                let entry = self.cells.entry(key).or_default();
+                if drawn {
+                    // The drawn cell keeps its own marks; what rises from below joins where it is louder.
+                    if let Some(c) = new_ink {
+                        let mine = entry.ink.get_or_insert_with(ClassCell::new);
+                        for i in 0..TRI {
+                            if c.cov[i] > mine.cov[i] {
+                                mine.cov[i] = c.cov[i];
+                                mine.class[i] = c.class[i];
+                            }
+                        }
+                    }
+                    if let Some(c) = new_sel {
+                        let mine = entry.sel.get_or_insert_with(CovCell::new);
+                        for i in 0..TRI {
+                            mine.cov[i] = mine.cov[i].max(c.cov[i]);
+                        }
+                    }
+                } else {
+                    entry.ink = new_ink;
+                    entry.sel = new_sel;
+                }
+                entry.version = built_version;
+                if entry.is_empty() {
+                    self.cells.remove(&key);
+                    self.drawn.remove(&key);
+                }
+            }
+        }
+    }
+
+    /// Like [`Self::ink_from_parents`], from drawn ancestors only: a built one may be stale mid-rebuild.
+    fn ink_from_drawn_ancestor(&self, key: CellKey) -> Option<ClassCell> {
+        let mut k = key;
+        while k.depth > USER_MIN_DEPTH {
+            k = k.parent();
+            if self.drawn.contains_key(&k) {
+                if let Some(ink) = self.cells.get(&k).and_then(|c| c.ink.as_ref()) {
+                    let map = Self::map_to_ancestor(key, k);
+                    let mut out = ClassCell::new();
+                    for (i, &j) in map.iter().enumerate() {
+                        out.cov[i] = ink.cov[j];
+                        out.class[i] = ink.class[j];
+                    }
+                    return Some(out);
+                }
+            }
+        }
+        None
+    }
+
+    fn sel_from_drawn_ancestor(&self, key: CellKey) -> Option<CovCell> {
+        let mut k = key;
+        while k.depth > USER_MIN_DEPTH {
+            k = k.parent();
+            if self.drawn.contains_key(&k) {
+                if let Some(sel) = self.cells.get(&k).and_then(|c| c.sel.as_ref()) {
+                    let map = Self::map_to_ancestor(key, k);
+                    let mut out = CovCell::new();
+                    for (i, &j) in map.iter().enumerate() {
+                        out.cov[i] = sel.cov[j];
+                    }
+                    return Some(out);
+                }
+            }
+        }
+        None
     }
 
     /// The levels above every drawn depth, from the deepest up: at each level the box filter of the level below, with cells drawn at that level laid over it where they have ink or selection.
@@ -482,6 +646,7 @@ impl UserLayer {
             if changed {
                 cell.version += 1;
                 self.dirty.insert(k);
+                self.touched_since.insert(k);
             }
         }
     }
@@ -501,6 +666,12 @@ impl UserLayer {
             }
             d -= 1;
         }
+    }
+
+    /// The cells changed since the last call, cloned for saving elsewhere, None where one is gone.
+    pub fn take_dirty_cells(&mut self) -> Vec<(CellKey, Option<UserCell>)> {
+        let keys: Vec<CellKey> = self.dirty.drain().collect();
+        keys.into_iter().map(|k| (k, self.cells.get(&k).filter(|c| !c.is_empty()).cloned())).collect()
     }
 
     /// The cells changed since the last call, for saving, and whether each still exists.

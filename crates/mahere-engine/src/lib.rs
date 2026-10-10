@@ -492,15 +492,22 @@ impl MapCore {
         self.dirty = true;
     }
 
+    /// The cells a stroke changed, encoded and written on a thread of their own: the encode is the slow part, and the touch must not wait for it.
     fn save_user(&mut self) {
-        let dirty = self.user.take_dirty();
+        let dirty = self.user.take_dirty_cells();
+        if dirty.is_empty() {
+            return;
+        }
         if let Some(store) = &self.user_store {
-            for (k, bytes) in dirty {
-                match bytes {
-                    Some(b) => store.put(k, &b),
-                    None => store.delete(k),
+            let store = store.clone();
+            std::thread::spawn(move || {
+                for (k, cell) in dirty {
+                    match cell {
+                        Some(c) => store.put(k, &ink::encode_user_cell(&c)),
+                        None => store.delete(k),
+                    }
                 }
-            }
+            });
         }
     }
 
