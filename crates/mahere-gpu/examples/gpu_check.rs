@@ -132,7 +132,7 @@ fn main() {
         gpu.set_overlay(&device, &queue, w as u32, h as u32, &overlay);
     }
     // MAHERE_INK=1: a pen stroke across the centre, then the view zoomed in and out around it; the stroke must show at every zoom on both renderers.
-    if std::env::var("MAHERE_INK").as_deref() == Ok("1") {
+    if matches!(std::env::var("MAHERE_INK").as_deref(), Ok("1") | Ok("2")) {
         ink_check(&device, &queue, &mut gpu, &target, &view, &mut map, w, h);
         return;
     }
@@ -280,6 +280,28 @@ fn ink_check(device: &wgpu::Device, queue: &wgpu::Queue, gpu: &mut GpuMap, targe
     map.begin_stroke(cx - 100.0, cy, 0.5, w, h);
     map.extend_stroke(cx + 100.0, cy, 0.5, w, h);
     map.end_stroke(w, h);
+    // MAHERE_INK=2: a second, finer stroke beside the first, then the view zoomed in on the first: a magnified mark must keep clean edges where the finer cells cover it.
+    if std::env::var("MAHERE_INK").as_deref() == Ok("2") {
+        map.zoom_about(8.0, cx, cy, w, h);
+        map.set_pen(3);
+        map.begin_stroke(cx + 60.0, cy - 150.0, 0.5, w, h);
+        map.extend_stroke(cx + 60.0, cy + 150.0, 0.5, w, h);
+        map.end_stroke(w, h);
+        map.render(w, h);
+        let plan = map.plan(w, h);
+        gpu.set_user(device, queue, &map.user, &map.preview, map.preview_version, w as u32, h as u32);
+        let mut enc = device.create_command_encoder(&Default::default());
+        gpu.render(device, queue, &mut enc, view, &plan, map.luts(), w as u32, h as u32, mahere_gpu::RenderMode::Full);
+        queue.submit([enc.finish()]);
+        device.poll(wgpu::PollType::wait_indefinitely()).ok();
+        let px = read(device, queue);
+        let out = std::env::var("MAHERE_INK_OUT").unwrap_or_else(|_| "/tmp/claude-1000/ink_zoomed.png".into());
+        write_png(&out, w, h, |i| [(px[i] >> 16) as u8, (px[i] >> 8) as u8, px[i] as u8]);
+        let cpu_out = out.replace(".png", "_cpu.png");
+        write_png(&cpu_out, w, h, |i| [(map.canvas[i] >> 16) as u8, (map.canvas[i] >> 8) as u8, map.canvas[i] as u8]);
+        eprintln!("wrote {out} and {cpu_out}");
+        return;
+    }
     for factor in [1.0, 2.0, 0.5, 0.5, 0.5, 8.0] {
         map.zoom_about(factor, cx, cy, w, h);
         map.render(w, h);
