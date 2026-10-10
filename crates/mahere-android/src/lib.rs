@@ -47,6 +47,8 @@ pub struct AndroidApp {
     stylus: bool,
     pressure: f32,
     stylus_seen: Option<Instant>,
+    /// What the phone says about its pen being out (Samsung's slot broadcast, or a stylus hover); None when it has said nothing, and the last stylus touch decides.
+    pen_out: Option<bool>,
     last_cursor: (f64, f64),
     two: Option<TwoFinger>,
     /// Re-anchor the next CursorMoved instead of panning (finger handoff after a pinch would otherwise jump by the stale delta).
@@ -345,7 +347,7 @@ impl FluorApp for AndroidApp {
                     self.had_two = false;
                     self.last_cursor = (ctx.cursor_x as f64, ctx.cursor_y as f64);
                     // With a tool on, the touch draws: the pen's, always; a finger's unless a pen touched in the last few seconds, which says the pen is out and fingers only navigate (Nick 2026-10-10).
-                    let pen_out = !self.stylus && self.stylus_seen.is_some_and(|t| t.elapsed() < std::time::Duration::from_secs(3));
+                    let pen_out = !self.stylus && self.pen_out.unwrap_or_else(|| self.stylus_seen.is_some_and(|t| t.elapsed() < std::time::Duration::from_secs(3)));
                     if self.map.tool != mahere_engine::ink::Tool::None && !pen_out {
                         self.map.begin_stroke(ctx.cursor_x as f64, ctx.cursor_y as f64, self.pressure as f64, self.w, self.h);
                         self.drawing = true;
@@ -550,6 +552,7 @@ pub extern "system" fn Java_nz_mahere_app_MahereActivity_nativeInit(
         stylus: false,
         pressure: 0.5,
         stylus_seen: None,
+        pen_out: None,
         last_cursor: (0., 0.),
         two: None,
         suppress_move: false,
@@ -698,6 +701,14 @@ pub extern "system" fn Java_nz_mahere_app_MahereActivity_nativeOnTouch(
         s.app().two_end();
     }
     s.on_touch(action, x0, y0)
+}
+
+/// The phone says its pen is out or back in its slot (Samsung's broadcast), or a stylus is hovering (out, then).
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_nz_mahere_app_MahereActivity_nativePenOut(_env: JNIEnv, _class: JClass, ptr: jlong, out: jboolean) {
+    if ptr != 0 {
+        shell(ptr).app().pen_out = Some(out != 0);
+    }
 }
 
 /// A place to look at, from a `geo:` intent (a shared location, or adb): the camera goes there, at the zoom given (pixels per degree) when positive.

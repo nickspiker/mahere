@@ -15,7 +15,9 @@ import android.hardware.SensorManager
 import android.location.Location
 import android.location.LocationListener
 import android.location.LocationManager
+import android.content.BroadcastReceiver
 import android.content.Intent
+import android.content.IntentFilter
 import android.os.Bundle
 import android.view.Choreographer
 import android.view.MotionEvent
@@ -49,6 +51,7 @@ class MahereActivity : Activity(), SurfaceHolder.Callback, Choreographer.FrameCa
         x0: Float, y0: Float, x1: Float, y1: Float,
         tool: Int, pressure: Float,
     ): Int
+    private external fun nativePenOut(ptr: Long, out: Boolean)
     private external fun nativeOnLocation(ptr: Long, lat: Double, lon: Double, accuracy: Float)
     private external fun nativeGoTo(ptr: Long, lat: Double, lon: Double, ppd: Double)
     private external fun nativeOnDeclination(ptr: Long, declinationDeg: Float)
@@ -92,6 +95,12 @@ class MahereActivity : Activity(), SurfaceHolder.Callback, Choreographer.FrameCa
         setContentView(surfaceView)
         hideSystemBars()
         takeGeo(intent)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            registerReceiver(penReceiver, IntentFilter("com.samsung.pen.INSERT"), Context.RECEIVER_EXPORTED)
+        } else {
+            @Suppress("DEPRECATION")
+            registerReceiver(penReceiver, IntentFilter("com.samsung.pen.INSERT"))
+        }
         // The map tags its buffers BT.2020 (gpu_host::tag_bt2020); wide-gamut mode lets the panel show them without an sRGB clamp, and minimal post-processing asks the compositor to skip vendor saturation passes.
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             window.colorMode = ActivityInfo.COLOR_MODE_WIDE_COLOR_GAMUT
@@ -234,6 +243,11 @@ class MahereActivity : Activity(), SurfaceHolder.Callback, Choreographer.FrameCa
         if (ptr != 0L) nativeGoTo(ptr, lat, lon, ppd) else pendingGeo = Triple(lat, lon, ppd)
     }
 
+    override fun onDestroy() {
+        runCatching { unregisterReceiver(penReceiver) }
+        super.onDestroy()
+    }
+
     override fun onResume() {
         super.onResume()
         hideSystemBars()
@@ -250,6 +264,24 @@ class MahereActivity : Activity(), SurfaceHolder.Callback, Choreographer.FrameCa
     }
 
     // ---- Input: raw pointers, no detectors ----
+
+    /// Samsung says when the S Pen leaves or returns to its slot: the broadcast `com.samsung.pen.INSERT` with `penInsert`. While the pen is out, fingers only navigate.
+    private val penReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            val inserted = intent?.getBooleanExtra("penInsert", true) ?: true
+            val ptr = nativePtr
+            if (ptr != 0L) nativePenOut(ptr, !inserted)
+        }
+    }
+
+    /// A stylus hovering over the screen is a pen that is out, on any phone.
+    override fun onGenericMotionEvent(event: MotionEvent): Boolean {
+        if (event.getToolType(0) == MotionEvent.TOOL_TYPE_STYLUS && event.actionMasked == MotionEvent.ACTION_HOVER_MOVE) {
+            val ptr = nativePtr
+            if (ptr != 0L) nativePenOut(ptr, true)
+        }
+        return super.onGenericMotionEvent(event)
+    }
 
     override fun onTouchEvent(event: MotionEvent): Boolean {
         if (nativePtr == 0L) return true
