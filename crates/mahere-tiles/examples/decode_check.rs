@@ -17,6 +17,17 @@ fn main() {
                 }
             }
             println!("line {} land {} water {}", p.line.is_some(), p.land.is_some(), p.water.is_some());
+            // The line classes present, with their texel counts.
+            if let Some(l) = &p.line {
+                let mut counts = [0usize; 32];
+                for i in 0..l.class.len() {
+                    if l.cov[i] != 0 {
+                        counts[(l.class[i] as usize).min(31)] += 1;
+                    }
+                }
+                let present: Vec<String> = counts.iter().enumerate().filter(|(_, n)| **n > 0).map(|(c, n)| format!("{c}:{n}")).collect();
+                println!("line classes {}", present.join(" "));
+            }
             // The apron against the edge it sits beside: a seam shows as a large step.
             if let Some(d) = &p.dem {
                 let tex = mahere_tiles::TEX;

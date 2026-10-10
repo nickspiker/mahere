@@ -134,7 +134,8 @@ impl RoadClass {
                 _ if operator.contains("forest service") => RoadClass::NationalForest,
                 _ => RoadClass::Protected,
             }),
-            Some("administrative") => matches!(admin, Some(4) | Some(6)).then_some(RoadClass::Admin),
+            // Countries, states and counties.
+            Some("administrative") => matches!(admin, Some(2) | Some(4) | Some(6)).then_some(RoadClass::Admin),
             _ => reserve.then_some(RoadClass::Protected),
         }
     }
@@ -389,18 +390,30 @@ pub fn load_features(path: &str) -> Result<Features, osmpbf::Error> {
                 let mut out = Vec::new();
                 let refs: Vec<i64> = w.refs().collect();
                 let is_member = member_ids.binary_search(&w.id()).is_ok();
-                // A boundary's seaward run (OSM tags it maritime) and its run along the coast draw nothing: the coast is the terrain's and a line through the sea around an island outlines it for no reader (Nick 2026-10-09).
+                // A state's or county's seaward run (OSM tags it maritime) and any run along the coast draw nothing: the coast is the terrain's and a line through the sea around an island outlines it for no reader. The territorial limit itself (boundary=maritime, border_type=territorial, twelve nautical miles out) is a legal boundary and stays (Nick 2026-10-09).
                 let seaward = w.tags().any(|(k, v)| (k == "maritime" && v == "yes") || (k == "natural" && v == "coastline"));
                 if is_member && !seaward {
                     out.push(WayRec::Member(w.id(), refs.clone()));
                 }
+                // Boundaries from the ways themselves, since a region extract carries no boundary relations: a country's, state's or county's border on land (administrative, levels 2, 4 and 6, not maritime), and the territorial sea's limit twelve nautical miles out, which is the country's legal edge and stays though it is maritime; the contiguous zone and the EEZ beyond it are zones, not borders, and draw nothing (Nick 2026-10-09).
+                let (mut admin_level, mut administrative, mut maritime, mut territorial) = (None, false, false, false);
+                for (k, v) in w.tags() {
+                    match k {
+                        "boundary" if v == "administrative" => administrative = true,
+                        "admin_level" => admin_level = v.parse::<u8>().ok(),
+                        "maritime" if v == "yes" => maritime = true,
+                        "border_type" if v == "territorial" => territorial = true,
+                        _ => {}
+                    }
+                }
+                let border = territorial || (administrative && matches!(admin_level, Some(2) | Some(4) | Some(6)) && !maritime);
                 let line = w.tags().find_map(|(k, v)| match k {
                     "highway" => RoadClass::from_tag(v),
                     "waterway" => RoadClass::from_waterway(v),
                     "railway" => RoadClass::from_railway(v),
                     "power" => RoadClass::from_power(v),
                     _ => None,
-                });
+                }).or(border.then_some(RoadClass::Admin));
                 // Sidewalks, crossings and traffic islands are footways that only shadow a street: a trail map leaves them out, or every downtown street grows a trail-coloured fringe.
                 let street_furniture = w.tags().any(|(k, v)| k == "footway" && matches!(v, "sidewalk" | "crossing" | "traffic_island" | "access_aisle"));
                 if let Some(class) = line.filter(|_| !street_furniture) {
