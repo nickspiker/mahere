@@ -389,7 +389,9 @@ pub fn load_features(path: &str) -> Result<Features, osmpbf::Error> {
                 let mut out = Vec::new();
                 let refs: Vec<i64> = w.refs().collect();
                 let is_member = member_ids.binary_search(&w.id()).is_ok();
-                if is_member {
+                // A boundary's seaward run (OSM tags it maritime) and its run along the coast draw nothing: the coast is the terrain's and a line through the sea around an island outlines it for no reader (Nick 2026-10-09).
+                let seaward = w.tags().any(|(k, v)| (k == "maritime" && v == "yes") || (k == "natural" && v == "coastline"));
+                if is_member && !seaward {
                     out.push(WayRec::Member(w.id(), refs.clone()));
                 }
                 let line = w.tags().find_map(|(k, v)| match k {

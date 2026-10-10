@@ -1617,6 +1617,23 @@ pub fn write_cell(out: &Path, key: CellKey, cell: &Cell, loss: &Loss) -> Result<
     write_file(&path, &planes.encode_with(loss, kept_dem, kept_img)?)
 }
 
+/// Edit a cell's vector planes in place: the file decoded, `edit` applied, the file written again with its terrain and imagery sections carried over byte for byte. False when the file is not there.
+pub fn edit_vectors(path: &Path, edit: impl FnOnce(&mut CellPlanes)) -> Result<bool, String> {
+    let Ok(existing) = std::fs::read(path) else { return Ok(false) };
+    let mut planes = decode_cell(&existing)?;
+    edit(&mut planes);
+    let kept_dem = planes.dem.as_ref().and_then(|_| raw_section(&existing, "dem"));
+    let kept_img = planes.img.as_ref().and_then(|_| raw_section(&existing, "img"));
+    if kept_dem.is_some() {
+        planes.dem = None;
+    }
+    if kept_img.is_some() {
+        planes.img = None;
+    }
+    write_file(path, &planes.encode_with(&Loss { dem_m: 0.0, img: 0 }, kept_dem, kept_img)?)?;
+    Ok(true)
+}
+
 /// One section of a cell file as stored, for carrying over unchanged.
 fn raw_section(data: &[u8], name: &str) -> Option<vsf::VsfSection> {
     let plain: Vec<u8>;
