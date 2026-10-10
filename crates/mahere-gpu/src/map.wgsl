@@ -335,6 +335,30 @@ fn line_colour(cls_id: u32, mag: u32) -> vec3<f32> {
     return c;
 }
 
+// The coarsest view depth a line class draws at (the CPU's line_min_depth): interstates at every zoom, the great rivers too, streets from depth 9, so a continent zoomed out is not painted as lines.
+fn line_min_depth(cls: u32, mag: u32) -> u32 {
+    switch cls {
+        case 1u: { return 0u; }
+        case 2u: { return 2u; }
+        case 3u: { return 4u; }
+        case 4u: { return 6u; }
+        case 5u: { return 7u; }
+        case 6u, 8u, 9u: { return 9u; }
+        case 7u: { return 10u; }
+        case 10u: { return 4u; }
+        case 11u: { return 8u; }
+        case 12u: {
+            if (mag >= 200u) { return 0u; }
+            if (mag >= 128u) { return 3u; }
+            if (mag >= 64u) { return 6u; }
+            return 8u;
+        }
+        case 13u, 14u, 15u, 16u: { return 5u; }
+        case 17u: { return 3u; }
+        default: { return 0u; }
+    }
+}
+
 // Coverage of a line as drawn: every class but water fades against the boldest of its class in view, so a lane next to a highway falls back and the same lane alone is full.
 fn line_alpha(cls_id: u32, cov: u32, mag: u32) -> f32 {
     let cls = min(cls_id, CLASS_MAX);
@@ -508,7 +532,7 @@ fn compose(d: u32, u: u32, v: u32, pos: vec2<f32>) -> Composed {
     }
     if (vi != NONE) {
         let flags = vflags;
-        let draw_line = (mask & M_LINE) != 0u && line.y != 0u && (line.x < BOUNDARY_FIRST || (mask & M_BOUND) != 0u);
+        let draw_line = (mask & M_LINE) != 0u && line.y != 0u && (line.x < BOUNDARY_FIRST || (mask & M_BOUND) != 0u) && U.depths.x >= line_min_depth(line.x, line.z);
         if ((mask & M_IMAGERY) != 0u && (im.x != 0u || im.y != 0u || im.z != 0u)) {
             // Imagery stands in for the ground: nothing lights it. True colour, or the near-infrared band as grey, unrolled to scene light.
             out.ground = false;
