@@ -94,6 +94,54 @@ impl Camera {
         (lat.to_degrees(), (lon + 180.0).rem_euclid(360.0) - 180.0)
     }
 
+    /// The view's basis in world coordinates (the unit sphere, x toward 0°N 0°E, z toward the north pole): screen right, screen up, and the axis toward the viewer, which is the camera point itself.
+    pub fn basis(&self) -> [[f64; 3]; 3] {
+        let (sl, cl) = self.lat.to_radians().sin_cos();
+        let (so, co) = self.lon.to_radians().sin_cos();
+        let east = [-so, co, 0.0];
+        let north = [-sl * co, -sl * so, cl];
+        let centre = [cl * co, cl * so, sl];
+        let (sb, cb) = self.bearing.sin_cos();
+        let right = [east[0] * cb - north[0] * sb, east[1] * cb - north[1] * sb, east[2] * cb - north[2] * sb];
+        let up = [east[0] * sb + north[0] * cb, east[1] * sb + north[1] * cb, east[2] * sb + north[2] * cb];
+        [right, up, centre]
+    }
+
+    /// The camera whose view has this basis: the camera point from the axis toward the viewer, the bearing from where screen right lies between east and north there.
+    pub fn from_basis(b: [[f64; 3]; 3], ppd: f64) -> Camera {
+        let c = b[2];
+        let lat = c[2].clamp(-1.0, 1.0).asin();
+        let lon = c[1].atan2(c[0]);
+        let (sl, cl) = lat.sin_cos();
+        let (so, co) = lon.sin_cos();
+        let east = [-so, co, 0.0];
+        let north = [-sl * co, -sl * so, cl];
+        let r = b[0];
+        let bearing = (-dot(r, north)).atan2(dot(r, east)).rem_euclid(core::f64::consts::TAU);
+        Camera { lat: lat.to_degrees(), lon: lon.to_degrees(), ppd, bearing }
+    }
+
+    /// The unit vector of a place on the globe.
+    pub fn unit(lat: f64, lon: f64) -> [f64; 3] {
+        let (sl, cl) = lat.to_radians().sin_cos();
+        let (so, co) = lon.to_radians().sin_cos();
+        [cl * co, cl * so, sl]
+    }
+
+    /// The view-space direction of a screen point on the globe, the limb for a point past it.
+    pub fn view_dir(&self, px: f64, py: f64, w: usize, h: usize) -> [f64; 3] {
+        let r = self.radius();
+        let mut x = (px - w as f64 * 0.5) / r;
+        let mut y = (h as f64 * 0.5 - py) / r;
+        let rho2 = x * x + y * y;
+        if rho2 >= 1.0 {
+            let k = (1.0 - 1e-9) / rho2.sqrt();
+            x *= k;
+            y *= k;
+        }
+        [x, y, (1.0 - x * x - y * y).max(0.0).sqrt()]
+    }
+
     /// Whether a screen point lies on the globe.
     pub fn on_globe(&self, px: f64, py: f64, w: usize, h: usize) -> bool {
         let sx = px - w as f64 * 0.5;
@@ -107,6 +155,22 @@ impl Camera {
         let r = self.radius();
         (w * w + h * h) as f64 * 0.25 > r * r
     }
+}
+
+fn dot(a: [f64; 3], b: [f64; 3]) -> f64 {
+    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+}
+
+fn cross(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
+    [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]]
+}
+
+/// `v` turned about the unit axis `k` by `angle` (Rodrigues).
+fn rotate(v: [f64; 3], k: [f64; 3], angle: f64) -> [f64; 3] {
+    let (s, c) = angle.sin_cos();
+    let kv = cross(k, v);
+    let kd = dot(k, v) * (1.0 - c);
+    [v[0] * c + kv[0] * s + k[0] * kd, v[1] * c + kv[1] * s + k[1] * kd, v[2] * c + kv[2] * s + k[2] * kd]
 }
 
 #[derive(Clone, Copy)]
@@ -255,25 +319,11 @@ impl MapCore {
         }
     }
 
-    /// Pan by a screen-pixel delta: the globe turns under the camera so the ground that was that far from the centre comes to it.
+    /// Pan by a screen-pixel delta: the ground at the centre goes that far across the screen, the globe turning under the camera.
     pub fn pan(&mut self, dx: f64, dy: f64, w: usize, h: usize) {
-        self.centre_on_screen(w as f64 * 0.5 - dx, h as f64 * 0.5 - dy, w, h);
-        self.camera_moved(w, h);
-    }
-
-    /// Bring the ground at screen (sx, sy) to the centre, keeping the view's orientation there: the ground a little above that point ends straight above the centre, so the bearing follows the great circle and a pan near or across a pole does not spin the map (Nick 2026-10-09).
-    fn centre_on_screen(&mut self, sx: f64, sy: f64, w: usize, h: usize) {
-        let up = (self.cam.radius() * 0.25).min(64.0).max(1.0);
-        let (lat, lon) = self.cam.screen_to_geo(sx, sy, w, h);
-        let (ulat, ulon) = self.cam.screen_to_geo(sx, sy - up, w, h);
-        self.cam.lat = lat;
-        self.cam.lon = lon;
-        self.clamp_camera();
-        let (px, py) = self.cam.geo_to_screen(ulat, ulon, w, h);
-        let (dx, dy) = (px - w as f64 * 0.5, h as f64 * 0.5 - py);
-        if dx * dx + dy * dy > 1e-12 {
-            self.cam.bearing = (self.cam.bearing + dx.atan2(dy)).rem_euclid(core::f64::consts::TAU);
-        }
+        let (cx, cy) = (w as f64 * 0.5, h as f64 * 0.5);
+        let (lat, lon) = self.cam.screen_to_geo(cx, cy, w, h);
+        self.place_anchor(lat, lon, cx + dx, cy + dy, w, h);
     }
 
     /// The least pixels per degree a screen may show: the whole globe as a disk filling 94% of the shorter side.
@@ -289,16 +339,36 @@ impl MapCore {
         self.place_anchor(alat, alon, ax, ay, w, h);
     }
 
-    /// Re-solve the camera so (alat, alon) sits at screen (ax, ay): the globe is turned by the anchor's screen error, a few times over, since on a sphere the turn that fixes the error is not quite the error itself.
+    /// Re-solve the camera so (alat, alon) sits at screen (ax, ay): the globe turns, in view space, by the one rotation that carries the anchor from where it appears to where it should, about the axis between the two. Exact at every zoom, the limb included, and parallel transport along the way, so a pan near or across a pole does not spin the map (Nick 2026-10-09).
     pub fn place_anchor(&mut self, alat: f64, alon: f64, ax: f64, ay: f64, w: usize, h: usize) {
-        for _ in 0..4 {
-            let (px, py) = self.cam.geo_to_screen(alat, alon, w, h);
-            let (ex, ey) = (ax - px, ay - py);
-            if ex.abs() < 1e-3 && ey.abs() < 1e-3 {
-                break;
+        let b = self.cam.basis();
+        let p = Camera::unit(alat, alon);
+        let from = [dot(p, b[0]), dot(p, b[1]), dot(p, b[2])];
+        let to = self.cam.view_dir(ax, ay, w, h);
+        let mut axis = cross(from, to);
+        let n = dot(axis, axis).sqrt();
+        let angle = dot(from, to).clamp(-1.0, 1.0).acos();
+        if n < 1e-12 {
+            if angle < 1e-9 {
+                self.camera_moved(w, h);
+                return;
             }
-            self.centre_on_screen(w as f64 * 0.5 - ex, h as f64 * 0.5 - ey, w, h);
+            // Antipodal: half a turn about any axis across the line, screen up.
+            axis = [0.0, 1.0, 0.0];
+        } else {
+            axis = [axis[0] / n, axis[1] / n, axis[2] / n];
         }
+        // The rotation acts in view space; the basis vectors (world) move by its rows: new row_i = Σ_j D_ij row_j, where D's columns are the turned axes.
+        let e = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+        let cols = [rotate(e[0], axis, angle), rotate(e[1], axis, angle), rotate(e[2], axis, angle)];
+        let mut nb = [[0.0; 3]; 3];
+        for i in 0..3 {
+            for k in 0..3 {
+                nb[i][k] = cols[0][i] * b[0][k] + cols[1][i] * b[1][k] + cols[2][i] * b[2][k];
+            }
+        }
+        self.cam = Camera::from_basis(nb, self.cam.ppd);
+        self.clamp_camera();
         self.camera_moved(w, h);
     }
 
