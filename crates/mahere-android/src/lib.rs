@@ -24,13 +24,13 @@ mod gpu_host;
 use gpu_host::GpuHost;
 
 struct TwoFinger {
-    /// Geography captured under each finger at gesture start.
+    /// The ground under the screen midpoint at the gesture's start, which the gesture keeps there.
     geo_mid: (f64, f64),
     d0: f64,
-    ppd0: f64,
-    /// Screen angle of the finger vector at capture, and bearing then.
+    /// The view at the gesture's start: every update is built from it.
+    cam0: Camera,
+    /// Screen angle of the finger vector at capture.
     alpha0: f64,
-    bearing0: f64,
 }
 
 pub struct AndroidApp {
@@ -219,22 +219,24 @@ impl AndroidApp {
         self.two = Some(TwoFinger {
             geo_mid,
             d0,
-            ppd0: self.map.cam.ppd,
+            cam0: self.map.cam,
             alpha0: (y1 - y0).atan2(x1 - x0),
-            bearing0: self.map.cam.bearing(),
         });
         self.dragging = false;
     }
 
-    /// Full 4-DOF similarity solve: two finger correspondences determine pan+rotate+zoom. Scale from the distance ratio, bearing from the finger-vector angle (screen angle of a fixed geo segment is -(B + its ENU angle), so B = B0 + (alpha0 - alpha)), then the ground that was under the screen midpoint pinned under it.
+    /// Full 4-DOF similarity solve: two finger correspondences determine pan+rotate+zoom. Scale from the distance ratio, the turn from the finger-vector angle's change, then the ground that was under the screen midpoint pinned under it.
     fn two_update(&mut self, x0: f64, y0: f64, x1: f64, y1: f64) {
         let Some(t) = &self.two else { return };
         let d = ((x1 - x0).powi(2) + (y1 - y0).powi(2)).sqrt().max(1.0);
         let alpha = (y1 - y0).atan2(x1 - x0);
-        self.map.set_ppd(t.ppd0 * d / t.d0);
-        self.map.set_bearing(t.bearing0 + (t.alpha0 - alpha));
+        // From the view at the gesture's start every time, so nothing accumulates: the scale, the turn by the fingers' angle (a rotation of the ball about the view axis, never a bearing), then the anchor.
+        let (geo_mid, cam0, d0, alpha0) = (t.geo_mid, t.cam0, t.d0, t.alpha0);
+        self.map.cam = cam0;
+        self.map.set_ppd(cam0.ppd * d / d0);
+        self.map.rotate_view(alpha0 - alpha);
         let (mx, my) = ((x0 + x1) * 0.5, (y0 + y1) * 0.5);
-        self.map.place_anchor(t.geo_mid.0, t.geo_mid.1, mx, my, self.w, self.h);
+        self.map.place_anchor(geo_mid.0, geo_mid.1, mx, my, self.w, self.h);
     }
 
     fn two_end(&mut self) {

@@ -260,7 +260,7 @@ impl FluorApp for MahereApp {
                     } else if da < -std::f64::consts::PI {
                         da += std::f64::consts::TAU;
                     }
-                    self.map.set_bearing(self.map.cam.bearing() - da);
+                    self.map.rotate_view(-da);
                     self.map.camera_moved(w, h);
                     ctx.window.request_redraw();
                 }
@@ -320,12 +320,12 @@ impl FluorApp for MahereApp {
                         true
                     }
                     Some("q") => {
-                        self.map.set_bearing(self.map.cam.bearing() + 15f64.to_radians());
+                        self.map.rotate_view(15f64.to_radians());
                         self.map.camera_moved(w, h);
                         true
                     }
                     Some("e") => {
-                        self.map.set_bearing(self.map.cam.bearing() - 15f64.to_radians());
+                        self.map.rotate_view(-15f64.to_radians());
                         self.map.camera_moved(w, h);
                         true
                     }

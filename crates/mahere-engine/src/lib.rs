@@ -79,9 +79,19 @@ impl Camera {
         (1.0 - z * z).max(0.0).sqrt()
     }
 
-    /// Turn the view about its own axis so screen up is this bearing.
+    /// Turn the view about its own axis by `delta` radians, screen up going clockwise: pure rotation of the ball, no angle read back, so it is as good at a pole as anywhere (Nick 2026-10-10: turning at a pole spun the globe, since the bearing read there is noise).
+    pub fn rotate_view(&mut self, delta: f64) {
+        let (s, c) = delta.sin_cos();
+        let [r, u, centre] = self.basis;
+        let right = [r[0] * c - u[0] * s, r[1] * c - u[1] * s, r[2] * c - u[2] * s];
+        let up = [u[0] * c + r[0] * s, u[1] * c + r[1] * s, u[2] * c + r[2] * s];
+        self.basis = [right, up, centre];
+    }
+
+    /// Turn the view about its own axis so screen up is this bearing (an absolute target, which at a pole means little; gestures turn by [`Camera::rotate_view`]).
     pub fn set_bearing(&mut self, bearing: f64) {
-        *self = Camera::new(self.lat(), self.lon(), self.ppd, bearing);
+        let delta = bearing - self.bearing();
+        self.rotate_view(delta);
     }
 
     /// Look at a place, screen up at this bearing.
@@ -377,6 +387,13 @@ impl MapCore {
         self.cam = Camera::from_basis(nb, self.cam.ppd);
         self.clamp_camera();
         self.camera_moved(w, h);
+    }
+
+    /// Turn the view by `delta` radians clockwise.
+    pub fn rotate_view(&mut self, delta: f64) {
+        self.cam.rotate_view(delta);
+        self.unlock_measure();
+        self.dirty = true;
     }
 
     pub fn set_bearing(&mut self, bearing: f64) {
@@ -1346,6 +1363,26 @@ mod globe_tests {
             let (px, py) = map.cam.geo_to_screen(above.0, above.1, w, h);
             // A sphere's pan is not quite a rigid slide: a screen-vertical line through the target is a great circle only through the centre, so a point 100 px up lands within a couple of pixels, never spun away.
             assert!((px - w as f64 * 0.5).abs() < 3.0 && (py - (h as f64 * 0.5 - 100.0)).abs() < 3.0, "the ground above the target drifted to {px},{py}");
+        }
+    }
+
+    /// Turning at a pole turns about the view axis and nothing else: the camera point stays put and the ball stays a ball.
+    #[test]
+    fn turning_at_the_pole_only_turns() {
+        let mut cam = Camera::new(89.9999, 12.0, 300.0, 0.0);
+        let before = cam.basis()[2];
+        for _ in 0..50 {
+            cam.rotate_view(0.137);
+        }
+        let b = cam.basis();
+        for k in 0..3 {
+            assert!((b[2][k] - before[k]).abs() < 1e-12, "the camera point moved");
+        }
+        for i in 0..3 {
+            for j in 0..3 {
+                let d = b[i][0] * b[j][0] + b[i][1] * b[j][1] + b[i][2] * b[j][2];
+                assert!((d - if i == j { 1.0 } else { 0.0 }).abs() < 1e-9, "not orthonormal");
+            }
         }
     }
 
