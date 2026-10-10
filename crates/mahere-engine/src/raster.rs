@@ -330,6 +330,9 @@ pub struct FrameLuts {
     /// The display encode, and whether highlights are compressed (else linear).
     pub display: crate::colour::Display,
     pub compressed: bool,
+    /// The world's pole axis in view coordinates (screen right, up, toward the viewer), and the globe's disk on the screen (centre x, y, radius in pixels): together they give every pixel its own east-north-up frame, so the ball is lit as a ball (Nick 2026-10-10).
+    pub pole: [f32; 3],
+    pub disk: [f32; 3],
 }
 
 pub struct FrameStats {
@@ -408,7 +411,7 @@ pub fn render_frame(
                 );
                 continue;
             }
-            render_block_interp(band, w, x0, bweff, band_h, c00, c10, c01, c11, pool, luts, dem_depth, vec_depth, &mut range);
+            render_block_interp(band, w, x0, bweff, band_h, by, c00, c10, c01, c11, pool, luts, dem_depth, vec_depth, &mut range);
         }
         range
     }).reduce(|| ElevRange::EMPTY, ElevRange::merge);
@@ -530,9 +533,32 @@ pub(crate) fn dem_texel(dem: &DemRef, pool: &Pool, diamond: u8, uq: i64, vq: i64
     }
 }
 
+/// A local east-north-up normal turned into the view frame at a screen position: the pixel's own direction on the ball is its up, the pole crossed with it its east. At the centre of the disk this is the identity, so a trail-zoom frame is lit exactly as before; across a full disk every normal faces the sun from where it stands.
 #[inline(always)]
-fn compose(dem: &DemRef, vec: &VecRef, pool: &Pool, diamond: u8, uq: i64, vq: i64, luts: &FrameLuts, range: &mut ElevRange) -> u32 {
-    let rgb = compose_rgb(dem, vec, pool, diamond, uq, vq, luts, range);
+pub fn view_normal(luts: &FrameLuts, sx: f32, sy: f32, n: [f32; 3]) -> [f32; 3] {
+    let [cx, cy, r] = luts.disk;
+    let x = (sx - cx) / r;
+    let y = (cy - sy) / r;
+    let up = [x, y, (1.0 - x * x - y * y).max(0.0).sqrt()];
+    let p = luts.pole;
+    let mut east = [p[1] * up[2] - p[2] * up[1], p[2] * up[0] - p[0] * up[2], p[0] * up[1] - p[1] * up[0]];
+    let len = (east[0] * east[0] + east[1] * east[1] + east[2] * east[2]).sqrt();
+    if len < 1e-6 {
+        east = [1.0, 0.0, 0.0];
+    } else {
+        east = [east[0] / len, east[1] / len, east[2] / len];
+    }
+    let north = [up[1] * east[2] - up[2] * east[1], up[2] * east[0] - up[0] * east[2], up[0] * east[1] - up[1] * east[0]];
+    [
+        n[0] * east[0] + n[1] * north[0] + n[2] * up[0],
+        n[0] * east[1] + n[1] * north[1] + n[2] * up[1],
+        n[0] * east[2] + n[1] * north[2] + n[2] * up[2],
+    ]
+}
+
+#[inline(always)]
+fn compose(dem: &DemRef, vec: &VecRef, pool: &Pool, diamond: u8, uq: i64, vq: i64, luts: &FrameLuts, range: &mut ElevRange, sx: f32, sy: f32) -> u32 {
+    let rgb = compose_rgb(dem, vec, pool, diamond, uq, vq, luts, range, sx, sy);
     if !luts.mask.debug {
         return rgb;
     }
@@ -568,7 +594,7 @@ fn contour_cov(elev_m: f32, slope: f32, c: &Contours) -> (f32, bool) {
 
 
 #[inline(always)]
-fn compose_rgb(dem: &DemRef, vec: &VecRef, pool: &Pool, diamond: u8, uq: i64, vq: i64, luts: &FrameLuts, range: &mut ElevRange) -> u32 {
+fn compose_rgb(dem: &DemRef, vec: &VecRef, pool: &Pool, diamond: u8, uq: i64, vq: i64, luts: &FrameLuts, range: &mut ElevRange, sx: f32, sy: f32) -> u32 {
     let mask = luts.mask;
     // Terrain: tint from elevation, shade from the normal.
     let st = &luts.style;
@@ -596,10 +622,12 @@ fn compose_rgb(dem: &DemRef, vec: &VecRef, pool: &Pool, diamond: u8, uq: i64, vq
                 let ny = (t >> 32) as u16 as i16 as f32;
                 let nz = (t >> 48) as u16 as i16 as f32;
                 if mask.dem {
-                    diffuse = ((nx * luts.sun[0] + ny * luts.sun[1] + nz * luts.sun[2]) / 32767.0).max(0.0);
+                    // The texel's normal in the view frame: lit from where it stands on the ball.
+                    let [vx, vy, vz] = view_normal(luts, sx, sy, [nx, ny, nz]);
+                    diffuse = ((vx * luts.sun[0] + vy * luts.sun[1] + vz * luts.sun[2]) / 32767.0).max(0.0);
                     // Irradiance from the environment: ten multiply-adds per channel on the world normal.
                     const K: f32 = 1.0 / 32767.0;
-                    let e = luts.light.eval(nx * K, ny * K, nz * K);
+                    let e = luts.light.eval(vx * K, vy * K, vz * K);
                     // No cap: the display's highlight curve is the only place light meets white; the floor is physics, not a clip.
                     light = [e[0].max(0.0), e[1].max(0.0), e[2].max(0.0)];
                     let elev_m = eq as f32 * ELEV_STEP - ELEV_OFFSET;
@@ -769,6 +797,7 @@ fn render_block_interp(
     x0: usize,
     bweff: usize,
     band_h: usize,
+    by: usize,
     c00: CornerPt,
     c10: CornerPt,
     c01: CornerPt,
@@ -824,16 +853,17 @@ fn render_block_interp(
         let dux = du_dx + twist_u * py as i64;
         let dvx = dv_dx + twist_v * py as i64;
         let row = &mut band[py * w + x0..py * w + x0 + bweff];
+        let sy = (by * BLOCK + py) as f32 + 0.5;
         if one_cell {
             let dref = &dem_refs[0].1;
             let vref = &vec_refs[0].1;
-            for px in row.iter_mut() {
-                *px = compose(dref, vref, pool, d, uq, vq, luts, range);
+            for (i, px) in row.iter_mut().enumerate() {
+                *px = compose(dref, vref, pool, d, uq, vq, luts, range, (x0 + i) as f32 + 0.5, sy);
                 uq += dux;
                 vq += dvx;
             }
         } else {
-            for px in row.iter_mut() {
+            for (i, px) in row.iter_mut().enumerate() {
                 let raw = raw_of(d, uq, vq);
                 // Match against each ref's RESOLVED (prefix, shift): a ref that fell back to a parent covers many nominal prefixes.
                 let mut dref = DemRef::None;
@@ -861,7 +891,7 @@ fn render_block_interp(
                 if matches!(vref, VecRef::None) {
                     vref = resolve_vec(pool, vec_depth, raw);
                 }
-                *px = compose(&dref, &vref, pool, d, uq, vq, luts, range);
+                *px = compose(&dref, &vref, pool, d, uq, vq, luts, range, (x0 + i) as f32 + 0.5, sy);
                 uq += dux;
                 vq += dvx;
             }
@@ -901,7 +931,7 @@ fn render_block_exact(
             let raw = c.raw();
             let dref = resolve_dem(pool, dem_depth, raw);
             let vref = resolve_vec(pool, vec_depth, raw);
-            *px = compose(&dref, &vref, pool, c.diamond(), uq, vq, luts, range);
+            *px = compose(&dref, &vref, pool, c.diamond(), uq, vq, luts, range, (x0 + i) as f32 + 0.5, gy as f32 + 0.5);
         }
     }
 }
@@ -957,6 +987,8 @@ mod tests {
         );
 
         let luts = FrameLuts {
+            pole: [0.0, 1.0, 0.0],
+            disk: [128.0, 64.0, 1.0e9],
             hypso: build_hypso_lut(),
             style: Style::default(),
             sun: [0.0, 0.0, 1.0],

@@ -65,6 +65,8 @@ struct Uniforms {
     img_table: array<vec4<f32>, 64>,
     // The globe's disk in render-target pixels: centre x, y, radius squared, and 1 when the limb is on the screen.
     globe: vec4<f32>,
+    // The world's pole axis in view coordinates.
+    pole: vec4<f32>,
 };
 
 // a: diamond, depth, cu, cv. b: dem slot, line slot, land+water slot, img slot. c: flags. d: base, step, eu, nu. e: ev, nv, inv det.
@@ -369,7 +371,24 @@ fn fold(f: Fold, col: vec3<f32>, a: f32) -> Fold {
     return Fold(f.k * (1.0 - a), f.c * (1.0 - a) + col * a);
 }
 
-fn compose(d: u32, u: u32, v: u32) -> Composed {
+// A local east-north-up normal turned into the view frame at a fragment: the fragment's own direction on the ball is its up, the pole crossed with it its east (the CPU's view_normal). The identity at the disk's centre; across a full disk every normal faces the sun from where it stands.
+fn view_normal(n: vec3<f32>, pos: vec2<f32>) -> vec3<f32> {
+    let r = sqrt(U.globe.z);
+    let x = (pos.x - U.globe.x) / r;
+    let y = (U.globe.y - pos.y) / r;
+    let up = vec3<f32>(x, y, sqrt(max(1.0 - x * x - y * y, 0.0)));
+    var east = cross(U.pole.xyz, up);
+    let len = length(east);
+    if (len < 1e-6) {
+        east = vec3<f32>(1.0, 0.0, 0.0);
+    } else {
+        east = east / len;
+    }
+    let north = cross(up, east);
+    return n.x * east + n.y * north + n.z * up;
+}
+
+fn compose(d: u32, u: u32, v: u32, pos: vec2<f32>) -> Composed {
     let mask = U.mask;
     var out: Composed;
     out.base = U.style_no_dem.rgb;
@@ -397,7 +416,7 @@ fn compose(d: u32, u: u32, v: u32) -> Composed {
             // The renderer's quantum: half-metre steps from 11 km below the sea (the CPU's ELEV_OFFSET and ELEV_STEP).
             let eq = u32(clamp((s.elev + 11000.0) * 2.0, 0.0, 65534.0));
             if ((mask & M_DEM) != 0u) {
-                out.n = s.n;
+                out.n = view_normal(s.n, pos);
                 // The open sea: exactly zero and dead flat, which is how a global DEM writes the ocean (below-sea-level land keeps its colour).
                 if (abs(s.elev) < 0.75 && s.n.z > 0.9995) {
                     is_sea = true;
@@ -620,7 +639,7 @@ fn fs_map(in: VOut) -> @location(0) vec4<f32> {
         return vec4<f32>(to_display(U.style_bg.rgb) / 255.0, 1.0);
     }
     let s = sample_uv(in);
-    let p = compose(s.x, s.y, s.z);
+    let p = compose(s.x, s.y, s.z, in.pos.xy);
     return vec4<f32>(to_display(shade(p.base, p.ground, p.n, p.k1, p.c1, p.water, p.k2, p.c2)) / 255.0, 1.0);
 }
 
@@ -635,7 +654,7 @@ struct GOut {
 @fragment
 fn fs_map_g(in: VOut) -> GOut {
     let s = sample_uv(in);
-    var p = compose(s.x, s.y, s.z);
+    var p = compose(s.x, s.y, s.z, in.pos.xy);
     if (off_globe(in.pos.xy)) {
         p.base = U.style_bg.rgb;
         p.ground = false;

@@ -1,6 +1,7 @@
 //! mahere's host-independent map core — the #pagetable edition. A frame is fetches: 32 px block grid → diamond UV → page table → plane fetch → LUT composite. No vectors, no reservoir, no source data at runtime: the renderer's entire diet is baked cells served by a CellStore through the clipmap residency layer. Frontends feed input and blit `canvas`.
 
 pub mod colour;
+pub mod ink;
 pub mod plan;
 pub mod probe;
 pub mod raster;
@@ -287,6 +288,8 @@ impl MapCore {
                 light: sh::Sh9::sun_and_sky(315.0, 40.0).quadratic((0.0, 1.0)),
                 display: colour::Display::default(),
                 compressed: true,
+                pole: [0.0, 1.0, 0.0],
+                disk: [0.0, 0.0, 1.0e9],
             },
             env: sh::Sh9::sun_and_sky(315.0, 40.0),
             luts_sun: (f32::NAN, f32::NAN, f64::NAN),
@@ -914,6 +917,12 @@ impl MapCore {
         self.canvas.resize(w * h, BG_RGB);
         if w == 0 || h == 0 {
             return;
+        }
+        {
+            // Every pixel's own frame: the pole in view coordinates and the disk, for the ball's lighting.
+            let b = self.cam.basis();
+            self.luts.pole = [b[0][2] as f32, b[1][2] as f32, b[2][2] as f32];
+            self.luts.disk = [w as f32 * 0.5, h as f32 * 0.5, self.cam.radius() as f32];
         }
         let (stats, want) = raster::render_frame(
             &mut self.canvas,
