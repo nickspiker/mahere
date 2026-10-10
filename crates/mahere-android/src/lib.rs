@@ -248,8 +248,8 @@ impl AndroidApp {
     fn on_gps(&mut self, fix: GpsFix) {
         if !self.centered_once {
             self.centered_once = true;
-            self.map.cam.lat() = fix.lat;
-            self.map.cam.lon() = fix.lon;
+            let bearing = self.map.cam.bearing();
+            self.map.cam.look_at(fix.lat, fix.lon, bearing);
             self.map.camera_moved(self.w, self.h);
         }
         self.map.set_gps(fix);
