@@ -280,7 +280,15 @@ impl UserLayer {
                     sel.insert(*k, s.clone());
                 }
             }
-            let ink_up = mahere_tiles::pyramid_class(ink, depth, depth - 1, ClassMerge::Major);
+            // Ink above the drawn depth: the mean of the children doubled, so a stroke halves in texels each level (its area) but a line one texel wide, two children of four, stays full and never fades or swells; the map's own lines sum, which would swell a stroke. The selection is an area: the plain mean.
+            let mut ink_up = mahere_tiles::pyramid_class(ink, depth, depth - 1, ClassMerge::Dominant);
+            for (k, c) in ink_up.iter_mut() {
+                if k.depth == depth - 1 {
+                    for v in c.cov.iter_mut() {
+                        *v = (*v as u32 * 2).min(255) as u8;
+                    }
+                }
+            }
             let sel_up = mahere_tiles::pyramid_cov(sel, depth, depth - 1);
             for (k, c) in ink_up.into_iter().filter(|(k, _)| k.depth == depth - 1) {
                 let cell = self.cells.entry(k).or_default();

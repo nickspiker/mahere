@@ -273,7 +273,7 @@ fn ink_check(device: &wgpu::Device, queue: &wgpu::Queue, gpu: &mut GpuMap, targe
         }
         px
     };
-    let reds = |px: &[u32]| px.iter().filter(|p| (**p >> 16) & 255 > 180 && (**p & 255) < 110).count();
+    let reds = |px: &[u32]| px.iter().filter(|p| (**p >> 16) & 255 > 180 && (**p >> 8) & 255 < 40 && (**p & 255) < 110).count();
     let (cx, cy) = (w as f64 * 0.5, h as f64 * 0.5);
     map.set_tool(mahere_engine::ink::Tool::Pen);
     map.set_pen(0);

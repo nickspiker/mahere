@@ -899,8 +899,8 @@ impl MapCore {
     pub fn plan(&mut self, w: usize, h: usize) -> Arc<plan::FramePlan> {
         let t0 = Instant::now();
         self.prepare(w, h);
-        // The same view over the same cells is the same plan: a frame the sensor or the GPS made dirty costs nothing here.
-        let key = (self.cam.lat().to_bits(), self.cam.lon().to_bits(), self.cam.ppd.to_bits(), self.cam.bearing().to_bits(), w, h, self.res.pool_version, self.dem_depth, self.vec_depth);
+        // The same view over the same cells, the user's included, is the same plan: a frame the sensor or the GPS made dirty costs nothing here.
+        let key = (self.cam.lat().to_bits(), self.cam.lon().to_bits(), self.cam.ppd.to_bits(), self.cam.bearing().to_bits(), w, h, self.res.pool_version + (self.user.version << 40), self.dem_depth, self.vec_depth);
         self.plan_cached = false;
         if let Some((k, p)) = &self.plan_cache {
             if *k == key {
