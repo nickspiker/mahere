@@ -259,6 +259,8 @@ pub struct GpuMap {
     /// The user's cells (ink and selection) as a plane of their own, and the selection being drawn as a screen mask.
     ink: Plane,
     user_version: u64,
+    /// Each uploaded user cell's version, so a change re-uploads only the cells it touched.
+    ink_uploaded: FxHashMap<CellKey, u64>,
     preview: Option<(wgpu::Texture, wgpu::TextureView, u32, u32)>,
     preview_version: u64,
     pub uploads: usize,
@@ -366,6 +368,7 @@ impl GpuMap {
             img,
             ink,
             user_version: u64::MAX,
+            ink_uploaded: FxHashMap::default(),
             preview: None,
             preview_version: u64::MAX,
             dem_scale: FxHashMap::default(),
@@ -411,13 +414,18 @@ impl GpuMap {
                 if let Some(slot) = self.ink.map.remove(&k) {
                     self.ink.free.push(slot);
                 }
+                self.ink_uploaded.remove(&k);
             }
             let mut grew = false;
             let mut scratch = vec![0u8; TRI * 4];
             for (key, c) in user.cells.iter() {
+                if self.ink_uploaded.get(key) == Some(&c.version) && self.ink.map.contains_key(key) {
+                    continue;
+                }
                 let (slot, g) = self.ink.alloc(device, queue, *key);
                 grew |= g;
                 if let Some((slot, _)) = slot {
+                    self.ink_uploaded.insert(*key, c.version);
                     for i in 0..TRI {
                         scratch[4 * i] = c.ink.as_ref().map_or(0, |k| k.class[i]);
                         scratch[4 * i + 1] = c.ink.as_ref().map_or(0, |k| k.cov[i]);

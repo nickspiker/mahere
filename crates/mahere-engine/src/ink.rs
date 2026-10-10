@@ -41,6 +41,8 @@ pub trait UserStore: Send + Sync {
 pub struct UserCell {
     pub ink: Option<ClassCell>,
     pub sel: Option<CovCell>,
+    /// Bumped whenever the cell's planes change, so a renderer uploads only what changed.
+    pub version: u64,
 }
 
 impl UserCell {
@@ -58,6 +60,9 @@ pub struct UserLayer {
     dirty: FxHashSet<CellKey>,
     /// Bumped on every change, for a renderer to know its planes are stale.
     pub version: u64,
+    /// The cells a stroke in progress has touched, as they were before it (None: not there), for undoing it; and whether the levels above still wait to be rebuilt (deferred to the stroke's end, since mid-stroke the view reads the drawn cells themselves).
+    undo: Option<FxHashMap<CellKey, Option<UserCell>>>,
+    stale_above: bool,
 }
 
 /// The texel a screen point falls in at `depth`: the cell and the triangle index, or nothing off the globe.
@@ -231,22 +236,73 @@ impl UserLayer {
         Some(out)
     }
 
+    /// A cell about to change: remembered as it was, once, for the stroke's undo.
+    fn remember(&mut self, key: CellKey) {
+        if let Some(undo) = &mut self.undo {
+            if !undo.contains_key(&key) {
+                undo.insert(key, self.cells.get(&key).cloned());
+            }
+        }
+    }
+
     /// The cell at `key` ready for the pen: made if missing, its ink plane seeded from the nearest ancestor's if it had none.
     fn ink_cell(&mut self, key: CellKey) -> &mut ClassCell {
+        self.remember(key);
         if self.cells.get(&key).is_none_or(|c| c.ink.is_none()) {
             let seed = self.ink_from_parents(key).unwrap_or_else(ClassCell::new);
             self.cells.entry(key).or_default().ink = Some(seed);
         }
-        self.cells.get_mut(&key).unwrap().ink.as_mut().unwrap()
+        let cell = self.cells.get_mut(&key).unwrap();
+        cell.version += 1;
+        cell.ink.as_mut().unwrap()
     }
 
     /// The cell at `key` ready for a selection: made if missing, its selection plane seeded from the nearest ancestor's if it had none.
     fn sel_cell(&mut self, key: CellKey) -> &mut CovCell {
+        self.remember(key);
         if self.cells.get(&key).is_none_or(|c| c.sel.is_none()) {
             let seed = self.sel_from_parents(key).unwrap_or_else(CovCell::new);
             self.cells.entry(key).or_default().sel = Some(seed);
         }
-        self.cells.get_mut(&key).unwrap().sel.as_mut().unwrap()
+        let cell = self.cells.get_mut(&key).unwrap();
+        cell.version += 1;
+        cell.sel.as_mut().unwrap()
+    }
+
+    /// A stroke begins: from here every touched cell is remembered, and the levels above wait until it ends.
+    pub fn begin_undo(&mut self) {
+        self.undo = Some(FxHashMap::default());
+    }
+
+    /// The stroke stands: the undo is forgotten and the levels above are rebuilt now.
+    pub fn commit_undo(&mut self) {
+        self.undo = None;
+        if self.stale_above {
+            self.rebuild_above();
+            self.stale_above = false;
+            self.version += 1;
+        }
+    }
+
+    /// The stroke is undone: every cell it touched goes back to what it was.
+    pub fn rollback_undo(&mut self) {
+        if let Some(undo) = self.undo.take() {
+            for (k, before) in undo {
+                match before {
+                    Some(c) => {
+                        let mut c = c;
+                        c.version += 1_000_000;
+                        self.cells.insert(k, c);
+                    }
+                    None => {
+                        self.cells.remove(&k);
+                        self.drawn.remove(&k);
+                    }
+                }
+            }
+            self.stale_above = false;
+            self.version += 1;
+        }
     }
 
     /// Clear the whole selection.
@@ -271,14 +327,18 @@ impl UserLayer {
         self.after_change(0, touched);
     }
 
-    /// After cells changed at `depth`: they count as drawn, the levels above are rebuilt, the empties dropped, the version bumped.
+    /// After cells changed at `depth`: they count as drawn, the levels above are rebuilt (or, mid-stroke, left for the stroke's end), the empties dropped, the version bumped.
     fn after_change(&mut self, depth: u8, touched: FxHashSet<CellKey>) {
         for k in &touched {
             if k.depth == depth {
                 self.drawn.insert(*k, ());
             }
         }
-        self.rebuild_above();
+        if self.undo.is_some() {
+            self.stale_above = true;
+        } else {
+            self.rebuild_above();
+        }
         self.cells.retain(|k, c| {
             let keep = !c.is_empty();
             if !keep {
@@ -295,9 +355,10 @@ impl UserLayer {
     /// The levels above every drawn depth, from the deepest up: at each level the box filter of the level below, with cells drawn at that level laid over it where they have ink or selection.
     fn rebuild_above(&mut self) {
         let Some(deepest) = self.drawn.keys().map(|k| k.depth).max() else { return };
-        // Drop every built cell; only drawn ones stay.
+        // Drop every built cell; only drawn ones stay. The cells built below carry this rebuild's version, so a renderer sees them as new.
         let drawn = self.drawn.clone();
         self.cells.retain(|k, _| drawn.contains_key(k));
+        let built_version = self.version + 1;
         let mut depth = deepest;
         while depth > USER_MIN_DEPTH {
             let mut ink: std::collections::HashMap<CellKey, ClassCell> = std::collections::HashMap::new();
@@ -331,6 +392,7 @@ impl UserLayer {
                     }
                 }
                 let cell = self.cells.entry(k).or_default();
+                cell.version = built_version;
                 match &mut cell.ink {
                     Some(mine) => {
                         for i in 0..TRI {
@@ -352,6 +414,7 @@ impl UserLayer {
                     }
                 }
                 let cell = self.cells.entry(k).or_default();
+                cell.version = built_version;
                 match &mut cell.sel {
                     Some(mine) => {
                         for i in 0..TRI {
@@ -444,7 +507,7 @@ pub fn encode_user_cell(c: &UserCell) -> Vec<u8> {
 
 pub fn decode_user_cell(bytes: &[u8]) -> Option<UserCell> {
     let p = mahere_tiles::decode_cell(bytes).ok()?;
-    Some(UserCell { ink: p.line, sel: p.water })
+    Some(UserCell { ink: p.line, sel: p.water, version: 0 })
 }
 
 #[cfg(test)]
@@ -497,7 +560,7 @@ mod tests {
                 ink.cov[((ty << 8) | tx) << 1] = 255;
             }
         }
-        u.cells.insert(parent, UserCell { ink: Some(ink), sel: None });
+        u.cells.insert(parent, UserCell { ink: Some(ink), sel: None, version: 0 });
         let child = parent.child(0).child(0);
         let seed = u.ink_from_parents(child).unwrap();
         // Four fine texels to a coarse one each way: the fine triangles whose centroids lie below the coarse diagonal are inked.

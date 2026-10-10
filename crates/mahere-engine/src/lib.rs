@@ -212,7 +212,6 @@ fn rotate(v: [f64; 3], k: [f64; 3], angle: f64) -> [f64; 3] {
 struct Stroke {
     /// Screen points with the brush width at each, from the pen's pressure.
     pts: Vec<(f64, f64, f64)>,
-    before: ink::UserLayer,
     depth: u8,
     add: bool,
 }
@@ -522,7 +521,8 @@ impl MapCore {
         let depth = self.draw_depth();
         let add = !self.user.selected_at(&self.cam, w, h, depth, x, y);
         let width = self.brush_width(pressure);
-        self.stroke = Some(Stroke { pts: vec![(x, y, width)], before: self.user.clone(), depth, add });
+        self.user.begin_undo();
+        self.stroke = Some(Stroke { pts: vec![(x, y, width)], depth, add });
         if self.tool == ink::Tool::Pen {
             self.user.stroke(&self.cam, w, h, depth, &[(x, y, width)], self.pen);
         }
@@ -557,6 +557,7 @@ impl MapCore {
             let poly: Vec<(f64, f64)> = st.pts.iter().map(|p| (p.0, p.1)).collect();
             self.user.select(&self.cam, w, h, st.depth, &poly, st.add);
         }
+        self.user.commit_undo();
         self.preview.clear();
         self.preview_version += 1;
         self.save_user();
@@ -565,8 +566,8 @@ impl MapCore {
 
     /// A second finger, or a tool change, mid-stroke: everything the stroke did is undone.
     pub fn cancel_stroke(&mut self) {
-        if let Some(st) = self.stroke.take() {
-            self.user = st.before;
+        if self.stroke.take().is_some() {
+            self.user.rollback_undo();
             self.preview.clear();
             self.preview_version += 1;
             self.dirty = true;
