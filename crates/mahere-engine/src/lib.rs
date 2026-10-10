@@ -1076,8 +1076,14 @@ impl MapCore {
                 self.sun_world = sun_world_at(lat, lon, self.sun_az, self.sun_alt);
             }
         }
-        // Lighting lives in the view frame, where the normals now are (each turned by its own place on the ball): the sun is a world direction brought into view space by the basis, and the environment (sun + sky as SH) is built around it there. The key is the sun's view vector itself, to the thousandth, so a still screen is not relit every frame.
-        let sv = self.sun_view();
+        // Lighting lives in the view frame, where the normals now are (each turned by its own place on the ball). The map's own sun is fixed to the screen: its azimuth is clockwise from screen up and nothing about the view enters, so the lit side stays where the phone has it as the globe turns and a pole is nothing special (Nick 2026-10-10: phone-relative, not planet-relative). The real sun is a world direction, brought into view space by the basis. The key is the sun's view vector, to the thousandth, so a still screen is not relit every frame.
+        let sv = if self.real_sun {
+            self.sun_view()
+        } else {
+            let az = (self.sun_az as f64).to_radians();
+            let alt = (self.sun_alt as f64).to_radians();
+            [(az.sin() * alt.cos()) as f32, (az.cos() * alt.cos()) as f32, alt.sin() as f32]
+        };
         let key = (self.sun_az, self.sun_alt, ((sv[0] * 1000.0).round() as f64) * 1.0e6 + ((sv[1] * 1000.0).round() as f64) * 1.0e3 + (sv[2] * 1000.0).round() as f64);
         if self.luts_sun != key {
             self.luts.sun = sv;

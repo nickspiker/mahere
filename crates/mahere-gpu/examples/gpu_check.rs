@@ -131,6 +131,11 @@ fn main() {
     } else {
         gpu.set_overlay(&device, &queue, w as u32, h as u32, &overlay);
     }
+    // MAHERE_INK=1: a pen stroke across the centre, then the view zoomed in and out around it; the stroke must show at every zoom on both renderers.
+    if std::env::var("MAHERE_INK").as_deref() == Ok("1") {
+        ink_check(&device, &queue, &mut gpu, &target, &view, &mut map, w, h);
+        return;
+    }
     let luts = map.luts();
     // Time the second frame: the first pays for pipeline warm-up.
     let mut frame_ms = 0.0;
@@ -240,4 +245,53 @@ fn relight_check(device: &wgpu::Device, queue: &wgpu::Queue, gpu: &mut GpuMap, t
         }
     }
     println!("relight: {:.2}% of pixels beyond 2 levels of the full frame, worst {worst}; relight frame {relight_ms:.2} ms submit to idle", n as f64 * 100.0 / (w * h) as f64);
+}
+
+/// The stroke at every zoom: red pixels counted on the CPU frame and the GPU frame after each zoom step.
+#[allow(clippy::too_many_arguments)]
+fn ink_check(device: &wgpu::Device, queue: &wgpu::Queue, gpu: &mut GpuMap, target: &wgpu::Texture, view: &wgpu::TextureView, map: &mut MapCore, w: usize, h: usize) {
+    let read = |device: &wgpu::Device, queue: &wgpu::Queue| -> Vec<u32> {
+        let bpr = ((w as u32 * 4) + 255) / 256 * 256;
+        let buf = device.create_buffer(&wgpu::BufferDescriptor { label: Some("readback"), size: (bpr * h as u32) as u64, usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ, mapped_at_creation: false });
+        let mut enc = device.create_command_encoder(&Default::default());
+        enc.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo { texture: target, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+            wgpu::TexelCopyBufferInfo { buffer: &buf, layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(bpr), rows_per_image: Some(h as u32) } },
+            wgpu::Extent3d { width: w as u32, height: h as u32, depth_or_array_layers: 1 },
+        );
+        queue.submit([enc.finish()]);
+        let slice = buf.slice(..);
+        slice.map_async(wgpu::MapMode::Read, |_| {});
+        device.poll(wgpu::PollType::wait_indefinitely()).ok();
+        let data = slice.get_mapped_range();
+        let mut px = vec![0u32; w * h];
+        for y in 0..h {
+            for x in 0..w {
+                let p = &data[y * bpr as usize + x * 4..][..4];
+                px[y * w + x] = ((p[0] as u32) << 16) | ((p[1] as u32) << 8) | p[2] as u32;
+            }
+        }
+        px
+    };
+    let reds = |px: &[u32]| px.iter().filter(|p| (**p >> 16) & 255 > 180 && (**p & 255) < 110).count();
+    let (cx, cy) = (w as f64 * 0.5, h as f64 * 0.5);
+    map.set_tool(mahere_engine::ink::Tool::Pen);
+    map.set_pen(0);
+    map.begin_stroke(cx - 100.0, cy, 0.5, w, h);
+    map.extend_stroke(cx + 100.0, cy, 0.5, w, h);
+    map.end_stroke(w, h);
+    for factor in [1.0, 2.0, 0.5, 0.5, 0.5, 8.0] {
+        map.zoom_about(factor, cx, cy, w, h);
+        map.render(w, h);
+        let cpu = reds(&map.canvas);
+        let plan = map.plan(w, h);
+        gpu.set_user(device, queue, &map.user, &map.preview, map.preview_version, w as u32, h as u32);
+        let mut enc = device.create_command_encoder(&Default::default());
+        gpu.render(device, queue, &mut enc, view, &plan, map.luts(), w as u32, h as u32, mahere_gpu::RenderMode::Full);
+        queue.submit([enc.finish()]);
+        device.poll(wgpu::PollType::wait_indefinitely()).ok();
+        let g = reds(&read(device, queue));
+        let user_refs = plan.refs.iter().filter(|r| r.flags & mahere_engine::plan::FLAG_INK != 0).count();
+        eprintln!("ppd {:.0} dem depth {}: red pixels cpu {cpu} gpu {g}; user cells {} (refs {user_refs}) at depths {:?}", map.cam.ppd, plan.dem_depth, map.user.cells.len(), map.user.cells.keys().map(|k| k.depth).collect::<std::collections::BTreeSet<_>>());
+    }
 }
