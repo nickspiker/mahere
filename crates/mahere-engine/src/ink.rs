@@ -116,6 +116,9 @@ impl UserLayer {
                 }
             }
         }
+        for k in touched.iter().copied().collect::<Vec<_>>() {
+            self.push_down(k);
+        }
         self.after_change(depth, touched);
     }
 
@@ -189,25 +192,8 @@ impl UserLayer {
             k = k.parent();
             levels += 1;
             if self.cells.get(&k).is_some_and(&has) {
-                let (cu, cv) = key.grid();
-                let (pu, pv) = k.grid();
-                let (ou, ov) = ((cu - (pu << levels)) as usize, (cv - (pv << levels)) as usize);
-                // Each fine triangle takes the ancestor triangle its centroid lies in: the ancestor's texel by shifting, and its lower or upper half by where the centroid falls against that texel's diagonal (a fine texel's own half says nothing about that, and using it dotted every edge).
-                let mut map = vec![0usize; TRI];
-                let p = 1usize << levels;
-                for ty in 0..256 {
-                    for tx in 0..256 {
-                        let (gx, gy) = ((ou << 8) + tx, (ov << 8) + ty);
-                        let (sx, sy) = (gx >> levels, gy >> levels);
-                        let (fx, fy) = (gx & (p - 1), gy & (p - 1));
-                        for half in 0..2 {
-                            // Centroid thirds: the lower triangle's at (1/3, 1/3) of the texel, the upper's at (2/3, 2/3); times three to stay in integers.
-                            let upper = 3 * (fx + fy) + 2 + 2 * half >= 3 * p;
-                            map[((ty << 8) | tx) << 1 | half] = ((sy << 8) | sx) << 1 | upper as usize;
-                        }
-                    }
-                }
-                return Some((k, map));
+                let _ = levels;
+                return Some((k, Self::map_to_ancestor(key, k)));
             }
         }
         None
@@ -428,12 +414,15 @@ impl UserLayer {
         }
     }
 
-    /// The ink at a raw coordinate, from the finest cell at or above `depth` that has any there: the pen (an index into [`PENS`]) and the coverage.
+    /// Whether the cell at `key` was drawn (as against built above drawn ones).
+    pub fn is_drawn(&self, key: CellKey) -> bool {
+        self.drawn.contains_key(&key)
+    }
+
+    /// The ink at a raw coordinate, from the finest cell at or above `depth` that has an ink plane there: the pen (an index into [`PENS`]) and the coverage. The finest cell decides, which holds because every cell carries what coarser cells have there: seeded when made, pushed down when a coarser stroke lands, completed when built.
     pub fn ink_at(&self, raw: u64, depth: u8) -> Option<(u8, u8)> {
-        let diamond = (raw >> 60) as u8;
         let (iu, iv) = Coord::from_raw(raw).uv();
         let (uq, vq) = ((iu as i64) << 16, (iv as i64) << 16);
-        let _ = diamond;
         let mut d = depth;
         loop {
             let key = CellKey { depth: d, prefix: raw >> (60 - 2 * d as u32) };
@@ -448,6 +437,52 @@ impl UserLayer {
                 return None;
             }
             d -= 1;
+        }
+    }
+
+    /// The map from a finer cell's texels to those of its ancestor `anc`: the ancestor texel by shifting, its lower or upper half by where the fine triangle's centroid falls against that texel's diagonal (the lower triangle's centroid at a third, the upper's at two thirds; times three to stay in integers).
+    fn map_to_ancestor(key: CellKey, anc: CellKey) -> Vec<usize> {
+        let levels = (key.depth - anc.depth) as u32;
+        let (cu, cv) = key.grid();
+        let (pu, pv) = anc.grid();
+        let (ou, ov) = ((cu - (pu << levels)) as usize, (cv - (pv << levels)) as usize);
+        let mut map = vec![0usize; TRI];
+        let p = 1usize << levels;
+        for ty in 0..256 {
+            for tx in 0..256 {
+                let (gx, gy) = ((ou << 8) + tx, (ov << 8) + ty);
+                let (sx, sy) = (gx >> levels, gy >> levels);
+                let (fx, fy) = (gx & (p - 1), gy & (p - 1));
+                for half in 0..2 {
+                    let upper = 3 * (fx + fy) + 2 + 2 * half >= 3 * p;
+                    map[((ty << 8) | tx) << 1 | half] = ((sy << 8) | sx) << 1 | upper as usize;
+                }
+            }
+        }
+        map
+    }
+
+    /// A coarse cell's ink pushed down into every finer cell beneath it: where the fine texel is empty and the coarse one inked, the fine takes it. So a stroke made zoomed out shows at once through finer cells drawn earlier, the finest cell still deciding (Nick 2026-10-10).
+    fn push_down(&mut self, key: CellKey) {
+        let Some(ink) = self.cells.get(&key).and_then(|c| c.ink.clone()) else { return };
+        let below: Vec<CellKey> = self.cells.keys().filter(|k| k.depth > key.depth && k.ancestor(key.depth) == key).copied().collect();
+        for k in below {
+            let map = Self::map_to_ancestor(k, key);
+            self.remember(k);
+            let cell = self.cells.get_mut(&k).unwrap();
+            let fine = cell.ink.get_or_insert_with(ClassCell::new);
+            let mut changed = false;
+            for (i, &j) in map.iter().enumerate() {
+                if fine.cov[i] == 0 && ink.cov[j] != 0 {
+                    fine.cov[i] = ink.cov[j];
+                    fine.class[i] = ink.class[j];
+                    changed = true;
+                }
+            }
+            if changed {
+                cell.version += 1;
+                self.dirty.insert(k);
+            }
         }
     }
 
@@ -567,6 +602,21 @@ mod tests {
         let at = |tx: usize, ty: usize, half: usize| seed.cov[((ty << 8) | tx) << 1 | half] != 0;
         assert!(at(0, 0, 0) && at(0, 0, 1) && at(3, 0, 0) && at(0, 3, 0), "under the diagonal");
         assert!(!at(3, 3, 0) && !at(3, 3, 1) && !at(3, 0, 1) && !at(2, 2, 1), "over it");
+    }
+
+    /// A stroke made zoomed out, over an area with finer strokes, shows through the finer cells' empty texels the moment it is drawn, before any level is rebuilt.
+    #[test]
+    fn a_coarse_stroke_shows_through_finer_cells_at_once() {
+        let mut u = UserLayer::default();
+        let (w, h) = (800, 600);
+        u.stroke(&cam(), w, h, 12, &[(100.0, 100.0, 6.0), (700.0, 100.0, 6.0)], 3);
+        u.begin_undo();
+        u.stroke(&cam(), w, h, 9, &[(400.0, 50.0, 6.0), (400.0, 550.0, 6.0)], 0);
+        let (lat, lon) = cam().screen_to_geo(400.0, 300.0, w, h);
+        let raw = Coord::from_lat_lon(lat, lon).raw();
+        assert_eq!(u.ink_at(raw, 13).map(|(p, _)| p), Some(0), "the coarse stroke through the fine cells, mid-stroke");
+        u.commit_undo();
+        assert_eq!(u.ink_at(raw, 13).map(|(p, _)| p), Some(0), "and after the lift");
     }
 
     #[test]

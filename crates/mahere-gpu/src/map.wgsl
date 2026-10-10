@@ -146,22 +146,6 @@ fn lookup(d: u32, depth: u32, u: u32, v: u32) -> u32 {
 }
 
 // The probe: the cell at `want` or the nearest parent carrying any of `need`.
-// The user's cell for this texel: the finest at or above `want` (user cells sit in the table under their depth plus INK_TAG_DEPTH).
-fn find_user(d: u32, want: u32, u: u32, v: u32) -> u32 {
-    var depth = want;
-    for (var k = 0u; k <= 30u; k++) {
-        let r = lookup(d, depth + INK_TAG_DEPTH, u, v);
-        if (r != NONE && r != ABSENT) {
-            return r;
-        }
-        if (depth == 0u) {
-            return NONE;
-        }
-        depth = depth - 1u;
-    }
-    return NONE;
-}
-
 // Bounded by the depth count rather than open: no loop in this shader may run unbounded.
 fn find(d: u32, want: u32, u: u32, v: u32, need: u32) -> u32 {
     var depth = want;
@@ -650,18 +634,26 @@ fn compose(d: u32, u: u32, v: u32, pos: vec2<f32>) -> Composed {
             out.c2 = vec3<f32>(0.0);
         }
     }
-    // The user's marks over everything: the pen's ink in its colour, the selection as a wash.
-    let ui = find_user(d, U.depths.x, u, v);
-    if (ui != NONE) {
-        let r = refs[ui];
-        let t = tri(u, v, r.a.y);
-        let px = textureLoad(ink_tex, vec2<i32>(i32(2u * t.x + t.z), i32(t.y)), i32(r.b.x), 0);
-        if (px.y != 0u) {
-            { let f = fold(Fold(out.k2, out.c2), pen_colour(px.x - 1u), f32(px.y) / 255.0); out.k2 = f.k; out.c2 = f.c; }
+    // The user's marks over everything, from the finest user cell here (every cell carries what coarser ones have): the pen's ink in its colour, the selection as a wash.
+    var udepth = U.depths.x;
+    for (var k = 0u; k <= 30u; k++) {
+        let ui = lookup(d, udepth + INK_TAG_DEPTH, u, v);
+        if (ui != NONE && ui != ABSENT) {
+            let r = refs[ui];
+            let t = tri(u, v, r.a.y);
+            let px = textureLoad(ink_tex, vec2<i32>(i32(2u * t.x + t.z), i32(t.y)), i32(r.b.x), 0);
+            if (px.y != 0u) {
+                { let f = fold(Fold(out.k2, out.c2), pen_colour(px.x - 1u), f32(px.y) / 255.0); out.k2 = f.k; out.c2 = f.c; }
+            }
+            if (px.z != 0u) {
+                { let f = fold(Fold(out.k2, out.c2), SEL_TINT, f32(px.z) / 255.0 * SEL_ALPHA); out.k2 = f.k; out.c2 = f.c; }
+            }
+            break;
         }
-        if (px.z != 0u) {
-            { let f = fold(Fold(out.k2, out.c2), SEL_TINT, f32(px.z) / 255.0 * SEL_ALPHA); out.k2 = f.k; out.c2 = f.c; }
+        if (udepth == 0u) {
+            break;
         }
+        udepth = udepth - 1u;
     }
     if ((mask & M_DEBUG) != 0u) {
         var tintd = vec3<f32>(-1.0);
