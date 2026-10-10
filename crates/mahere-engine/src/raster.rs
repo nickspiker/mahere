@@ -647,8 +647,11 @@ fn user_marks(rgb: [f32; 3], user: &crate::ink::UserLayer, raw: u64, depth: u8) 
         return rgb;
     }
     let mut rgb = rgb;
-    if let Some((pen, cov)) = user.ink_at(raw, depth) {
-        rgb = lerp3(rgb, lin(crate::ink::PENS[pen as usize]), cov as f32 / 255.0);
+    if let Some(p) = user.ink_at(raw, depth) {
+        // Premultiplied over: what the ink leaves of the ground, plus the ink's own light.
+        let k = 1.0 - p[3] as f32 / 255.0;
+        let ink = lin([p[0], p[1], p[2]]);
+        rgb = [rgb[0] * k + ink[0], rgb[1] * k + ink[1], rgb[2] * k + ink[2]];
     }
     let sel = user.sel_at(raw, depth);
     if sel != 0 {

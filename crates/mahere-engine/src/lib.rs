@@ -531,7 +531,7 @@ impl MapCore {
         self.user.begin_undo();
         self.stroke = Some(Stroke { pts: vec![(x, y, width)], depth, add });
         if self.tool == ink::Tool::Pen {
-            self.user.stroke(&self.cam, w, h, depth, &[(x, y, width)], self.pen);
+            self.user.stroke(&self.cam, w, h, depth, &[(x, y, width)], ink::PENS[self.pen as usize], 1.0);
         }
         self.dirty = true;
     }
@@ -549,7 +549,7 @@ impl MapCore {
         match self.tool {
             ink::Tool::Pen => {
                 let seg = [last, (x, y, width)];
-                self.user.stroke(&self.cam, w, h, depth, &seg, self.pen);
+                self.user.stroke(&self.cam, w, h, depth, &seg, ink::PENS[self.pen as usize], 1.0);
             }
             ink::Tool::Select => self.rebuild_preview(w, h),
             ink::Tool::None => {}

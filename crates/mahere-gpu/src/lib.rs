@@ -258,6 +258,7 @@ pub struct GpuMap {
     overlay: Option<(wgpu::Texture, wgpu::TextureView, u32, u32)>,
     /// The user's cells (ink and selection) as a plane of their own, and the selection being drawn as a screen mask.
     ink: Plane,
+    sel: Plane,
     user_version: u64,
     /// Each uploaded user cell's version, so a change re-uploads only the cells it touched.
     ink_uploaded: FxHashMap<CellKey, u64>,
@@ -280,7 +281,7 @@ impl GpuMap {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("mahere map"), source: wgpu::ShaderSource::Wgsl(include_str!("map.wgsl").into()) });
         let uint_array = wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Uint, view_dimension: wgpu::TextureViewDimension::D2Array, multisampled: false };
         let storage = wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: true }, has_dynamic_offset: false, min_binding_size: None };
-        let entries: Vec<wgpu::BindGroupLayoutEntry> = (0..10u32)
+        let entries: Vec<wgpu::BindGroupLayoutEntry> = (0..11u32)
             .map(|i| wgpu::BindGroupLayoutEntry {
                 binding: i,
                 visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
@@ -344,6 +345,7 @@ impl GpuMap {
         let lw = Plane::new(device, "land water", 2 * TEX as u32, TEX as u32, wgpu::TextureFormat::Rgba8Uint, max_layers);
         let img = Plane::new(device, "img", 2 * TEX as u32, TEX as u32, wgpu::TextureFormat::Rgba8Uint, max_layers);
         let ink = Plane::new(device, "ink", 2 * TEX as u32, TEX as u32, wgpu::TextureFormat::Rgba8Uint, max_layers);
+        let sel = Plane::new(device, "sel", 2 * TEX as u32, TEX as u32, wgpu::TextureFormat::Rgba8Uint, max_layers);
 
         GpuMap {
             map_layout,
@@ -367,6 +369,7 @@ impl GpuMap {
             lw,
             img,
             ink,
+            sel,
             user_version: u64::MAX,
             ink_uploaded: FxHashMap::default(),
             preview: None,
@@ -386,7 +389,7 @@ impl GpuMap {
     }
 
     fn make_map_bind(&mut self, device: &wgpu::Device) {
-        let (dv, lv, wv, iv, kv) = (self.dem.view(), self.line.view(), self.lw.view(), self.img.view(), self.ink.view());
+        let (dv, lv, wv, iv, kv, sv) = (self.dem.view(), self.line.view(), self.lw.view(), self.img.view(), self.ink.view(), self.sel.view());
         self.map_bind = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("map"),
             layout: &self.map_layout,
@@ -401,6 +404,7 @@ impl GpuMap {
                 wgpu::BindGroupEntry { binding: 7, resource: wgpu::BindingResource::TextureView(&wv) },
                 wgpu::BindGroupEntry { binding: 8, resource: wgpu::BindingResource::TextureView(&iv) },
                 wgpu::BindGroupEntry { binding: 9, resource: wgpu::BindingResource::TextureView(&kv) },
+                wgpu::BindGroupEntry { binding: 10, resource: wgpu::BindingResource::TextureView(&sv) },
             ],
         }));
     }
@@ -414,6 +418,9 @@ impl GpuMap {
                 if let Some(slot) = self.ink.map.remove(&k) {
                     self.ink.free.push(slot);
                 }
+                if let Some(slot) = self.sel.map.remove(&k) {
+                    self.sel.free.push(slot);
+                }
                 self.ink_uploaded.remove(&k);
             }
             let mut grew = false;
@@ -426,13 +433,26 @@ impl GpuMap {
                 grew |= g;
                 if let Some((slot, _)) = slot {
                     self.ink_uploaded.insert(*key, c.version);
+                    // The ink plane as stored: premultiplied gamma-2 RGB and alpha; the selection's coverage rides in its own layer slot's plane beside it, so two planes per cell.
                     for i in 0..TRI {
-                        scratch[4 * i] = c.ink.as_ref().map_or(0, |k| k.class[i]);
-                        scratch[4 * i + 1] = c.ink.as_ref().map_or(0, |k| k.cov[i]);
-                        scratch[4 * i + 2] = c.sel.as_ref().map_or(0, |k| k.cov[i]);
-                        scratch[4 * i + 3] = 0;
+                        let p = c.ink.as_ref().map_or([0; 4], |k| k.px(i));
+                        scratch[4 * i] = p[0];
+                        scratch[4 * i + 1] = p[1];
+                        scratch[4 * i + 2] = p[2];
+                        scratch[4 * i + 3] = p[3];
                     }
                     write_layer(queue, &self.ink.tex, slot, 2 * TEX as u32, TEX as u32, 4, &scratch);
+                    for i in 0..TRI {
+                        scratch[4 * i] = c.sel.as_ref().map_or(0, |k| k.cov[i]);
+                        scratch[4 * i + 1] = 0;
+                        scratch[4 * i + 2] = 0;
+                        scratch[4 * i + 3] = 0;
+                    }
+                    let (sslot, g2) = self.sel.alloc(device, queue, *key);
+                    grew |= g2;
+                    if let Some((sslot, _)) = sslot {
+                        write_layer(queue, &self.sel.tex, sslot, 2 * TEX as u32, TEX as u32, 4, &scratch);
+                    }
                 }
             }
             if grew {
@@ -757,7 +777,8 @@ impl GpuMap {
                 let img = self.img.map.get(&r.key).copied();
                 if flags & FLAG_INK != 0 {
                     let ink = self.ink.map.get(&r.key).copied();
-                    return GpuRef { a: [r.diamond as u32, r.key.depth as u32, r.cu, r.cv], b: [ink.unwrap_or(0), 0, 0, 0], c: [if ink.is_some() { FLAG_INK } else { 0 }, 0, 0, 0], d: [0.0; 4], e: [0.0; 4] };
+                    let sel = self.sel.map.get(&r.key).copied();
+                    return GpuRef { a: [r.diamond as u32, r.key.depth as u32, r.cu, r.cv], b: [ink.unwrap_or(0), sel.unwrap_or(0), 0, 0], c: [if ink.is_some() { FLAG_INK } else { 0 }, 0, 0, 0], d: [0.0; 4], e: [0.0; 4] };
                 }
                 if dem.is_none() {
                     flags &= !FLAG_DEM;

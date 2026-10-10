@@ -214,7 +214,7 @@ pub fn tri_children(tx: usize, ty: usize, half: usize) -> [(usize, usize, usize)
 
 /// Parent-cell texel -> its four children as (child cell Morton digit, memory index in that child cell).
 #[inline]
-fn child_cell_texels(tx: usize, ty: usize, half: usize) -> [(u64, usize); 4] {
+pub fn child_cell_texels(tx: usize, ty: usize, half: usize) -> [(u64, usize); 4] {
     tri_children(tx, ty, half).map(|(cx, cy, ch)| {
         let q = (((cx >> TEX_BITS) as u64) << 1) | (cy >> TEX_BITS) as u64;
         (q, tri_idx(cx & (TEX - 1), cy & (TEX - 1), ch))

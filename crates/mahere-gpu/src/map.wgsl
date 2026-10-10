@@ -7,21 +7,9 @@ const ABSENT: u32 = 0xFFFFFFFEu;
 const MIN_DEPTH: u32 = 0u;
 const IMG_WATER: f32 = 0.03;
 const INK_TAG_DEPTH: u32 = 64u;
-// The pens (the CPU's PENS, gamma 2) and the selection's wash.
+// The selection's wash (the CPU's SEL_TINT and SEL_ALPHA).
 const SEL_TINT: vec3<f32> = vec3<f32>(0.35, 0.6, 1.0);
 const SEL_ALPHA: f32 = 0.35;
-fn pen_colour(i: u32) -> vec3<f32> {
-    switch i {
-        case 0u: { return dec(vec3<f32>(230.0, 40.0, 40.0)); }
-        case 1u: { return dec(vec3<f32>(240.0, 140.0, 30.0)); }
-        case 2u: { return dec(vec3<f32>(240.0, 220.0, 40.0)); }
-        case 3u: { return dec(vec3<f32>(60.0, 200.0, 70.0)); }
-        case 4u: { return dec(vec3<f32>(40.0, 210.0, 220.0)); }
-        case 5u: { return dec(vec3<f32>(50.0, 110.0, 240.0)); }
-        case 6u: { return dec(vec3<f32>(220.0, 60.0, 220.0)); }
-        default: { return dec(vec3<f32>(16.0, 16.0, 16.0)); }
-    }
-}
 // The seabed, as the CPU's: the sea colour darkening to this much less light at this depth, the water a glaze over it.
 const SEABED_FULL_DEPTH: f32 = 6000.0;
 const SEABED_DARK: f32 = 0.64;
@@ -101,6 +89,7 @@ struct Slot { tag: u32, cu: u32, cv: u32, index: u32 };
 @group(0) @binding(7) var lw_tex: texture_2d_array<u32>;
 @group(0) @binding(8) var img_tex: texture_2d_array<u32>;
 @group(0) @binding(9) var ink_tex: texture_2d_array<u32>;
+@group(0) @binding(10) var sel_tex: texture_2d_array<u32>;
 
 struct VOut {
     @builtin(position) pos: vec4<f32>,
@@ -641,12 +630,18 @@ fn compose(d: u32, u: u32, v: u32, pos: vec2<f32>) -> Composed {
         if (ui != NONE && ui != ABSENT) {
             let r = refs[ui];
             let t = tri(u, v, r.a.y);
-            let px = textureLoad(ink_tex, vec2<i32>(i32(2u * t.x + t.z), i32(t.y)), i32(r.b.x), 0);
-            if (px.y != 0u) {
-                { let f = fold(Fold(out.k2, out.c2), pen_colour(px.x - 1u), f32(px.y) / 255.0); out.k2 = f.k; out.c2 = f.c; }
+            let xy = vec2<i32>(i32(2u * t.x + t.z), i32(t.y));
+            let px = textureLoad(ink_tex, xy, i32(r.b.x), 0);
+            if (px.w != 0u) {
+                // Premultiplied over, after the light: the ground kept by what the ink leaves, plus the ink's own light.
+                let a = f32(px.w) / 255.0;
+                let ink = dec(vec3<f32>(f32(px.x), f32(px.y), f32(px.z)));
+                out.k2 = out.k2 * (1.0 - a);
+                out.c2 = out.c2 * (1.0 - a) + ink;
             }
-            if (px.z != 0u) {
-                { let f = fold(Fold(out.k2, out.c2), SEL_TINT, f32(px.z) / 255.0 * SEL_ALPHA); out.k2 = f.k; out.c2 = f.c; }
+            let sp = textureLoad(sel_tex, xy, i32(r.b.y), 0);
+            if (sp.x != 0u) {
+                { let f = fold(Fold(out.k2, out.c2), SEL_TINT, f32(sp.x) / 255.0 * SEL_ALPHA); out.k2 = f.k; out.c2 = f.c; }
             }
             break;
         }
