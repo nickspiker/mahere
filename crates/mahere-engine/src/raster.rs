@@ -171,17 +171,27 @@ impl ElevRange {
 /// The colours a frame draws with, from the theme: land and line tables, the water and contour inks, the flat and no-terrain grounds, the background.
 #[derive(Clone, Copy, Debug)]
 pub struct Style {
-    pub land: [[u8; 3]; 14],
-    pub line: [[u8; 3]; 18],
-    pub water: [u8; 3],
-    pub contour: [u8; 3],
-    pub contour_index: [u8; 3],
-    pub contour_alpha: [f32; 2],
+    pub land: [[u8; 4]; 14],
+    pub line: [[u8; 4]; 18],
+    pub water: [u8; 4],
+    pub contour: [u8; 4],
+    pub contour_index: [u8; 4],
     /// The open sea: ground at exactly zero and dead flat, which is how a global DEM writes the ocean.
-    pub sea: [u8; 3],
-    pub flat: [u8; 3],
-    pub bg: [u8; 3],
-    pub no_dem: [u8; 3],
+    pub sea: [u8; 4],
+    pub flat: [u8; 4],
+    pub bg: [u8; 4],
+    pub no_dem: [u8; 4],
+}
+
+/// A styled colour's three channels, and its opacity as a fraction.
+#[inline(always)]
+pub fn rgb3(c: [u8; 4]) -> [u8; 3] {
+    [c[0], c[1], c[2]]
+}
+
+#[inline(always)]
+pub fn alpha(c: [u8; 4]) -> f32 {
+    c[3] as f32 / 255.0
 }
 
 impl Default for Style {
@@ -447,7 +457,7 @@ pub fn render_frame(
     }).reduce(|| ElevRange::EMPTY, ElevRange::merge);
     // Off the globe: the background. Only when the limb is on the screen.
     if cam.limb_visible(w, h) {
-        let bg = pack(luts, lin(luts.style.bg));
+        let bg = pack(luts, lin(rgb3(luts.style.bg)));
         let r2 = cam.radius() * cam.radius();
         let (cx, cy) = (w as f64 * 0.5, h as f64 * 0.5);
         canvas.par_chunks_mut(w).enumerate().for_each(|(y, row)| {
@@ -511,11 +521,17 @@ pub fn tri_index(uq: i64, vq: i64, shift: u32) -> usize {
     (((ty << 8) | tx) << 1) | half
 }
 
+/// A line's opacity from its styled colour.
+#[inline(always)]
+fn line_opacity(line: &ClassCell, i: usize, style: &Style) -> f32 {
+    alpha(style.line[(line.class[i] as usize).min(CLASS_MAX)])
+}
+
 /// A line texel's colour, linear: the class LUT, with waterways dimmed by their log magnitude (a trickle at ~40%, a big river at full).
 #[inline(always)]
 fn line_colour(line: &ClassCell, i: usize, style: &Style) -> [f32; 3] {
     let cls = (line.class[i] as usize).min(CLASS_MAX);
-    let c = lin(style.line[cls]);
+    let c = lin(rgb3(style.line[cls]));
     if cls == WATERWAY_CLASS {
         let m = 0.4 + 0.6 * line.mag_at(i) as f32 / 255.0;
         [c[0] * m, c[1] * m, c[2] * m]
@@ -629,7 +645,7 @@ fn compose_rgb(dem: &DemRef, vec: &VecRef, pool: &Pool, diamond: u8, uq: i64, vq
     // Terrain: tint from elevation, shade from the normal.
     let st = &luts.style;
     // All linear from here: every authored colour decoded from gamma 2, one encode at the end.
-    let mut tint = lin(st.no_dem);
+    let mut tint = lin(rgb3(st.no_dem));
     let mut diffuse = 1.0f32;
     let mut light = [1.0f32; 3];
     let mut have_ground = false;
@@ -665,13 +681,13 @@ fn compose_rgb(dem: &DemRef, vec: &VecRef, pool: &Pool, diamond: u8, uq: i64, vq
                     is_sea = sea;
                     seabed = !sea && elev_m < 0.0 && wet != 0;
                     tint = if sea {
-                        lin(st.sea)
+                        lin(rgb3(st.sea))
                     } else if seabed {
-                        seabed_tint(st.sea, elev_m)
+                        seabed_tint(rgb3(st.sea), elev_m)
                     } else if mask.hypso {
                         lin(luts.hypso[(eq >> 4) as usize])
                     } else {
-                        lin(st.flat)
+                        lin(rgb3(st.flat))
                     };
                     have_ground = true;
                 }
@@ -691,7 +707,7 @@ fn compose_rgb(dem: &DemRef, vec: &VecRef, pool: &Pool, diamond: u8, uq: i64, vq
                 }
             }
         } else if mask.dem {
-            tint = lin(st.bg);
+            tint = lin(rgb3(st.bg));
         }
     }
     let mut rgb = tint;
@@ -711,7 +727,7 @@ fn compose_rgb(dem: &DemRef, vec: &VecRef, pool: &Pool, diamond: u8, uq: i64, vq
             rgb = [rgb[0] * light[0], rgb[1] * light[1], rgb[2] * light[2]];
         }
         if contour.0 > 0.0 {
-            rgb = lerp3(rgb, lin(if contour.1 { st.contour_index } else { st.contour }), contour.0 * st.contour_alpha[contour.1 as usize]);
+            rgb = lerp3(rgb, lin(rgb3(if contour.1 { st.contour_index } else { st.contour })), contour.0 * alpha(if contour.1 { st.contour_index } else { st.contour }));
         }
         return pack(luts, rgb);
     }
@@ -722,7 +738,7 @@ fn compose_rgb(dem: &DemRef, vec: &VecRef, pool: &Pool, diamond: u8, uq: i64, vq
             // Under the water, as over the ground: the waterway lines, so a lake covers the river running into it (Nick 2026-10-10).
             if let Some(line) = line {
                 if line_cov(line) != 0 && line.class[i] as usize == WATERWAY_CLASS {
-                    rgb = lerp3(rgb, line_colour(line, i, &luts.style), line_cov(line) as f32 / 255.0);
+                    rgb = lerp3(rgb, line_colour(line, i, &luts.style), line_cov(line) as f32 / 255.0 * line_opacity(line, i, &luts.style));
                 }
             }
             // The water fill paints over imagery as it does over the ground: the sea is the theme's water wherever the terrain says so, and a lake or a coast texel WorldCover says is water, wholly or in part, matches it instead of showing the composite's own dark water (Nick 2026-10-09: the water/land border).
@@ -731,8 +747,8 @@ fn compose_rgb(dem: &DemRef, vec: &VecRef, pool: &Pool, diamond: u8, uq: i64, vq
                 if let Some(water) = water {
                     let wc = water.cov[i];
                     if wc != 0 {
-                        let t = wc as f32 / 255.0 * if seabed { SEABED_GLAZE } else { 1.0 };
-                        let w = lin(st.water);
+                        let t = wc as f32 / 255.0 * alpha(st.water) * if seabed { SEABED_GLAZE } else { 1.0 };
+                        let w = lin(rgb3(st.water));
                         for c in 0..3 {
                             rgb[c] = (rgb[c] - t * IMG_WATER).max(0.0) + t * w[c];
                         }
@@ -741,11 +757,11 @@ fn compose_rgb(dem: &DemRef, vec: &VecRef, pool: &Pool, diamond: u8, uq: i64, vq
             }
             // Contours over the imagery and the water, under the other lines (Nick 2026-10-10).
             if contour.0 > 0.0 {
-                rgb = lerp3(rgb, lin(if contour.1 { st.contour_index } else { st.contour }), contour.0 * st.contour_alpha[contour.1 as usize]);
+                rgb = lerp3(rgb, lin(rgb3(if contour.1 { st.contour_index } else { st.contour })), contour.0 * alpha(if contour.1 { st.contour_index } else { st.contour }));
             }
             if let Some(line) = line {
                 if line_cov(line) != 0 && line.class[i] as usize != WATERWAY_CLASS {
-                    rgb = lerp3(rgb, line_colour(line, i, &luts.style), line_cov(line) as f32 / 255.0);
+                    rgb = lerp3(rgb, line_colour(line, i, &luts.style), line_cov(line) as f32 / 255.0 * line_opacity(line, i, &luts.style));
                 }
             }
             return pack(luts, rgb);
@@ -754,7 +770,8 @@ fn compose_rgb(dem: &DemRef, vec: &VecRef, pool: &Pool, diamond: u8, uq: i64, vq
             if let Some(land) = land {
                 let lc = land.cov[i];
                 if lc != 0 {
-                    rgb = lerp3(rgb, lin(st.land[(land.class[i] as usize).min(13)]), lc as f32 / 255.0 * 0.85);
+                    let col = st.land[(land.class[i] as usize).min(13)];
+                    rgb = lerp3(rgb, lin(rgb3(col)), lc as f32 / 255.0 * alpha(col));
                 }
             }
         }
@@ -766,12 +783,12 @@ fn compose_rgb(dem: &DemRef, vec: &VecRef, pool: &Pool, diamond: u8, uq: i64, vq
         }
         // Under the water: the contours and the waterway lines, so a lake covers the river running into it. Over it: every other line (bridges, trails along the shore, boundaries).
         if contour.0 > 0.0 {
-            rgb = lerp3(rgb, lin(if contour.1 { st.contour_index } else { st.contour }), contour.0 * st.contour_alpha[contour.1 as usize]);
+            rgb = lerp3(rgb, lin(rgb3(if contour.1 { st.contour_index } else { st.contour })), contour.0 * alpha(if contour.1 { st.contour_index } else { st.contour }));
         }
         let line_cov = |line: &ClassCell| -> u8 { if mask.line && (mask.boundaries || (line.class[i] as usize) < BOUNDARY_FIRST) && luts.dem_depth >= line_min_depth(line.class[i] as usize, line.mag_at(i)) { line.cov[i] } else { 0 } };
         if let Some(line) = line {
             if line_cov(line) != 0 && line.class[i] as usize == WATERWAY_CLASS {
-                rgb = lerp3(rgb, line_colour(line, i, &luts.style), line_cov(line) as f32 / 255.0);
+                rgb = lerp3(rgb, line_colour(line, i, &luts.style), line_cov(line) as f32 / 255.0 * line_opacity(line, i, &luts.style));
             }
         }
         if mask.water {
@@ -779,9 +796,9 @@ fn compose_rgb(dem: &DemRef, vec: &VecRef, pool: &Pool, diamond: u8, uq: i64, vq
                 let wc = water.cov[i];
                 if wc != 0 {
                     let s = 0.85 + 0.15 * diffuse;
-                    let w = lin(st.water);
+                    let w = lin(rgb3(st.water));
                     let wr = [w[0] * s, w[1] * s, w[2] * s];
-                    let t = wc as f32 / 255.0 * if seabed { SEABED_GLAZE } else { 1.0 };
+                    let t = wc as f32 / 255.0 * alpha(st.water) * if seabed { SEABED_GLAZE } else { 1.0 };
                     rgb = [rgb[0] + (wr[0] - rgb[0]) * t, rgb[1] + (wr[1] - rgb[1]) * t, rgb[2] + (wr[2] - rgb[2]) * t];
                 }
             }
@@ -790,7 +807,7 @@ fn compose_rgb(dem: &DemRef, vec: &VecRef, pool: &Pool, diamond: u8, uq: i64, vq
             if line_cov(line) != 0 && line.class[i] as usize != WATERWAY_CLASS {
                 // Boundaries sit under the map, never competing with a road or a trail.
                 let a = if line.class[i] as usize >= BOUNDARY_FIRST { 0.55 } else { 1.0 };
-                rgb = lerp3(rgb, line_colour(line, i, &luts.style), line_cov(line) as f32 / 255.0 * a);
+                rgb = lerp3(rgb, line_colour(line, i, &luts.style), line_cov(line) as f32 / 255.0 * line_opacity(line, i, &luts.style) * a);
             }
         }
     } else {
@@ -801,7 +818,7 @@ fn compose_rgb(dem: &DemRef, vec: &VecRef, pool: &Pool, diamond: u8, uq: i64, vq
             rgb = lerp3(rgb, lin(col), 0.45);
         }
         if contour.0 > 0.0 {
-            rgb = lerp3(rgb, lin(if contour.1 { st.contour_index } else { st.contour }), contour.0 * st.contour_alpha[contour.1 as usize]);
+            rgb = lerp3(rgb, lin(rgb3(if contour.1 { st.contour_index } else { st.contour })), contour.0 * alpha(if contour.1 { st.contour_index } else { st.contour }));
         }
     }
     // Where the wanted terrain cell has not arrived at all (no entry yet, loaded or confirmed absent) and nothing at any depth stands in, the cell's two triangles each take a random dark colour of their own: a loading view shows the wanted cells as a dark mesh; a coarser stand-in draws as it is, untinted (Nick 2026-10-10).
@@ -1033,12 +1050,12 @@ mod tests {
         let mut canvas = vec![0u32; w * h];
         let (stats, _want) = render_frame(&mut canvas, w, h, &cam, &pool, &luts, 6, 13);
         assert_eq!(stats.straddle_blocks, 0);
-        // Expected: the flat white (land cover makes the elevation tint inert) lerped 85% to forest, lit by the SH irradiance at a flat normal in the device frame.
+        // Expected: the flat white (land cover makes the elevation tint inert) lerped to forest by the forest colour's opacity, lit by the SH irradiance at a flat normal in the device frame.
         let t = luts.style.flat;
         let f = luts.style.land[5];
         let e = luts.light.eval(0.0, 0.0, 1.0);
-        let (tl, fl) = (lin(t), lin(f));
-        let mix = |c: usize| (tl[c] + (fl[c] - tl[c]) * 0.85) * e[c].max(0.0);
+        let (tl, fl) = (lin(rgb3(t)), lin(rgb3(f)));
+        let mix = |c: usize| (tl[c] + (fl[c] - tl[c]) * alpha(f)) * e[c].max(0.0);
         let expect = pack(&luts, [mix(0), mix(1), mix(2)]);
         let center = canvas[(h / 2) * w + w / 2];
         assert_eq!(center, expect, "center {center:#08x} vs expected {expect:#08x}");

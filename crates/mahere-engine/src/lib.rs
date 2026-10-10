@@ -174,6 +174,19 @@ impl Camera {
     }
 }
 
+/// The sun's world direction from an azimuth (degrees clockwise from north) and altitude at a place: along that place's east, north and up.
+fn sun_world_at(lat: f64, lon: f64, az_deg: f32, alt_deg: f32) -> [f64; 3] {
+    let (sl, cl) = lat.to_radians().sin_cos();
+    let (so, co) = lon.to_radians().sin_cos();
+    let east = [-so, co, 0.0];
+    let north = [-sl * co, -sl * so, cl];
+    let up = [cl * co, cl * so, sl];
+    let (sa, ca) = (az_deg as f64).to_radians().sin_cos();
+    let (sh, ch) = (alt_deg as f64).to_radians().sin_cos();
+    let (e, n, u) = (sa * ch, ca * ch, sh);
+    [e * east[0] + n * north[0] + u * up[0], e * east[1] + n * north[1] + u * up[1], e * east[2] + n * north[2] + u * up[2]]
+}
+
 fn normalize(v: [f64; 3]) -> [f64; 3] {
     let n = dot(v, v).sqrt().max(1e-300);
     [v[0] / n, v[1] / n, v[2] / n]
@@ -210,6 +223,8 @@ pub struct MapCore {
     luts_sun: (f32, f32, f64),
     pub sun_az: f32,
     pub sun_alt: f32,
+    /// The sun as a direction in the world (the unit sphere), fixed while the ball turns under the camera; set from the azimuth and altitude at the camera point when they change, or by the almanac. The frame takes it into view space with the ball's basis, so no bearing is read, and the poles are nothing special (Nick 2026-10-10: the lighting jumped there).
+    sun_world: [f64; 3],
     pub gps: Option<GpsFix>,
     pub canvas: Vec<u32>,
     canvas_w: usize,
@@ -295,6 +310,7 @@ impl MapCore {
             luts_sun: (f32::NAN, f32::NAN, f64::NAN),
             sun_az: 315.0,
             sun_alt: 40.0,
+            sun_world: sun_world_at(home.lat(), home.lon(), 315.0, 40.0),
             gps: None,
             canvas: Vec::new(),
             canvas_w: 0,
@@ -429,7 +445,15 @@ impl MapCore {
     pub fn adjust_sun(&mut self, daz: f32, dalt: f32) {
         self.sun_az = (self.sun_az + daz).rem_euclid(360.0);
         self.sun_alt = (self.sun_alt + dalt).clamp(5.0, 85.0);
+        self.sun_world = sun_world_at(self.cam.lat(), self.cam.lon(), self.sun_az, self.sun_alt);
         self.dirty = true;
+    }
+
+    /// The sun in view space: screen right, up, toward the viewer.
+    fn sun_view(&self) -> [f32; 3] {
+        let b = self.cam.basis();
+        let s = self.sun_world;
+        [dot(b[0], s) as f32, dot(b[1], s) as f32, dot(b[2], s) as f32]
     }
 
     /// A fix redraws only when the pin is on screen and has moved by a pixel (Nick 2026-10-06): a phone sitting still gets no frame per second from its GPS.
@@ -852,26 +876,22 @@ impl MapCore {
             let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0.0, |d| d.as_secs_f64());
             let (az, alt) = sh::sun_position(lat, lon, now);
             // The clock moves the sun a few thousandths of a degree a second: follow it in steps too small to see, so a still screen is not relit every frame.
-            let az = ((az - self.cam.bearing().to_degrees()).rem_euclid(360.0)) as f32;
+            let az = (az.rem_euclid(360.0)) as f32;
             if (az - self.sun_az).abs() > 0.05 || (alt as f32 - self.sun_alt).abs() > 0.05 {
                 self.sun_az = az;
                 self.sun_alt = alt as f32;
+                self.sun_world = sun_world_at(lat, lon, self.sun_az, self.sun_alt);
             }
         }
-        // Lighting lives in the device frame: the environment (sun + sky as SH) is fixed to the screen, and normals are rotated by the bearing at lookup. The world-frame sun vector stays for the water glint.
-        if self.luts_sun != (self.sun_az, self.sun_alt, self.cam.bearing()) {
-            let az = (self.sun_az as f64 + self.cam.bearing().to_degrees()).to_radians();
-            let alt = (self.sun_alt as f64).to_radians();
-            self.luts.sun = [
-                (az.sin() * alt.cos()) as f32,
-                (az.cos() * alt.cos()) as f32,
-                alt.sin() as f32,
-            ];
+        // Lighting lives in the view frame, where the normals now are (each turned by its own place on the ball): the sun is a world direction brought into view space by the basis, and the environment (sun + sky as SH) is built around it there. The key is the sun's view vector itself, to the thousandth, so a still screen is not relit every frame.
+        let sv = self.sun_view();
+        let key = (self.sun_az, self.sun_alt, ((sv[0] * 1000.0).round() as f64) * 1.0e6 + ((sv[1] * 1000.0).round() as f64) * 1.0e3 + (sv[2] * 1000.0).round() as f64);
+        if self.luts_sun != key {
+            self.luts.sun = sv;
             if let (true, Some(env)) = (self.real_light, self.probe.as_ref()) {
-                // The camera's environment is already in the device frame; the bearing conjugates it onto world normals as for the sun and sky.
-                let (sb, cb) = self.cam.bearing().sin_cos();
-                self.luts.light = env.quadratic((sb as f32, cb as f32));
-                self.luts_sun = (self.sun_az, self.sun_alt, self.cam.bearing());
+                // The camera's environment is already in the device frame, which is the view frame.
+                self.luts.light = env.quadratic((0.0, 1.0));
+                self.luts_sun = key;
                 self.light_version += 1;
             } else if self.real_sun {
                 // The real sun alone, in the device frame: the landscape is lit exactly as the phone is held, by max(0, n·sun) and nothing else. No sky, no fading: at night the sun is under the landscape and it renders black; turn the phone over and the sun lights it from below (Nick 2026-10-06).
@@ -883,17 +903,19 @@ impl MapCore {
                 let t = &self.themes[self.theme.min(self.themes.len() - 1)];
                 let (sb, cb) = self.cam.bearing().sin_cos();
                 self.sun_device = frames.to_screen(az as f32, alt as f32);
-                self.luts.light = sh::Quad::directional(self.sun_device, t.sun, (sb as f32, cb as f32));
-                self.luts_sun = (self.sun_az, self.sun_alt, self.cam.bearing());
+                self.luts.sun = self.sun_device;
+                let _ = (sb, cb);
+                self.luts.light = sh::Quad::directional(self.sun_device, t.sun, (0.0, 1.0));
+                self.luts_sun = key;
                 self.light_version += 1;
             } else {
-                if self.luts_sun.0 != self.sun_az || self.luts_sun.1 != self.sun_alt || self.device_heading != 0.0 || self.luts_sun.2.is_nan() {
-                    let t = &self.themes[self.theme.min(self.themes.len() - 1)];
-                    self.env = sh::Sh9::sun_and_sky_coloured(self.sun_az - self.device_heading, self.sun_alt, t.sun, t.sky);
-                }
-                let (sb, cb) = self.cam.bearing().sin_cos();
-                self.luts.light = self.env.quadratic((sb as f32, cb as f32));
-                self.luts_sun = (self.sun_az, self.sun_alt, self.cam.bearing());
+                // The sun and sky around the sun's view direction: its azimuth and altitude as seen on the screen.
+                let t = &self.themes[self.theme.min(self.themes.len() - 1)];
+                let az_v = sv[0].atan2(sv[1]).to_degrees();
+                let alt_v = sv[2].clamp(-1.0, 1.0).asin().to_degrees();
+                self.env = sh::Sh9::sun_and_sky_coloured(az_v, alt_v, t.sun, t.sky);
+                self.luts.light = self.env.quadratic((0.0, 1.0));
+                self.luts_sun = key;
                 self.light_version += 1;
             }
         }

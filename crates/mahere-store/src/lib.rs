@@ -507,12 +507,12 @@ pub mod themes {
         vault_key(&[name("theme"), name("index")])
     }
 
-    fn rgb_t(c: [u8; 3]) -> VsfType {
-        VsfType::t_u3(Tensor::new(vec![3], c.to_vec()))
+    fn rgb_t(c: [u8; 4]) -> VsfType {
+        VsfType::t_u3(Tensor::new(vec![4], c.to_vec()))
     }
 
-    fn table_t<const N: usize>(t: &[[u8; 3]; N]) -> VsfType {
-        VsfType::t_u3(Tensor::new(vec![N, 3], t.iter().flatten().copied().collect()))
+    fn table_t<const N: usize>(t: &[[u8; 4]; N]) -> VsfType {
+        VsfType::t_u3(Tensor::new(vec![N, 4], t.iter().flatten().copied().collect()))
     }
 
     pub fn encode(t: &Theme) -> Option<Vec<u8>> {
@@ -532,7 +532,6 @@ pub mod themes {
                     ("water".to_string(), rgb_t(t.water)),
                     ("contour".to_string(), rgb_t(t.contour)),
                     ("index".to_string(), rgb_t(t.contour_index)),
-                    ("contouralpha".to_string(), VsfType::t_f5(Tensor::new(vec![2], t.contour_alpha.to_vec()))),
                 ],
             )
             .add_section("light", vec![("sun".to_string(), VsfType::t_f5(Tensor::new(vec![3], t.sun.to_vec()))), ("sky".to_string(), VsfType::t_f5(Tensor::new(vec![3], t.sky.to_vec())))])
@@ -558,17 +557,26 @@ pub mod themes {
         }
     }
 
-    fn rgb3(v: &VsfType) -> Option<[u8; 3]> {
+    /// A colour with its opacity; a colour saved before opacities (three bytes) takes `alpha`.
+    fn rgba(v: &VsfType, alpha: u8) -> Option<[u8; 4]> {
         let b = bytes_of(v)?;
-        (b.len() == 3).then(|| [b[0], b[1], b[2]])
+        match b.len() {
+            4 => Some([b[0], b[1], b[2], b[3]]),
+            3 => Some([b[0], b[1], b[2], alpha]),
+            _ => None,
+        }
     }
 
-    fn table<const N: usize>(v: &VsfType) -> Option<[[u8; 3]; N]> {
+    fn table<const N: usize>(v: &VsfType, alpha: u8) -> Option<[[u8; 4]; N]> {
         let b = bytes_of(v)?;
-        if b.len() != N * 3 {
-            return None;
+        if b.len() == N * 4 {
+            return Some(std::array::from_fn(|i| [b[4 * i], b[4 * i + 1], b[4 * i + 2], b[4 * i + 3]]));
         }
-        Some(std::array::from_fn(|i| [b[3 * i], b[3 * i + 1], b[3 * i + 2]]))
+        if b.len() == N * 3 {
+            // Saved before opacities: the empty class clear, the rest at the default.
+            return Some(std::array::from_fn(|i| [b[3 * i], b[3 * i + 1], b[3 * i + 2], if i == 0 { 0 } else { alpha }]));
+        }
+        None
     }
 
     pub fn decode(data: &[u8]) -> Option<Theme> {
@@ -612,6 +620,7 @@ pub mod themes {
             // A theme saved before the flag with a name no built-in has is the user's own.
             _ => !mahere_engine::theme::BUILTIN_NAMES.contains(&theme_name.as_str()),
         };
+        // Contour opacities from a theme saved before they lived in the colours.
         let contour_alpha = get("inks", "contouralpha").and_then(floats_of).filter(|a| a.len() == 2).map_or([0.85, 0.85], |a| [a[0], a[1]]);
         let sun = floats_of(get("light", "sun")?)?;
         let sky = floats_of(get("light", "sky")?)?;
@@ -622,17 +631,16 @@ pub mod themes {
             name: theme_name,
             revision,
             edited,
-            contour_alpha,
             hypso,
-            sea: rgb3(get("inks", "sea")?)?,
-            flat: rgb3(get("inks", "flat")?)?,
-            bg: rgb3(get("inks", "background")?)?,
-            no_dem: rgb3(get("inks", "noterrain")?)?,
-            land: table(get("tables", "land")?)?,
-            line: table(get("tables", "line")?)?,
-            water: rgb3(get("inks", "water")?)?,
-            contour: rgb3(get("inks", "contour")?)?,
-            contour_index: rgb3(get("inks", "index")?)?,
+            sea: rgba(get("inks", "sea")?, 255)?,
+            flat: rgba(get("inks", "flat")?, 255)?,
+            bg: rgba(get("inks", "background")?, 255)?,
+            no_dem: rgba(get("inks", "noterrain")?, 255)?,
+            land: table(get("tables", "land")?, 217)?,
+            line: table(get("tables", "line")?, 255)?,
+            water: rgba(get("inks", "water")?, 255)?,
+            contour: rgba(get("inks", "contour")?, (contour_alpha[0] * 255.0).round() as u8)?,
+            contour_index: rgba(get("inks", "index")?, (contour_alpha[1] * 255.0).round() as u8)?,
             sun: [sun[0], sun[1], sun[2]],
             sky: [sky[0], sky[1], sky[2]],
             layers,

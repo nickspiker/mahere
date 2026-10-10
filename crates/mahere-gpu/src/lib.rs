@@ -327,7 +327,7 @@ impl GpuMap {
         let blocks = storage_buffer(device, "blocks", (blocks_cap * std::mem::size_of::<GpuBlock>()) as u64);
         let refs = storage_buffer(device, "refs", (refs_cap * std::mem::size_of::<GpuRef>()) as u64);
         let table = storage_buffer(device, "table", (TABLE_N * std::mem::size_of::<GpuSlot>()) as u64);
-        // Style tables: 4096 hypsometric rows, then the line classes and the land classes, each 0xRRGGBB; filled by `update_style` from the theme.
+        // Style tables: 4096 hypsometric rows, then the line classes and the land classes, each 0xAARRGGBB (the ramp's alpha byte unused); filled by `update_style` from the theme.
         let lut = storage_buffer(device, "lut", ((4096 + 64) * 4) as u64);
 
         let max_layers = device.limits().max_texture_array_layers.max(1);
@@ -574,14 +574,16 @@ impl GpuMap {
     pub fn update_style(&mut self, queue: &wgpu::Queue, luts: &FrameLuts) {
         let mut lut_data = vec![0u32; 4096 + 64];
         let pack = |c: [u8; 3]| ((c[0] as u32) << 16) | ((c[1] as u32) << 8) | c[2] as u32;
+        // The styled tables carry their opacity in the top byte.
+        let pack4 = |c: [u8; 4]| ((c[3] as u32) << 24) | ((c[0] as u32) << 16) | ((c[1] as u32) << 8) | c[2] as u32;
         for (i, c) in luts.hypso.iter().enumerate() {
             lut_data[i] = pack(*c);
         }
         for (i, c) in luts.style.line.iter().enumerate() {
-            lut_data[4096 + i] = pack(*c);
+            lut_data[4096 + i] = pack4(*c);
         }
         for (i, c) in luts.style.land.iter().enumerate() {
-            lut_data[4128 + i] = pack(*c);
+            lut_data[4128 + i] = pack4(*c);
         }
         queue.write_buffer(&self.lut, 0, bytemuck::cast_slice(&lut_data));
         self.style_loaded = true;
@@ -718,13 +720,13 @@ impl GpuMap {
             },
             line_hi: std::array::from_fn(|i| std::array::from_fn(|j| plan.line_mag_hi[4 * i + j].max(1) as f32)),
             measure: self.measure.map_or([0.0; 4], |(ox, oy, tx, ty)| [ox, oy, tx, ty]),
-            style_water: rgb4(luts.style.water),
-            style_contour: with_alpha(luts.style.contour, luts.style.contour_alpha[0]),
-            style_contour_index: with_alpha(luts.style.contour_index, luts.style.contour_alpha[1]),
-            style_flat: rgb4(luts.style.flat),
-            style_bg: rgb4(luts.style.bg),
-            style_no_dem: rgb4(luts.style.no_dem),
-            style_sea: rgb4(luts.style.sea),
+            style_water: rgba(luts.style.water),
+            style_contour: rgba(luts.style.contour),
+            style_contour_index: rgba(luts.style.contour_index),
+            style_flat: rgba(luts.style.flat),
+            style_bg: rgba(luts.style.bg),
+            style_no_dem: rgba(luts.style.no_dem),
+            style_sea: rgba(luts.style.sea),
             display: luts.display.rows(),
             tone: [luts.compressed as u32 as f32, 0.0, 0.0, 0.0],
             img_table: {
@@ -805,11 +807,10 @@ impl GpuMap {
 }
 
 /// A style colour as the shader takes it: linear light.
-fn rgb4(c: [u8; 3]) -> [f32; 4] {
-    with_alpha(c, 0.0)
+/// A styled colour as the shader's vec4: linear light (the shader mixes it as it is), the opacity as a fraction.
+fn rgba(c: [u8; 4]) -> [f32; 4] {
+    let l = mahere_engine::colour::lin([c[0], c[1], c[2]]);
+    [l[0], l[1], l[2], c[3] as f32 / 255.0]
 }
 
-fn with_alpha(c: [u8; 3], a: f32) -> [f32; 4] {
-    let l = mahere_engine::colour::lin(c);
-    [l[0], l[1], l[2], a]
-}
+

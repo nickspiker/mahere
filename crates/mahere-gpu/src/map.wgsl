@@ -303,6 +303,11 @@ fn unpack_rgb(p: u32) -> vec3<f32> {
     return dec(vec3<f32>(f32((p >> 16u) & 255u), f32((p >> 8u) & 255u), f32(p & 255u)));
 }
 
+// A styled table entry's opacity, its top byte as a fraction.
+fn unpack_a(p: u32) -> f32 {
+    return f32(p >> 24u) / 255.0;
+}
+
 fn img_light(b: u32) -> f32 {
     return U.img_table[b >> 2u][b & 3u];
 }
@@ -362,14 +367,16 @@ fn line_min_depth(cls: u32, mag: u32) -> u32 {
 // Coverage of a line as drawn: every class but water fades against the boldest of its class in view, so a lane next to a highway falls back and the same lane alone is full.
 fn line_alpha(cls_id: u32, cov: u32, mag: u32) -> f32 {
     let cls = min(cls_id, CLASS_MAX);
+    // The theme's opacity for the class, then the magnitude's.
+    let a = unpack_a(lut[CLASS_BASE + cls]);
     if (cls == WATERWAY_CLASS) {
-        return f32(cov) / 255.0;
+        return f32(cov) / 255.0 * a;
     }
     // Boundaries sit under the map, never competing with a road or a trail.
     if (cls >= BOUNDARY_FIRST) {
-        return f32(cov) / 255.0 * 0.55;
+        return f32(cov) / 255.0 * 0.55 * a;
     }
-    return f32(cov) / 255.0 * (0.5 + 0.5 * line_scale(cls, mag));
+    return f32(cov) / 255.0 * (0.5 + 0.5 * line_scale(cls, mag)) * a;
 }
 
 fn lerp3(a: vec3<f32>, b: vec3<f32>, t: f32) -> vec3<f32> {
@@ -547,7 +554,7 @@ fn compose(d: u32, u: u32, v: u32, pos: vec2<f32>) -> Composed {
             }
             // The water fill paints over imagery as it does over the ground, so a lake or a coast texel that is water in part matches the sea instead of showing the composite's own dark water: the composite's water taken out at the coverage, the theme's put in (the CPU's IMG_WATER).
             if ((mask & M_WATER) != 0u && lw.z != 0u) {
-                let t = f32(lw.z) / 255.0 * select(1.0, SEABED_GLAZE, seabed);
+                let t = f32(lw.z) / 255.0 * U.style_water.a * select(1.0, SEABED_GLAZE, seabed);
                 out.base = max(out.base - vec3<f32>(t * IMG_WATER), vec3<f32>(0.0)) + t * U.style_water.rgb;
             }
             // Contours over the imagery and the water, under the other lines.
@@ -561,7 +568,7 @@ fn compose(d: u32, u: u32, v: u32, pos: vec2<f32>) -> Composed {
             return out;
         }
         if ((mask & M_LAND) != 0u && lw.y != 0u) {
-            out.base = lerp3(out.base, unpack_rgb(lut[LAND_BASE + min(lw.x, 13u)]), f32(lw.y) / 255.0 * 0.85);
+            out.base = lerp3(out.base, unpack_rgb(lut[LAND_BASE + min(lw.x, 13u)]), f32(lw.y) / 255.0 * unpack_a(lut[LAND_BASE + min(lw.x, 13u)]));
         }
         if (have_band) {
             { let f = fold(Fold(out.k1, out.c1), band, 0.45); out.k1 = f.k; out.c1 = f.c; }
@@ -575,7 +582,7 @@ fn compose(d: u32, u: u32, v: u32, pos: vec2<f32>) -> Composed {
             { let f = fold(Fold(out.k1, out.c1), line_colour(line.x, line.z), line_alpha(line.x, line.y, line.z)); out.k1 = f.k; out.c1 = f.c; }
         }
         if ((mask & M_WATER) != 0u && lw.z != 0u) {
-            out.water = f32(lw.z) / 255.0 * select(1.0, SEABED_GLAZE, seabed);
+            out.water = f32(lw.z) / 255.0 * U.style_water.a * select(1.0, SEABED_GLAZE, seabed);
         }
         if (draw_line && line.x != WATERWAY_CLASS) {
             { let f = fold(Fold(out.k2, out.c2), line_colour(line.x, line.z), line_alpha(line.x, line.y, line.z)); out.k2 = f.k; out.c2 = f.c; }

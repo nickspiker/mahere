@@ -299,9 +299,8 @@ impl Panel {
     fn open_field(&mut self, f: Field, vals: [f32; 4]) {
         self.field_vals = vals;
         let n = match f {
-            Field::Hypso(_) => 4,
-            Field::ContourAlpha(_) => 1,
-            _ => 3,
+            Field::Sun | Field::Sky => 3,
+            _ => 4,
         };
         self.sliders = (0..n).map(|i| Slider::new(&mut self.hits, 0.0, 0.0, 10.0, 10.0, Self::slider_pos(f, i, self.field_vals[i]))).collect();
         self.stack.push(Page::Field(f));
@@ -313,7 +312,6 @@ impl Panel {
     fn slider_pos(f: Field, i: usize, v: f32) -> f32 {
         match (f, i) {
             (Field::Hypso(_), 3) => v / 4000.0,
-            (Field::ContourAlpha(_), _) => v,
             (Field::Sun | Field::Sky, _) => v / 3.0,
             _ => v / 255.0,
         }
@@ -322,7 +320,6 @@ impl Panel {
     fn slider_val(f: Field, i: usize, pos: f32) -> f32 {
         match (f, i) {
             (Field::Hypso(_), 3) => pos * 4000.0,
-            (Field::ContourAlpha(_), _) => pos,
             (Field::Sun | Field::Sky, _) => pos * 3.0,
             _ => (pos * 255.0).round(),
         }
@@ -891,7 +888,7 @@ impl Panel {
                 Field::Sea | Field::Flat | Field::Bg | Field::NoDem => "ground",
                 Field::Land(_) => "land cover",
                 Field::Line(_) => "lines",
-                Field::Water | Field::Contour | Field::ContourIndex | Field::ContourAlpha(_) => "inks",
+                Field::Water | Field::Contour | Field::ContourIndex => "inks",
                 Field::Sun | Field::Sky => "light",
             };
             if sec != section {
@@ -914,7 +911,6 @@ impl Panel {
                     paint::fill_rect(canvas, x0 as isize, (y - sh * 0.5) as isize, sw as isize, sh as isize, swatch(c), None, None);
                 } else {
                     let label = match f {
-                        Field::ContourAlpha(_) => format!("{:.2}", v[0]),
                         _ => format!("{:.1}", 0.3 * v[0] + 0.6 * v[1] + 0.1 * v[2]),
                     };
                     text.draw_text_left(canvas, &label, x0, y, &small, None, None);
@@ -965,21 +961,19 @@ impl Panel {
         let sw = cw - font * 1.8;
         if f.is_colour() {
             paint::fill_rect(canvas, x0 as isize, y as isize, sw as isize, (font * 1.6) as isize, swatch([vals[0] as u8, vals[1] as u8, vals[2] as u8]), None, None);
-        } else if !matches!(f, Field::ContourAlpha(_)) {
+        } else {
             let c = mahere_engine::colour::Display::default().encode([vals[0] * 0.5, vals[1] * 0.5, vals[2] * 0.5], true);
             paint::fill_rect(canvas, x0 as isize, y as isize, sw as isize, (font * 1.6) as isize, (theme::dark(theme::fmt(((c[0] as u32) << 16) | ((c[1] as u32) << 8) | c[2] as u32)) & 0x00FF_FFFF) | 0xFF00_0000, None, None);
         }
         y += font * 2.4;
         let labels: [&str; 4] = match f {
-            Field::ContourAlpha(_) => ["opacity", "", "", ""],
             Field::Hypso(_) => ["R", "G", "B", "metres"],
-            _ => ["R", "G", "B", ""],
+            _ => ["R", "G", "B", "A"],
         };
         for (i, sl) in sliders.iter_mut().enumerate() {
             text.draw_text_left(canvas, labels[i], x0, y, &dim, None, None);
             let val = match (f, i) {
                 (Field::Hypso(_), 3) => format!("{} m", vals[3].round() as i64),
-                (Field::ContourAlpha(_), _) => format!("{:.2}", vals[0]),
                 (Field::Sun | Field::Sky, _) => format!("{:.2}", vals[i]),
                 _ => format!("{}", vals[i] as u8),
             };
