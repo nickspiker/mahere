@@ -221,7 +221,7 @@ impl AndroidApp {
             d0,
             ppd0: self.map.cam.ppd,
             alpha0: (y1 - y0).atan2(x1 - x0),
-            bearing0: self.map.cam.bearing,
+            bearing0: self.map.cam.bearing(),
         });
         self.dragging = false;
     }
@@ -248,8 +248,8 @@ impl AndroidApp {
     fn on_gps(&mut self, fix: GpsFix) {
         if !self.centered_once {
             self.centered_once = true;
-            self.map.cam.lat = fix.lat;
-            self.map.cam.lon = fix.lon;
+            self.map.cam.lat() = fix.lat;
+            self.map.cam.lon() = fix.lon;
             self.map.camera_moved(self.w, self.h);
         }
         self.map.set_gps(fix);
@@ -269,7 +269,7 @@ impl AndroidApp {
     fn save_session(&self) {
         if let Some(store) = &self.store {
             let c = &self.map.cam;
-            let s = mahere_store::Session { lat: c.lat, lon: c.lon, ppd: c.ppd, bearing: c.bearing, sun_az: self.map.sun_az as f64, sun_alt: self.map.sun_alt as f64 };
+            let s = mahere_store::Session { lat: c.lat(), lon: c.lon(), ppd: c.ppd, bearing: c.bearing(), sun_az: self.map.sun_az as f64, sun_alt: self.map.sun_alt as f64 };
             let store = store.clone();
             self.persist.run(move || {
                 let _ = mahere_store::save_session(&store, &s);
@@ -467,14 +467,14 @@ pub extern "system" fn Java_nz_mahere_app_MahereActivity_nativeInit(
     let session = store.as_ref().and_then(|s| mahere_store::load_session(s));
     let settings = store.as_ref().and_then(|s| mahere_store::load_settings(s));
     // Mt St Helens until the first GPS fix recenters us; a saved view only if it is a view (finite, on the globe, at a zoom the map has).
-    let home = Camera { lat: 46.2000, lon: -122.1900, ppd: 12_000.0, bearing: 0.0 };
+    let home = Camera::new(46.2000, -122.1900, 12_000.0, 0.0);
     let cam = match session {
         Some(s) if s.lat.is_finite() && s.lon.is_finite() && s.ppd.is_finite() && s.bearing.is_finite() && s.lat.abs() <= 90.0 && s.lon.abs() <= 360.0 && (1.0..=4_000_000.0).contains(&s.ppd) => {
-            Camera { lat: s.lat, lon: s.lon, ppd: s.ppd, bearing: s.bearing }
+            Camera::new(s.lat, s.lon, s.ppd, s.bearing)
         }
         _ => home,
     };
-    eprintln!("camera: {:.5} {:.5} ppd {:.1} bearing {:.3}", cam.lat, cam.lon, cam.ppd, cam.bearing);
+    eprintln!("camera: {:.5} {:.5} ppd {:.1} bearing {:.3}", cam.lat(), cam.lon(), cam.ppd, cam.bearing());
     let mut map = MapCore::new(cell_store, cam);
     if let Some(s) = session {
         map.sun_az = s.sun_az as f32;

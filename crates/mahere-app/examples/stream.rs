@@ -21,7 +21,7 @@ fn main() {
         Arc::new(mahere_store::VaultCells::new(vault.clone())),
         remote.clone(),
     ));
-    let mut map = MapCore::new(store, Camera { lat: 46.20, lon: -122.19, ppd: 12000.0, bearing: 0.0 });
+    let mut map = MapCore::new(store, Camera::new(46.20, -122.19, 12000.0, 0.0));
     let (w, h) = (1024usize, 768usize);
     let t = std::time::Instant::now();
     for _ in 0..3000 {

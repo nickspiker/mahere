@@ -30,9 +30,6 @@ pub fn seabed_tint(sea: [u8; 3], elev_m: f32) -> [f32; 3] {
     [s[0] * k, s[1] * k, s[2] * k]
 }
 
-/// How strongly the loading mesh tints a coarser stand-in.
-pub const LOADING_TINT: f32 = 0.35;
-
 /// The colour of a cell triangle no cell has arrived for: a hash of its place (diamond, depth, cell across the diamond, which half), each channel a gamma-2 byte in 0..64 (a byte shifted down two), so the loading mesh is dark and every triangle its own colour. The GPU shader computes the same.
 pub fn loading_noise(d: u32, depth: u32, cu: u32, cv: u32, half: u32) -> [u8; 3] {
     let mut h = d.wrapping_mul(0x27D4EB2F) ^ depth.wrapping_mul(0xC2B2AE3D) ^ cu.wrapping_mul(0x9E3779B1) ^ cv.wrapping_mul(0x85EBCA77) ^ half.wrapping_mul(0x165667B1);
@@ -93,11 +90,11 @@ impl Default for LayerMask {
 }
 
 impl LayerMask {
-    /// Which rows a dominating layer makes inert: imagery replaces everything but lines and the water fill, land cover and a terrain that is off make the elevation tint moot. The panel greys these; the renderer treats them as off through [`LayerMask::effective`].
-    /// Imagery stands in for the ground where it exists, so land cover, contours and slope bands are inert under it; the water fill still paints over it, the terrain stays live as what shows where the imagery runs out, and the sea comes from it everywhere.
+    /// Which rows a dominating layer makes inert: imagery replaces everything but lines, contours and the water fill, land cover and a terrain that is off make the elevation tint moot. The panel greys these; the renderer treats them as off through [`LayerMask::effective`].
+    /// Imagery stands in for the ground where it exists, so land cover and slope bands are inert under it; contours and the water fill still draw over it, the terrain stays live as what shows where the imagery runs out, and the sea comes from it everywhere.
     pub fn inert(self) -> LayerMask {
         let im = self.imagery;
-        LayerMask { dem: false, land: im, water: false, line: false, debug: false, imagery: false, contours: im, slope: im, infrared: !im, hypso: self.land || !self.dem, boundaries: !self.line }
+        LayerMask { dem: false, land: im, water: false, line: false, debug: false, imagery: false, contours: false, slope: im, infrared: !im, hypso: self.land || !self.dem, boundaries: !self.line }
     }
 
     /// The mask as bits, one per field in declaration order, for a shader or a settings document.
@@ -655,6 +652,9 @@ fn compose_rgb(dem: &DemRef, vec: &VecRef, pool: &Pool, diamond: u8, uq: i64, vq
         if have_ground {
             rgb = [rgb[0] * light[0], rgb[1] * light[1], rgb[2] * light[2]];
         }
+        if contour.0 > 0.0 {
+            rgb = lerp3(rgb, lin(if contour.1 { st.contour_index } else { st.contour }), contour.0 * st.contour_alpha[contour.1 as usize]);
+        }
         return pack(luts, rgb);
     }
     if let VecRef::Cell { line, land, water, shift, .. } = vec {
@@ -673,6 +673,10 @@ fn compose_rgb(dem: &DemRef, vec: &VecRef, pool: &Pool, diamond: u8, uq: i64, vq
                         }
                     }
                 }
+            }
+            // Contours over the imagery, under the lines (Nick 2026-10-10).
+            if contour.0 > 0.0 {
+                rgb = lerp3(rgb, lin(if contour.1 { st.contour_index } else { st.contour }), contour.0 * st.contour_alpha[contour.1 as usize]);
             }
             if mask.line {
                 if let Some(line) = line {
@@ -738,7 +742,7 @@ fn compose_rgb(dem: &DemRef, vec: &VecRef, pool: &Pool, diamond: u8, uq: i64, vq
             rgb = lerp3(rgb, lin(if contour.1 { st.contour_index } else { st.contour }), contour.0 * st.contour_alpha[contour.1 as usize]);
         }
     }
-    // Where the wanted terrain cell has not arrived at all (no entry yet, loaded or confirmed absent), the cell's two triangles each take a random dark colour of their own: where nothing at any depth stands in it is the colour outright, over a coarser stand-in it is a tint, so a loading view shows the wanted cells as a dark mesh and never loses the coarse ground beneath (Nick 2026-10-09: per cell triangle, not per texel, and never only the noise).
+    // Where the wanted terrain cell has not arrived at all (no entry yet, loaded or confirmed absent) and nothing at any depth stands in, the cell's two triangles each take a random dark colour of their own: a loading view shows the wanted cells as a dark mesh; a coarser stand-in draws as it is, untinted (Nick 2026-10-10).
     if (mask.dem || mask.contours || mask.slope) && dem_ref_depth(dem) != Some(luts.dem_depth) {
         let key = CellKey { depth: luts.dem_depth, prefix: raw_of(diamond, uq, vq) >> (60 - 2 * luts.dem_depth as u32) };
         if !pool.map.contains_key(&key) {
@@ -746,7 +750,9 @@ fn compose_rgb(dem: &DemRef, vec: &VecRef, pool: &Pool, diamond: u8, uq: i64, vq
             let m = (1i64 << shift) - 1;
             let half = (((uq & m) + (vq & m)) >> shift) & 1;
             let noise = lin(loading_noise(diamond as u32, luts.dem_depth as u32, (uq >> shift) as u32, (vq >> shift) as u32, half as u32));
-            rgb = if dem_ref_depth(dem).is_none() { noise } else { lerp3(rgb, noise, LOADING_TINT) };
+            if dem_ref_depth(dem).is_none() {
+                rgb = noise;
+            }
         }
     }
     pack(luts, rgb)
@@ -922,8 +928,8 @@ mod tests {
         let eq = 6000u64;
         let nz = 32767u64;
         let texel = vec![eq | (nz << 48); mahere_tiles::TRI];
-        let cam = crate::Camera { lat: 46.2, lon: -121.5, ppd: 6000.0, bearing: 0.0 };
-        let c = mahere_coord::Coord::from_lat_lon(cam.lat, cam.lon);
+        let cam = crate::Camera::new(46.2, -121.5, 6000.0, 0.0);
+        let c = mahere_coord::Coord::from_lat_lon(cam.lat(), cam.lon());
         let key = CellKey { depth: 6, prefix: c.raw() >> (60 - 2 * 6) };
         let mut land = ClassCell::new();
         for i in 0..mahere_tiles::TRI {

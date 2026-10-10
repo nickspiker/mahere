@@ -20,105 +20,78 @@ use residency::{CellStore, Residency};
 pub const PPD_REF: f64 = 6000.;
 pub const BG_RGB: u32 = 0x12141A;
 
-/// View state: the globe seen from far off, the camera pointed at (lat, lon), which sits at the screen's centre; ppd = pixels per degree of arc there, so the whole globe is a disk of radius ppd·180/π pixels; bearing = radians the view is rotated (0 = north-up at the centre). The projection is orthographic, so the near ground is the plain map it always was and zooming out flattens the globe into a circle (Nick 2026-10-09).
+/// View state: the globe seen from far off, orthographically. The view is a rotation of the ball, kept as its basis in world coordinates (the unit sphere, x toward 0°N 0°E, z toward the north pole): screen right, screen up, and the axis toward the viewer, which is the camera point at the screen's centre. Latitude, longitude and bearing are read off it, never stored, so no pole is special: an unmarked ball (Nick 2026-10-10). ppd = pixels per degree of arc at the centre, so the whole globe is a disk of radius ppd·180/π pixels.
 #[derive(Clone, Copy)]
 pub struct Camera {
-    pub lat: f64,
-    pub lon: f64,
+    basis: [[f64; 3]; 3],
     pub ppd: f64,
-    pub bearing: f64,
 }
 
 impl Camera {
+    /// The view over (lat, lon) with screen up turned `bearing` radians clockwise from north.
+    pub fn new(lat: f64, lon: f64, ppd: f64, bearing: f64) -> Camera {
+        let (sl, cl) = lat.to_radians().sin_cos();
+        let (so, co) = lon.to_radians().sin_cos();
+        let east = [-so, co, 0.0];
+        let north = [-sl * co, -sl * so, cl];
+        let centre = [cl * co, cl * so, sl];
+        let (sb, cb) = bearing.sin_cos();
+        let right = [east[0] * cb - north[0] * sb, east[1] * cb - north[1] * sb, east[2] * cb - north[2] * sb];
+        let up = [east[0] * sb + north[0] * cb, east[1] * sb + north[1] * cb, east[2] * sb + north[2] * cb];
+        Camera { basis: [right, up, centre], ppd }
+    }
+
+    /// The camera whose view has this basis, made orthonormal again (the axis toward the viewer kept, right squared against it, up their cross).
+    pub fn from_basis(b: [[f64; 3]; 3], ppd: f64) -> Camera {
+        let c = normalize(b[2]);
+        let d = dot(b[0], c);
+        let r = normalize([b[0][0] - d * c[0], b[0][1] - d * c[1], b[0][2] - d * c[2]]);
+        let u = cross(c, r);
+        Camera { basis: [r, u, c], ppd }
+    }
+
+    pub fn basis(&self) -> [[f64; 3]; 3] {
+        self.basis
+    }
+
+    /// Latitude of the camera point, degrees.
+    pub fn lat(&self) -> f64 {
+        self.basis[2][2].clamp(-1.0, 1.0).asin().to_degrees()
+    }
+
+    /// Longitude of the camera point, degrees in (−180, 180].
+    pub fn lon(&self) -> f64 {
+        self.basis[2][1].atan2(self.basis[2][0]).to_degrees()
+    }
+
+    /// Screen up's turn clockwise from north at the camera point, radians in [0, 2π). At a pole north is whichever meridian the longitude names, so the pair stays consistent.
+    pub fn bearing(&self) -> f64 {
+        let (sl, cl) = self.lat().to_radians().sin_cos();
+        let (so, co) = self.lon().to_radians().sin_cos();
+        let east = [-so, co, 0.0];
+        let north = [-sl * co, -sl * so, cl];
+        let r = self.basis[0];
+        (-dot(r, north)).atan2(dot(r, east)).rem_euclid(core::f64::consts::TAU)
+    }
+
     pub fn coslat(&self) -> f64 {
-        self.lat.to_radians().cos()
+        let z = self.basis[2][2];
+        (1.0 - z * z).max(0.0).sqrt()
+    }
+
+    /// Turn the view about its own axis so screen up is this bearing.
+    pub fn set_bearing(&mut self, bearing: f64) {
+        *self = Camera::new(self.lat(), self.lon(), self.ppd, bearing);
+    }
+
+    /// Look at a place, screen up at this bearing.
+    pub fn look_at(&mut self, lat: f64, lon: f64, bearing: f64) {
+        *self = Camera::new(lat, lon, self.ppd, bearing);
     }
 
     /// The globe's radius on the screen, in pixels: pixels per radian of arc.
     pub fn radius(&self) -> f64 {
         self.ppd * 180.0 / core::f64::consts::PI
-    }
-
-    /// Screen basis in local east/north at the centre: up = (sin B, cos B), right = (cos B, −sin B). B = 0 is north-up. A point on the far side of the globe is pushed well outside the disk, so a mark there draws nowhere.
-    pub fn geo_to_screen(&self, lat: f64, lon: f64, w: usize, h: usize) -> (f64, f64) {
-        let (sl0, cl0) = self.lat.to_radians().sin_cos();
-        let (sl, cl) = lat.to_radians().sin_cos();
-        let (sd, cd) = (lon - self.lon).to_radians().sin_cos();
-        let r = self.radius();
-        let mut e = cl * sd * r;
-        let mut n = (cl0 * sl - sl0 * cl * cd) * r;
-        let cosc = sl0 * sl + cl0 * cl * cd;
-        if cosc < 0.0 {
-            let rho = (e * e + n * n).sqrt();
-            if rho < 1e-6 {
-                // The antipode itself has no direction: straight up and away.
-                e = 0.0;
-                n = r * 4.0;
-            } else {
-                let k = r * 4.0 / rho;
-                e *= k;
-                n *= k;
-            }
-        }
-        let (sb, cb) = self.bearing.sin_cos();
-        (
-            w as f64 * 0.5 + e * cb - n * sb,
-            h as f64 * 0.5 - (e * sb + n * cb),
-        )
-    }
-
-    /// The ground under a screen point. Past the limb the point is taken at the limb, so a corner off the globe still names ground (the renderers paint the background there).
-    pub fn screen_to_geo(&self, px: f64, py: f64, w: usize, h: usize) -> (f64, f64) {
-        let sx = px - w as f64 * 0.5;
-        let sy = h as f64 * 0.5 - py; // screen-up positive
-        let (sb, cb) = self.bearing.sin_cos();
-        let mut e = sx * cb + sy * sb;
-        let mut n = -sx * sb + sy * cb;
-        let r = self.radius();
-        let mut rho = (e * e + n * n).sqrt();
-        if rho < 1e-9 {
-            return (self.lat, self.lon);
-        }
-        let limb = r * (1.0 - 1e-9);
-        if rho > limb {
-            let k = limb / rho;
-            e *= k;
-            n *= k;
-            rho = limb;
-        }
-        let c = (rho / r).asin();
-        let (sc, cc) = c.sin_cos();
-        let (sl0, cl0) = self.lat.to_radians().sin_cos();
-        let lat = (cc * sl0 + n * sc * cl0 / rho).clamp(-1.0, 1.0).asin();
-        let lon = self.lon + (e * sc).atan2(rho * cc * cl0 - n * sc * sl0).to_degrees();
-        (lat.to_degrees(), (lon + 180.0).rem_euclid(360.0) - 180.0)
-    }
-
-    /// The view's basis in world coordinates (the unit sphere, x toward 0°N 0°E, z toward the north pole): screen right, screen up, and the axis toward the viewer, which is the camera point itself.
-    pub fn basis(&self) -> [[f64; 3]; 3] {
-        let (sl, cl) = self.lat.to_radians().sin_cos();
-        let (so, co) = self.lon.to_radians().sin_cos();
-        let east = [-so, co, 0.0];
-        let north = [-sl * co, -sl * so, cl];
-        let centre = [cl * co, cl * so, sl];
-        let (sb, cb) = self.bearing.sin_cos();
-        let right = [east[0] * cb - north[0] * sb, east[1] * cb - north[1] * sb, east[2] * cb - north[2] * sb];
-        let up = [east[0] * sb + north[0] * cb, east[1] * sb + north[1] * cb, east[2] * sb + north[2] * cb];
-        [right, up, centre]
-    }
-
-    /// The camera whose view has this basis: the camera point from the axis toward the viewer, the bearing from where screen right lies between east and north there.
-    pub fn from_basis(b: [[f64; 3]; 3], ppd: f64) -> Camera {
-        let c = b[2];
-        let lat = c[2].clamp(-1.0, 1.0).asin();
-        let lon = c[1].atan2(c[0]);
-        let (sl, cl) = lat.sin_cos();
-        let (so, co) = lon.sin_cos();
-        let east = [-so, co, 0.0];
-        let north = [-sl * co, -sl * so, cl];
-        let r = b[0];
-        let bearing = (-dot(r, north)).atan2(dot(r, east)).rem_euclid(core::f64::consts::TAU);
-        Camera { lat: lat.to_degrees(), lon: lon.to_degrees(), ppd, bearing }
     }
 
     /// The unit vector of a place on the globe.
@@ -142,6 +115,39 @@ impl Camera {
         [x, y, (1.0 - x * x - y * y).max(0.0).sqrt()]
     }
 
+    /// Where a place lands on the screen. A place on the far side of the globe is pushed well outside the disk, so a mark there draws nowhere.
+    pub fn geo_to_screen(&self, lat: f64, lon: f64, w: usize, h: usize) -> (f64, f64) {
+        let p = Camera::unit(lat, lon);
+        let r = self.radius();
+        let mut x = dot(p, self.basis[0]) * r;
+        let mut y = dot(p, self.basis[1]) * r;
+        if dot(p, self.basis[2]) < 0.0 {
+            let rho = (x * x + y * y).sqrt();
+            if rho < 1e-6 {
+                // The antipode itself has no direction: straight up and away.
+                x = 0.0;
+                y = r * 4.0;
+            } else {
+                let k = r * 4.0 / rho;
+                x *= k;
+                y *= k;
+            }
+        }
+        (w as f64 * 0.5 + x, h as f64 * 0.5 - y)
+    }
+
+    /// The ground under a screen point. Past the limb the point is taken at the limb, so a corner off the globe still names ground (the renderers paint the background there).
+    pub fn screen_to_geo(&self, px: f64, py: f64, w: usize, h: usize) -> (f64, f64) {
+        let v = self.view_dir(px, py, w, h);
+        let b = self.basis;
+        let p = [
+            v[0] * b[0][0] + v[1] * b[1][0] + v[2] * b[2][0],
+            v[0] * b[0][1] + v[1] * b[1][1] + v[2] * b[2][1],
+            v[0] * b[0][2] + v[1] * b[1][2] + v[2] * b[2][2],
+        ];
+        (p[2].clamp(-1.0, 1.0).asin().to_degrees(), p[1].atan2(p[0]).to_degrees())
+    }
+
     /// Whether a screen point lies on the globe.
     pub fn on_globe(&self, px: f64, py: f64, w: usize, h: usize) -> bool {
         let sx = px - w as f64 * 0.5;
@@ -155,6 +161,11 @@ impl Camera {
         let r = self.radius();
         (w * w + h * h) as f64 * 0.25 > r * r
     }
+}
+
+fn normalize(v: [f64; 3]) -> [f64; 3] {
+    let n = dot(v, v).sqrt().max(1e-300);
+    [v[0] / n, v[1] / n, v[2] / n]
 }
 
 fn dot(a: [f64; 3], b: [f64; 3]) -> f64 {
@@ -310,13 +321,9 @@ impl MapCore {
 
     // ==================== INPUT ====================
 
+    /// The ball stays a ball: the basis made orthonormal again after a turn.
     pub fn clamp_camera(&mut self) {
-        self.cam.lat = self.cam.lat.clamp(-89.9, 89.9);
-        if self.cam.lon > 180.0 {
-            self.cam.lon -= 360.0;
-        } else if self.cam.lon < -180.0 {
-            self.cam.lon += 360.0;
-        }
+        self.cam = Camera::from_basis(self.cam.basis(), self.cam.ppd);
     }
 
     /// Pan by a screen-pixel delta: the ground at the centre goes that far across the screen, the globe turning under the camera.
@@ -373,7 +380,7 @@ impl MapCore {
     }
 
     pub fn set_bearing(&mut self, bearing: f64) {
-        self.cam.bearing = bearing.rem_euclid(core::f64::consts::TAU);
+        self.cam.set_bearing(bearing.rem_euclid(core::f64::consts::TAU));
         self.unlock_measure();
         self.dirty = true;
     }
@@ -386,9 +393,7 @@ impl MapCore {
 
     /// Look at a place: the camera point goes there, north up, at the zoom given or the one it has.
     pub fn go_to(&mut self, lat: f64, lon: f64, ppd: Option<f64>, w: usize, h: usize) {
-        self.cam.lat = lat;
-        self.cam.lon = lon;
-        self.cam.bearing = 0.0;
+        self.cam.look_at(lat, lon, 0.0);
         if let Some(p) = ppd {
             self.cam.ppd = p.clamp(Self::ppd_floor(w, h), 4_000_000.);
         }
@@ -473,7 +478,7 @@ impl MapCore {
             self.device_heading = heading_deg;
             self.luts_sun = (f32::NAN, f32::NAN, f64::NAN);
             if self.follow_heading {
-                self.cam.bearing = (self.true_heading() as f64).to_radians().rem_euclid(core::f64::consts::TAU);
+                self.cam.set_bearing((self.true_heading() as f64).to_radians().rem_euclid(core::f64::consts::TAU));
             }
             self.dirty = true;
         }
@@ -510,7 +515,7 @@ impl MapCore {
             self.declination_deg = deg;
             self.luts_sun = (f32::NAN, f32::NAN, f64::NAN);
             if self.follow_heading {
-                self.cam.bearing = (self.true_heading() as f64).to_radians();
+                self.cam.set_bearing((self.true_heading() as f64).to_radians());
             }
             self.dirty = true;
         }
@@ -608,7 +613,7 @@ impl MapCore {
     pub fn set_follow_heading(&mut self, on: bool) {
         self.follow_heading = on;
         if on {
-            self.cam.bearing = (self.true_heading() as f64).to_radians().rem_euclid(core::f64::consts::TAU);
+            self.cam.set_bearing((self.true_heading() as f64).to_radians().rem_euclid(core::f64::consts::TAU));
         }
         self.dirty = true;
     }
@@ -658,14 +663,14 @@ impl MapCore {
         let t0 = Instant::now();
         self.prepare(w, h);
         // The same view over the same cells is the same plan: a frame the sensor or the GPS made dirty costs nothing here.
-        let key = (self.cam.lat.to_bits(), self.cam.lon.to_bits(), self.cam.ppd.to_bits(), self.cam.bearing.to_bits(), w, h, self.res.pool_version, self.dem_depth, self.vec_depth);
+        let key = (self.cam.lat().to_bits(), self.cam.lon().to_bits(), self.cam.ppd.to_bits(), self.cam.bearing().to_bits(), w, h, self.res.pool_version, self.dem_depth, self.vec_depth);
         self.plan_cached = false;
         if let Some((k, p)) = &self.plan_cache {
             if *k == key {
                 self.plan_cached = true;
                 let p = p.clone();
                 // Residency still hears the want: it re-sends an unchanged missing list once a second.
-                let center = Coord::from_lat_lon(self.cam.lat, self.cam.lon);
+                let center = Coord::from_lat_lon(self.cam.lat(), self.cam.lon());
                 let (cu, cv) = center.uv();
                 self.res.want(p.want.clone(), (cu, cv));
                 self.last_frame_ms = t0.elapsed().as_secs_f32() * 1000.0;
@@ -675,7 +680,7 @@ impl MapCore {
         let p = Arc::new(plan::plan_frame(w, h, &self.cam, &self.res.pool, self.dem_depth, self.vec_depth));
         self.last_straddle_blocks = p.straddle_blocks;
         self.last_range = p.elev;
-        let center = Coord::from_lat_lon(self.cam.lat, self.cam.lon);
+        let center = Coord::from_lat_lon(self.cam.lat(), self.cam.lon());
         let (cu, cv) = center.uv();
         self.res.want(p.want.clone(), (cu, cv));
         self.plan_cache = Some((key, p.clone()));
@@ -823,19 +828,19 @@ impl MapCore {
         self.canvas_h = h;
         // The real sun: azimuth and altitude from the clock and the position (the fix, or the view), as a screen-relative azimuth. Nothing is clamped: below the horizon it is below the horizon.
         if self.real_sun {
-            let (lat, lon) = self.gps.map_or((self.cam.lat, self.cam.lon), |g| (g.lat, g.lon));
+            let (lat, lon) = self.gps.map_or((self.cam.lat(), self.cam.lon()), |g| (g.lat, g.lon));
             let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0.0, |d| d.as_secs_f64());
             let (az, alt) = sh::sun_position(lat, lon, now);
             // The clock moves the sun a few thousandths of a degree a second: follow it in steps too small to see, so a still screen is not relit every frame.
-            let az = ((az - self.cam.bearing.to_degrees()).rem_euclid(360.0)) as f32;
+            let az = ((az - self.cam.bearing().to_degrees()).rem_euclid(360.0)) as f32;
             if (az - self.sun_az).abs() > 0.05 || (alt as f32 - self.sun_alt).abs() > 0.05 {
                 self.sun_az = az;
                 self.sun_alt = alt as f32;
             }
         }
         // Lighting lives in the device frame: the environment (sun + sky as SH) is fixed to the screen, and normals are rotated by the bearing at lookup. The world-frame sun vector stays for the water glint.
-        if self.luts_sun != (self.sun_az, self.sun_alt, self.cam.bearing) {
-            let az = (self.sun_az as f64 + self.cam.bearing.to_degrees()).to_radians();
+        if self.luts_sun != (self.sun_az, self.sun_alt, self.cam.bearing()) {
+            let az = (self.sun_az as f64 + self.cam.bearing().to_degrees()).to_radians();
             let alt = (self.sun_alt as f64).to_radians();
             self.luts.sun = [
                 (az.sin() * alt.cos()) as f32,
@@ -844,31 +849,31 @@ impl MapCore {
             ];
             if let (true, Some(env)) = (self.real_light, self.probe.as_ref()) {
                 // The camera's environment is already in the device frame; the bearing conjugates it onto world normals as for the sun and sky.
-                let (sb, cb) = self.cam.bearing.sin_cos();
+                let (sb, cb) = self.cam.bearing().sin_cos();
                 self.luts.light = env.quadratic((sb as f32, cb as f32));
-                self.luts_sun = (self.sun_az, self.sun_alt, self.cam.bearing);
+                self.luts_sun = (self.sun_az, self.sun_alt, self.cam.bearing());
                 self.light_version += 1;
             } else if self.real_sun {
                 // The real sun alone, in the device frame: the landscape is lit exactly as the phone is held, by max(0, n·sun) and nothing else. No sky, no fading: at night the sun is under the landscape and it renders black; turn the phone over and the sun lights it from below (Nick 2026-10-06).
-                let (lat, lon) = self.gps.map_or((self.cam.lat, self.cam.lon), |g| (g.lat, g.lon));
+                let (lat, lon) = self.gps.map_or((self.cam.lat(), self.cam.lon()), |g| (g.lat, g.lon));
                 let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0.0, |d| d.as_secs_f64());
                 let (az, alt) = sh::sun_position(lat, lon, now);
                 // The frames, in order. The almanac gives a true azimuth; the sensor's world frame has magnetic north on its Y axis, so the sun is first expressed against magnetic north (azimuth less the declination, east positive). Rᵀ then takes it into the device frame: x right, y up the screen, z out of it — the lighting frame, since the Activity is locked to portrait. Last, when the map's up is not where the phone points, the device-frame sun is turned by (bearing − true heading): a device turned clockwise sees a fixed world vector turn counterclockwise, so this is the lighting the phone would show turned to match the map, tilt kept. With follow heading on the two agree and nothing turns; without a sensor (R identity, heading = declination) it collapses to the map-locked rotation by the bearing.
-                let frames = Frames { declination_deg: self.declination_deg, map_locked: !self.have_rotation, rot: self.device_rot, bearing_deg: self.cam.bearing.to_degrees() as f32, heading_mag_deg: self.device_heading };
+                let frames = Frames { declination_deg: self.declination_deg, map_locked: !self.have_rotation, rot: self.device_rot, bearing_deg: self.cam.bearing().to_degrees() as f32, heading_mag_deg: self.device_heading };
                 let t = &self.themes[self.theme.min(self.themes.len() - 1)];
-                let (sb, cb) = self.cam.bearing.sin_cos();
+                let (sb, cb) = self.cam.bearing().sin_cos();
                 self.sun_device = frames.to_screen(az as f32, alt as f32);
                 self.luts.light = sh::Quad::directional(self.sun_device, t.sun, (sb as f32, cb as f32));
-                self.luts_sun = (self.sun_az, self.sun_alt, self.cam.bearing);
+                self.luts_sun = (self.sun_az, self.sun_alt, self.cam.bearing());
                 self.light_version += 1;
             } else {
                 if self.luts_sun.0 != self.sun_az || self.luts_sun.1 != self.sun_alt || self.device_heading != 0.0 || self.luts_sun.2.is_nan() {
                     let t = &self.themes[self.theme.min(self.themes.len() - 1)];
                     self.env = sh::Sh9::sun_and_sky_coloured(self.sun_az - self.device_heading, self.sun_alt, t.sun, t.sky);
                 }
-                let (sb, cb) = self.cam.bearing.sin_cos();
+                let (sb, cb) = self.cam.bearing().sin_cos();
                 self.luts.light = self.env.quadratic((sb as f32, cb as f32));
-                self.luts_sun = (self.sun_az, self.sun_alt, self.cam.bearing);
+                self.luts_sun = (self.sun_az, self.sun_alt, self.cam.bearing());
                 self.light_version += 1;
             }
         }
@@ -907,7 +912,7 @@ impl MapCore {
         self.last_range = stats.elev;
 
         // Residency: request what the lattice says we need, nearest-first.
-        let center = Coord::from_lat_lon(self.cam.lat, self.cam.lon);
+        let center = Coord::from_lat_lon(self.cam.lat(), self.cam.lon());
         let (cu, cv) = center.uv();
         self.res.want(want, (cu, cv));
 
@@ -937,7 +942,7 @@ impl MapCore {
         const INK: [u8; 3] = [236, 238, 244];
         let (cx, cy) = (w as f32 - 46.0, 78.0);
         // Screen direction of true north: up = (sin B, cos B) in east/north, so north on screen is (-sin B, -cos B) in (x right, y down).
-        let (sb, cb) = self.cam.bearing.sin_cos();
+        let (sb, cb) = self.cam.bearing().sin_cos();
         let (nx, ny) = (-(sb as f32), -(cb as f32));
         let len = 26.0;
         let (tx, ty) = (cx + nx * len, cy + ny * len);
@@ -950,7 +955,7 @@ impl MapCore {
             let hy = ty - ny * 9.0 + py * sgn * 6.0;
             draw_segment(&mut self.canvas, w, h, tx, ty, hx, hy, 1.4, INK);
         }
-        let mut deg = self.cam.bearing.to_degrees().rem_euclid(360.0);
+        let mut deg = self.cam.bearing().to_degrees().rem_euclid(360.0);
         if deg > 180.0 {
             deg -= 360.0;
         }
@@ -1098,7 +1103,7 @@ mod tests {
     /// Shells that draw on demand rely on `tick` to report camera changes (the Android two-finger path has no redraw request of its own).
     #[test]
     fn tick_reports_camera_changes() {
-        let cam = Camera { lat: 46.2, lon: -121.5, ppd: 2800.0, bearing: 0.0 };
+        let cam = Camera::new(46.2, -121.5, 2800.0, 0.0);
         let mut map = MapCore::new(Arc::new(Empty), cam);
         for _ in 0..500 {
             map.render(64, 64);
@@ -1308,7 +1313,7 @@ mod globe_tests {
     /// The projection inverts itself across the visible hemisphere, and the far side lands off the disk.
     #[test]
     fn the_globe_projection_round_trips() {
-        let cam = Camera { lat: 47.0, lon: -121.0, ppd: 20.0, bearing: 0.7 };
+        let cam = Camera::new(47.0, -121.0, 20.0, 0.7);
         let (w, h) = (1200, 800);
         for &(lat, lon) in &[(47.0, -121.0), (21.3, -157.8), (64.0, -150.0), (10.0, -80.0), (47.1, -120.9), (-20.0, -170.0)] {
             let (px, py) = cam.geo_to_screen(lat, lon, w, h);
@@ -1332,7 +1337,7 @@ mod globe_tests {
                 crate::residency::Fetch::Absent
             }
         }
-        let mut map = MapCore::new(std::sync::Arc::new(Nothing), Camera { lat: 84.0, lon: 30.0, ppd: 20.0, bearing: 0.4 });
+        let mut map = MapCore::new(std::sync::Arc::new(Nothing), Camera::new(84.0, 30.0, 20.0, 0.4));
         for _ in 0..6 {
             let (dx, dy) = (120.0, -260.0);
             let target = (w as f64 * 0.5 - dx, h as f64 * 0.5 - dy);
@@ -1344,10 +1349,38 @@ mod globe_tests {
         }
     }
 
+    /// Over the pole and back: the ball has no seam there. A pan straight up from 89°N crosses the pole onto the far meridian, the ground under the drag keeps its place, and the angles read off the basis rebuild the same basis.
+    #[test]
+    fn the_pole_is_nothing_special() {
+        use super::MapCore;
+        struct Nothing;
+        impl crate::residency::CellStore for Nothing {
+            fn get(&self, _key: mahere_tiles::CellKey) -> crate::residency::Fetch {
+                crate::residency::Fetch::Absent
+            }
+        }
+        let (w, h) = (1000, 800);
+        let mut map = MapCore::new(std::sync::Arc::new(Nothing), Camera::new(89.0, 30.0, 20.0, 0.0));
+        for _ in 0..4 {
+            let target = (500.0, 100.0);
+            let ground = map.cam.screen_to_geo(target.0, target.1, w, h);
+            map.pan(0.0, 300.0, w, h);
+            let (px, py) = map.cam.geo_to_screen(ground.0, ground.1, w, h);
+            assert!((px - 500.0).abs() < 1e-6 && (py - 400.0).abs() < 1e-6, "the ground under the drag landed at {px},{py}");
+            let again = Camera::new(map.cam.lat(), map.cam.lon(), map.cam.ppd, map.cam.bearing());
+            for i in 0..3 {
+                for k in 0..3 {
+                    assert!((again.basis()[i][k] - map.cam.basis()[i][k]).abs() < 1e-9, "the angles do not rebuild the basis");
+                }
+            }
+        }
+        assert!(map.cam.lat() < 89.0, "the camera crossed the pole: lat {}", map.cam.lat());
+    }
+
     /// A screen corner off the globe still names ground, at the limb.
     #[test]
     fn a_corner_off_the_globe_names_the_limb() {
-        let cam = Camera { lat: 0.0, lon: 0.0, ppd: 6.0, bearing: 0.0 };
+        let cam = Camera::new(0.0, 0.0, 6.0, 0.0);
         let (lat, lon) = cam.screen_to_geo(0.0, 0.0, 1024, 768);
         assert!(lat.is_finite() && lon.is_finite());
         let (px, py) = cam.geo_to_screen(lat, lon, 1024, 768);

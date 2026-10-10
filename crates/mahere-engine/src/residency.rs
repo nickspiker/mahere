@@ -235,6 +235,26 @@ impl Residency {
         self.failed.retain(|k, t| desired.contains(k) && now.duration_since(*t) < RETRY_AFTER);
         // Everything still missing goes every time, pending or not: the loader keeps only the newest list, so a cell dropped from an older one would otherwise stay pending forever and never arrive (the holes Nick saw once the orientation sensor made every frame a new list). Nothing is sent while the missing set is unchanged.
         list.retain(|k| !self.pool.map.contains_key(k) && !self.failed.contains_key(k));
+        // Below a cell the loader confirmed absent nothing exists: its descendants are marked absent here and never asked for, so zooming past the finest data does not ask the bucket for a screen of cells that cannot be there (Nick 2026-10-10).
+        let mut under_absent = Vec::new();
+        list.retain(|k| {
+            let (mut depth, mut prefix) = (k.depth, k.prefix);
+            while depth > 0 {
+                depth -= 1;
+                prefix >>= 2;
+                if self.pool.map.get(&CellKey { depth, prefix }).is_some_and(|e| e.present == 0 && e.is_absent()) {
+                    under_absent.push(*k);
+                    return false;
+                }
+            }
+            true
+        });
+        if !under_absent.is_empty() {
+            for k in under_absent {
+                self.pool.map.insert(k, Entry::default());
+            }
+            self.pool_version += 1;
+        }
         list.sort_by_key(|k| {
             let (cu, cv) = k.grid();
             // Chebyshev distance in this depth's grid, normalized by shifting the center (given at depth 30-ish precision) down.

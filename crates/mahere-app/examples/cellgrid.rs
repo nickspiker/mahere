@@ -17,7 +17,7 @@ fn save(path: &str, canvas: &[u32], w: usize, h: usize) {
 fn main() {
     let ppd: f64 = std::env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(2800.0);
     let store = std::sync::Arc::new(DirStore("data/cells".into()));
-    let cam = Camera { lat: 46.2024, lon: -121.4909, ppd, bearing: 0.0 };
+    let cam = Camera::new(46.2024, -121.4909, ppd, 0.0);
     let mut map = MapCore::new(store, cam);
     let (w, h) = (1024usize, 768usize);
     for _ in 0..600 {

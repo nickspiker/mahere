@@ -27,7 +27,7 @@ fn main() {
 
     let cells = std::env::var("MAHERE_CELLS").unwrap_or_else(|_| "data/cells".into());
     let store = Arc::new(DirStore(cells.into()));
-    let mut map = MapCore::new(store, Camera { lat, lon, ppd, bearing });
+    let mut map = MapCore::new(store, Camera::new(lat, lon, ppd, bearing));
     // MAHERE_THEME=n picks a built-in theme (its layers first, MAHERE_LAYERS over them).
     if let Some(t) = std::env::var("MAHERE_THEME").ok().and_then(|s| s.parse::<usize>().ok()) {
         map.set_theme(t);
@@ -124,7 +124,7 @@ fn main() {
             panel.show_themes();
         }
         let c = map.cam;
-        let readouts = mahere_panel::Readouts { lat: c.lat, lon: c.lon, elev: map.elevation_at(c.lat, c.lon), heading_deg: c.bearing.to_degrees(), m_per_px: 111_320.0 / c.ppd, frame_ms: cpu_ms, resident: map.pool().map.len(), phone_heading: None, cache_used: 0, cache_max: 1 << 30 };
+        let readouts = mahere_panel::Readouts { lat: c.lat(), lon: c.lon(), elev: map.elevation_at(c.lat(), c.lon()), heading_deg: c.bearing().to_degrees(), m_per_px: 111_320.0 / c.ppd, frame_ms: cpu_ms, resident: map.pool().map.len(), phone_heading: None, cache_used: 0, cache_max: 1 << 30 };
         panel.paint(w, h, map.layers(), mahere_panel::Controls::default(), &readouts, None, &map.themes, None);
         let rgba = panel.overlay_rgba(&overlay, w, h);
         gpu.set_overlay_rgba(&device, &queue, w as u32, h as u32, &rgba);

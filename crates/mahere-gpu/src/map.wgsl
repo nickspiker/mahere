@@ -6,7 +6,6 @@ const ABSENT: u32 = 0xFFFFFFFEu;
 // The coarsest depth a cell exists at (the global bake's root), the same as the planner's. A walk below it must stop: a fragment loop that never ends hangs the GPU and the driver resets it for every process on the device (2026-10-09, the phone's SystemUI went down with mahere).
 const MIN_DEPTH: u32 = 0u;
 const IMG_WATER: f32 = 0.03;
-const LOADING_TINT: f32 = 0.35;
 // The seabed, as the CPU's: the sea colour darkening to this much less light at this depth, the water a glaze over it.
 const SEABED_FULL_DEPTH: f32 = 6000.0;
 const SEABED_DARK: f32 = 0.64;
@@ -482,6 +481,10 @@ fn compose(d: u32, u: u32, v: u32) -> Composed {
     if (vi == NONE && (mask & M_IMAGERY) != 0u && (im.x != 0u || im.y != 0u || im.z != 0u)) {
         out.ground = false;
         out.base = select(vec3<f32>(img_light(im.x), img_light(im.y), img_light(im.z)), vec3<f32>(img_light(im.w)), (mask & M_INFRARED) != 0u);
+        if (contour_cov > 0.0) {
+            let ink = select(U.style_contour, U.style_contour_index, contour_index);
+            { let f = fold(Fold(out.k2, out.c2), ink.rgb, contour_cov * ink.a); out.k2 = f.k; out.c2 = f.c; }
+        }
         return out;
     }
     if (vi != NONE) {
@@ -499,6 +502,11 @@ fn compose(d: u32, u: u32, v: u32) -> Composed {
             if ((mask & M_WATER) != 0u && lw.z != 0u) {
                 let t = f32(lw.z) / 255.0 * select(1.0, SEABED_GLAZE, seabed);
                 out.base = max(out.base - vec3<f32>(t * IMG_WATER), vec3<f32>(0.0)) + t * U.style_water.rgb;
+            }
+            // Contours over the imagery, under the lines.
+            if (contour_cov > 0.0) {
+                let ink = select(U.style_contour, U.style_contour_index, contour_index);
+                { let f = fold(Fold(out.k2, out.c2), ink.rgb, contour_cov * ink.a); out.k2 = f.k; out.c2 = f.c; }
             }
             if (draw_line) {
                 { let f = fold(Fold(out.k2, out.c2), line_colour(line.x, line.z), line_alpha(line.x, line.y, line.z)); out.k2 = f.k; out.c2 = f.c; }
@@ -534,7 +542,7 @@ fn compose(d: u32, u: u32, v: u32) -> Composed {
             { let f = fold(Fold(out.k2, out.c2), ink.rgb, contour_cov * ink.a); out.k2 = f.k; out.c2 = f.c; }
         }
     }
-    // Where the wanted terrain cell has not arrived at all (no reference and no absent marker), the cell's two triangles each take a random dark colour of their own, the CPU's loading_noise: outright where nothing at any depth stands in, a tint over a coarser stand-in.
+    // Where the wanted terrain cell has not arrived at all (no reference and no absent marker), the cell's two triangles each take a random dark colour of their own, the CPU's loading_noise, where nothing at any depth stands in; a coarser stand-in draws as it is.
     if (want_dem && found_depth != U.depths.x && lookup(d, U.depths.x, u, v) == NONE) {
         let s = 30u - U.depths.x;
         let m = (1u << s) - 1u;
@@ -552,8 +560,6 @@ fn compose(d: u32, u: u32, v: u32) -> Composed {
             out.water = 0.0;
             out.k2 = 1.0;
             out.c2 = vec3<f32>(0.0);
-        } else {
-            { let f = fold(Fold(out.k2, out.c2), noise, LOADING_TINT); out.k2 = f.k; out.c2 = f.c; }
         }
     }
     if ((mask & M_DEBUG) != 0u) {

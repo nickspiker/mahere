@@ -260,7 +260,7 @@ impl FluorApp for MahereApp {
                     } else if da < -std::f64::consts::PI {
                         da += std::f64::consts::TAU;
                     }
-                    self.map.set_bearing(self.map.cam.bearing - da);
+                    self.map.set_bearing(self.map.cam.bearing() - da);
                     self.map.camera_moved(w, h);
                     ctx.window.request_redraw();
                 }
@@ -320,12 +320,12 @@ impl FluorApp for MahereApp {
                         true
                     }
                     Some("q") => {
-                        self.map.set_bearing(self.map.cam.bearing + 15f64.to_radians());
+                        self.map.set_bearing(self.map.cam.bearing() + 15f64.to_radians());
                         self.map.camera_moved(w, h);
                         true
                     }
                     Some("e") => {
-                        self.map.set_bearing(self.map.cam.bearing - 15f64.to_radians());
+                        self.map.set_bearing(self.map.cam.bearing() - 15f64.to_radians());
                         self.map.camera_moved(w, h);
                         true
                     }
@@ -385,10 +385,10 @@ impl FluorApp for MahereApp {
                 let _ = mahere_store::save_session(
                     store,
                     &mahere_store::Session {
-                        lat: c.lat,
-                        lon: c.lon,
+                        lat: c.lat(),
+                        lon: c.lon(),
                         ppd: c.ppd,
-                        bearing: c.bearing,
+                        bearing: c.bearing(),
                         sun_az: self.map.sun_az as f64,
                         sun_alt: self.map.sun_alt as f64,
                     },
@@ -406,12 +406,12 @@ impl FluorApp for MahereApp {
         }
         // The panel over the map, then fluor composites front-to-back: the map is the chrome group's BACKGROUND layer, never painted straight over `target`.
         let c = self.map.cam;
-        let mut heading = c.bearing.to_degrees().rem_euclid(360.0);
+        let mut heading = c.bearing().to_degrees().rem_euclid(360.0);
         if heading > 180.0 {
             heading -= 360.0;
         }
         let used = self.cells.as_ref().map_or(0, |c| c.cached_bytes());
-        let readouts = Readouts { lat: c.lat, lon: c.lon, elev: self.map.elevation_at(c.lat, c.lon), heading_deg: heading, m_per_px: 111_320.0 / c.ppd, frame_ms: self.map.last_frame_ms, resident: self.map.pool().map.len(), phone_heading: None, cache_used: used, cache_max: used + (8u64 << 30) };
+        let readouts = Readouts { lat: c.lat(), lon: c.lon(), elev: self.map.elevation_at(c.lat(), c.lon()), heading_deg: heading, m_per_px: 111_320.0 / c.ppd, frame_ms: self.map.last_frame_ms, resident: self.map.pool().map.len(), phone_heading: None, cache_used: used, cache_max: used + (8u64 << 30) };
         let measure = self.map.measure_view(w, h, Panel::strip_samples(w));
         let themes = self.map.themes.clone();
         self.panel.set_ru(ctx.viewport.ru);
@@ -468,8 +468,8 @@ fn main() {
     };
     let session = vault.as_ref().and_then(|s| mahere_store::load_session(s));
     let cam = match session {
-        Some(s) => Camera { lat: s.lat, lon: s.lon, ppd: s.ppd, bearing: s.bearing },
-        None => Camera { lat: 46.2000, lon: -122.1900, ppd: 12_000.0, bearing: 0.0 },
+        Some(s) => Camera::new(s.lat, s.lon, s.ppd, s.bearing),
+        None => Camera::new(46.2000, -122.1900, 12_000.0, 0.0),
     };
     let mut map = MapCore::new(store, cam);
     if let Some(s) = session {

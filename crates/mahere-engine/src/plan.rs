@@ -313,7 +313,7 @@ mod tests {
             let key = CellKey { depth, prefix: c.raw() >> (60 - 2 * depth as u32) };
             pool.map.insert(key, crate::residency::Entry { present: crate::residency::PRESENT_WATER, water: Some(mahere_tiles::CovCell::new()), ..Default::default() });
         }
-        let cam = Camera { lat: 46.2, lon: -122.19, ppd: 6000.0, bearing: 0.3 };
+        let cam = Camera::new(46.2, -122.19, 6000.0, 0.3);
         let plan = plan_frame(256, 128, &cam, &pool, 12, 12);
         assert_eq!(plan.refs.len(), (12 - MIN_DEPTH + 1) as usize);
         for (i, r) in plan.refs.iter().enumerate() {
