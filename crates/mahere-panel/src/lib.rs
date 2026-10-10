@@ -395,8 +395,12 @@ impl Panel {
         let top = theme_y + row * 0.8;
         let mut last = top;
         for (i, (l, cb)) in self.checks.iter_mut().enumerate() {
-            // The modes sit a little apart from the layers.
-            let gap = if matches!(l, Layer::RealSun | Layer::RealLight | Layer::Linear | Layer::FollowHeading | Layer::LockToFix) { row * 0.5 } else { 0.0 };
+            // The modes sit a little apart from the layers, and the tools a little apart from the modes.
+            let gap = match l {
+                Layer::RealSun | Layer::RealLight | Layer::Linear | Layer::FollowHeading | Layer::LockToFix => row * 0.5,
+                Layer::Pen | Layer::PenColour | Layer::Select | Layer::ClearInk | Layer::ClearSel => row,
+                _ => 0.0,
+            };
             let cy = top + row * (i as f32 + 0.5) + gap;
             cb.set_font_size(self.font);
             cb.set_rect(x0 + (self.panel_w - x0 * 1.5) * 0.5, cy, self.panel_w - x0 * 1.5, row);
