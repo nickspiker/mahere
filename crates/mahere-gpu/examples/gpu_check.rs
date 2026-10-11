@@ -82,6 +82,14 @@ fn main() {
 
     // The plan first, then the CPU frame: both then fit the contour interval to the same range.
     let plan = map.plan(w, h);
+    // The plan's cost, timed once more with nothing cached (the cache key is the camera, so a nudge forces a fresh plan).
+    {
+        map.pan(0.5, 0.0, w, h);
+        let t = std::time::Instant::now();
+        let p2 = map.plan(w, h);
+        eprintln!("plan {:.2} ms, elevation in view {}..{} m", t.elapsed().as_secs_f32() * 1000.0, p2.elev.lo as f32 * 0.5 - 11000.0, p2.elev.hi as f32 * 0.5 - 11000.0);
+        map.pan(-0.5, 0.0, w, h);
+    }
     map.render(w, h);
     let cpu: Vec<u32> = map.canvas.clone();
     let cpu_ms = map.last_frame_ms;
