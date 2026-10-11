@@ -3,12 +3,12 @@
 //! Diamond-straddling blocks are subdivided into 4 px sub-blocks with exact corners restricted to the corner diamonds; a sub-block whose corners still disagree takes its first corner's diamond for all four (a seam error under four pixels wide).
 
 use mahere_coord::{Coord, uv_to_lat_lon};
-use mahere_tiles::{CellKey, ELEV_NODATA, TEX};
+use mahere_tiles::{CellKey, TEX};
 use rayon::prelude::*;
 
 
 use crate::Camera;
-use crate::raster::{BLOCK, CornerPt, ElevRange, MIN_DEPTH, corner, raw_of};
+use crate::raster::{BLOCK, CornerPt, MIN_DEPTH, corner, raw_of};
 use crate::residency::Pool;
 
 pub const NONE: u32 = u32::MAX;
@@ -79,7 +79,6 @@ pub struct FramePlan {
     pub refs: Vec<PlanRef>,
     pub table: Vec<TableSlot>,
     pub want: Vec<CellKey>,
-    pub elev: ElevRange,
     pub straddle_blocks: usize,
     pub dem_depth: u8,
     pub vec_depth: u8,
@@ -135,31 +134,7 @@ fn block_of(x: usize, y: usize, size: usize, c00: CornerPt, c10: CornerPt, c01: 
     }
 }
 
-/// The quantised elevation at a diamond's (u, v) (30-bit grid units), from the finest resident cell at or above `depth` that has terrain there.
-fn elev_at(pool: &Pool, diamond: u8, u: f64, v: f64, depth: u8) -> Option<u16> {
-    let lim = (1u64 << 30) as f64;
-    if !(0.0..lim).contains(&u) || !(0.0..lim).contains(&v) {
-        return None;
-    }
-    let (uq, vq) = ((u as i64) << 16, (v as i64) << 16);
-    let raw = raw_of(diamond, uq, vq);
-    let mut d = depth;
-    loop {
-        let key = CellKey { depth: d, prefix: raw >> (60 - 2 * d as u32) };
-        if let Some(e) = pool.map.get(&key).filter(|e| e.has_dem()) {
-            let i = crate::raster::tri_index(uq, vq, 16 + 22 - d as u32);
-            if let Some(eq) = e.elev_q_at(i).filter(|&q| q != ELEV_NODATA) {
-                return Some(eq);
-            }
-        }
-        if d <= MIN_DEPTH {
-            return None;
-        }
-        d -= 1;
-    }
-}
-
-/// Plan a frame: the lattice, the references, the table, the desired set and the lattice's elevation range.
+/// Plan a frame: the lattice, the references, the table and the desired set. The elevation range in view comes from the frame drawn (the GPU's gather, the CPU's compose), not from here.
 pub fn plan_frame(w: usize, h: usize, cam: &Camera, pool: &Pool, dem_depth: u8, vec_depth: u8, user: &crate::ink::UserLayer) -> FramePlan {
     let bw = w.div_ceil(BLOCK);
     let bh = h.div_ceil(BLOCK);
@@ -310,33 +285,6 @@ pub fn plan_frame(w: usize, h: usize, cam: &Camera, pool: &Pool, dem_depth: u8, 
         }
     }
 
-    // The elevation span of the terrain on screen, sampled on screen: every 8 px across each block, from the finest resident cell at or above the terrain depth, as the shader draws it. The union of whole cells' spans it replaced reached off screen (a cell is kilometres wide, and every resident cell at the depth counted, the prefetch ring and where the view had been included), so the raw elevation view and the contour interval swung wide or clipped (Nick 2026-10-10).
-    let elev = blocks
-        .par_iter()
-        .map(|b| {
-            let mut r = ElevRange::EMPTY;
-            let step = (b.size / 4).max(1);
-            let mut py = step / 2;
-            while py < b.size {
-                let mut px = step / 2;
-                while px < b.size {
-                    let (sx, sy) = ((b.x + px) as f64, (b.y + py) as f64);
-                    if cam.on_globe(sx, sy, w, h) && (b.x + px) < w as u32 && (b.y + py) < h as u32 {
-                        let (fx, fy) = (px as f64, py as f64);
-                        let u = b.u0 as f64 + b.du_dx as f64 * fx + b.du_dy as f64 * fy + b.twist_u as f64 * fx * fy;
-                        let v = b.v0 as f64 + b.dv_dx as f64 * fx + b.dv_dy as f64 * fy + b.twist_v as f64 * fx * fy;
-                        if let Some(eq) = elev_at(pool, b.diamond as u8, u, v, dem_depth) {
-                            r.lo = r.lo.min(eq);
-                            r.hi = r.hi.max(eq);
-                        }
-                    }
-                    px += step;
-                }
-                py += step;
-            }
-            r
-        })
-        .reduce(|| ElevRange::EMPTY, |a, b| ElevRange { lo: a.lo.min(b.lo), hi: a.hi.max(b.hi) });
     let magnified = crate::raster::texel_px(cam.ppd, dem_depth) >= 1.5;
     let mut line_mag_hi = [0u8; 32];
     for r in refs.iter().filter(|r| r.key.depth == vec_depth || r.key.depth + 1 == vec_depth) {
@@ -365,7 +313,7 @@ pub fn plan_frame(w: usize, h: usize, cam: &Camera, pool: &Pool, dem_depth: u8, 
     let globe = [w as f32 * 0.5, h as f32 * 0.5, cam.radius() as f32, cam.limb_visible(w, h) as u32 as f32];
     let b = cam.basis();
     let pole = [b[0][2] as f32, b[1][2] as f32, b[2][2] as f32, 0.0];
-    FramePlan { blocks, refs, table, want: desired.into_iter().collect(), elev, straddle_blocks, dem_depth, vec_depth, magnified, line_mag_hi, globe, pole }
+    FramePlan { blocks, refs, table, want: desired.into_iter().collect(), straddle_blocks, dem_depth, vec_depth, magnified, line_mag_hi, globe, pole }
 }
 
 #[cfg(test)]

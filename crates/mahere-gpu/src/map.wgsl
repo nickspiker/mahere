@@ -133,6 +133,8 @@ struct Slot { tag: u32, cu: u32, cv: u32, index: u32 };
 @group(0) @binding(9) var ink_tex: texture_2d_array<u32>;
 @group(0) @binding(10) var sel_tex: texture_2d_array<u32>;
 @group(0) @binding(11) var ov_tex: texture_2d_array<u32>;
+// The elevations this map pass draws, lowest and highest as quantised elevations: read back for the next frame's contour interval and raw elevation range (Nick 2026-10-10: the final gather, not a sampling).
+@group(0) @binding(12) var<storage, read_write> view_range: array<atomic<u32>, 2>;
 
 struct VOut {
     @builtin(position) pos: vec4<f32>,
@@ -590,6 +592,13 @@ fn compose(d: u32, u: u32, v: u32, pos: vec2<f32>) -> Composed {
             elev_m = s.elev;
             // The renderer's quantum: half-metre steps from 11 km below the sea (the CPU's ELEV_OFFSET and ELEV_STEP).
             let eq = u32(clamp((s.elev + 11000.0) * 2.0, 0.0, 65534.0));
+            // Gathered for the range in view, every fragment (about 0.3 ms at 3× on a desktop GPU; subsampling saved nothing); the load first, so most fragments never touch the atomic.
+            if (eq < atomicLoad(&view_range[0])) {
+                atomicMin(&view_range[0], eq);
+            }
+            if (eq > atomicLoad(&view_range[1])) {
+                atomicMax(&view_range[1], eq);
+            }
             // Raw elevation: grey across the range in view as a byte, unlit (the CPU's raw_grey, from the same quantum).
             if ((mask & M_RAW) != 0u) {
                 let q = f32(eq) * 0.5 - 11000.0;

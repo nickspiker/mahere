@@ -251,6 +251,11 @@ pub struct GpuMap {
     line: Plane,
     lw: Plane,
     ov: Plane,
+    /// The elevations the last map pass drew (lowest, highest), written by the shader; the readback buffers and their states; which one this frame copied into.
+    view_range: wgpu::Buffer,
+    range_read: [wgpu::Buffer; 2],
+    range_state: [std::sync::Arc<std::sync::atomic::AtomicU8>; 2],
+    range_copied: Option<usize>,
     img: Plane,
     /// Each resident dem plane.s quantisation (base, step), set when it is uploaded.
     dem_scale: FxHashMap<CellKey, (f32, f32)>,
@@ -282,18 +287,26 @@ pub struct GpuMap {
 /// Style entries after the 4096 hypsometric rows: line classes at 0, land at 32, ownership at 64 (the wilderness at 80), motor vehicle use at 96.
 const LUT_STYLE: usize = 128;
 
+/// A readback buffer's state: free, copied into this frame, being mapped, mapped and ready to read.
+const RANGE_IDLE: u8 = 0;
+const RANGE_COPIED: u8 = 1;
+const RANGE_MAPPING: u8 = 2;
+const RANGE_READY: u8 = 3;
+
 impl GpuMap {
     pub fn new(device: &wgpu::Device, _queue: &wgpu::Queue, present_format: wgpu::TextureFormat) -> GpuMap {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("mahere map"), source: wgpu::ShaderSource::Wgsl(include_str!("map.wgsl").into()) });
         let uint_array = wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Uint, view_dimension: wgpu::TextureViewDimension::D2Array, multisampled: false };
         let storage = wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: true }, has_dynamic_offset: false, min_binding_size: None };
-        let entries: Vec<wgpu::BindGroupLayoutEntry> = (0..12u32)
+        let entries: Vec<wgpu::BindGroupLayoutEntry> = (0..13u32)
             .map(|i| wgpu::BindGroupLayoutEntry {
                 binding: i,
-                visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                // The elevation range the map pass writes is fragment-only: a vertex stage may not write storage.
+                visibility: if i == 12 { wgpu::ShaderStages::FRAGMENT } else { wgpu::ShaderStages::VERTEX_FRAGMENT },
                 ty: match i {
                     0 => wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None },
                     1..=4 => storage,
+                    12 => wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: false }, has_dynamic_offset: false, min_binding_size: None },
                     _ => uint_array,
                 },
                 count: None,
@@ -345,6 +358,9 @@ impl GpuMap {
         // Style tables: 4096 hypsometric rows, then the line classes, the land classes, the ownership classes with the wilderness, and the motor vehicle use classes, each 0xAARRGGBB (the ramp's alpha byte unused); filled by `update_style` from the theme.
         let lut = storage_buffer(device, "lut", ((4096 + LUT_STYLE) * 4) as u64);
 
+        // The elevations the map pass drew, lowest and highest as quantised elevations, and two buffers to read them back through without waiting on the GPU.
+        let view_range = device.create_buffer(&wgpu::BufferDescriptor { label: Some("view range"), size: 8, usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC, mapped_at_creation: false });
+        let range_read: [wgpu::Buffer; 2] = std::array::from_fn(|_| device.create_buffer(&wgpu::BufferDescriptor { label: Some("view range readback"), size: 8, usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false }));
         let max_layers = device.limits().max_texture_array_layers.max(1);
         let dem = Plane::new(device, "dem", DEMQ_W as u32, DEMQ_H as u32, wgpu::TextureFormat::R16Uint, max_layers);
         let line = Plane::new(device, "line", 2 * TEX as u32, TEX as u32, wgpu::TextureFormat::Rgba8Uint, max_layers);
@@ -379,6 +395,10 @@ impl GpuMap {
             ink,
             sel,
             ov,
+            view_range,
+            range_read,
+            range_state: std::array::from_fn(|_| std::sync::Arc::new(std::sync::atomic::AtomicU8::new(RANGE_IDLE))),
+            range_copied: None,
             user_version: u64::MAX,
             ink_uploaded: FxHashMap::default(),
             preview: None,
@@ -415,6 +435,7 @@ impl GpuMap {
                 wgpu::BindGroupEntry { binding: 9, resource: wgpu::BindingResource::TextureView(&kv) },
                 wgpu::BindGroupEntry { binding: 10, resource: wgpu::BindingResource::TextureView(&sv) },
                 wgpu::BindGroupEntry { binding: 11, resource: wgpu::BindingResource::TextureView(&ovv) },
+                wgpu::BindGroupEntry { binding: 12, resource: self.view_range.as_entire_binding() },
             ],
         }));
     }
@@ -914,6 +935,11 @@ impl GpuMap {
         let u = Uniforms { depths: [plan.dem_depth as u32, plan.vec_depth as u32, plan.magnified as u32, measure_on as u32], ..u };
         queue.write_buffer(&self.uniforms, 0, bytemuck::bytes_of(&u));
 
+        // The map pass gathers the elevations it draws: reset, then copied out after the pass into a free readback buffer (none free: this frame's range is skipped, the next one's read).
+        let draws_map = mode != RenderMode::Relight;
+        if draws_map {
+            queue.write_buffer(&self.view_range, 0, bytemuck::cast_slice(&[u32::MAX, 0u32]));
+        }
         let scale = self.scale.max(1);
         let (_, _, map_view, _, _) = self.offscreen.iter().find(|(s, ..)| *s == scale).unwrap();
         let clear = wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color { r: 18.0 / 255.0, g: 20.0 / 255.0, b: 26.0 / 255.0, a: 1.0 }), store: wgpu::StoreOp::Store };
@@ -960,6 +986,14 @@ impl GpuMap {
             pass.set_bind_group(0, self.map_bind.as_ref().unwrap(), &[]);
             pass.draw(0..6, 0..blocks.len() as u32);
         }
+        if draws_map {
+            let idle = (0..2).find(|&i| self.range_state[i].load(std::sync::atomic::Ordering::Acquire) == RANGE_IDLE);
+            if let Some(i) = idle {
+                encoder.copy_buffer_to_buffer(&self.view_range, 0, &self.range_read[i], 0, 8);
+                self.range_state[i].store(RANGE_COPIED, std::sync::atomic::Ordering::Release);
+                self.range_copied = Some(i);
+            }
+        }
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("present"),
@@ -979,6 +1013,39 @@ impl GpuMap {
             pass.set_bind_group(1, &self.present_binds[&scale], &[]);
             pass.draw(0..3, 0..1);
         }
+    }
+}
+
+impl GpuMap {
+    /// After the frame's submit: start mapping the readback buffer it copied the elevation range into. Never waits; the range arrives on a later poll.
+    pub fn after_submit(&mut self) {
+        let Some(i) = self.range_copied.take() else { return };
+        if self.range_state[i].load(std::sync::atomic::Ordering::Acquire) != RANGE_COPIED {
+            return;
+        }
+        self.range_state[i].store(RANGE_MAPPING, std::sync::atomic::Ordering::Release);
+        let state = self.range_state[i].clone();
+        self.range_read[i].slice(..).map_async(wgpu::MapMode::Read, move |r| {
+            state.store(if r.is_ok() { RANGE_READY } else { RANGE_IDLE }, std::sync::atomic::Ordering::Release);
+        });
+    }
+
+    /// The elevations the last read-back map pass drew, as quantised elevations (lowest, highest), if one has arrived since last asked; None when it drew no terrain.
+    pub fn take_range(&mut self) -> Option<Option<(u16, u16)>> {
+        let mut out = None;
+        for i in 0..2 {
+            if self.range_state[i].load(std::sync::atomic::Ordering::Acquire) == RANGE_READY {
+                let (lo, hi) = {
+                    let view = self.range_read[i].slice(..).get_mapped_range();
+                    let v: &[u32] = bytemuck::cast_slice(&view);
+                    (v[0], v[1])
+                };
+                self.range_read[i].unmap();
+                self.range_state[i].store(RANGE_IDLE, std::sync::atomic::Ordering::Release);
+                out = Some((lo <= hi).then_some((lo.min(u16::MAX as u32) as u16, hi.min(u16::MAX as u32) as u16)));
+            }
+        }
+        out
     }
 }
 

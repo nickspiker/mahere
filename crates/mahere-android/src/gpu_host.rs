@@ -142,6 +142,10 @@ impl GpuHost {
             tag_bt2020(&self.window);
         }
         // Nothing changed and nothing arrived: the surface keeps its last image, and the CPU keeps its budget. The poll still runs so finished uploads release their staging memory. Once a quarter second has passed since the last change, one more frame is drawn at the still factor and stays on screen.
+        // The elevations the last map pass drew, if they have come back: the next frame's range.
+        if let Some(r) = self.map.take_range() {
+            map.set_drawn_range(r);
+        }
         let fresh = self.configured != (w, h) || self.frames == 0;
         let panel_dirty = panel.take_dirty();
         if panel_dirty {
@@ -238,6 +242,7 @@ impl GpuHost {
         self.map.set_user(&self.device, &self.queue, &map.user, &map.preview, map.preview_version, w, h);
         self.map.render(&self.device, &self.queue, &mut enc, &view, &plan, map.luts(), w, h, mode);
         self.queue.submit([enc.finish()]);
+        self.map.after_submit();
         frame.present();
         // Reclaim what finished: staging buffers behind every upload and the arrays replaced by growth are only freed when the device is polled.
         self.device.poll(wgpu::PollType::Poll).ok();

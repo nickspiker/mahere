@@ -82,14 +82,6 @@ fn main() {
 
     // The plan first, then the CPU frame: both then fit the contour interval to the same range.
     let plan = map.plan(w, h);
-    // The plan's cost, timed once more with nothing cached (the cache key is the camera, so a nudge forces a fresh plan).
-    {
-        map.pan(0.5, 0.0, w, h);
-        let t = std::time::Instant::now();
-        let p2 = map.plan(w, h);
-        eprintln!("plan {:.2} ms, elevation in view {}..{} m", t.elapsed().as_secs_f32() * 1000.0, p2.elev.lo as f32 * 0.5 - 11000.0, p2.elev.hi as f32 * 0.5 - 11000.0);
-        map.pan(-0.5, 0.0, w, h);
-    }
     map.render(w, h);
     let cpu: Vec<u32> = map.canvas.clone();
     let cpu_ms = map.last_frame_ms;
@@ -177,10 +169,19 @@ fn main() {
         let mut enc = device.create_command_encoder(&Default::default());
         gpu.render(&device, &queue, &mut enc, &view, &plan, luts, w as u32, h as u32, mahere_gpu::RenderMode::Full);
         queue.submit([enc.finish()]);
+        gpu.after_submit();
         device.poll(wgpu::PollType::wait_indefinitely()).ok();
         if i == 1 {
             frame_ms = t.elapsed().as_secs_f32() * 1000.0;
         }
+    }
+    // The elevations the map pass drew, read back as the phone reads them, against the CPU frame's own range.
+    device.poll(wgpu::PollType::wait_indefinitely()).ok();
+    let q = |e: u16| e as f32 * 0.5 - 11000.0;
+    match gpu.take_range() {
+        Some(Some((lo, hi))) => eprintln!("gpu drew elevations {}..{} m", q(lo), q(hi)),
+        Some(None) => eprintln!("gpu drew no terrain"),
+        None => eprintln!("gpu range not read back"),
     }
     if std::env::var("MAHERE_RELIGHT").as_deref() == Ok("1") {
         relight_check(&device, &queue, &mut gpu, &target, &view, &plan, luts, w, h);

@@ -918,6 +918,16 @@ impl MapCore {
         self.res.pending_count()
     }
 
+    /// The elevations a GPU's map pass drew (quantised, lowest and highest), read back after the frame: the next frame's contour interval and raw elevation range come from them, and a change redraws. None when it drew no terrain, which keeps the last. Until the first arrives a frame draws unscaled.
+    pub fn set_drawn_range(&mut self, range: Option<(u16, u16)>) {
+        if let Some((lo, hi)) = range {
+            if (lo, hi) != (self.last_range.lo, self.last_range.hi) {
+                self.last_range = ElevRange { lo, hi };
+                self.dirty = true;
+            }
+        }
+    }
+
     pub fn needs_render(&self, _w: usize, _h: usize) -> bool {
         true
     }
@@ -955,7 +965,6 @@ impl MapCore {
         }
         let p = Arc::new(plan::plan_frame(w, h, &self.cam, &self.res.pool, self.dem_depth, self.vec_depth, &self.user));
         self.last_straddle_blocks = p.straddle_blocks;
-        self.last_range = p.elev;
         let center = Coord::from_lat_lon(self.cam.lat(), self.cam.lon());
         let (cu, cv) = center.uv();
         self.res.want(p.want.clone(), (cu, cv));
