@@ -77,6 +77,8 @@ pub struct AndroidApp {
     /// The saved areas, and a file written for the share sheet, taken by the touch that asked for it.
     areas: mahere_engine::areas::Areas,
     share_file: Option<String>,
+    /// When the panel last repainted for a download's progress: a few times a second, not every frame.
+    areas_shown: Instant,
 }
 
 /// Vault writes, off the UI thread. The vault serialises every write through one queue, and the loader fills it with cells while the map streams: a settings save on the UI thread waited behind hundreds of them and the system killed the app as unresponsive. Touch, location and pause now hand their writes here and return at once.
@@ -238,8 +240,9 @@ impl AndroidApp {
                         let share = std::path::PathBuf::from(dir).join("share");
                         let _ = std::fs::create_dir_all(&share);
                         let path = share.join(format!("{}.vsf.zst", name.replace(' ', "-")));
-                        if std::fs::write(&path, &bytes).is_ok() {
-                            self.share_file = Some(path.to_string_lossy().to_string());
+                        match std::fs::write(&path, &bytes) {
+                            Ok(()) => self.share_file = Some(path.to_string_lossy().to_string()),
+                            Err(e) => eprintln!("share: writing {}: {e}", path.display()),
                         }
                     }
                 }
@@ -628,6 +631,7 @@ pub extern "system" fn Java_nz_mahere_app_MahereActivity_nativeInit(
         data_dir: Some(dir.clone()),
         areas,
         share_file: None,
+        areas_shown: Instant::now(),
     };
     app.panel.set_ru(ui_ru);
     Box::into_raw(Box::new(AndroidShell::new(app, width as u32, height as u32))) as jlong
@@ -679,7 +683,12 @@ pub extern "system" fn Java_nz_mahere_app_MahereActivity_nativeDraw(
         }
         let stats = app.cache_stats();
         let ctl = app.controls();
-        app.areas.poll();
+        // A download's progress repaints the open panel a few times a second; the GPU host otherwise skips frames while the map is still.
+        let finished = app.areas.poll();
+        if app.panel.is_open() && (finished || (app.areas.downloading() && app.areas_shown.elapsed().as_millis() >= 250)) {
+            app.panel.invalidate();
+            app.areas_shown = Instant::now();
+        }
         let areas = app.areas.view(app.map.user.has_selection());
         let AndroidApp { gpu: Some(g), map, panel, w, h, .. } = app else {
             return shell(ptr).draw(&window) as jboolean;
@@ -742,7 +751,9 @@ pub extern "system" fn Java_nz_mahere_app_MahereActivity_nativeOnTouch(
             s.app().save_settings();
             return 0;
         }
-        return s.on_touch(action, x0, y0);
+        let r = s.on_touch(action, x0, y0);
+        share_if_asked(&mut env, &activity, s);
+        return r;
     }
     if count >= 2 {
         if action == ACTION_POINTER_UP {
@@ -759,16 +770,21 @@ pub extern "system" fn Java_nz_mahere_app_MahereActivity_nativeOnTouch(
         s.app().two_end();
     }
     let r = s.on_touch(action, x0, y0);
-    // A share the panel asked for: the activity opens the system's share sheet on the file.
+    share_if_asked(&mut env, &activity, s);
+    r
+}
+
+/// A share the panel asked for during this touch: the activity opens the system's share sheet on the file.
+fn share_if_asked(env: &mut JNIEnv, activity: &JObject, s: &mut Shell) {
     if let Some(path) = s.app().share_file.take() {
+        eprintln!("share: {path}");
         if let Ok(jpath) = env.new_string(&path) {
-            if let Err(e) = env.call_method(&activity, "shareFile", "(Ljava/lang/String;)V", &[jni::objects::JValue::Object(&jpath)]) {
+            if let Err(e) = env.call_method(activity, "shareFile", "(Ljava/lang/String;)V", &[jni::objects::JValue::Object(&jpath)]) {
                 eprintln!("share: {e}");
                 let _ = env.exception_clear();
             }
         }
     }
-    r
 }
 
 /// A shared area document, from a file or link the activity received: kept with the areas and opened.

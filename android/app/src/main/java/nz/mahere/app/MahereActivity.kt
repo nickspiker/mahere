@@ -95,14 +95,18 @@ class MahereActivity : Activity(), SurfaceHolder.Callback, Choreographer.FrameCa
     fun shareFile(path: String) {
         val f = java.io.File(path)
         val uri = Uri.parse("content://nz.mahere.app.share/" + Uri.encode(f.name))
+        android.util.Log.i("mahere", "share $path as $uri (${f.length()} bytes)")
         val send = Intent(Intent.ACTION_SEND).apply {
             type = "application/vnd.mahere.area"
             putExtra(Intent.EXTRA_STREAM, uri)
             putExtra(Intent.EXTRA_SUBJECT, f.name.removeSuffix(".vsf.zst"))
             putExtra(Intent.EXTRA_TEXT, "A mahere area: " + f.name.removeSuffix(".vsf.zst").replace('-', ' '))
+            // The clip carries the grant to the share sheet itself, so it can show the file.
+            clipData = android.content.ClipData.newUri(contentResolver, "mahere area", uri)
             addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
         }
-        runCatching { startActivity(Intent.createChooser(send, "Share area")) }
+        val chooser = Intent.createChooser(send, "Share area").apply { addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION) }
+        runCatching { startActivity(chooser) }.onFailure { android.util.Log.e("mahere", "share failed", it) }
     }
 
     /// An area document sent or opened with the app: its bytes to the native side, or kept until it is up. Anything that does not decode is ignored there.

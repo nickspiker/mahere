@@ -367,6 +367,11 @@ impl Panel {
         (AREA_MIN_DEPTH as f32 + pos.clamp(0.0, 1.0) * (AREA_MAX_DEPTH - AREA_MIN_DEPTH) as f32).round() as u8
     }
 
+    /// Repaint on the next frame (a download's progress changed).
+    pub fn invalidate(&mut self) {
+        self.dirty = true;
+    }
+
     /// Back one page (the preview example).
     pub fn pop_page(&mut self) {
         self.pop();
@@ -1317,9 +1322,9 @@ impl Panel {
         let actions: Vec<(&str, AreaRow)> = if a.progress.is_some() {
             vec![("\u{25a0}  Cancel", AreaRow::Cancel)]
         } else if a.fetched.is_some() {
-            vec![("\u{2193}  Download again", AreaRow::Refresh)]
+            vec![("Download again", AreaRow::Refresh)]
         } else {
-            vec![("\u{2193}  Download", AreaRow::Download)]
+            vec![("Download", AreaRow::Download)]
         };
         for (label, r) in actions.into_iter().chain([("\u{203a}  Share", AreaRow::Share), ("\u{25cb}  Show selection", AreaRow::Show), ("\u{2715}  Delete", AreaRow::Delete)]) {
             text.draw_text_left(canvas, label, x0, y, &title, None, None);
