@@ -324,6 +324,8 @@ impl UserLayer {
         let y0 = y0.floor().max(0.0) as i64;
         let y1 = y1.ceil().min(h as f64 - 1.0) as i64;
         let mut touched: FxHashSet<CellKey> = FxHashSet::default();
+        // The texels the shape set in each cell, so the change can be pushed into the finer cells beneath.
+        let mut changed: FxHashMap<CellKey, Vec<bool>> = FxHashMap::default();
         let mut xs: Vec<f64> = Vec::new();
         // Every half pixel, as a stroke is stamped, so no texel inside the shape is missed.
         for py2 in (y0 * 2)..=(y1 * 2 + 1) {
@@ -346,8 +348,27 @@ impl UserLayer {
                         let sel = self.sel_cell(key);
                         sel.cov[i] = if add { 255 } else { 0 };
                         touched.insert(key);
+                        changed.entry(key).or_insert_with(|| vec![false; TRI])[i] = true;
                     }
                 }
+            }
+        }
+        // The finer drawn cells beneath take the change where the shape touched (a selection made at one zoom after another, in either direction, would otherwise be decided by the finer cell and never show; Nick 2026-10-10).
+        for (key, mask) in changed {
+            let below: Vec<CellKey> = self.drawn.keys().filter(|k| k.depth > key.depth && k.ancestor(key.depth) == key).copied().collect();
+            if below.is_empty() {
+                continue;
+            }
+            let coarse = self.cells[&key].sel.clone().unwrap_or_default();
+            for k in below {
+                let map = map_to_ancestor(k, key);
+                let fine = self.sel_cell(k);
+                for (i, &j) in map.iter().enumerate() {
+                    if mask[j] {
+                        fine.cov[i] = coarse.cov[j];
+                    }
+                }
+                touched.insert(k);
             }
         }
         self.after_change(depth, touched);
@@ -784,6 +805,31 @@ mod tests {
         assert!(pen(&u, 600.0, 500.0, 12).is_none(), "off the stroke");
         // Averaged as an area, a thin stroke fades with each level above and is gone long before the top: the levels it has vanished from are not kept.
         assert!(u.cells.keys().all(|k| k.depth >= 3), "faded out above");
+    }
+
+    #[test]
+    fn a_selection_made_zoomed_out_reaches_the_finer_cells_beneath() {
+        let mut u = UserLayer::default();
+        let (w, h) = (800, 600);
+        let c = cam();
+        // A small shape zoomed in (fine cells), then a large one zoomed out over it, then the large one taken away again.
+        u.select(&c, w, h, 13, &[(380.0, 280.0), (420.0, 280.0), (420.0, 320.0), (380.0, 320.0)], true);
+        assert!(u.selected_at(&c, w, h, 13, 400.0, 300.0));
+        assert!(!u.selected_at(&c, w, h, 13, 300.0, 300.0));
+        u.select(&c, w, h, 10, &[(100.0, 100.0), (700.0, 100.0), (700.0, 500.0), (100.0, 500.0)], true);
+        assert!(u.selected_at(&c, w, h, 13, 300.0, 300.0), "the coarse add shows outside the fine cells");
+        assert!(u.selected_at(&c, w, h, 13, 400.0, 300.0));
+        u.select(&c, w, h, 10, &[(100.0, 100.0), (700.0, 100.0), (700.0, 500.0), (100.0, 500.0)], false);
+        assert!(!u.selected_at(&c, w, h, 13, 400.0, 300.0), "the coarse remove reaches into the fine cells");
+        assert!(!u.selected_at(&c, w, h, 13, 300.0, 300.0));
+        // And the snapshot agrees: nothing left.
+        assert!(mahere_tiles::area::disjoint_planes(u.drawn_selection()).is_empty());
+        u.select(&c, w, h, 10, &[(100.0, 100.0), (700.0, 100.0), (700.0, 500.0), (100.0, 500.0)], true);
+        let planes = mahere_tiles::area::disjoint_planes(u.drawn_selection());
+        let a = mahere_tiles::area::Area { name: String::new(), created: 0, depth: 13, cells: planes, fetched: None };
+        let (lat, lon) = c.screen_to_geo(400.0, 300.0, w, h);
+        let fine = CellKey::containing(Coord::from_lat_lon(lat, lon), 13);
+        assert!(a.cells_at(13).contains(&fine), "the fine cell under the coarse add is in the area");
     }
 
     #[test]
