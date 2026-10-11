@@ -653,9 +653,12 @@ fn user_marks(rgb: [f32; 3], user: &crate::ink::UserLayer, raw: u64, depth: u8) 
         let ink = lin([p[0], p[1], p[2]]);
         rgb = [rgb[0] * k + ink[0], rgb[1] * k + ink[1], rgb[2] * k + ink[2]];
     }
-    let sel = user.sel_at(raw, depth);
+    let (sel, edge) = user.sel_edge_at(raw, depth);
     if sel != 0 {
         rgb = lerp3(rgb, crate::ink::SEL_TINT, sel as f32 / 255.0 * crate::ink::SEL_ALPHA);
+    }
+    if edge {
+        rgb = lerp3(rgb, crate::ink::SEL_TINT, crate::ink::SEL_EDGE_ALPHA);
     }
     rgb
 }

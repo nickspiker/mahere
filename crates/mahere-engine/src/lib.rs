@@ -1198,10 +1198,15 @@ impl MapCore {
                 (ink::SEL_TINT[1].sqrt() * 255.0) as u8,
                 (ink::SEL_TINT[2].sqrt() * 255.0) as u8,
             ]);
-            for (px, &m) in self.canvas.iter_mut().zip(self.preview.iter()) {
-                if m != 0 {
+            // The wash inside, and the edge (two pixels either side of the curve) stronger, as the selection itself is drawn.
+            let pv = &self.preview;
+            for (i, px) in self.canvas.iter_mut().enumerate() {
+                let m = pv[i];
+                let (x, y) = (i % w, i / w);
+                let edge = (x > 0 && pv[i - 1] != m) || (x + 1 < w && pv[i + 1] != m) || (y > 0 && pv[i - w] != m) || (y + 1 < h && pv[i + w] != m);
+                if m != 0 || edge {
                     let (r, g, b) = ((*px >> 16) & 255, (*px >> 8) & 255, *px & 255);
-                    let a = (ink::SEL_ALPHA * 255.0) as u32;
+                    let a = ((if edge { ink::SEL_EDGE_ALPHA } else { ink::SEL_ALPHA }) * 255.0) as u32;
                     let mix = |c: u32, t: u32| (c * (255 - a) + t * a) / 255;
                     *px = (mix(r, tint[0] as u32) << 16) | (mix(g, tint[1] as u32) << 8) | mix(b, tint[2] as u32);
                 }

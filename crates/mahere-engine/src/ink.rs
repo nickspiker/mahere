@@ -14,9 +14,30 @@ use crate::raster::tri_index;
 /// The pens, VSF RGB at gamma 2: red, orange, yellow, green, cyan, blue, magenta, black. A stroke keeps its own colour; the list is only what the panel offers.
 pub const PENS: [[u8; 3]; 8] = [[230, 40, 40], [240, 140, 30], [240, 220, 40], [60, 200, 70], [40, 210, 220], [50, 110, 240], [220, 60, 220], [16, 16, 16]];
 
-/// The selection's wash, linear, and how much of it.
+/// The selection's wash, linear, and how much of it; and how much of the tint its edge gets (a two-texel line either side of where the coverage crosses half, so the shape reads over imagery; Nick 2026-10-10).
 pub const SEL_TINT: [f32; 3] = [0.35, 0.6, 1.0];
 pub const SEL_ALPHA: f32 = 0.35;
+pub const SEL_EDGE_ALPHA: f32 = 0.85;
+
+/// The three triangles sharing an edge with texel `i` of a plane, within the cell; fewer at the cell's border.
+pub fn tri_neighbours(i: usize) -> [Option<usize>; 3] {
+    let half = i & 1;
+    let tx = (i >> 1) & (TEX - 1);
+    let ty = i >> (1 + 8);
+    let at = |x: isize, y: isize, h: usize| -> Option<usize> { (x >= 0 && y >= 0 && (x as usize) < TEX && (y as usize) < TEX).then(|| tri_idx(x as usize, y as usize, h)) };
+    let (x, y) = (tx as isize, ty as isize);
+    if half == 0 {
+        [at(x, y, 1), at(x, y - 1, 1), at(x - 1, y, 1)]
+    } else {
+        [at(x, y, 0), at(x, y + 1, 0), at(x + 1, y, 0)]
+    }
+}
+
+/// Whether texel `i` sits on the selection's edge: its coverage is on one side of half and a neighbour's on the other.
+pub fn sel_edge(cov: &[u8], i: usize) -> bool {
+    let inside = cov[i] >= 128;
+    tri_neighbours(i).iter().flatten().any(|&j| (cov[j] >= 128) != inside)
+}
 
 /// How far above a drawn depth the parents are kept.
 pub const USER_MIN_DEPTH: u8 = 0;
@@ -671,16 +692,22 @@ impl UserLayer {
 
     /// The selection's coverage at a raw coordinate, from the finest cell at or above `depth` with a selection plane.
     pub fn sel_at(&self, raw: u64, depth: u8) -> u8 {
+        self.sel_edge_at(raw, depth).0
+    }
+
+    /// The coverage there, and whether the texel is on the selection's edge.
+    pub fn sel_edge_at(&self, raw: u64, depth: u8) -> (u8, bool) {
         let (iu, iv) = Coord::from_raw(raw).uv();
         let (uq, vq) = ((iu as i64) << 16, (iv as i64) << 16);
         let mut d = depth;
         loop {
             let key = CellKey { depth: d, prefix: raw >> (60 - 2 * d as u32) };
             if let Some(sel) = self.cells.get(&key).and_then(|c| c.sel.as_ref()) {
-                return sel.cov[tri_index(uq, vq, 16 + 22 - d as u32)];
+                let i = tri_index(uq, vq, 16 + 22 - d as u32);
+                return (sel.cov[i], sel_edge(&sel.cov, i));
             }
             if d == USER_MIN_DEPTH {
-                return 0;
+                return (0, false);
             }
             d -= 1;
         }
@@ -805,6 +832,23 @@ mod tests {
         assert!(pen(&u, 600.0, 500.0, 12).is_none(), "off the stroke");
         // Averaged as an area, a thin stroke fades with each level above and is gone long before the top: the levels it has vanished from are not kept.
         assert!(u.cells.keys().all(|k| k.depth >= 3), "faded out above");
+    }
+
+    #[test]
+    fn the_selection_has_an_edge_where_its_coverage_crosses_half() {
+        let mut cov = vec![0u8; TRI];
+        for ty in 0..TEX {
+            for tx in 0..100 {
+                cov[tri_idx(tx, ty, 0)] = 255;
+                cov[tri_idx(tx, ty, 1)] = 255;
+            }
+        }
+        assert!(!sel_edge(&cov, tri_idx(50, 50, 0)), "deep inside");
+        assert!(!sel_edge(&cov, tri_idx(150, 50, 1)), "well outside");
+        assert!(sel_edge(&cov, tri_idx(99, 50, 1)), "the last covered upper triangle meets an empty one");
+        assert!(sel_edge(&cov, tri_idx(100, 50, 0)), "the first empty lower triangle meets a covered one");
+        assert!(!sel_edge(&cov, tri_idx(0, 0, 0)), "the cell's border is not an edge");
+        assert_eq!(tri_neighbours(tri_idx(0, 0, 0)), [Some(tri_idx(0, 0, 1)), None, None]);
     }
 
     #[test]

@@ -10,6 +10,34 @@ const INK_TAG_DEPTH: u32 = 64u;
 // The selection's wash (the CPU's SEL_TINT and SEL_ALPHA).
 const SEL_TINT: vec3<f32> = vec3<f32>(0.35, 0.6, 1.0);
 const SEL_ALPHA: f32 = 0.35;
+const SEL_EDGE_ALPHA: f32 = 0.85;
+
+// Whether a selection texel is on the shape's edge: its coverage on one side of half, a neighbouring triangle's on the other (the CPU's sel_edge). The three neighbours of the lower triangle are the upper of its square and the uppers below and to the left; of the upper, the lower of its square and the lowers above and to the right. The cell's border is not an edge.
+fn sel_edge(layer: i32, t: vec3<u32>, own: u32) -> bool {
+    let inside = own >= 128u;
+    let x = i32(t.x);
+    let y = i32(t.y);
+    var n0: vec2<i32>;
+    var n1: vec2<i32>;
+    var n2: vec2<i32>;
+    if (t.z == 0u) {
+        n0 = vec2<i32>(2 * x + 1, y);
+        n1 = vec2<i32>(2 * x + 1, y - 1);
+        n2 = vec2<i32>(2 * (x - 1) + 1, y);
+    } else {
+        n0 = vec2<i32>(2 * x, y);
+        n1 = vec2<i32>(2 * x, y + 1);
+        n2 = vec2<i32>(2 * (x + 1), y);
+    }
+    let lim = 256;
+    if (n1.y >= 0 && n1.y < lim && (textureLoad(sel_tex, n1, layer, 0).x >= 128u) != inside) {
+        return true;
+    }
+    if (n2.x >= 0 && n2.x < 2 * lim && (textureLoad(sel_tex, n2, layer, 0).x >= 128u) != inside) {
+        return true;
+    }
+    return (textureLoad(sel_tex, n0, layer, 0).x >= 128u) != inside;
+}
 // The seabed, as the CPU's: the sea colour darkening to this much less light at this depth, the water a glaze over it.
 const SEABED_FULL_DEPTH: f32 = 6000.0;
 const SEABED_DARK: f32 = 0.64;
@@ -426,6 +454,42 @@ fn view_normal(n: vec3<f32>, pos: vec2<f32>) -> vec3<f32> {
     return n.x * east + n.y * north + n.z * up;
 }
 
+// The user's marks over everything, from the finest user cell here (every cell carries what coarser ones have): the pen's ink in its colour, the selection as a wash with its edge. Applied at every exit of the composite, over imagery too, as the CPU's user_marks is.
+fn user_marks(composed: Composed, d: u32, u: u32, v: u32) -> Composed {
+    var out = composed;
+    // From the finest user cell here (every cell carries what coarser ones have): the pen's ink in its colour, the selection as a wash.
+    var udepth = U.depths.x;
+    for (var k = 0u; k <= 30u; k++) {
+        let ui = lookup(d, udepth + INK_TAG_DEPTH, u, v);
+        if (ui != NONE && ui != ABSENT) {
+            let r = refs[ui];
+            let t = tri(u, v, r.a.y);
+            let xy = vec2<i32>(i32(2u * t.x + t.z), i32(t.y));
+            let px = textureLoad(ink_tex, xy, i32(r.b.x), 0);
+            if (px.w != 0u) {
+                // Premultiplied over, after the light: the ground kept by what the ink leaves, plus the ink's own light.
+                let a = f32(px.w) / 255.0;
+                let ink = dec(vec3<f32>(f32(px.x), f32(px.y), f32(px.z)));
+                out.k2 = out.k2 * (1.0 - a);
+                out.c2 = out.c2 * (1.0 - a) + ink;
+            }
+            let sp = textureLoad(sel_tex, xy, i32(r.b.y), 0);
+            if (sp.x != 0u) {
+                { let f = fold(Fold(out.k2, out.c2), SEL_TINT, f32(sp.x) / 255.0 * SEL_ALPHA); out.k2 = f.k; out.c2 = f.c; }
+            }
+            if (sel_edge(i32(r.b.y), t, sp.x)) {
+                { let f = fold(Fold(out.k2, out.c2), SEL_TINT, SEL_EDGE_ALPHA); out.k2 = f.k; out.c2 = f.c; }
+            }
+            break;
+        }
+        if (udepth == 0u) {
+            break;
+        }
+        udepth = udepth - 1u;
+    }
+    return out;
+}
+
 fn compose(d: u32, u: u32, v: u32, pos: vec2<f32>) -> Composed {
     let mask = U.mask;
     var out: Composed;
@@ -542,7 +606,7 @@ fn compose(d: u32, u: u32, v: u32, pos: vec2<f32>) -> Composed {
             let ink = select(U.style_contour, U.style_contour_index, contour_index);
             { let f = fold(Fold(out.k2, out.c2), ink.rgb, contour_cov * ink.a); out.k2 = f.k; out.c2 = f.c; }
         }
-        return out;
+        return user_marks(out, d, u, v);
     }
     if (vi != NONE) {
         let flags = vflags;
@@ -572,7 +636,7 @@ fn compose(d: u32, u: u32, v: u32, pos: vec2<f32>) -> Composed {
             if (draw_line && line.x != WATERWAY_CLASS) {
                 { let f = fold(Fold(out.k2, out.c2), line_colour(line.x, line.z), line_alpha(line.x, line.y, line.z)); out.k2 = f.k; out.c2 = f.c; }
             }
-            return out;
+            return user_marks(out, d, u, v);
         }
         if ((mask & M_LAND) != 0u && lw.y != 0u) {
             out.base = lerp3(out.base, unpack_rgb(lut[LAND_BASE + min(lw.x, 13u)]), f32(lw.y) / 255.0 * unpack_a(lut[LAND_BASE + min(lw.x, 13u)]));
@@ -623,33 +687,7 @@ fn compose(d: u32, u: u32, v: u32, pos: vec2<f32>) -> Composed {
             out.c2 = vec3<f32>(0.0);
         }
     }
-    // The user's marks over everything, from the finest user cell here (every cell carries what coarser ones have): the pen's ink in its colour, the selection as a wash.
-    var udepth = U.depths.x;
-    for (var k = 0u; k <= 30u; k++) {
-        let ui = lookup(d, udepth + INK_TAG_DEPTH, u, v);
-        if (ui != NONE && ui != ABSENT) {
-            let r = refs[ui];
-            let t = tri(u, v, r.a.y);
-            let xy = vec2<i32>(i32(2u * t.x + t.z), i32(t.y));
-            let px = textureLoad(ink_tex, xy, i32(r.b.x), 0);
-            if (px.w != 0u) {
-                // Premultiplied over, after the light: the ground kept by what the ink leaves, plus the ink's own light.
-                let a = f32(px.w) / 255.0;
-                let ink = dec(vec3<f32>(f32(px.x), f32(px.y), f32(px.z)));
-                out.k2 = out.k2 * (1.0 - a);
-                out.c2 = out.c2 * (1.0 - a) + ink;
-            }
-            let sp = textureLoad(sel_tex, xy, i32(r.b.y), 0);
-            if (sp.x != 0u) {
-                { let f = fold(Fold(out.k2, out.c2), SEL_TINT, f32(sp.x) / 255.0 * SEL_ALPHA); out.k2 = f.k; out.c2 = f.c; }
-            }
-            break;
-        }
-        if (udepth == 0u) {
-            break;
-        }
-        udepth = udepth - 1u;
-    }
+    out = user_marks(out, d, u, v);
     if ((mask & M_DEBUG) != 0u) {
         var tintd = vec3<f32>(-1.0);
         if (found_depth == NONE) {
@@ -809,10 +847,20 @@ fn fs_present(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         let cov = max(line_cov * 0.85, cross);
         rgb = mix(rgb, vec3<f32>(255.0, 196.0, 64.0) / 256.0, cov);
     }
-    // The selection being drawn: a wash where its closed curve covers, in display terms.
-    let pv = textureLoad(preview_tex, vec2<i32>(pos.xy), 0).r;
+    // The selection being drawn: a wash where its closed curve covers, and its edge stronger, in display terms.
+    let pxy = vec2<i32>(pos.xy);
+    let pv = textureLoad(preview_tex, pxy, 0).r;
+    let pdim = vec2<i32>(textureDimensions(preview_tex));
+    var pedge = false;
+    if (pxy.x > 0) { pedge = pedge || textureLoad(preview_tex, pxy - vec2<i32>(1, 0), 0).r != pv; }
+    if (pxy.x + 1 < pdim.x) { pedge = pedge || textureLoad(preview_tex, pxy + vec2<i32>(1, 0), 0).r != pv; }
+    if (pxy.y > 0) { pedge = pedge || textureLoad(preview_tex, pxy - vec2<i32>(0, 1), 0).r != pv; }
+    if (pxy.y + 1 < pdim.y) { pedge = pedge || textureLoad(preview_tex, pxy + vec2<i32>(0, 1), 0).r != pv; }
     if (pv > 0.0) {
         rgb = mix(rgb, sqrt(SEL_TINT), pv * SEL_ALPHA);
+    }
+    if (pedge) {
+        rgb = mix(rgb, sqrt(SEL_TINT), SEL_EDGE_ALPHA);
     }
     // Truncated to the code value, written exactly so the hardware's own rounding has nothing to do.
     return vec4<f32>(min(floor(rgb * 256.0), vec3<f32>(255.0)) / 255.0, 1.0);
