@@ -410,6 +410,20 @@ impl FluorApp for MahereApp {
                 if event.state != ElementState::Pressed {
                     return EventResponse::Pass;
                 }
+                // Escape steps back: the panel one page up, then closed, then a measurement cleared.
+                if event.logical_key == fluor::event::Key::Named(fluor::event::NamedKey::Escape) {
+                    if self.panel.back() {
+                        self.chrome.invalidate_bg();
+                        ctx.window.request_redraw();
+                        return EventResponse::Handled;
+                    }
+                    if self.map.has_measure() {
+                        self.map.clear_measure();
+                        ctx.window.request_redraw();
+                        return EventResponse::Handled;
+                    }
+                    return EventResponse::Pass;
+                }
                 let handled = match event.text.as_deref() {
                     Some("a") => {
                         self.map.adjust_sun(-15.0, 0.0);

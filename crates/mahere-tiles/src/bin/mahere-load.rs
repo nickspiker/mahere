@@ -67,8 +67,10 @@ fn main() {
             None => Vec::new(),
         }
     };
+    // --vectors-only: lines, land cover and water alone, merged over the bake (its terrain and imagery carried as they are), for re-running the vector pass without reading the rasters again.
+    let vectors_only = args.iter().any(|a| a == "--vectors-only");
     let tifs = list("--dem");
-    assert!(!tifs.is_empty(), "--dem <tif>...");
+    assert!(vectors_only || !tifs.is_empty(), "--dem <tif>...");
     // Imagery: --naip <tif>... (red, green, blue, near-infrared in one file, or true colour alone), --nir <tif>... (a separate near-infrared band, as Sentinel-2 ships it), --img-base <depth> (default the vector base, never past depth 14).
     let naip = list("--naip");
     let nir = list("--nir");
@@ -103,10 +105,21 @@ fn main() {
             roads.push(mahere_osm::Road { class: r.class, pts: run, weight: r.weight, uses: r.uses });
         }
     }
+    // A polygon belongs to the box when its own box overlaps it, not when a vertex lies inside: a piece in the middle of a lake or a forest has none of its shoreline or edge, and dropped the whole polygon (Flathead Lake, 2026-10-11).
+    let _ = &in_box;
     let areas: Vec<_> = feats
         .areas
         .into_iter()
-        .filter(|a| a.rings.iter().flatten().any(|&(la, lo)| in_box(la, lo)))
+        .filter(|a| {
+            let (mut la0, mut lo0, mut la1, mut lo1) = (f64::MAX, f64::MAX, f64::MIN, f64::MIN);
+            for &(la, lo) in a.rings.iter().flatten() {
+                la0 = la0.min(la as f64);
+                la1 = la1.max(la as f64);
+                lo0 = lo0.min(lo as f64);
+                lo1 = lo1.max(lo as f64);
+            }
+            la0 <= lat1 && la1 >= lat0 && lo0 <= lon1 && lo1 >= lon0
+        })
         .collect();
     eprintln!("{} lines, {} areas in box, {:.1}s", roads.len(), areas.len(), t.elapsed().as_secs_f32());
 
@@ -120,6 +133,17 @@ fn main() {
     water.retain(|k, _| keep(k));
     eprintln!("land {} cells, water {} cells, {:.1}s", land.len(), water.len(), t.elapsed().as_secs_f32());
 
+    if vectors_only {
+        let t = std::time::Instant::now();
+        let cells = mahere_tiles::assemble(Vec::new(), line, land, water, Vec::new());
+        let n = cells.len();
+        use rayon::prelude::*;
+        cells.par_iter().for_each(|(key, cell)| {
+            mahere_tiles::write_cell(out, *key, cell, &loss).expect("write cell");
+        });
+        eprintln!("{n} cells written (vectors only, merged over existing), {:.1}s", t.elapsed().as_secs_f32());
+        return;
+    }
     let t = std::time::Instant::now();
     let dem = mahere_dem::DemStore::load(&tifs).expect("dem");
     eprintln!("dem source loaded ({} tiles) {:.1}s", dem.tile_count(), t.elapsed().as_secs_f32());

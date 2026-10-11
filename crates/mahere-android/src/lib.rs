@@ -800,6 +800,24 @@ fn share_if_asked(env: &mut JNIEnv, activity: &JObject, s: &mut Shell) {
     }
 }
 
+/// The back button: the panel one page back, or closed; else a measurement shown is cleared. False when there was nothing to step back from, and the system's back applies.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_nz_mahere_app_MahereActivity_nativeBack(_env: JNIEnv, _class: JClass, ptr: jlong) -> jboolean {
+    if ptr == 0 {
+        return 0;
+    }
+    let app = shell(ptr).app();
+    if app.panel.back() {
+        app.save_settings();
+        return 1;
+    }
+    if app.map.has_measure() {
+        app.map.clear_measure();
+        return 1;
+    }
+    0
+}
+
 /// A shared area document, from a file or link the activity received: kept with the areas and opened.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_nz_mahere_app_MahereActivity_nativeOpenArea(env: JNIEnv, _class: JClass, ptr: jlong, bytes: jni::objects::JByteArray) {

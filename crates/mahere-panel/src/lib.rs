@@ -386,6 +386,22 @@ impl Panel {
         }
     }
 
+    /// Back, from the phone's back button or Escape: one page up the stack, the panel closed from its first page. False when the panel was already closed, for the host to do whatever back means outside it.
+    pub fn back(&mut self) -> bool {
+        if !self.open {
+            return false;
+        }
+        if self.stack.len() > 1 {
+            self.pop();
+        } else {
+            self.open = false;
+            self.dirty = true;
+        }
+        self.layers_press = None;
+        self.press = None;
+        true
+    }
+
     /// Show or hide the panel (the host's orb was tapped).
     pub fn toggle(&mut self) {
         self.open = !self.open;

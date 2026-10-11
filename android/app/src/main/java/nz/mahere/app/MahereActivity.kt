@@ -56,6 +56,7 @@ class MahereActivity : Activity(), SurfaceHolder.Callback, Choreographer.FrameCa
     private external fun nativeOnLocation(ptr: Long, lat: Double, lon: Double, accuracy: Float)
     private external fun nativeGoTo(ptr: Long, lat: Double, lon: Double, ppd: Double)
     private external fun nativeOpenArea(ptr: Long, bytes: ByteArray)
+    private external fun nativeBack(ptr: Long): Boolean
     private external fun nativeOnDeclination(ptr: Long, declinationDeg: Float)
     private external fun nativeOnOrientation(ptr: Long, r0: Float, r1: Float, r2: Float, r3: Float, r4: Float, r5: Float, r6: Float, r7: Float, r8: Float)
     private external fun nativeOnPause(ptr: Long)
@@ -283,6 +284,15 @@ class MahereActivity : Activity(), SurfaceHolder.Callback, Choreographer.FrameCa
         val ppd = if (z != null) 0.711 * Math.pow(2.0, z) else -1.0
         val ptr = nativePtr
         if (ptr != 0L) nativeGoTo(ptr, lat, lon, ppd) else pendingGeo = Triple(lat, lon, ppd)
+    }
+
+    // Back steps through the map's own pages first (the panel one page up, then closed, then a measurement cleared); only with nothing left there does it leave the app.
+    @Deprecated("Back is routed through the map first")
+    override fun onBackPressed() {
+        val ptr = nativePtr
+        if (ptr != 0L && nativeBack(ptr)) return
+        @Suppress("DEPRECATION")
+        super.onBackPressed()
     }
 
     override fun onDestroy() {

@@ -1,6 +1,8 @@
 //! `coverage <area.vsf.zst> <cells dir> [depth]`: what the baked cells actually hold, not what the sources' outlines claim: every cell of the area at the depth (14 by default) decoded, its texels with no elevation and with no imagery counted, the worst cells listed with where they are.
 use rayon::prelude::*;
 
+static WET: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let area = mahere_tiles::area::Area::decode(&std::fs::read(&args[1]).expect("area file")).expect("area document");
@@ -15,6 +17,14 @@ fn main() {
             let Ok(bytes) = std::fs::read(dir.join(k.path())) else { return (k, false, tri, tri, false) };
             let Ok(p) = mahere_tiles::decode_cell(&bytes) else { return (k, false, tri, tri, false) };
             let no_dem = p.dem.as_ref().map_or(tri, |d| d.elev.iter().filter(|e| e.is_nan()).count() as u64);
+            // Of those, how many the water layer marks as water: lidar gets no return off open water, so a gap there is the lake, not missing ground.
+            let wet_gap = match (&p.dem, &p.water) {
+                (Some(d), Some(w)) => (0..mahere_tiles::TRI).filter(|&i| d.elev[i].is_nan() && w.cov[i] > 0).count() as u64,
+                // No terrain plane at all (a cell wholly on the lake): every texel is a gap.
+                (None, Some(w)) => w.cov.iter().filter(|&&c| c > 0).count() as u64,
+                _ => 0,
+            };
+            WET.fetch_add(wet_gap, std::sync::atomic::Ordering::Relaxed);
             let no_img = p.img.as_ref().map_or(tri, |im| (0..mahere_tiles::TRI).filter(|&i| im.red[i] == 0 && im.green[i] == 0 && im.blue[i] == 0).count() as u64);
             (k, true, no_dem, no_img, p.img.is_some())
         })
@@ -24,7 +34,7 @@ fn main() {
     let (dem_gap, img_gap): (u64, u64) = rows.iter().fold((0, 0), |a, r| (a.0 + r.2, a.1 + r.3));
     let all = n * tri;
     println!("{} cells at depth {depth}: {} missing from the folder", n, missing);
-    println!("texels without elevation: {:.3}%", dem_gap as f64 * 100.0 / all as f64);
+    println!("texels without elevation: {:.3}%, of which {:.1}% are water", dem_gap as f64 * 100.0 / all as f64, WET.load(std::sync::atomic::Ordering::Relaxed) as f64 * 100.0 / dem_gap.max(1) as f64);
     println!("texels without imagery:   {:.3}%", img_gap as f64 * 100.0 / all as f64);
     let dem_cells = rows.iter().filter(|r| r.2 > tri / 100).count();
     let img_cells = rows.iter().filter(|r| r.3 > tri / 100).count();
