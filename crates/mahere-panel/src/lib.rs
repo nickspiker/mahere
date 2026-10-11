@@ -104,7 +104,7 @@ const LAYERS: [(Layer, &str); 25] = [
     (Layer::Slope, "Slope bands"),
     (Layer::Imagery, "Imagery"),
     (Layer::Infrared, "Infrared"),
-    (Layer::Debug, "Residency"),
+    (Layer::Debug, "Detail"),
     (Layer::RealSun, "Real sun"),
     (Layer::RealLight, "Real light"),
     (Layer::Linear, "Linear highlights"),
@@ -202,6 +202,10 @@ fn hm(a: f32, b: f32) -> f32 {
 const PANEL_BG: u32 = ink(0x0E_12_1A, 222);
 const GEAR_BG: u32 = ink(0x14_18_22, 230);
 const PANEL_DIM: u32 = ink(0x0E_12_1A, 170);
+/// The footer's ground: a shade apart from the column's, so the readouts read as their own panel.
+const FOOTER_BG: u32 = ink(0x18_1E_2A, 236);
+/// The footer's height in font sizes: the slider and its label, six readouts and the world code's label and three lines.
+const FOOTER_LINES: f32 = 15.0;
 const STRIP_FILL: u32 = ink(0x3A_5A_7A, 200);
 const SLIDER_TRACK: u32 = ink(0x2A_30_3C, 255);
 const SLIDER_FILL: u32 = ink(0x1A_22_4E, 255);
@@ -283,8 +287,6 @@ enum Row {
     Act(ThemeEdit),
 }
 
-/// The rail's share of the column when a page is stacked over another.
-const RAIL: f32 = 0.38;
 
 pub struct Panel {
     open: bool,
@@ -330,6 +332,11 @@ pub struct Panel {
     areas: AreasView,
     /// Where the host draws the orb itself (a desktop's chrome, with the title beside it): the panel then lays out under it, takes a tap there as the toggle, and paints no orb of its own.
     host_orb: Option<(f32, f32, f32)>,
+    /// The Layers page scrolls between the orb and the footer (Nick 2026-10-11): how far, how far it can, a press on it (where it started, whether it has moved), and the band it scrolls in (top, bottom, where the footer starts).
+    layers_scroll: f32,
+    layers_extent: f32,
+    layers_press: Option<(f32, f32, bool)>,
+    layers_band: (f32, f32),
     /// The app orb decoded once, and resampled to the last size asked, in fluor's stored form.
     orb_icon: Option<fluor::host::icon::Icon>,
     orb_scaled: (usize, Vec<u32>),
@@ -345,7 +352,7 @@ impl Panel {
     pub fn new() -> Panel {
         let mut hits: HitId = HIT_NONE;
         let checks = LAYERS.iter().map(|&(l, label)| (l, Checkbox::new(&mut hits, label, 0.0, 0.0, 10.0, 10.0, 10.0, false))).collect();
-        Panel { open: false, dirty: true, ru: 1.0, stack: vec![Page::Layers], theme_rows: Vec::new(), edit_rows: Vec::new(), edit_scroll: 0.0, edit_extent: 0.0, press: None, sliders: Vec::new(), field_vals: [0.0; 4], held: None, edits: Vec::new(), hits, checks, text: TextRenderer::new(), buf: Vec::new(), w: 0, h: 0, font: 16.0, gear: (0.0, 0.0, 0.0), panel_w: 0.0, theme_row: (0.0, 0.0, 0.0), slider: (0.0, 0.0, 0.0), slider_held: false, cache_max: CACHE_MIN + 1, strip_close: None, clear_measure: false, area_rows: Vec::new(), area_acts: Vec::new(), areas: AreasView::default(), host_orb: None, orb_icon: fluor::host::icon::Icon::from_vsf_bytes(APP_ORB_VSF).ok(), orb_scaled: (0, Vec::new()) }
+        Panel { open: false, dirty: true, ru: 1.0, stack: vec![Page::Layers], theme_rows: Vec::new(), edit_rows: Vec::new(), edit_scroll: 0.0, edit_extent: 0.0, press: None, sliders: Vec::new(), field_vals: [0.0; 4], held: None, edits: Vec::new(), hits, checks, text: TextRenderer::new(), buf: Vec::new(), w: 0, h: 0, font: 16.0, gear: (0.0, 0.0, 0.0), panel_w: 0.0, theme_row: (0.0, 0.0, 0.0), slider: (0.0, 0.0, 0.0), slider_held: false, cache_max: CACHE_MIN + 1, strip_close: None, clear_measure: false, area_rows: Vec::new(), area_acts: Vec::new(), areas: AreasView::default(), host_orb: None, layers_scroll: 0.0, layers_extent: 0.0, layers_press: None, layers_band: (0.0, 0.0), orb_icon: fluor::host::icon::Icon::from_vsf_bytes(APP_ORB_VSF).ok(), orb_scaled: (0, Vec::new()) }
     }
 
     pub fn is_open(&self) -> bool {
@@ -476,9 +483,9 @@ impl Panel {
         self.dirty = true;
     }
 
-    /// The rail's width when a page is stacked, else zero: the content starts after it.
+    /// Where a page's content starts: every page has the whole column (the rail that showed the page under it is gone, Nick 2026-10-11); its title row goes back.
     fn rail_w(&self) -> f32 {
-        if self.stack.len() >= 2 { self.panel_w * RAIL } else { 0.0 }
+        0.0
     }
 
     /// Open the pen's mixer: four sliders from the pen's bytes.
@@ -560,8 +567,13 @@ impl Panel {
         self.panel_w = (self.font * 13.0).min(w as f32 * 0.7);
         let row = self.font * 1.7;
         let x0 = self.font * 0.8;
+        // The footer: the cache slider and the readouts, fixed at the bottom, the layers scrolling above it.
+        let footer_top = (h as f32 - self.font * FOOTER_LINES).max(self.gear.1 + r + row * 3.0);
+        let band_top = self.gear.1 + r + self.font * 0.5;
+        self.layers_band = (band_top, footer_top);
+        let scroll = self.layers_scroll;
         // The theme row sits first, then the layers.
-        let theme_y = self.gear.1 + r + self.font * 0.9 + row * 0.5;
+        let theme_y = self.gear.1 + r + self.font * 0.9 + row * 0.5 - scroll;
         self.theme_row = (x0, theme_y, row * 0.5);
         let top = theme_y + row * 0.8;
         let mut last = top;
@@ -578,8 +590,55 @@ impl Panel {
             cb.set_rect(x0 + (self.panel_w - x0 * 1.5) * 0.5, cy, self.panel_w - x0 * 1.5, row);
             last = cy + row * 0.5;
         }
-        // The cache slider below the modes: a track the width of the column.
-        self.slider = (x0, last + row * 1.3, self.panel_w - x0 * 2.0);
+        // How far the list runs past the footer, from where it would sit unscrolled.
+        self.layers_extent = (last + scroll + row * 0.5 - footer_top).max(0.0);
+        if self.layers_scroll > self.layers_extent {
+            self.layers_scroll = self.layers_extent;
+        }
+        // The cache slider at the footer's top: a track the width of the column.
+        self.slider = (x0, footer_top + self.font * 1.9, self.panel_w - x0 * 2.0);
+    }
+
+    /// Whether a point on the Layers page is on a row the list shows (inside the band it scrolls in).
+    fn in_band(&self, y: f32) -> bool {
+        y >= self.layers_band.0 && y < self.layers_band.1
+    }
+
+    /// A press released where it started on the Layers page: the row under it opens or flips. True when something the host applies changed.
+    fn activate_layers_row(&mut self, x: f32, y: f32, mask: &mut LayerMask, ctl: &mut Controls) -> bool {
+        if !self.in_band(y) {
+            return false;
+        }
+        let (tx, ty, tr) = self.theme_row;
+        if (y - ty).abs() <= tr && x >= tx && x < self.panel_w {
+            self.stack.push(Page::Themes);
+            self.dirty = true;
+            return false;
+        }
+        for (l, cb) in &mut self.checks {
+            if cb.bbox().contains(x, y) {
+                if *l == Layer::PenColour {
+                    let rgba = ctl.pen_rgba;
+                    self.open_pen(rgba);
+                    return false;
+                }
+                if *l == Layer::Areas {
+                    self.stack.push(Page::Areas);
+                    self.dirty = true;
+                    return false;
+                }
+                // A row a dominating layer has greyed takes the tap but changes nothing.
+                if inert(mask, ctl, *l) {
+                    return false;
+                }
+                let v = !get(mask, ctl, *l);
+                set(mask, ctl, *l, v);
+                cb.set_checked(get(mask, ctl, *l));
+                self.dirty = true;
+                return true;
+            }
+        }
+        false
     }
 
     /// A tap at screen (x, y): true if the panel took it. The orb toggles the panel; a row flips its layer in `mask`.
@@ -603,11 +662,6 @@ impl Panel {
         }
         if x >= self.panel_w {
             return false;
-        }
-        // The rail is the page under this one: a tap there goes back.
-        if self.stack.len() >= 2 && x < self.rail_w() {
-            self.pop();
-            return true;
         }
         match self.page() {
             Page::Themes => {
@@ -723,36 +777,12 @@ impl Panel {
             }
             Page::Layers => {}
         }
-        // The theme row above the layers opens the theme page.
-        let (tx, ty, tr) = self.theme_row;
-        if (y - ty).abs() <= tr && x >= tx && x < self.panel_w {
-            self.stack.push(Page::Themes);
-            self.dirty = true;
+        // The list takes a press and acts on its release, so a drag scrolls it instead; the footer's slider acts at once.
+        if self.in_band(y) {
+            self.layers_press = Some((x, y, false));
             return true;
         }
-        for (l, cb) in &mut self.checks {
-            if cb.bbox().contains(x, y) {
-                if *l == Layer::PenColour {
-                    let rgba = ctl.pen_rgba;
-                    self.open_pen(rgba);
-                    return true;
-                }
-                if *l == Layer::Areas {
-                    self.stack.push(Page::Areas);
-                    self.dirty = true;
-                    return true;
-                }
-                // A row a dominating layer has greyed takes the tap but changes nothing.
-                if inert(mask, ctl, *l) {
-                    return true;
-                }
-                let v = !get(mask, ctl, *l);
-                set(mask, ctl, *l, v);
-                cb.set_checked(get(mask, ctl, *l));
-                self.dirty = true;
-                return true;
-            }
-        }
+        let _ = mask;
         if self.slider_press(x, y, ctl) {
             return true;
         }
@@ -822,8 +852,7 @@ impl Panel {
             }
             paint::circle_filled(&mut canvas, gx as isize, gy as isize, gr as isize, GEAR_BG, None, None);
         }
-        let (page, rail, depth) = (self.page(), self.rail_w(), self.stack.len());
-        let under = if depth >= 2 { self.stack[depth - 2] } else { Page::Layers };
+        let (page, rail) = (self.page(), self.rail_w());
         let mut damage = Damage::new();
         let mut canvas = Canvas::new(&mut self.buf, w, h, &mut damage);
         self.strip_close = None;
@@ -834,7 +863,7 @@ impl Panel {
             return &self.buf;
         }
         if page != Page::Layers {
-            // Top first: the content page, its background, then the rail (the page under it, smaller and dimmed) and the column's background.
+            // Top first: the content page, then the column's background.
             let cw = self.panel_w - rail;
             let current = themes.get(ctl.theme);
             match page {
@@ -852,92 +881,89 @@ impl Panel {
                 Page::Area(i) => self.area_rows = Self::paint_area(&mut canvas, &mut self.text, font, rail, cw, self.gear, &self.areas, i, &mut self.sliders, self.field_vals[0] as u8),
                 Page::Layers => {}
             }
-            paint::fill_rect(&mut canvas, rail as isize, 0, cw as isize, h as isize, PANEL_BG, None, None);
-            if depth >= 2 {
-                paint::fill_rect(&mut canvas, 0, 0, rail as isize, h as isize, PANEL_DIM, None, None);
-                let small = font * 0.72;
-                match under {
-                    Page::Themes => {
-                        Self::paint_themes(&mut canvas, &mut self.text, small, 0.0, rail, self.gear, h, themes, ctl.theme);
-                    }
-                    Page::Edit => {
-                        if let Some(t) = current {
-                            let _ = Self::paint_edit(&mut canvas, &mut self.text, small, 0.0, rail, self.gear, h, t, 0.0);
-                        }
-                    }
-                    Page::Areas => {
-                        let _ = Self::paint_areas(&mut canvas, &mut self.text, small, 0.0, rail, self.gear, &self.areas);
-                    }
-                    _ => {
-                        self.text.draw_text_left(&mut canvas, "\u{2039}", font * 0.9, self.gear.1 + self.gear.2 + font * 1.7, &TextStyle::new(font, theme::TEXTBOX_TEXT), None, None);
-                    }
-                }
-            }
             paint::fill_rect(&mut canvas, 0, 0, self.panel_w as isize, h as isize, PANEL_BG, None, None);
             return &self.buf;
         }
-        // The theme row: the current theme's name and a chevron.
-        let (tx, ty, _) = self.theme_row;
-        let current = themes.get(ctl.theme).map_or("Trail", |t| t.name.as_str());
-        self.text.draw_text_left(&mut canvas, &format!("Theme   {current}  \u{203a}"), tx, ty, &TextStyle::new(font, theme::TEXTBOX_TEXT), None, None);
-        for (l, cb) in &mut self.checks {
-            cb.set_checked(get(&mask, &ctl, *l));
-            // Greyed: a wash of the panel colour over the row, painted first so it lies on top.
-            if inert(&mask, &ctl, *l) {
-                let b = cb.bbox();
-                paint::fill_rect(&mut canvas, b.x as isize, b.y as isize, b.w as isize, b.h as isize, PANEL_DIM, None, None);
-            }
-            cb.render_content_into(&mut canvas, &mut self.text, None, None);
-            // The pen colour row shows the colour it opens, at its opacity, at the row's right end.
-            if *l == Layer::PenColour {
-                let b = cb.bbox();
-                let side = b.h * 0.7;
-                paint::fill_rect(&mut canvas, (b.x + b.w - side - font * 0.6) as isize, (b.y + (b.h - side) * 0.5) as isize, side as isize, side as isize, pen_swatch(ctl.pen_rgba), None, None);
-            }
-        }
+        // Topmost first: the footer (its slider and readouts, then its own background), then the list clipped to its band, then the column's background.
+        let (band_top, footer_top) = self.layers_band;
         self.cache_max = r.cache_max;
         Self::paint_slider(&mut canvas, &mut self.text, font, self.slider, &ctl, r);
-        // Readouts below the slider, one line each, dim labels.
         let x = font * 0.9;
-        let step = font * 1.35;
-        let mut y = self.slider.1 + font * 1.6;
-        let small = TextStyle::new(font * 0.9, READOUT);
-        let dim = TextStyle::new(font * 0.75, READOUT_DIM);
-        // The world code is seven words: wrapped to the column so none is cut.
+        let right = self.panel_w - font * 0.9;
+        let mut y = self.slider.1 + font * 1.4;
+        let small = TextStyle::new(font * 0.82, READOUT);
+        let dim = TextStyle::new(font * 0.72, READOUT_DIM);
+        let rows: [(&str, String); 6] = [
+            ("position", format!("{:.5}  {:.5}", r.lat, r.lon)),
+            ("elevation", r.elev.map_or("\u{2014}".into(), |e| format!("{} m", e.round() as i64))),
+            ("heading", format!("{:+}\u{b0}", r.heading_deg.round() as i64)),
+            ("phone", r.phone_heading.map_or("\u{2014}".into(), |h| format!("{}\u{b0}", h.round() as i64))),
+            ("scale", format!("{:.2} m/px", r.m_per_px)),
+            ("frame", format!("{:.1} ms  \u{b7}  {} cells", r.frame_ms, r.resident)),
+        ];
+        let line = font * 1.15;
+        for (label, value) in rows.iter() {
+            if y > h as f32 {
+                break;
+            }
+            self.text.draw_text_left(&mut canvas, label, x, y, &dim, None, None);
+            self.text.draw_text_right(&mut canvas, value, right, y, &small, None, None);
+            y += line;
+        }
+        // The world code is seven words: under its label, wrapped to the column so none is cut.
         let words = vsf::types::WorldCoord::from_lat_lon(r.lat, r.lon).to_words();
         let max_w = self.panel_w - x * 2.0;
         let mut world_lines: Vec<String> = Vec::new();
         for word in words.split_whitespace() {
             match world_lines.last_mut() {
-                Some(line) if self.text.measure_text(&format!("{line} {word}"), &small) <= max_w => {
-                    line.push(' ');
-                    line.push_str(word);
+                Some(l) if self.text.measure_text(&format!("{l} {word}"), &small) <= max_w => {
+                    l.push(' ');
+                    l.push_str(word);
                 }
                 _ => world_lines.push(word.to_string()),
             }
         }
-        let mut lines: Vec<(&str, Vec<String>)> = vec![
-            ("position", vec![format!("{:.5}  {:.5}", r.lat, r.lon)]),
-            ("world", world_lines),
-            ("elevation", vec![r.elev.map_or("—".into(), |e| format!("{} m", e.round() as i64))]),
-            ("heading", vec![format!("{:+}°", r.heading_deg.round() as i64)]),
-            ("phone", vec![r.phone_heading.map_or("—".into(), |h| format!("{}°", h.round() as i64))]),
-            ("scale", vec![format!("{:.2} m/px", r.m_per_px)]),
-            ("frame", vec![format!("{:.1} ms  ·  {} cells", r.frame_ms, r.resident)]),
-        ];
-        for (label, values) in lines.iter_mut() {
-            if y + step > h as f32 {
+        self.text.draw_text_left(&mut canvas, "world", x, y, &dim, None, None);
+        y += font * 0.9;
+        for l in &world_lines {
+            if y > h as f32 {
                 break;
             }
-            self.text.draw_text_left(&mut canvas, label, x, y, &dim, None, None);
-            y += font * 0.85;
-            for v in values.iter() {
-                self.text.draw_text_left(&mut canvas, v, x, y, &small, None, None);
-                y += font * 1.1;
-            }
-            y += font * 0.4;
+            self.text.draw_text_left(&mut canvas, l, x, y, &small, None, None);
+            y += font * 1.05;
         }
-        let _ = step;
+        // The footer's own ground and a hairline along its top, so it reads apart from the list.
+        paint::fill_rect(&mut canvas, 0, footer_top as isize, self.panel_w as isize, 1.max((font / 24.0) as isize), READOUT_DIM, None, None);
+        paint::fill_rect(&mut canvas, 0, footer_top as isize, self.panel_w as isize, (h as f32 - footer_top) as isize, FOOTER_BG, None, None);
+        let clip = Some(paint::Clip::new(0, band_top.max(0.0) as usize, self.panel_w as usize, footer_top.max(0.0) as usize));
+        // Where the list runs past the footer, a thin bar at the column's edge shows where in it the view is.
+        if self.layers_extent > 0.0 {
+            let span = footer_top - band_top;
+            let len = span * span / (span + self.layers_extent);
+            let at = band_top + (span - len) * (self.layers_scroll / self.layers_extent);
+            paint::fill_rect(&mut canvas, (self.panel_w - font * 0.25) as isize, at as isize, (font * 0.12).max(2.0) as isize, len as isize, READOUT_DIM, None, None);
+        }
+        // The theme row: the current theme's name and a chevron.
+        let (tx, ty, _) = self.theme_row;
+        let current = themes.get(ctl.theme).map_or("Trail", |t| t.name.as_str());
+        self.text.draw_text_left(&mut canvas, &format!("Theme   {current}  \u{203a}"), tx, ty, &TextStyle::new(font, theme::TEXTBOX_TEXT), clip, None);
+        for (l, cb) in &mut self.checks {
+            cb.set_checked(get(&mask, &ctl, *l));
+            let b = cb.bbox();
+            if b.y + b.h < band_top || b.y > footer_top {
+                continue;
+            }
+            // Greyed: a wash of the panel colour over the row, painted first so it lies on top.
+            if inert(&mask, &ctl, *l) {
+                paint::fill_rect(&mut canvas, b.x as isize, b.y as isize, b.w as isize, b.h as isize, PANEL_DIM, clip, None);
+            }
+            cb.render_content_into(&mut canvas, &mut self.text, clip, None);
+            // The pen colour row shows the colour it opens, at its opacity, at the row's right end.
+            if *l == Layer::PenColour {
+                let side = b.h * 0.7;
+                paint::fill_rect(&mut canvas, (b.x + b.w - side - font * 0.6) as isize, (b.y + (b.h - side) * 0.5) as isize, side as isize, side as isize, pen_swatch(ctl.pen_rgba), clip, None);
+            }
+        }
         paint::fill_rect(&mut canvas, 0, 0, self.panel_w as isize, h as isize, PANEL_BG, None, None);
         &self.buf
     }
@@ -1084,6 +1110,15 @@ impl Panel {
 
     /// A move while the slider is held: the budget follows the finger. True while it does.
     pub fn drag(&mut self, x: f32, y: f32, ctl: &mut Controls) -> bool {
+        if let (Some((px, py, moved)), Page::Layers) = (self.layers_press, self.page()) {
+            let moved = moved || (y - py).abs() + (x - px).abs() > 12.0;
+            if moved {
+                self.layers_scroll = (self.layers_scroll - (y - py)).clamp(0.0, self.layers_extent);
+                self.dirty = true;
+            }
+            self.layers_press = Some((x, y, moved));
+            return true;
+        }
         if let (Some((px, py, under, moved)), Page::Edit) = (self.press, self.page()) {
             let moved = moved || (y - py).abs() + (x - px).abs() > 12.0;
             if moved {
@@ -1131,9 +1166,16 @@ impl Panel {
         true
     }
 
-    pub fn release(&mut self) {
+    /// The finger lifted. A press on the Layers list that never moved opens or flips its row there; true when that changed something the host applies from `mask` and `ctl`.
+    pub fn release(&mut self, mask: &mut LayerMask, ctl: &mut Controls) -> bool {
         self.slider_held = false;
         self.held = None;
+        let mut changed = false;
+        if let Some((x, y, moved)) = self.layers_press.take() {
+            if !moved && self.page() == Page::Layers {
+                changed = self.activate_layers_row(x, y, mask, ctl);
+            }
+        }
         match self.press.take() {
             Some((_, _, Some(Row::Field(f, v)), false)) => self.open_field(f, v),
             Some((_, _, Some(Row::Act(a)), false)) => {
@@ -1146,6 +1188,7 @@ impl Panel {
             }
             _ => {}
         }
+        changed
     }
 
     fn paint_slider(canvas: &mut Canvas, text: &mut TextRenderer, font: f32, slider: (f32, f32, f32), ctl: &Controls, r: &Readouts) {
@@ -1153,7 +1196,7 @@ impl Panel {
         let max = r.cache_max.max(CACHE_MIN + 1);
         let t = ((ctl.cache_budget.saturating_sub(CACHE_MIN)) as f64 / (max - CACHE_MIN) as f64).clamp(0.0, 1.0) as f32;
         let used = (r.cache_used as f64 / max as f64).clamp(0.0, 1.0) as f32;
-        let label = format!("cache  {} of {}  ·  holding {}", bytes_text(ctl.cache_budget), bytes_text(max), bytes_text(r.cache_used));
+        let label = format!("cache  {}  \u{b7}  {} held", bytes_text(ctl.cache_budget), bytes_text(r.cache_used));
         text.draw_text_left(canvas, &label, sx, sy - font * 1.0, &TextStyle::new(font * 0.75, READOUT_DIM), None, None);
         // Knob, then the budget's fill, then what is held, then the track under all of them.
         let th = (font * 0.28).max(3.0);
@@ -1174,7 +1217,7 @@ impl Panel {
         let mut y = gear.1 + gear.2 + font * 0.9 + row * 0.5;
         let mut rows = Vec::new();
         let title = TextStyle::new(font, theme::TEXTBOX_TEXT);
-        text.draw_text_left(canvas, "\u{2039}  Layers", x0, y, &title, None, None);
+        text.draw_text_left(canvas, "\u{2039}  Themes", x0, y, &title, None, None);
         rows.push((y, row * 0.5));
         y += row * 1.2;
         for (i, t) in themes.iter().enumerate() {

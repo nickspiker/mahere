@@ -641,21 +641,18 @@ fn compose(dem: &DemRef, vec: &VecRef, pool: &Pool, diamond: u8, uq: i64, vq: i6
     if !luts.mask.debug {
         return rgb;
     }
-    // Debug tint by fallback distance of the dem ref.
-    let tint: Option<[u32; 3]> = match dem_ref_depth(dem) {
-        None => Some([255, 0, 255]),
-        Some(d) if d + 2 <= luts.dem_depth => Some([255, 40, 40]),
-        Some(d) if d + 1 == luts.dem_depth => Some([255, 170, 0]),
-        _ => None,
+    // Detail: the pixel tinted by the depth of the terrain cell it is drawn from, a spectrum from the global base to the finest bakes (Nick 2026-10-11); magenta where there is none.
+    let t = match dem_ref_depth(dem) {
+        None => [255, 0, 255],
+        Some(d) => DETAIL_COLOURS[(d.saturating_sub(DETAIL_FIRST) as usize).min(DETAIL_COLOURS.len() - 1)].map(|c| c as u32),
     };
-    match tint {
-        None => rgb,
-        Some(t) => {
-            let (r, g, b) = ((rgb >> 16) & 255, (rgb >> 8) & 255, rgb & 255);
-            (((r + t[0]) / 2) << 16) | (((g + t[1]) / 2) << 8) | ((b + t[2]) / 2)
-        }
-    }
+    let (r, g, b) = ((rgb >> 16) & 255, (rgb >> 8) & 255, rgb & 255);
+    (((r + t[0]) / 2) << 16) | (((g + t[1]) / 2) << 8) | ((b + t[2]) / 2)
 }
+
+/// The detail spectrum: a colour per terrain depth from `DETAIL_FIRST` (the global base, about 100 m, and anything coarser) to the finest bakes (1.7 m and finer), blue through green and yellow to red.
+pub const DETAIL_FIRST: u8 = 8;
+pub const DETAIL_COLOURS: [[u8; 3]; 7] = [[40, 90, 230], [40, 160, 230], [40, 200, 160], [90, 210, 60], [220, 220, 40], [240, 140, 30], [230, 40, 40]];
 
 /// Contour coverage at a pixel: distance (in metres) to the nearest multiple of the interval, over the slope and the metres per pixel, gives the distance on screen; feather over one pixel. Flat ground (where the distance would be meaningless) draws nothing. Returns (coverage, is_index).
 #[inline(always)]

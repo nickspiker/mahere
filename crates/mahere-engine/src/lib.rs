@@ -1319,6 +1319,16 @@ impl MapCore {
         draw_seven_seg(&mut self.canvas, w, h, &text, cx, cy + len + 30.0, 18.0, INK);
         // The zoom: the depth of the cells the view is drawn from, under the heading (Nick 2026-10-10: to see the level and when it changes).
         draw_seven_seg(&mut self.canvas, w, h, &format!("z{}", self.vec_depth), cx, cy + len + 58.0, 18.0, INK);
+        // With Detail on, its legend under the zoom: a bar in each depth's colour, the depth beside it, finest at the top.
+        if self.luts.mask.debug {
+            let n = raster::DETAIL_COLOURS.len();
+            for (k, col) in raster::DETAIL_COLOURS.iter().enumerate().rev() {
+                let y = cy + len + 84.0 + (n - 1 - k) as f32 * 22.0;
+                draw_segment(&mut self.canvas, w, h, cx - 22.0, y, cx - 8.0, y, 5.0, *col);
+                let d = raster::DETAIL_FIRST as usize + k;
+                draw_seven_seg(&mut self.canvas, w, h, &format!("{d}"), cx + 14.0, y + 7.0, 14.0, INK);
+            }
+        }
     }
 
     /// The depth of the cells the view is drawn from: what the corner shows as z.

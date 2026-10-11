@@ -420,7 +420,13 @@ impl FluorApp for AndroidApp {
                 EventResponse::Handled
             }
             FEvent::MouseInput { state: ElementState::Released, button: MouseButton::Left } => {
-                self.panel.release();
+                // A press on the layer list acts when it lifts without having scrolled.
+                let mut mask = self.map.layers();
+                let mut ctl = self.controls();
+                if self.panel.release(&mut mask, &mut ctl) {
+                    self.apply_controls(ctl, mask);
+                }
+                self.apply_area_acts();
                 if self.drawing {
                     self.map.end_stroke(self.w, self.h);
                     self.drawing = false;

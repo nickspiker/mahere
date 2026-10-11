@@ -787,18 +787,24 @@ fn compose(d: u32, u: u32, v: u32, pos: vec2<f32>) -> Composed {
         }
     }
     out = user_marks(out, d, u, v);
+    // Detail: tinted by the depth of the terrain cell drawn, the CPU's DETAIL_COLOURS from depth 8 (the global base) to 14 (the finest bakes); magenta where there is none.
     if ((mask & M_DEBUG) != 0u) {
-        var tintd = vec3<f32>(-1.0);
-        if (found_depth == NONE) {
-            tintd = dec(vec3<f32>(255.0, 0.0, 255.0));
-        } else if (found_depth + 2u <= U.depths.x) {
-            tintd = dec(vec3<f32>(255.0, 40.0, 40.0));
-        } else if (found_depth + 1u == U.depths.x) {
-            tintd = dec(vec3<f32>(255.0, 170.0, 0.0));
+        var tintd = dec(vec3<f32>(255.0, 0.0, 255.0));
+        if (found_depth != NONE) {
+            let i = min(max(found_depth, 8u) - 8u, 6u);
+            var c = vec3<f32>(230.0, 40.0, 40.0);
+            switch i {
+                case 0u: { c = vec3<f32>(40.0, 90.0, 230.0); }
+                case 1u: { c = vec3<f32>(40.0, 160.0, 230.0); }
+                case 2u: { c = vec3<f32>(40.0, 200.0, 160.0); }
+                case 3u: { c = vec3<f32>(90.0, 210.0, 60.0); }
+                case 4u: { c = vec3<f32>(220.0, 220.0, 40.0); }
+                case 5u: { c = vec3<f32>(240.0, 140.0, 30.0); }
+                default: {}
+            }
+            tintd = dec(c);
         }
-        if (tintd.x >= 0.0) {
-            { let f = fold(Fold(out.k2, out.c2), tintd, 0.5); out.k2 = f.k; out.c2 = f.c; }
-        }
+        { let f = fold(Fold(out.k2, out.c2), tintd, 0.5); out.k2 = f.k; out.c2 = f.c; }
     }
     return out;
 }

@@ -102,6 +102,47 @@ impl MahereApp {
         }
     }
 
+    /// What a tap or a release on the panel changed, applied to the map.
+    fn apply_controls(&mut self, ctl: Controls, mask: mahere_engine::LayerMask) {
+        self.cache_budget = ctl.cache_budget;
+        self.apply_theme_edits();
+        self.apply_area_acts();
+        if ctl.theme != self.map.theme {
+            self.map.set_theme(ctl.theme);
+        }
+        if self.panel.take_clear_measure() {
+            self.map.clear_measure();
+        }
+        self.map.set_layers(mask);
+        if ctl.real_sun != self.map.real_sun {
+            self.map.set_real_sun(ctl.real_sun);
+        }
+        if ctl.real_light != self.map.real_light {
+            self.map.set_real_light(ctl.real_light);
+        }
+        if ctl.compressed != self.map.compressed() {
+            self.map.set_compressed(ctl.compressed);
+        }
+        if ctl.follow_heading != self.map.follow_heading {
+            self.map.set_follow_heading(ctl.follow_heading);
+        }
+        if ctl.lock_to_fix != self.map.lock_to_fix {
+            self.map.set_lock_to_fix(ctl.lock_to_fix);
+        }
+        self.map.set_tool(match ctl.tool {
+            1 => mahere_engine::ink::Tool::Pen,
+            2 => mahere_engine::ink::Tool::Select,
+            _ => mahere_engine::ink::Tool::None,
+        });
+        self.map.set_pen_colour(ctl.pen_rgba);
+        if ctl.clear_ink {
+            self.map.clear_ink();
+        }
+        if ctl.clear_sel {
+            self.map.clear_selection();
+        }
+    }
+
     /// What the areas pages asked. A share is a file under data/user/share, its path printed.
     fn apply_area_acts(&mut self) {
         use mahere_panel::AreaAct;
@@ -244,43 +285,7 @@ impl FluorApp for MahereApp {
                 let mut ctl = Controls { real_sun: self.map.real_sun, real_light: self.map.real_light, follow_heading: self.map.follow_heading, lock_to_fix: self.map.lock_to_fix, cache_budget: self.cache_budget, theme: self.map.theme, compressed: self.map.compressed(), tool: self.map.tool as u8, pen_rgba: self.map.pen_colour, clear_ink: false, clear_sel: false };
                 let was_open = self.panel.is_open();
                 if self.panel.tap(cx as f32, cy as f32, w, h, &mut mask, &mut ctl, &self.map.themes) {
-                    self.cache_budget = ctl.cache_budget;
-                    self.apply_theme_edits();
-                    self.apply_area_acts();
-                    if ctl.theme != self.map.theme {
-                        self.map.set_theme(ctl.theme);
-                    }
-                    if self.panel.take_clear_measure() {
-                        self.map.clear_measure();
-                    }
-                    self.map.set_layers(mask);
-                    if ctl.real_sun != self.map.real_sun {
-                        self.map.set_real_sun(ctl.real_sun);
-                    }
-                    if ctl.real_light != self.map.real_light {
-                        self.map.set_real_light(ctl.real_light);
-                    }
-                    if ctl.compressed != self.map.compressed() {
-                        self.map.set_compressed(ctl.compressed);
-                    }
-                    if ctl.follow_heading != self.map.follow_heading {
-                        self.map.set_follow_heading(ctl.follow_heading);
-                    }
-                    if ctl.lock_to_fix != self.map.lock_to_fix {
-                        self.map.set_lock_to_fix(ctl.lock_to_fix);
-                    }
-                    self.map.set_tool(match ctl.tool {
-                        1 => mahere_engine::ink::Tool::Pen,
-                        2 => mahere_engine::ink::Tool::Select,
-                        _ => mahere_engine::ink::Tool::None,
-                    });
-                    self.map.set_pen_colour(ctl.pen_rgba);
-                    if ctl.clear_ink {
-                        self.map.clear_ink();
-                    }
-                    if ctl.clear_sel {
-                        self.map.clear_selection();
-                    }
+                    self.apply_controls(ctl, mask);
                     ctx.window.request_redraw();
                     return EventResponse::Handled;
                 }
@@ -301,7 +306,13 @@ impl FluorApp for MahereApp {
                 EventResponse::Handled
             }
             FEvent::MouseInput { state: ElementState::Released, button: MouseButton::Left } => {
-                self.panel.release();
+                // A press on the layer list acts when it lifts without having scrolled.
+                let mut mask = self.map.layers();
+                let mut ctl = Controls { real_sun: self.map.real_sun, real_light: self.map.real_light, follow_heading: self.map.follow_heading, lock_to_fix: self.map.lock_to_fix, cache_budget: self.cache_budget, theme: self.map.theme, compressed: self.map.compressed(), tool: self.map.tool as u8, pen_rgba: self.map.pen_colour, clear_ink: false, clear_sel: false };
+                if self.panel.release(&mut mask, &mut ctl) {
+                    self.apply_controls(ctl, mask);
+                    ctx.window.request_redraw();
+                }
                 if self.drawing {
                     self.map.end_stroke(w, h);
                     self.drawing = false;
