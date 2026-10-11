@@ -344,28 +344,18 @@ impl Sphere {
     /// The painted sphere as the light, projected in the device frame for `rot` and held to its own level: flat ground, the world's up, is lit to one, so a slope facing the light goes past one and rolls into white as it does under the themed sun; the level does not move when the phone turns. While the sphere holds no light above the horizon (the camera has only seen the floor), the brightest normal is one instead. None while the sphere is all black.
     pub fn light(&mut self, rot: &[f32; 9]) -> Option<Sh9> {
         let omega = 4.0 * std::f32::consts::PI / TRIS as f32;
-        // What the camera has not seen is taken to be the mean of what it has: a sphere black everywhere but where the camera looked lit only the slopes facing there, in patches that moved with the phone, and every newly painted bright patch renormalised the rest to black (Nick 2026-10-10: it should brighten or darken as a whole when the phone turns). The orb still shows the unseen as black.
-        let painted: Vec<usize> = (0..TRIS).filter(|&t| self.tris[t] != [0; 3]).collect();
-        if painted.is_empty() {
-            return None;
-        }
-        let mut mean = [0u64; 3];
-        for &t in &painted {
-            for k in 0..3 {
-                mean[k] += self.tris[t][k] as u64;
-            }
-        }
-        let fill = [(mean[0] / painted.len() as u64) as u32, (mean[1] / painted.len() as u64) as u32, (mean[2] / painted.len() as u64) as u32];
         let mut world = Sh9::ZERO;
         let mut device = Sh9::ZERO;
         for t in 0..TRIS {
-            let tri = if self.tris[t] == [0; 3] { fill } else { self.tris[t] };
+            if self.tris[t] == [0; 3] {
+                continue;
+            }
             let c = self.centres[t];
             // Device = rotᵀ · world.
             let dd = [rot[0] * c[0] + rot[3] * c[1] + rot[6] * c[2], rot[1] * c[0] + rot[4] * c[1] + rot[7] * c[2], rot[2] * c[0] + rot[5] * c[1] + rot[8] * c[2]];
             let (bw, bd) = (basis(c), basis(dd));
             for ch in 0..3 {
-                let v = tri[ch] as f32 * omega;
+                let v = self.tris[t][ch] as f32 * omega;
                 for k in 0..9 {
                     world.l[ch][k] += v * bw[k];
                     device.l[ch][k] += v * bd[k];
@@ -437,32 +427,15 @@ mod tests {
         // A 57° × 75° field covers around a tenth of the sphere.
         assert!((15..=60).contains(&seen), "{seen} triangles painted");
         let sh = s.light(&IDENTITY).unwrap();
-        // On the map's scale a sphere of radiance one lights every normal to one; with the unseen taken as the seen, one uniform patch is that sphere, so its radiance is one.
+        // On the map's scale a sphere of radiance one lights every normal to one, so a patch a tenth of the sphere that lights flat ground to one is brighter than one.
         let r = s.radiance([0.0, 0.0, 1.0]);
-        assert!((r[1] - 1.0).abs() < 0.02, "{r:?}");
+        assert!(r[1] > 1.0 && r[1] < 4.0, "{r:?}");
         assert_eq!(s.radiance([0.0, 0.0, -1.0]), [0.0; 3]);
-        // Painted straight up with the phone flat, the patch is the world's up: flat ground is lit to one. The unseen sphere is taken as the mean of the seen, so one uniform patch lights every normal alike until more is seen.
+        // Painted straight up with the phone flat, the patch is the world's up: flat ground is lit to one.
         let out = sh.irradiance([0.0, 0.0, 1.0]);
         let back = sh.irradiance([0.0, 0.0, -1.0]);
         assert!((out[1] - 1.0).abs() < 0.02, "{out:?}");
-        assert!((back[1] - 1.0).abs() < 0.05, "{back:?}");
-    }
-
-    #[test]
-    fn a_bright_patch_above_and_a_dim_one_below_light_from_above_with_fill_between() {
-        let lens = Lens::new(32, 24, 0.55, 0.77);
-        let mut s = Sphere::new();
-        s.paint(&vec![[1000u32; 3]; 32 * 24], &lens, &IDENTITY);
-        // The phone turned over: the camera looks down.
-        let flipped = [1.0, 0.0, 0.0, 0.0, -1.0, 0.0, 0.0, 0.0, -1.0];
-        s.paint(&vec![[100u32; 3]; 32 * 24], &lens, &flipped);
-        let sh = s.light(&IDENTITY).unwrap();
-        let up = sh.irradiance([0.0, 0.0, 1.0]);
-        let side = sh.irradiance([1.0, 0.0, 0.0]);
-        let down = sh.irradiance([0.0, 0.0, -1.0]);
-        assert!((up[1] - 1.0).abs() < 0.02, "{up:?}");
-        assert!(down[1] < side[1] && side[1] < up[1], "lit from above through the fill: {down:?} {side:?} {up:?}");
-        assert!(down[1] > 0.1, "the fill keeps the far side from black: {down:?}");
+        assert!(back[1] < 0.2, "{back:?}");
     }
 
     #[test]
