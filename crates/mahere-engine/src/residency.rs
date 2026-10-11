@@ -159,6 +159,8 @@ pub struct Pool {
 }
 
 pub struct Residency {
+    /// The store the loader reads, for reading one cell's planes back on demand (a tap's details on a host whose GPU took the CPU copies).
+    store: Arc<dyn CellStore>,
     /// Whether the loader packs the CPU raster's u64 texels (normals included) for each dem; a GPU-only host turns it off and saves a megabyte and a few milliseconds per cell.
     pack_cpu: Arc<std::sync::atomic::AtomicBool>,
     want_tx: Sender<WantList>,
@@ -187,8 +189,10 @@ impl Residency {
         let (done_tx, done_rx) = channel::<Loaded>();
         let pack_cpu = Arc::new(std::sync::atomic::AtomicBool::new(true));
         let pack = pack_cpu.clone();
+        let read_store = store.clone();
         std::thread::spawn(move || loader_thread(store, want_rx, done_tx, pack));
         Residency {
+            store: read_store,
             pack_cpu,
             want_tx,
             done_rx,
@@ -281,6 +285,17 @@ impl Residency {
         self.last_sent = list.clone();
         if !list.is_empty() {
             let _ = self.want_tx.send(WantList { list });
+        }
+    }
+
+    /// A resident cell's planes, decoded again from its store (the vault on a phone, so no network): for reading what a GPU host no longer keeps on the CPU.
+    pub fn read_planes(&self, key: CellKey) -> Option<mahere_tiles::CellPlanes> {
+        if !self.pool.map.contains_key(&key) {
+            return None;
+        }
+        match self.store.get(key) {
+            Fetch::Bytes(b) => mahere_tiles::decode_cell(&b).ok(),
+            _ => None,
         }
     }
 

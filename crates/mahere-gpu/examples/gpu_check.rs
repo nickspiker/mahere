@@ -147,9 +147,20 @@ fn main() {
         }
         let c = map.cam;
         let readouts = mahere_panel::Readouts { lat: c.lat(), lon: c.lon(), elev: map.elevation_at(c.lat(), c.lon()), heading_deg: c.bearing().to_degrees(), m_per_px: 111_320.0 / c.ppd, frame_ms: cpu_ms, resident: map.pool().map.len(), phone_heading: None, cache_used: 0, cache_max: 1 << 30 };
-        panel.paint(w, h, map.layers(), controls, &readouts, None, &map.themes, &areas, None);
+        // MAHERE_TAP=x,y taps the map there first: the measurement strip shows what is at the point, and the lines are printed.
+        if let Ok(t) = std::env::var("MAHERE_TAP") {
+            let v: Vec<f64> = t.split(',').map(|x| x.parse().unwrap()).collect();
+            map.tap(v[0], v[1], w, h);
+            if let Some(m) = map.measure_view(w, h, 2) {
+                for l in &m.info {
+                    println!("tap: {l}");
+                }
+            }
+        }
+        let measure = map.measure_view(w, h, mahere_panel::Panel::strip_samples(w));
+        panel.paint(w, h, map.layers(), controls, &readouts, measure.as_ref(), &map.themes, &areas, None);
         // The areas view is compared on paint, so the page is painted once more with it known.
-        panel.paint(w, h, map.layers(), controls, &readouts, None, &map.themes, &areas, None);
+        panel.paint(w, h, map.layers(), controls, &readouts, measure.as_ref(), &map.themes, &areas, None);
         let rgba = panel.overlay_rgba(&overlay, w, h);
         gpu.set_overlay_rgba(&device, &queue, w as u32, h as u32, &rgba);
     } else {

@@ -309,6 +309,8 @@ pub struct MapCore {
     pub preview: Vec<u8>,
     pub preview_version: u64,
     user_store: Option<Arc<dyn ink::UserStore>>,
+    /// What the last tap found at its point, for the measurement strip.
+    tap_info: Vec<String>,
 }
 
 type PlanKey = (u64, u64, u64, u64, usize, usize, u64, u8, u8);
@@ -381,6 +383,7 @@ impl MapCore {
             preview: Vec::new(),
             preview_version: 0,
             user_store: None,
+            tap_info: Vec::new(),
         }
     }
 
@@ -1607,6 +1610,8 @@ pub struct MeasureView {
     pub elev_target: Option<f32>,
     /// Elevation every step from origin to target, NaN where no terrain is resident.
     pub profile: Vec<f32>,
+    /// What is at the target, a line each: the road, trail or boundary under the finger, motor vehicle use, who manages the land, the ground, and the elevation with its slope and the way it faces.
+    pub info: Vec<String>,
 }
 
 impl MapCore {
@@ -1614,12 +1619,135 @@ impl MapCore {
     pub fn tap(&mut self, x: f64, y: f64, w: usize, h: usize) {
         let target = self.cam.screen_to_geo(x, y, w, h);
         self.measure = Some(Measure { target, from_fix: self.lock_to_fix && self.gps.is_some() });
+        self.tap_info = self.point_info(x, y, w, h);
         self.dirty = true;
     }
 
     pub fn clear_measure(&mut self) {
         self.measure = None;
+        self.tap_info.clear();
         self.dirty = true;
+    }
+
+    /// What is at a point on the screen (Nick 2026-10-11: the road, the national park, the elevation): from the finest resident cell there that carries vector planes, the lines searched within a finger's width, the areas read at the point itself.
+    pub fn point_info(&self, x: f64, y: f64, w: usize, h: usize) -> Vec<String> {
+        use mahere_tiles::CellKey;
+        use mahere_tiles::landuse::{mvum, own};
+        let mut cells: rustc_hash::FxHashMap<CellKey, Option<mahere_tiles::CellPlanes>> = Default::default();
+        let mut planes_of = |key: CellKey| -> Option<mahere_tiles::CellPlanes> { cells.entry(key).or_insert_with(|| self.res.read_planes(key)).clone() };
+        let at = |px: f64, py: f64| -> Option<(u64, i64, i64)> {
+            if !self.cam.on_globe(px, py, w, h) {
+                return None;
+            }
+            let (lat, lon) = self.cam.screen_to_geo(px, py, w, h);
+            let c = Coord::from_lat_lon(lat, lon);
+            let (iu, iv) = c.uv();
+            Some((c.raw(), (iu as i64) << 16, (iv as i64) << 16))
+        };
+        let Some((raw, uq, vq)) = at(x, y) else { return Vec::new() };
+        // The finest resident cell under the point that has vectors: the depth the rest of the reading uses.
+        let vec_bits = residency::PRESENT_LINE | residency::PRESENT_LAND | residency::PRESENT_WATER | residency::PRESENT_OWN | residency::PRESENT_MVUM;
+        let mut depth = None;
+        for d in (raster::MIN_DEPTH..=self.vec_depth.max(14)).rev() {
+            let key = CellKey { depth: d, prefix: raw >> (60 - 2 * d as u32) };
+            if self.res.pool.map.get(&key).is_some_and(|e| e.present & vec_bits != 0) {
+                depth = Some(d);
+                break;
+            }
+        }
+        let mut out = Vec::new();
+        if let Some(d) = depth {
+            let texel = |uq: i64, vq: i64| raster::tri_index(uq, vq, 16 + 22 - d as u32);
+            let key_of = |raw: u64| CellKey { depth: d, prefix: raw >> (60 - 2 * d as u32) };
+            // Lines are thin: the nearest within about 14 px, in rings out from the point.
+            let mut line: Option<(u8, u8)> = None;
+            let mut route: Option<u8> = None;
+            'rings: for r in 0..=7 {
+                let rr = r as f64 * 2.0;
+                let n = if r == 0 { 1 } else { 8 * r };
+                for k in 0..n {
+                    let a = k as f64 / n as f64 * std::f64::consts::TAU;
+                    let Some((sraw, su, sv)) = at(x + rr * a.cos(), y + rr * a.sin()) else { continue };
+                    let Some(p) = planes_of(key_of(sraw)) else { continue };
+                    let i = texel(su, sv);
+                    if line.is_none() {
+                        if let Some(l) = &p.line {
+                            if l.cov[i] >= 96 && l.class[i] != 0 {
+                                line = Some((l.class[i], l.uses_at(i)));
+                            }
+                        }
+                    }
+                    if route.is_none() {
+                        if let Some(m) = &p.mvum {
+                            if m.cov[i] >= 96 && m.class[i] != 0 {
+                                route = Some(m.class[i]);
+                            }
+                        }
+                    }
+                    if line.is_some() && route.is_some() {
+                        break 'rings;
+                    }
+                }
+            }
+            if let Some((class, uses)) = line {
+                let name = theme::CLASS_NAMES.get(class as usize).copied().unwrap_or("Line");
+                use mahere_tiles::use_bits::*;
+                let mut how: Vec<&str> = Vec::new();
+                for (bit, word) in [(FOOT, "foot"), (BIKE, "bikes"), (HORSE, "horses"), (SKI, "ski"), (MOTOR, "motor vehicles"), (UNPAVED, "unpaved"), (RESTRICTED, "restricted")] {
+                    if uses & bit != 0 {
+                        how.push(word);
+                    }
+                }
+                out.push(if how.is_empty() { name.to_string() } else { format!("{name}: {}", how.join(", ")) });
+            }
+            if let Some(c) = route {
+                out.push(format!("Motor vehicle use: {}", mvum::NAMES.get(c as usize).copied().unwrap_or("")));
+            }
+            if let Some(p) = planes_of(key_of(raw)) {
+                let i = texel(uq, vq);
+                if let Some(o) = &p.own {
+                    let c = o.class[i];
+                    if o.cov[i] >= 128 && c != 0 {
+                        let mgr = if c >= own::WILD { c - own::WILD } else { c };
+                        let name = own::NAMES.get(mgr as usize).copied().unwrap_or("Public land");
+                        out.push(if c >= own::WILD { format!("{name} \u{b7} Wilderness") } else { name.to_string() });
+                    } else {
+                        out.push("Private or unlisted land".to_string());
+                    }
+                }
+                let wet = p.water.as_ref().is_some_and(|w| w.cov[i] >= 128);
+                if wet {
+                    out.push("Water".to_string());
+                } else if let Some(l) = &p.land {
+                    if l.cov[i] >= 128 && l.class[i] != 0 {
+                        out.push(theme::LAND_NAMES.get(l.class[i] as usize).copied().unwrap_or("").to_string());
+                    }
+                }
+            }
+        }
+        // The ground: the elevation, and from the elevations a few metres either side the slope and the way it faces.
+        let (lat, lon) = self.cam.screen_to_geo(x, y, w, h);
+        if let Some(e) = self.elevation_at(lat, lon) {
+            let step = (mahere_tiles::texel_m(self.dem_depth) as f64 * 1.5).max(2.0);
+            let (dlat, dlon) = (step / 111_320.0, step / (111_320.0 * lat.to_radians().cos().max(1e-6)));
+            let face = match (self.elevation_at(lat, lon + dlon), self.elevation_at(lat, lon - dlon), self.elevation_at(lat + dlat, lon), self.elevation_at(lat - dlat, lon)) {
+                (Some(ee), Some(ew), Some(en), Some(es)) => {
+                    let (gx, gy) = ((ee - ew) as f64 / (2.0 * step), (en - es) as f64 / (2.0 * step));
+                    let slope = gx.hypot(gy).atan().to_degrees();
+                    if slope < 2.0 {
+                        "  \u{b7}  flat".to_string()
+                    } else {
+                        // Downhill is where it faces.
+                        let az = (-gx).atan2(-gy).to_degrees().rem_euclid(360.0);
+                        let dirs = ["N", "NE", "E", "SE", "S", "SW", "W", "NW"];
+                        format!("  \u{b7}  {}\u{b0} slope facing {}", slope.round() as i64, dirs[((az + 22.5) / 45.0) as usize % 8])
+                    }
+                }
+                _ => String::new(),
+            };
+            out.push(format!("{} m{face}", e.round() as i64));
+        }
+        out
     }
 
     pub fn set_lock_to_fix(&mut self, on: bool) {
@@ -1676,6 +1804,7 @@ impl MapCore {
             elev_origin: self.elevation_at(olat, olon),
             elev_target: self.elevation_at(tlat, tlon),
             profile,
+            info: self.tap_info.clone(),
         })
     }
 

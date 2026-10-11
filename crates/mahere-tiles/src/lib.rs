@@ -17,6 +17,8 @@
 pub mod area;
 /// The ownership and motor vehicle use classes, for the renderers and the themes.
 pub use mahere_osm::landuse;
+/// What a line is for, as the line plane's use bits carry it, for a reader naming them.
+pub use mahere_osm::use_bits;
 pub mod pyr;
 pub mod tone;
 

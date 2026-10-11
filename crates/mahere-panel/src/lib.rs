@@ -1048,13 +1048,20 @@ impl Panel {
     /// The measurement strip along the bottom: the elevation profile from origin to target as a filled area, with distance and bearing on the left and the elevations on the right.
     /// Returns the close button's centre and radius.
     fn paint_strip(canvas: &mut Canvas, text: &mut TextRenderer, w: usize, h: usize, font: f32, m: &MeasureView) -> (f32, f32, f32) {
-        let band = font * 6.5;
-        let top = h as f32 - band;
+        // What is at the point, a line each, above the distance and the profile; the strip grows to hold them.
+        let info_h = m.info.len() as f32 * font * 1.05;
+        let band = font * 6.5 + info_h;
+        let strip_top = h as f32 - band;
         let margin = font;
         // The close button, top right of the strip: a cross in a disc.
-        let (cx, cy, cr) = (w as f32 - font * 0.9, top + font * 0.9, font * 0.55);
+        let (cx, cy, cr) = (w as f32 - font * 0.9, strip_top + font * 0.9, font * 0.55);
         text.draw_text_center(canvas, "\u{00d7}", cx, cy, &TextStyle::new(font * 1.1, READOUT), None, None);
         paint::circle_filled(canvas, cx as isize, cy as isize, cr as isize, GEAR_BG, None, None);
+        let point = TextStyle::new(font * 0.9, theme::TEXTBOX_TEXT);
+        for (k, line) in m.info.iter().enumerate() {
+            text.draw_text_left(canvas, line, margin, strip_top + font * 0.9 + k as f32 * font * 1.05, &point, None, None);
+        }
+        let top = strip_top + info_h;
         let (lo, hi) = m.profile.iter().filter(|e| !e.is_nan()).fold((f32::MAX, f32::MIN), |(a, b), &e| (a.min(e), b.max(e)));
         let have = lo <= hi;
         let span = (hi - lo).max(1.0);
@@ -1087,7 +1094,7 @@ impl Panel {
             paint::fill_rect(canvas, x as isize, y as isize, 1, (floor_y - y).max(1.0) as isize, STRIP_FILL, None, None);
             paint::fill_rect(canvas, x as isize, y as isize - 1, 1, 2, STRIP_EDGE, None, None);
         }
-        paint::fill_rect(canvas, 0, top as isize, w as isize, band as isize, PANEL_BG, None, None);
+        paint::fill_rect(canvas, 0, strip_top as isize, w as isize, band as isize, PANEL_BG, None, None);
         (cx, cy, cr)
     }
 
