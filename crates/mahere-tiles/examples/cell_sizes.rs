@@ -1,6 +1,17 @@
 //! Mean bytes per cell at each depth across a cell directory: the table an area's download estimate rests on.
+//! `cell_sizes <dir> names <min depth>` prints instead the file names of the cells at that depth and finer, one a line, for an upload that must leave coarser cells in the bucket alone.
 fn main() {
     let dir = std::env::args().nth(1).unwrap_or_else(|| "data/cells".into());
+    if std::env::args().nth(2).as_deref() == Some("names") {
+        let min: u8 = std::env::args().nth(3).and_then(|d| d.parse().ok()).unwrap_or(0);
+        for e in std::fs::read_dir(&dir).expect("dir").flatten() {
+            let name = e.file_name().to_string_lossy().to_string();
+            if mahere_tiles::CellKey::from_name(&name).is_some_and(|k| k.depth >= min) {
+                println!("{name}");
+            }
+        }
+        return;
+    }
     let mut sum = [0u64; 32];
     let mut n = [0u64; 32];
     for e in std::fs::read_dir(&dir).expect("dir").flatten() {

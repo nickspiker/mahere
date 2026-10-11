@@ -162,6 +162,13 @@ impl CellKey {
         (cu as f64 * size, cv as f64 * size, size)
     }
 
+    /// The cell's four corners as latitude and longitude, (u, v) = (0, 0), (1, 0), (0, 1), (1, 1) of its square.
+    pub fn corners(self) -> [(f64, f64); 4] {
+        let (u0, v0, size) = self.uv_rect();
+        let d = self.diamond();
+        [uv_to_lat_lon(d, u0, v0), uv_to_lat_lon(d, u0 + size, v0), uv_to_lat_lon(d, u0, v0 + size), uv_to_lat_lon(d, u0 + size, v0 + size)]
+    }
+
     /// Rhombus edge length of one UV square (texel) in this cell, meters.
     pub fn texel_m(self) -> f64 {
         7_054_000.0 / (1u64 << self.depth) as f64 / TEX as f64
@@ -804,6 +811,20 @@ pub fn fill_apron_from_source(dem: &DemStore, key: CellKey, cell: &mut DemCell) 
             cell.apron[apron_idx(1, half, i)] = dem_texel_filtered(dem, d, u0, v0, step, TEX as i64, ii, half);
             cell.apron[apron_idx(2, half, i)] = dem_texel_filtered(dem, d, u0, v0, step, ii, -1, half);
             cell.apron[apron_idx(3, half, i)] = dem_texel_filtered(dem, d, u0, v0, step, ii, TEX as i64, half);
+        }
+    }
+}
+
+/// The apron texels nothing filled, sampled from the source: where a cell's neighbour was not baked in this run (a piece's edge, an area's edge), its edge normals are then still exact, and the neighbour pass, run after, overwrites with a baked neighbour's own edge wherever there is one.
+pub fn fill_apron_gaps_from_source(dem: &DemStore, key: CellKey, cell: &mut DemCell) {
+    if !cell.apron.iter().any(|e| e.is_nan()) {
+        return;
+    }
+    let mut full = DemCell { elev: Vec::new(), apron: vec![f32::NAN; APRON] };
+    fill_apron_from_source(dem, key, &mut full);
+    for (a, f) in cell.apron.iter_mut().zip(full.apron) {
+        if a.is_nan() {
+            *a = f;
         }
     }
 }
