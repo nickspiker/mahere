@@ -37,7 +37,7 @@ impl Quad {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Sh9 {
     /// Radiance coefficients per channel, real SH order: 00, 1-1, 10, 11, 2-2, 2-1, 20, 21, 22.
     pub l: [[f32; 9]; 3],
@@ -171,6 +171,88 @@ impl Sh9 {
         Sh9::sun_and_sky_coloured(az_deg, alt_deg, [0.74, 0.70, 0.62], [0.85, 0.95, 1.15])
     }
 
+    /// An outdoor light, for a theme to carry: a sun at an azimuth (clockwise from screen up) and altitude, a sky running from `horizon` at the horizon to `zenith` overhead, and the ground below bouncing `ground` back up. Radiances in linear light; the sky and ground projected numerically over the whole sphere.
+    pub fn outdoor(az_deg: f32, alt_deg: f32, sun: [f32; 3], zenith: [f32; 3], horizon: [f32; 3], ground: [f32; 3]) -> Sh9 {
+        let (az, alt) = (az_deg.to_radians(), alt_deg.to_radians());
+        let mut sh = Sh9::ZERO;
+        sh.add_sun([az.sin() * alt.cos(), az.cos() * alt.cos(), alt.sin()], sun);
+        let n = 48usize;
+        let mut acc = [[0f32; 9]; 3];
+        for i in 0..n {
+            for j in 0..(2 * n) {
+                let ct = 1.0 - 2.0 * (i as f32 + 0.5) / n as f32;
+                let st = (1.0 - ct * ct).max(0.0).sqrt();
+                let ph = std::f32::consts::TAU * (j as f32 + 0.5) / (2 * n) as f32;
+                let d = [st * ph.cos(), st * ph.sin(), ct];
+                // Above the horizon the sky deepens toward the zenith as the square root of the height (a real sky's gradient is steep near the horizon); below it, the ground.
+                let rad = if ct >= 0.0 {
+                    let t = ct.sqrt();
+                    [horizon[0] + (zenith[0] - horizon[0]) * t, horizon[1] + (zenith[1] - horizon[1]) * t, horizon[2] + (zenith[2] - horizon[2]) * t]
+                } else {
+                    ground
+                };
+                let b = basis(d);
+                for c in 0..3 {
+                    for k in 0..9 {
+                        acc[c][k] += rad[c] * b[k];
+                    }
+                }
+            }
+        }
+        let w = 4.0 * std::f32::consts::PI / (2 * n * n) as f32;
+        for c in 0..3 {
+            for k in 0..9 {
+                sh.l[c][k] += acc[c][k] * w;
+            }
+        }
+        sh
+    }
+
+    /// The light turned about the screen's axis (z, out of the screen) by `alpha` radians, counterclockwise as the screen sees it: the bands' m = ±1 pairs turn by alpha, the m = ±2 pair by twice it.
+    pub fn rotated_z(&self, alpha: f32) -> Sh9 {
+        let mut out = *self;
+        let turn = |c: &mut [f32; 9], cos_i: usize, sin_i: usize, a: f32| {
+            let (sa, ca) = a.sin_cos();
+            let (x, y) = (c[cos_i], c[sin_i]);
+            c[cos_i] = x * ca - y * sa;
+            c[sin_i] = x * sa + y * ca;
+        };
+        for c in out.l.iter_mut() {
+            turn(c, 3, 1, alpha);
+            turn(c, 7, 5, alpha);
+            turn(c, 8, 4, 2.0 * alpha);
+        }
+        out
+    }
+
+    /// The level a light is held to when used: the irradiance flat ground sees (luminance), or the brightest any normal sees where the ground sees little (a light from below). Absolute lights, a capture's included, all light flat ground to one at this level.
+    pub fn level(&self) -> f32 {
+        let lum = |e: [f32; 3]| 0.3 * e[0] + 0.6 * e[1] + 0.1 * e[2];
+        let up = lum(self.irradiance([0.0, 0.0, 1.0]));
+        let mut peak = 0f32;
+        let n = 256;
+        for i in 0..n {
+            let z = 1.0 - 2.0 * (i as f32 + 0.5) / n as f32;
+            let r = (1.0 - z * z).max(0.0).sqrt();
+            let a = i as f32 * 2.399_963;
+            peak = peak.max(lum(self.irradiance([r * a.cos(), r * a.sin(), z])));
+        }
+        if up > peak * 0.2 { up } else { peak.max(1e-6) }
+    }
+
+    /// The direction the light comes from most: its first band, luminance-weighted (the water's glint and the sun's place in the ball).
+    pub fn dominant_dir(&self) -> [f32; 3] {
+        let w = [0.3, 0.6, 0.1];
+        let mut d = [0f32; 3];
+        for c in 0..3 {
+            d[0] += w[c] * self.l[c][3];
+            d[1] += w[c] * self.l[c][1];
+            d[2] += w[c] * self.l[c][2];
+        }
+        let n = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
+        if n < 1e-9 { [0.0, 0.0, 1.0] } else { [d[0] / n, d[1] / n, d[2] / n] }
+    }
+
     /// The same with a theme's sun and sky colours: the cartographic light, a sun the user places above a sky dome.
     pub fn sun_and_sky_coloured(az_deg: f32, alt_deg: f32, sun: [f32; 3], sky: [f32; 3]) -> Sh9 {
         let (az, alt) = (az_deg.to_radians(), alt_deg.to_radians());
@@ -187,6 +269,28 @@ impl Sh9 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_outdoor_light_turns_held_to_its_level() {
+        let sh = Sh9::outdoor(315.0, 40.0, [1.0, 0.95, 0.85], [0.25, 0.35, 0.6], [0.6, 0.65, 0.7], [0.15, 0.12, 0.08]);
+        let lvl = sh.level();
+        let held = sh.scaled(1.0 / lvl);
+        let up = held.irradiance([0.0, 0.0, 1.0]);
+        assert!((0.3 * up[0] + 0.6 * up[1] + 0.1 * up[2] - 1.0).abs() < 1e-3, "flat ground at one: {up:?}");
+        // Lit from the top left: a slope facing up-left is brighter than one facing down-right, and turning the light half round swaps them.
+        let ul = [-0.5, 0.5, 0.7071];
+        let dr = [0.5, -0.5, 0.7071];
+        assert!(held.irradiance(ul)[1] > held.irradiance(dr)[1]);
+        let turned = held.rotated_z(std::f32::consts::PI);
+        assert!((turned.irradiance(dr)[1] - held.irradiance(ul)[1]).abs() < 1e-3);
+        let d = held.dominant_dir();
+        assert!(d[0] < 0.0 && d[1] > 0.0 && d[2] > 0.0, "{d:?}");
+        // A quarter turn counterclockwise takes a light from the top left to the bottom left.
+        let q = held.rotated_z(std::f32::consts::FRAC_PI_2).dominant_dir();
+        assert!(q[0] < 0.0 && q[1] < 0.0, "{q:?}");
+        // The ground's bounce reaches a face turned down, which a sun and sky alone leave near black.
+        assert!(held.irradiance([0.0, 0.0, -1.0])[0] > 0.02);
+    }
 
     #[test]
     fn flat_ground_under_sun_and_sky_matches_the_old_shade() {

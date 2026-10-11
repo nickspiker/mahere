@@ -52,6 +52,16 @@ impl MahereApp {
                         mahere_store::themes::save(store, self.map.current_theme());
                     }
                 }
+                mahere_panel::ThemeEdit::CaptureLight | mahere_panel::ThemeEdit::ClearLight => {
+                    if e == mahere_panel::ThemeEdit::ClearLight {
+                        self.map.clear_light();
+                    } else if !self.map.capture_light() {
+                        continue;
+                    }
+                    if let Some(store) = &self.store {
+                        mahere_store::themes::save(store, self.map.current_theme());
+                    }
+                }
                 mahere_panel::ThemeEdit::Delete => {
                     if let (Some(name), Some(store)) = (self.map.delete_theme(), &self.store) {
                         mahere_store::themes::delete(store, &name);

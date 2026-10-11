@@ -680,7 +680,14 @@ pub mod themes {
                     ("wilderness".to_string(), rgb_t(t.wild)),
                 ],
             )
-            .add_section("light", vec![("sun".to_string(), VsfType::t_f5(Tensor::new(vec![3], t.sun.to_vec()))), ("sky".to_string(), VsfType::t_f5(Tensor::new(vec![3], t.sky.to_vec())))])
+            .add_section("light", {
+                let mut f = vec![("sun".to_string(), VsfType::t_f5(Tensor::new(vec![3], t.sun.to_vec()))), ("sky".to_string(), VsfType::t_f5(Tensor::new(vec![3], t.sky.to_vec())))];
+                // The theme's own light, absolute: nine coefficients for each of red, green and blue.
+                if let Some(p) = &t.probe {
+                    f.push(("probe".to_string(), VsfType::t_f5(Tensor::new(vec![3, 9], p.l.iter().flatten().copied().collect()))));
+                }
+                f
+            })
             .build()
             .ok()
     }
@@ -793,6 +800,7 @@ pub mod themes {
             mvum: get("tables", "vehicleuse").and_then(|v| table(v, 220)).unwrap_or(mahere_engine::theme::MVUM),
             sun: [sun[0], sun[1], sun[2]],
             sky: [sky[0], sky[1], sky[2]],
+            probe: get("light", "probe").and_then(floats_of).filter(|v| v.len() == 27).map(|v| mahere_engine::sh::Sh9 { l: std::array::from_fn(|c| std::array::from_fn(|k| v[c * 9 + k])) }),
             layers,
         })
     }
@@ -872,5 +880,19 @@ mod theme_tests {
         assert_eq!(back.hypso, t.hypso);
         assert_eq!(back.layers.bits(), t.layers.bits());
         assert_eq!(back.contour_index, t.contour_index);
+    }
+
+    #[test]
+    fn every_builtin_survives_with_its_light_and_overlays() {
+        for t in mahere_engine::theme::builtin() {
+            let back = super::themes::decode(&super::themes::encode(&t).unwrap()).unwrap();
+            assert_eq!(back.probe, t.probe, "{}", t.name);
+            assert!(back.probe.is_some(), "{} ships a light", t.name);
+            assert_eq!((back.own, back.wild, back.mvum, back.land, back.flat), (t.own, t.wild, t.mvum, t.land, t.flat), "{}", t.name);
+        }
+        // A theme without its own light keeps none.
+        let mut t = mahere_engine::theme::trail();
+        t.probe = None;
+        assert_eq!(super::themes::decode(&super::themes::encode(&t).unwrap()).unwrap().probe, None);
     }
 }

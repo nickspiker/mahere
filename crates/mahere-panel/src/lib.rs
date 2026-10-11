@@ -270,6 +270,10 @@ pub enum ThemeEdit {
     Reset,
     /// The user's own theme removed.
     Delete,
+    /// The real light, as it stands, into the theme as its own light.
+    CaptureLight,
+    /// The theme's own light removed: back to its sun and sky.
+    ClearLight,
 }
 
 /// A row of the editor: a field to open, or an action.
@@ -1253,7 +1257,10 @@ impl Panel {
             y += row;
         }
         // The actions: a copy for anyone, the shipped theme back for a built-in that has been changed, deletion for the user's own.
-        let mut actions: Vec<(&str, ThemeEdit)> = vec![("\u{29c9}  Duplicate", ThemeEdit::Duplicate)];
+        let mut actions: Vec<(&str, ThemeEdit)> = vec![("\u{29c9}  Duplicate", ThemeEdit::Duplicate), ("\u{25cb}  Capture light", ThemeEdit::CaptureLight)];
+        if t.probe.is_some() {
+            actions.push(("\u{2715}  Clear light", ThemeEdit::ClearLight));
+        }
         if t.is_builtin() && t.edited {
             actions.push(("\u{21ba}  Reset to shipped", ThemeEdit::Reset));
         }

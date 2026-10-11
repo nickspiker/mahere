@@ -1058,6 +1058,32 @@ impl MapCore {
         j
     }
 
+    /// The real light as it stands, into the current theme as its own light: absolute, in the screen's frame as the phone is held now. False without a real light to take.
+    pub fn capture_light(&mut self) -> bool {
+        let (Some(p), Some(s)) = (&self.probe, &self.sphere) else { return false };
+        let absolute = p.scaled(s.level);
+        let i = self.theme.min(self.themes.len() - 1);
+        self.themes[i].probe = Some(absolute);
+        self.themes[i].edited = true;
+        self.luts_sun = (f32::NAN, f32::NAN, f64::NAN);
+        self.dirty = true;
+        true
+    }
+
+    /// The current theme back to its sun and sky.
+    pub fn clear_light(&mut self) {
+        let i = self.theme.min(self.themes.len() - 1);
+        self.themes[i].probe = None;
+        self.themes[i].edited = true;
+        self.luts_sun = (f32::NAN, f32::NAN, f64::NAN);
+        self.dirty = true;
+    }
+
+    /// How much of the light sphere the camera has painted, 0..1, for a capture to show what it would take.
+    pub fn light_seen(&self) -> Option<f32> {
+        self.sphere.as_ref().map(|s| s.tris.iter().filter(|t| **t != [0; 3]).count() as f32 / s.tris.len() as f32)
+    }
+
     pub fn current_theme(&self) -> &theme::Theme {
         &self.themes[self.theme.min(self.themes.len() - 1)]
     }
@@ -1153,6 +1179,14 @@ impl MapCore {
                 self.luts.sun = self.sun_device;
                 let _ = (sb, cb);
                 self.luts.light = sh::Quad::directional(self.sun_device, t.sun, (0.0, 1.0));
+                self.luts_sun = key;
+                self.light_version += 1;
+            } else if let Some(p) = self.themes[self.theme.min(self.themes.len() - 1)].probe {
+                // The theme's own light, turned with the map's sun (its azimuth from where the probe was made, top left) and held to its level, so flat ground lights to one whatever it was captured at (Nick 2026-10-10: stored absolute, normalised when used).
+                let turned = p.rotated_z(-(self.sun_az - 315.0).to_radians());
+                self.env = turned.scaled(1.0 / turned.level());
+                self.luts.sun = self.env.dominant_dir();
+                self.luts.light = self.env.quadratic((0.0, 1.0));
                 self.luts_sun = key;
                 self.light_version += 1;
             } else {

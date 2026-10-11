@@ -170,6 +170,15 @@ impl AndroidApp {
                         save_current(self);
                     }
                 }
+                mahere_panel::ThemeEdit::CaptureLight => {
+                    if self.map.capture_light() {
+                        save_current(self);
+                    }
+                }
+                mahere_panel::ThemeEdit::ClearLight => {
+                    self.map.clear_light();
+                    save_current(self);
+                }
                 mahere_panel::ThemeEdit::Delete => {
                     if let Some(name) = self.map.delete_theme() {
                         if let Some(store) = &self.store {
