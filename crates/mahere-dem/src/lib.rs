@@ -8,6 +8,9 @@ use std::io::BufReader;
 use tiff::decoder::{Decoder, DecodingResult};
 use tiff::tags::Tag;
 
+/// Below this a source's elevation is no data: 3DEP writes -999999, other rasters -3.4e38 or -32768; no ground on Earth is lower than -11 km.
+const NODATA_BELOW: f32 = -12_000.0;
+
 const EARTH_RADIUS_M: f64 = 6_371_000.0;
 
 /// How a tile's pixel grid maps to the world.
@@ -110,6 +113,7 @@ impl DemTile {
         self.data[y * self.width + x]
     }
 
+    /// Bilinear elevation from the four pixels around a point, the no-data ones left out and the rest re-weighted; -inf when all four are no-data. Blending a no-data pixel in (3DEP marks it -999999) at a data edge, a lakeshore or a project's boundary, gave a value that passed for ground: -9000 m on 1% of the weight (Flathead Lake, 2026-10-11).
     fn bilinear(&self, px: f64, py: f64) -> f32 {
         let x0 = px.floor() as usize;
         let y0 = py.floor() as usize;
@@ -117,9 +121,16 @@ impl DemTile {
         let y1 = (y0 + 1).min(self.height - 1);
         let fx = (px - x0 as f64) as f32;
         let fy = (py - y0 as f64) as f32;
-        let top = self.grid(x0, y0) * (1.0 - fx) + self.grid(x1, y0) * fx;
-        let bot = self.grid(x0, y1) * (1.0 - fx) + self.grid(x1, y1) * fx;
-        top * (1.0 - fy) + bot * fy
+        let corners = [(x0, y0, (1.0 - fx) * (1.0 - fy)), (x1, y0, fx * (1.0 - fy)), (x0, y1, (1.0 - fx) * fy), (x1, y1, fx * fy)];
+        let (mut sum, mut weight) = (0.0f32, 0.0f32);
+        for (x, y, w) in corners {
+            let e = self.grid(x, y);
+            if e.is_finite() && e > NODATA_BELOW {
+                sum += e * w;
+                weight += w;
+            }
+        }
+        if weight > 1e-6 { sum / weight } else { f32::NEG_INFINITY }
     }
 }
 
@@ -244,7 +255,7 @@ impl DemStore {
         for t in &self.tiles {
             if let Some((px, py)) = t.pixel_at(lat, lon) {
                 let e = t.bilinear(px, py);
-                if e > -10_000.0 {
+                if e > NODATA_BELOW {
                     return Some(e);
                 }
             }
@@ -257,7 +268,7 @@ impl DemStore {
         for t in &self.tiles {
             if let Some((px, py)) = t.pixel_at(lat, lon) {
                 let e = t.bilinear(px, py);
-                if e <= -10_000.0 {
+                if e <= NODATA_BELOW {
                     continue;
                 }
                 let east = t.bilinear((px + 1.0).min((t.width - 1) as f64), py)

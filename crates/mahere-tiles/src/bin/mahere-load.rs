@@ -11,7 +11,7 @@ fn arg(args: &[String], name: &str) -> Option<String> {
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    let pbf = arg(&args, "--pbf").expect("--pbf");
+    let pbf = arg(&args, "--pbf").unwrap_or_default();
     let out = arg(&args, "--out").expect("--out");
     let out = Path::new(&out);
     // --area <file>: a shared area document; the dem and imagery bake only the cells its shape covers, and its bounds stand in for --bbox.
@@ -69,6 +69,8 @@ fn main() {
     };
     // --vectors-only: lines, land cover and water alone, merged over the bake (its terrain and imagery carried as they are), for re-running the vector pass without reading the rasters again.
     let vectors_only = args.iter().any(|a| a == "--vectors-only");
+    // --terrain-only: the elevation alone, merged over the bake (its vectors, imagery and overlays kept), for re-running the terrain after a fix in its sampling.
+    let terrain_only = args.iter().any(|a| a == "--terrain-only");
     let tifs = list("--dem");
     assert!(vectors_only || !tifs.is_empty(), "--dem <tif>...");
     // Imagery: --naip <tif>... (red, green, blue, near-infrared in one file, or true colour alone), --nir <tif>... (a separate near-infrared band, as Sentinel-2 ships it), --img-base <depth> (default the vector base, never past depth 14).
@@ -80,7 +82,7 @@ fn main() {
     };
 
     let t = std::time::Instant::now();
-    let feats = mahere_osm::load_features(&pbf).expect("pbf");
+    let feats = if terrain_only { mahere_osm::Features { roads: Vec::new(), areas: Vec::new() } } else { mahere_osm::load_features(&pbf).expect("pbf") };
     // Lines are clipped to the box with a margin of a cell or so: a county line or a highway leaving the box would otherwise stamp lone-line cells along its whole length, eight objects for every one with terrain.
     let margin = 0.01;
     let clip = |la: f32, lo: f32| (la as f64) >= lat0 - margin && (la as f64) <= lat1 + margin && (lo as f64) >= lon0 - margin && (lo as f64) <= lon1 + margin;
@@ -165,7 +167,7 @@ fn main() {
     drop(dem);
 
     let mut img_cells: Vec<(mahere_tiles::CellKey, mahere_tiles::ImgCell)> = Vec::new();
-    if !naip.is_empty() {
+    if !naip.is_empty() && !terrain_only {
         let t = std::time::Instant::now();
         let naip_store = if naip.is_empty() { None } else { Some(mahere_dem::ImgStore::load(&naip).expect("naip")) };
         eprintln!("imagery sources loaded {:.1}s", t.elapsed().as_secs_f32());
