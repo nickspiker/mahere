@@ -95,6 +95,8 @@ pub const PRESENT_LINE: u8 = 2;
 pub const PRESENT_LAND: u8 = 4;
 pub const PRESENT_WATER: u8 = 8;
 pub const PRESENT_IMG: u8 = 16;
+pub const PRESENT_OWN: u8 = 32;
+pub const PRESENT_MVUM: u8 = 64;
 
 #[derive(Default)]
 pub struct Entry {
@@ -112,6 +114,9 @@ pub struct Entry {
     pub land: Option<ClassCell>,
     pub water: Option<CovCell>,
     pub img: Option<ImgCell>,
+    /// Land ownership and motor vehicle use, where an area's overlay pass put them.
+    pub own: Option<ClassCell>,
+    pub mvum: Option<ClassCell>,
 }
 
 impl Entry {
@@ -129,10 +134,10 @@ impl Entry {
         self.present & PRESENT_DEM != 0
     }
     pub fn is_absent(&self) -> bool {
-        self.dem.is_none() && self.line.is_none() && self.land.is_none() && self.water.is_none() && self.img.is_none()
+        self.dem.is_none() && self.line.is_none() && self.land.is_none() && self.water.is_none() && self.img.is_none() && self.own.is_none() && self.mvum.is_none()
     }
     pub fn has_vec(&self) -> bool {
-        self.line.is_some() || self.land.is_some() || self.water.is_some()
+        self.line.is_some() || self.land.is_some() || self.water.is_some() || self.own.is_some() || self.mvum.is_some()
     }
 }
 
@@ -366,7 +371,9 @@ fn load_cell(store: &dyn CellStore, key: CellKey, pack_cpu: bool) -> Loaded {
         | (planes.line.is_some() as u8) * PRESENT_LINE
         | (planes.land.is_some() as u8) * PRESENT_LAND
         | (planes.water.is_some() as u8) * PRESENT_WATER
-        | (planes.img.is_some() as u8) * PRESENT_IMG;
+        | (planes.img.is_some() as u8) * PRESENT_IMG
+        | (planes.own.is_some() as u8) * PRESENT_OWN
+        | (planes.mvum.is_some() as u8) * PRESENT_MVUM;
     let mut line_mag_max = [0u8; 32];
     if let Some(l) = &planes.line {
         for i in 0..mahere_tiles::TRI {
@@ -381,7 +388,7 @@ fn load_cell(store: &dyn CellStore, key: CellKey, pack_cpu: bool) -> Loaded {
     if let Some(im) = &mut img {
         im.retone(mahere_tiles::tone::IMG_TAG);
     }
-    Loaded { key, entry: Some(Entry { present, line_mag_max, elev_lo, elev_hi, dem, dem_q, line: planes.line, land: planes.land, water: planes.water, img }) }
+    Loaded { key, entry: Some(Entry { present, line_mag_max, elev_lo, elev_hi, dem, dem_q, line: planes.line, land: planes.land, water: planes.water, img, own: planes.own, mvum: planes.mvum }) }
 }
 
 // ==================== TIERED STORE: VAULT CACHE OVER THE BUCKET ====================

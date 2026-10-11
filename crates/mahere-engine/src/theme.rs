@@ -5,7 +5,7 @@
 use crate::raster::{LayerMask, Style};
 
 /// Bumped whenever the built-ins change, so a vault holding an older copy of one is refreshed.
-pub const BUILTIN_REVISION: u32 = 6;
+pub const BUILTIN_REVISION: u32 = 7;
 
 #[derive(Clone, Debug)]
 pub struct Theme {
@@ -29,6 +29,12 @@ pub struct Theme {
     pub water: [u8; 4],
     pub contour: [u8; 4],
     pub contour_index: [u8; 4],
+    /// Land ownership, a colour per manager (`mahere_tiles::landuse::own`): its alpha is the edge's, the fill inside is a fifth of it, so the land reads as a wash and its boundary as a line.
+    pub own: [[u8; 4]; 13],
+    /// Wilderness and wilderness study areas over the ownership, in the same way.
+    pub wild: [u8; 4],
+    /// Motor vehicle use routes, a colour per class (`mahere_tiles::landuse::mvum`), drawn as a band under the map's own lines.
+    pub mvum: [[u8; 4]; 15],
     /// Normal-incidence irradiance of the sun and the radiance tint of the sky dome; a sky of 1 lights flat ground to 0.3.
     pub sun: [f32; 3],
     pub sky: [f32; 3],
@@ -41,7 +47,16 @@ pub const LAND_NAMES: [&str; 14] = ["", "Grass", "Farmland", "Orchard", "Scrub",
 /// Line classes in table order (1-based ids; 0 is empty).
 pub const CLASS_NAMES: [&str; 18] = ["", "Motorway", "Trunk", "Primary", "Secondary", "Tertiary", "Residential", "Service", "Track", "Path", "Rail", "Power", "Waterway", "National park", "Wilderness", "National forest", "Protected", "County and state"];
 
-const ALL: LayerMask = LayerMask { dem: true, land: true, water: true, line: true, debug: false, imagery: false, contours: true, slope: false, infrared: false, hypso: true, boundaries: true };
+const ALL: LayerMask = LayerMask { dem: true, land: true, water: true, line: true, debug: false, imagery: false, contours: true, slope: false, infrared: false, hypso: true, boundaries: true, own: true, mvum: true };
+
+/// The ownership colours every built-in starts from (Nick 2026-10-10): the agencies' customary map colours, Forest Service green, BLM yellow, Park Service purple, state blue, tribal brown; the alpha is the boundary's, the wash a fifth of it.
+pub const OWN: [[u8; 4]; 13] = [[0, 0, 0, 0], [70, 150, 70, 200], [236, 204, 70, 200], [150, 110, 200, 200], [70, 160, 180, 200], [160, 140, 120, 200], [80, 130, 226, 200], [90, 186, 150, 200], [70, 166, 206, 200], [200, 132, 74, 200], [214, 120, 156, 200], [150, 174, 90, 200], [170, 170, 170, 200]];
+
+/// Wilderness: a deep green edge and wash over the manager's, where bikes and motors are banned.
+pub const WILD: [u8; 4] = [30, 96, 40, 230];
+
+/// Motor vehicle use: highway-legal roads blue, roads open to all vehicles green, trails for all vehicles darker green, 50-inch trails orange, motorcycle trails red, other OHV purple, special designations grey; seasonal ones at half the opacity.
+pub const MVUM: [[u8; 4]; 15] = [[0, 0, 0, 0], [70, 120, 230, 220], [70, 120, 230, 120], [60, 190, 80, 220], [60, 190, 80, 120], [40, 150, 60, 220], [40, 150, 60, 120], [240, 150, 40, 220], [240, 150, 40, 120], [220, 60, 60, 220], [220, 60, 60, 120], [170, 80, 200, 220], [170, 80, 200, 120], [130, 130, 130, 220], [130, 130, 130, 120]];
 
 // The light is linear: flat ground under a 40° sun sees about `sun · 0.64 + sky · 0.3`, a slope turned from the sun about `sky · 0.25`, a slope facing it up to `sun + sky · 0.3`, which the display's rail rolls into white. A sun near 1 over a sky near 1.2 keeps flat ground at its authored colour with the shade side a third of it.
 
@@ -63,6 +78,9 @@ pub fn trail() -> Theme {
         contour_index: [112, 82, 54, 168],
         sun: [1.02, 0.95, 0.82],
         sky: [1.08, 1.12, 1.22],
+        own: OWN,
+        wild: WILD,
+        mvum: MVUM,
         layers: ALL,
     }
 }
@@ -85,6 +103,9 @@ pub fn topo() -> Theme {
         contour_index: [138, 88, 46, 204],
         sun: [0.72, 0.72, 0.72],
         sky: [1.55, 1.55, 1.60],
+        own: OWN,
+        wild: WILD,
+        mvum: MVUM,
         layers: LayerMask { hypso: false, ..ALL },
     }
 }
@@ -107,6 +128,9 @@ pub fn night() -> Theme {
         contour_index: [178, 174, 156, 112],
         sun: [1.15, 1.15, 1.26],
         sky: [0.80, 0.86, 1.02],
+        own: OWN,
+        wild: WILD,
+        mvum: MVUM,
         layers: ALL,
     }
 }
@@ -129,6 +153,9 @@ pub fn alpine() -> Theme {
         contour_index: [74, 94, 128, 163],
         sun: [1.05, 1.00, 0.94],
         sky: [1.00, 1.14, 1.40],
+        own: OWN,
+        wild: WILD,
+        mvum: MVUM,
         layers: ALL,
     }
 }
@@ -151,6 +178,9 @@ pub fn desert() -> Theme {
         contour_index: [118, 74, 42, 168],
         sun: [1.06, 0.96, 0.82],
         sky: [1.00, 1.08, 1.28],
+        own: OWN,
+        wild: WILD,
+        mvum: MVUM,
         layers: ALL,
     }
 }
@@ -173,6 +203,9 @@ pub fn ink() -> Theme {
         contour_index: [84, 84, 84, 184],
         sun: [0.86, 0.86, 0.86],
         sky: [1.36, 1.36, 1.36],
+        own: OWN,
+        wild: WILD,
+        mvum: MVUM,
         layers: LayerMask { hypso: false, ..ALL },
     }
 }
@@ -190,6 +223,9 @@ pub enum Field {
     ContourIndex,
     Land(u8),
     Line(u8),
+    Own(u8),
+    Wild,
+    Mvum(u8),
     Sun,
     Sky,
 }
@@ -201,6 +237,9 @@ impl Field {
         v.extend([Field::Sea, Field::Flat, Field::Bg, Field::NoDem]);
         v.extend((1..14).map(Field::Land));
         v.extend((1..18).map(Field::Line));
+        v.extend((1..13).map(Field::Own));
+        v.push(Field::Wild);
+        v.extend((1..15).map(Field::Mvum));
         v.extend([Field::Water, Field::Contour, Field::ContourIndex, Field::Sun, Field::Sky]);
         v
     }
@@ -217,6 +256,9 @@ impl Field {
             Field::ContourIndex => "Index contour".into(),
             Field::Land(i) => LAND_NAMES[i as usize].to_string(),
             Field::Line(i) => CLASS_NAMES[i as usize].to_string(),
+            Field::Own(i) => mahere_tiles::landuse::own::NAMES[i as usize].to_string(),
+            Field::Wild => "Wilderness".into(),
+            Field::Mvum(i) => mahere_tiles::landuse::mvum::NAMES[i as usize].to_string(),
             Field::Sun => "Sun".into(),
             Field::Sky => "Sky".into(),
         }
@@ -246,6 +288,9 @@ impl Theme {
             Field::ContourIndex => c(self.contour_index),
             Field::Land(i) => c(self.land[i as usize]),
             Field::Line(i) => c(self.line[i as usize]),
+            Field::Own(i) => c(self.own[i as usize]),
+            Field::Wild => c(self.wild),
+            Field::Mvum(i) => c(self.mvum[i as usize]),
             Field::Sun => [self.sun[0], self.sun[1], self.sun[2], 0.0],
             Field::Sky => [self.sky[0], self.sky[1], self.sky[2], 0.0],
         }
@@ -265,6 +310,9 @@ impl Theme {
             Field::ContourIndex => self.contour_index = c,
             Field::Land(i) => self.land[i as usize] = c,
             Field::Line(i) => self.line[i as usize] = c,
+            Field::Own(i) => self.own[i as usize] = c,
+            Field::Wild => self.wild = c,
+            Field::Mvum(i) => self.mvum[i as usize] = c,
             Field::Sun => self.sun = [v[0].max(0.0), v[1].max(0.0), v[2].max(0.0)],
             Field::Sky => self.sky = [v[0].max(0.0), v[1].max(0.0), v[2].max(0.0)],
         }
@@ -299,6 +347,9 @@ pub fn blueprint() -> Theme {
         contour_index: [190, 225, 250, 191],
         sun: [0.90, 0.95, 1.05],
         sky: [1.10, 1.14, 1.24],
+        own: OWN,
+        wild: WILD,
+        mvum: MVUM,
         layers: ALL,
     }
 }
@@ -321,6 +372,9 @@ pub fn atlas() -> Theme {
         contour_index: [118, 82, 46, 184],
         sun: [1.04, 0.98, 0.86],
         sky: [1.06, 1.08, 1.12],
+        own: OWN,
+        wild: WILD,
+        mvum: MVUM,
         layers: ALL,
     }
 }
@@ -343,6 +397,9 @@ pub fn ember() -> Theme {
         contour_index: [200, 150, 110, 140],
         sun: [1.20, 0.80, 0.55],
         sky: [0.85, 0.84, 0.95],
+        own: OWN,
+        wild: WILD,
+        mvum: MVUM,
         layers: ALL,
     }
 }
@@ -365,6 +422,9 @@ pub fn monsoon() -> Theme {
         contour_index: [30, 60, 44, 184],
         sun: [1.06, 1.00, 0.84],
         sky: [1.00, 1.08, 1.14],
+        own: OWN,
+        wild: WILD,
+        mvum: MVUM,
         layers: ALL,
     }
 }
@@ -387,6 +447,9 @@ pub fn chart() -> Theme {
         contour_index: [50, 100, 160, 178],
         sun: [0.32, 0.32, 0.33],
         sky: [2.20, 2.22, 2.26],
+        own: OWN,
+        wild: WILD,
+        mvum: MVUM,
         layers: LayerMask { hypso: false, ..ALL },
     }
 }
@@ -409,6 +472,9 @@ pub fn neon() -> Theme {
         contour_index: [110, 150, 255, 168],
         sun: [1.10, 0.70, 1.10],
         sky: [0.80, 0.80, 1.10],
+        own: OWN,
+        wild: WILD,
+        mvum: MVUM,
         layers: ALL,
     }
 }
@@ -431,6 +497,9 @@ pub fn dawn() -> Theme {
         contour_index: [140, 86, 96, 163],
         sun: [1.10, 0.92, 0.78],
         sky: [0.96, 1.04, 1.26],
+        own: OWN,
+        wild: WILD,
+        mvum: MVUM,
         layers: ALL,
     }
 }
@@ -456,6 +525,9 @@ pub fn terra() -> Theme {
         contour_index: [240, 226, 190, 128],
         sun: [1.16, 1.08, 0.96],
         sky: [0.84, 0.90, 1.04],
+        own: OWN,
+        wild: WILD,
+        mvum: MVUM,
         layers: ALL,
     }
 }
@@ -478,6 +550,9 @@ pub fn tundra() -> Theme {
         contour_index: [236, 238, 232, 122],
         sun: [1.00, 0.98, 0.96],
         sky: [1.00, 1.06, 1.18],
+        own: OWN,
+        wild: WILD,
+        mvum: MVUM,
         layers: ALL,
     }
 }
@@ -500,6 +575,9 @@ pub fn savanna() -> Theme {
         contour_index: [250, 234, 200, 128],
         sun: [1.20, 1.14, 1.02],
         sky: [0.86, 0.90, 1.02],
+        own: OWN,
+        wild: WILD,
+        mvum: MVUM,
         layers: ALL,
     }
 }
@@ -522,6 +600,9 @@ pub fn candy() -> Theme {
         contour_index: [170, 120, 220, 168],
         sun: [1.04, 1.00, 1.00],
         sky: [1.10, 1.08, 1.16],
+        own: OWN,
+        wild: WILD,
+        mvum: MVUM,
         layers: ALL,
     }
 }
@@ -544,6 +625,9 @@ pub fn survey() -> Theme {
         contour_index: [90, 60, 30, 189],
         sun: [1.02, 0.96, 0.86],
         sky: [1.04, 1.06, 1.08],
+        own: OWN,
+        wild: WILD,
+        mvum: MVUM,
         layers: ALL,
     }
 }
@@ -566,6 +650,9 @@ pub fn woodcut() -> Theme {
         contour_index: [70, 66, 62, 178],
         sun: [1.00, 1.00, 1.00],
         sky: [1.04, 1.04, 1.06],
+        own: OWN,
+        wild: WILD,
+        mvum: MVUM,
         layers: ALL,
     }
 }
@@ -588,6 +675,9 @@ pub fn gazetteer() -> Theme {
         contour_index: [70, 78, 56, 184],
         sun: [1.00, 0.98, 0.92],
         sky: [1.04, 1.06, 1.10],
+        own: OWN,
+        wild: WILD,
+        mvum: MVUM,
         layers: ALL,
     }
 }
@@ -625,6 +715,6 @@ impl Theme {
     }
 
     pub fn style(&self) -> Style {
-        Style { land: self.land, line: self.line, water: self.water, contour: self.contour, contour_index: self.contour_index, sea: self.sea, flat: self.flat, bg: self.bg, no_dem: self.no_dem }
+        Style { land: self.land, line: self.line, water: self.water, contour: self.contour, contour_index: self.contour_index, sea: self.sea, flat: self.flat, bg: self.bg, no_dem: self.no_dem, own: self.own, wild: self.wild, mvum: self.mvum }
     }
 }

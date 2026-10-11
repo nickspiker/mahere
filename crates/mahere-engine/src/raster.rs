@@ -81,11 +81,15 @@ pub struct LayerMask {
     pub hypso: bool,
     /// Boundaries: parks, wilderness, national forests, other protected land, state and county lines.
     pub boundaries: bool,
+    /// Land ownership (PAD-US): a wash per manager with its boundary, and wilderness over it.
+    pub own: bool,
+    /// Motor vehicle use (USFS MVUM): what may be driven on each Forest Service road and trail, a band under the map's own lines.
+    pub mvum: bool,
 }
 
 impl Default for LayerMask {
     fn default() -> Self {
-        LayerMask { dem: true, land: true, water: true, line: true, debug: false, imagery: false, contours: true, slope: false, infrared: false, hypso: true, boundaries: true }
+        LayerMask { dem: true, land: true, water: true, line: true, debug: false, imagery: false, contours: true, slope: false, infrared: false, hypso: true, boundaries: true, own: true, mvum: true }
     }
 }
 
@@ -94,7 +98,7 @@ impl LayerMask {
     /// Imagery stands in for the ground where it exists, so land cover and slope bands are inert under it; contours and the water fill still draw over it, the terrain stays live as what shows where the imagery runs out, and the sea comes from it everywhere.
     pub fn inert(self) -> LayerMask {
         let im = self.imagery;
-        LayerMask { dem: false, land: im, water: false, line: false, debug: false, imagery: false, contours: false, slope: im, infrared: !im, hypso: self.land || !self.dem, boundaries: !self.line }
+        LayerMask { dem: false, land: im, water: false, line: false, debug: false, imagery: false, contours: false, slope: im, infrared: !im, hypso: self.land || !self.dem, boundaries: !self.line, own: false, mvum: false }
     }
 
     /// The mask as bits, one per field in declaration order, for a shader or a settings document.
@@ -110,10 +114,12 @@ impl LayerMask {
             | (self.infrared as u32) << 8
             | (self.hypso as u32) << 9
             | (self.boundaries as u32) << 10
+            | (self.own as u32) << 11
+            | (self.mvum as u32) << 12
     }
 
     pub fn from_bits(b: u32) -> LayerMask {
-        LayerMask { dem: b & 1 != 0, land: b & 2 != 0, water: b & 4 != 0, line: b & 8 != 0, debug: b & 16 != 0, imagery: b & 32 != 0, contours: b & 64 != 0, slope: b & 128 != 0, infrared: b & 256 != 0, hypso: b & 512 != 0, boundaries: b & 1024 != 0 }
+        LayerMask { dem: b & 1 != 0, land: b & 2 != 0, water: b & 4 != 0, line: b & 8 != 0, debug: b & 16 != 0, imagery: b & 32 != 0, contours: b & 64 != 0, slope: b & 128 != 0, infrared: b & 256 != 0, hypso: b & 512 != 0, boundaries: b & 1024 != 0, own: b & 2048 != 0, mvum: b & 4096 != 0 }
     }
 
     /// The mask as drawn: every inert row off.
@@ -131,6 +137,8 @@ impl LayerMask {
             infrared: self.infrared && !i.infrared,
             hypso: self.hypso && !i.hypso,
             boundaries: self.boundaries && !i.boundaries,
+            own: self.own,
+            mvum: self.mvum,
         }
     }
 }
@@ -181,6 +189,9 @@ pub struct Style {
     pub flat: [u8; 4],
     pub bg: [u8; 4],
     pub no_dem: [u8; 4],
+    pub own: [[u8; 4]; 13],
+    pub wild: [u8; 4],
+    pub mvum: [[u8; 4]; 15],
 }
 
 /// A styled colour's three channels, and its opacity as a fraction.
@@ -334,6 +345,8 @@ enum VecRef<'a> {
         line: Option<&'a ClassCell>,
         land: Option<&'a ClassCell>,
         water: Option<&'a CovCell>,
+        own: Option<&'a ClassCell>,
+        mvum: Option<&'a ClassCell>,
         shift: u32,
         prefix_shift: u32,
         prefix: u64,
@@ -496,6 +509,8 @@ fn resolve_vec<'a>(pool: &'a Pool, depth: u8, raw: u64) -> VecRef<'a> {
             line: e.line.as_ref(),
             land: e.land.as_ref(),
             water: e.water.as_ref(),
+            own: e.own.as_ref(),
+            mvum: e.mvum.as_ref(),
             shift: 16 + (22 - d as u32),
             prefix_shift: 60 - 2 * d as u32,
             prefix: pfx,
@@ -640,6 +655,52 @@ fn contour_cov(elev_m: f32, slope: f32, c: &Contours) -> (f32, bool) {
 }
 
 
+/// How much of an ownership colour fills the land; its full alpha is the boundary's.
+pub const OWN_FILL: f32 = 0.2;
+
+/// The overlays, over the ground and the water and under the map's own lines: land ownership as a wash with its boundary (a two-texel line where the manager changes, the wilderness's own where it ends), then motor vehicle use as a band the road or trail sits on.
+#[inline(always)]
+fn overlays(rgb: [f32; 3], own: Option<&ClassCell>, mvum: Option<&ClassCell>, i: usize, st: &Style, mask: LayerMask) -> [f32; 3] {
+    let mut rgb = rgb;
+    if mask.own {
+        if let Some(o) = own {
+            let wild = mahere_tiles::landuse::own::WILD;
+            let c = o.class[i];
+            if c != 0 && o.cov[i] != 0 {
+                let mgr = |c: u8| if c >= wild { c - wild } else { c };
+                let m = mgr(c);
+                let col = st.own[(m as usize).min(12)];
+                let cov = o.cov[i] as f32 / 255.0;
+                rgb = lerp3(rgb, lin(rgb3(col)), alpha(col) * OWN_FILL * cov);
+                if c >= wild {
+                    rgb = lerp3(rgb, lin(rgb3(st.wild)), alpha(st.wild) * OWN_FILL * cov);
+                }
+                let mut edge = false;
+                let mut wild_edge = false;
+                for j in crate::ink::tri_neighbours(i).into_iter().flatten() {
+                    edge |= mgr(o.class[j]) != m;
+                    wild_edge |= c >= wild && o.class[j] < wild;
+                }
+                if edge {
+                    rgb = lerp3(rgb, lin(rgb3(col)), alpha(col));
+                }
+                if wild_edge {
+                    rgb = lerp3(rgb, lin(rgb3(st.wild)), alpha(st.wild));
+                }
+            }
+        }
+    }
+    if mask.mvum {
+        if let Some(m) = mvum {
+            if m.cov[i] != 0 && m.class[i] != 0 {
+                let col = st.mvum[(m.class[i] as usize).min(14)];
+                rgb = lerp3(rgb, lin(rgb3(col)), m.cov[i] as f32 / 255.0 * alpha(col));
+            }
+        }
+    }
+    rgb
+}
+
 /// The user's marks over everything: the pen's ink in its colour, the selection as a wash.
 #[inline(always)]
 fn user_marks(rgb: [f32; 3], user: &crate::ink::UserLayer, raw: u64, depth: u8) -> [f32; 3] {
@@ -755,7 +816,7 @@ fn compose_rgb(dem: &DemRef, vec: &VecRef, pool: &Pool, diamond: u8, uq: i64, vq
         }
         return pack(luts, user_marks(rgb, user, raw_of(diamond, uq, vq), luts.dem_depth));
     }
-    if let VecRef::Cell { line, land, water, shift, .. } = vec {
+    if let VecRef::Cell { line, land, water, own, mvum, shift, .. } = vec {
         let i = tri_index(uq, vq, *shift);
         if mask.imagery && imaged {
             let line_cov = |line: &ClassCell| -> u8 { if mask.line && (mask.boundaries || (line.class[i] as usize) < BOUNDARY_FIRST) && luts.dem_depth >= line_min_depth(line.class[i] as usize, line.mag_at(i)) { line.cov[i] } else { 0 } };
@@ -783,6 +844,7 @@ fn compose_rgb(dem: &DemRef, vec: &VecRef, pool: &Pool, diamond: u8, uq: i64, vq
             if contour.0 > 0.0 {
                 rgb = lerp3(rgb, lin(rgb3(if contour.1 { st.contour_index } else { st.contour })), contour.0 * alpha(if contour.1 { st.contour_index } else { st.contour }));
             }
+            rgb = overlays(rgb, *own, *mvum, i, st, mask);
             if let Some(line) = line {
                 if line_cov(line) != 0 && line.class[i] as usize != WATERWAY_CLASS {
                     rgb = lerp3(rgb, line_colour(line, i, &luts.style), line_cov(line) as f32 / 255.0 * line_opacity(line, i, &luts.style));
@@ -827,6 +889,7 @@ fn compose_rgb(dem: &DemRef, vec: &VecRef, pool: &Pool, diamond: u8, uq: i64, vq
                 }
             }
         }
+        rgb = overlays(rgb, *own, *mvum, i, st, mask);
         if let Some(line) = line {
             if line_cov(line) != 0 && line.class[i] as usize != WATERWAY_CLASS {
                 // Boundaries sit under the map, never competing with a road or a trail.
@@ -1056,6 +1119,8 @@ mod tests {
                 land: Some(land),
                 water: Some(CovCell::new()),
                 img: None,
+                own: None,
+                mvum: None,
             },
         );
 

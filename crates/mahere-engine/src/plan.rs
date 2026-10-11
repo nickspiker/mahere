@@ -31,6 +31,9 @@ pub const FLAG_WATER: u32 = 8;
 pub const FLAG_IMG: u32 = 16;
 /// A user cell (ink and selection), its own plane; tagged in the table at its depth plus 64 so it never collides with the map's cell at the same key.
 pub const FLAG_INK: u32 = 32;
+/// The overlays: land ownership and motor vehicle use, one GPU plane between them.
+pub const FLAG_OWN: u32 = 64;
+pub const FLAG_MVUM: u32 = 128;
 pub const INK_TAG_DEPTH: u32 = 64;
 
 /// A resident cell as the shader sees it: where it is, what it carries, and the metres-per-texel Jacobian a normal needs.
@@ -248,6 +251,12 @@ pub fn plan_frame(w: usize, h: usize, cam: &Camera, pool: &Pool, dem_depth: u8, 
         }
         if p & crate::residency::PRESENT_IMG != 0 {
             flags |= FLAG_IMG;
+        }
+        if p & crate::residency::PRESENT_OWN != 0 {
+            flags |= FLAG_OWN;
+        }
+        if p & crate::residency::PRESENT_MVUM != 0 {
+            flags |= FLAG_MVUM;
         }
         let (cu, cv) = key.grid();
         if flags == 0 {

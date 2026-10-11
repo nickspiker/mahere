@@ -1,7 +1,7 @@
 //! The #pagetable compositor on the GPU. The engine still owns residency and the frame plan; this crate mirrors the resident cells into texture arrays (one slot per cell per plane), uploads the plan's blocks, references and page table, and draws every frame in two passes: the map at 2× into an offscreen target, then a 2×2 bin down onto the surface with the screen-space marks laid over. Any host with a wgpu device and a target view can drive it.
 
 use bytemuck::{Pod, Zeroable};
-use mahere_engine::plan::{FLAG_DEM, FLAG_IMG, FLAG_INK, FLAG_LAND, FLAG_LINE, FLAG_WATER, FramePlan, TABLE_N};
+use mahere_engine::plan::{FLAG_DEM, FLAG_IMG, FLAG_INK, FLAG_LAND, FLAG_LINE, FLAG_MVUM, FLAG_OWN, FLAG_WATER, FramePlan, TABLE_N};
 use mahere_engine::raster::{FrameLuts, LayerMask};
 use mahere_engine::residency::{DEMQ_H, DEMQ_W, Pool};
 use mahere_tiles::{CellKey, TEX, TRI};
@@ -248,6 +248,7 @@ pub struct GpuMap {
     dem: Plane,
     line: Plane,
     lw: Plane,
+    ov: Plane,
     img: Plane,
     /// Each resident dem plane.s quantisation (base, step), set when it is uploaded.
     dem_scale: FxHashMap<CellKey, (f32, f32)>,
@@ -276,12 +277,15 @@ pub struct GpuMap {
     style_loaded: bool,
 }
 
+/// Style entries after the 4096 hypsometric rows: line classes at 0, land at 32, ownership at 64 (the wilderness at 80), motor vehicle use at 96.
+const LUT_STYLE: usize = 128;
+
 impl GpuMap {
     pub fn new(device: &wgpu::Device, _queue: &wgpu::Queue, present_format: wgpu::TextureFormat) -> GpuMap {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("mahere map"), source: wgpu::ShaderSource::Wgsl(include_str!("map.wgsl").into()) });
         let uint_array = wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Uint, view_dimension: wgpu::TextureViewDimension::D2Array, multisampled: false };
         let storage = wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: true }, has_dynamic_offset: false, min_binding_size: None };
-        let entries: Vec<wgpu::BindGroupLayoutEntry> = (0..11u32)
+        let entries: Vec<wgpu::BindGroupLayoutEntry> = (0..12u32)
             .map(|i| wgpu::BindGroupLayoutEntry {
                 binding: i,
                 visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
@@ -336,8 +340,8 @@ impl GpuMap {
         let blocks = storage_buffer(device, "blocks", (blocks_cap * std::mem::size_of::<GpuBlock>()) as u64);
         let refs = storage_buffer(device, "refs", (refs_cap * std::mem::size_of::<GpuRef>()) as u64);
         let table = storage_buffer(device, "table", (TABLE_N * std::mem::size_of::<GpuSlot>()) as u64);
-        // Style tables: 4096 hypsometric rows, then the line classes and the land classes, each 0xAARRGGBB (the ramp's alpha byte unused); filled by `update_style` from the theme.
-        let lut = storage_buffer(device, "lut", ((4096 + 64) * 4) as u64);
+        // Style tables: 4096 hypsometric rows, then the line classes, the land classes, the ownership classes with the wilderness, and the motor vehicle use classes, each 0xAARRGGBB (the ramp's alpha byte unused); filled by `update_style` from the theme.
+        let lut = storage_buffer(device, "lut", ((4096 + LUT_STYLE) * 4) as u64);
 
         let max_layers = device.limits().max_texture_array_layers.max(1);
         let dem = Plane::new(device, "dem", DEMQ_W as u32, DEMQ_H as u32, wgpu::TextureFormat::R16Uint, max_layers);
@@ -346,6 +350,8 @@ impl GpuMap {
         let img = Plane::new(device, "img", 2 * TEX as u32, TEX as u32, wgpu::TextureFormat::Rgba8Uint, max_layers);
         let ink = Plane::new(device, "ink", 2 * TEX as u32, TEX as u32, wgpu::TextureFormat::Rgba8Uint, max_layers);
         let sel = Plane::new(device, "sel", 2 * TEX as u32, TEX as u32, wgpu::TextureFormat::Rgba8Uint, max_layers);
+        // The overlays: ownership class and coverage, motor vehicle use class and coverage.
+        let ov = Plane::new(device, "overlays", 2 * TEX as u32, TEX as u32, wgpu::TextureFormat::Rgba8Uint, max_layers);
 
         GpuMap {
             map_layout,
@@ -370,6 +376,7 @@ impl GpuMap {
             img,
             ink,
             sel,
+            ov,
             user_version: u64::MAX,
             ink_uploaded: FxHashMap::default(),
             preview: None,
@@ -389,7 +396,7 @@ impl GpuMap {
     }
 
     fn make_map_bind(&mut self, device: &wgpu::Device) {
-        let (dv, lv, wv, iv, kv, sv) = (self.dem.view(), self.line.view(), self.lw.view(), self.img.view(), self.ink.view(), self.sel.view());
+        let (dv, lv, wv, iv, kv, sv, ovv) = (self.dem.view(), self.line.view(), self.lw.view(), self.img.view(), self.ink.view(), self.sel.view(), self.ov.view());
         self.map_bind = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("map"),
             layout: &self.map_layout,
@@ -405,6 +412,7 @@ impl GpuMap {
                 wgpu::BindGroupEntry { binding: 8, resource: wgpu::BindingResource::TextureView(&iv) },
                 wgpu::BindGroupEntry { binding: 9, resource: wgpu::BindingResource::TextureView(&kv) },
                 wgpu::BindGroupEntry { binding: 10, resource: wgpu::BindingResource::TextureView(&sv) },
+                wgpu::BindGroupEntry { binding: 11, resource: wgpu::BindingResource::TextureView(&ovv) },
             ],
         }));
     }
@@ -507,7 +515,7 @@ impl GpuMap {
     /// Mirror the pool: a slot per resident plane, uploaded on first sight, freed when the cell leaves the pool, the arrays shrunk when the resident set does. With `release`, a plane's CPU copy is dropped once it is on the GPU (a host that never draws on the CPU): the entry keeps its presence bits and its elevation plane for readouts.
     pub fn sync(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, pool: &mut Pool, release: bool) {
         let mut grew = false;
-        for s in [&mut self.dem, &mut self.line, &mut self.lw, &mut self.img] {
+        for s in [&mut self.dem, &mut self.line, &mut self.lw, &mut self.img, &mut self.ov] {
             s.evict_absent(pool);
             if !grew {
                 grew |= s.shrink_if_sparse(device, queue);
@@ -559,6 +567,26 @@ impl GpuMap {
                     if release {
                         e.land = None;
                         e.water = None;
+                    }
+                }
+            }
+            if e.own.is_some() || e.mvum.is_some() {
+                let (slot, g) = self.ov.alloc(device, queue, *key);
+                grew |= g;
+                if let Some((slot, true)) = slot {
+                    for i in 0..TRI {
+                        let (oc, ov) = e.own.as_ref().map_or((0, 0), |o| (o.class[i], o.cov[i]));
+                        let (mc, mv) = e.mvum.as_ref().map_or((0, 0), |m| (m.class[i], m.cov[i]));
+                        scratch[4 * i] = oc;
+                        scratch[4 * i + 1] = ov;
+                        scratch[4 * i + 2] = mc;
+                        scratch[4 * i + 3] = mv;
+                    }
+                    write_layer(queue, &self.ov.tex, slot, w, h, 4, &scratch);
+                    self.uploads += 1;
+                    if release {
+                        e.own = None;
+                        e.mvum = None;
                     }
                 }
             }
@@ -701,7 +729,7 @@ impl GpuMap {
     /// Draw a planned frame to `target` (`w × h`, the present format): upload the plan, the map pass at 2×, the present pass.
     /// Upload the theme's tables: the hypsometric ramp and the line and land colours. Once at start and whenever the theme changes.
     pub fn update_style(&mut self, queue: &wgpu::Queue, luts: &FrameLuts) {
-        let mut lut_data = vec![0u32; 4096 + 64];
+        let mut lut_data = vec![0u32; 4096 + LUT_STYLE];
         let pack = |c: [u8; 3]| ((c[0] as u32) << 16) | ((c[1] as u32) << 8) | c[2] as u32;
         // The styled tables carry their opacity in the top byte.
         let pack4 = |c: [u8; 4]| ((c[3] as u32) << 24) | ((c[0] as u32) << 16) | ((c[1] as u32) << 8) | c[2] as u32;
@@ -713,6 +741,13 @@ impl GpuMap {
         }
         for (i, c) in luts.style.land.iter().enumerate() {
             lut_data[4128 + i] = pack4(*c);
+        }
+        for (i, c) in luts.style.own.iter().enumerate() {
+            lut_data[4160 + i] = pack4(*c);
+        }
+        lut_data[4176] = pack4(luts.style.wild);
+        for (i, c) in luts.style.mvum.iter().enumerate() {
+            lut_data[4192 + i] = pack4(*c);
         }
         queue.write_buffer(&self.lut, 0, bytemuck::cast_slice(&lut_data));
         self.style_loaded = true;
@@ -775,6 +810,7 @@ impl GpuMap {
                 let line = self.line.map.get(&r.key).copied();
                 let lw = self.lw.map.get(&r.key).copied();
                 let img = self.img.map.get(&r.key).copied();
+                let ov = self.ov.map.get(&r.key).copied();
                 if flags & FLAG_INK != 0 {
                     let ink = self.ink.map.get(&r.key).copied();
                     let sel = self.sel.map.get(&r.key).copied();
@@ -792,11 +828,14 @@ impl GpuMap {
                 if img.is_none() {
                     flags &= !FLAG_IMG;
                 }
+                if ov.is_none() {
+                    flags &= !(FLAG_OWN | FLAG_MVUM);
+                }
                 let (base, step) = self.dem_scale.get(&r.key).copied().unwrap_or((0.0, 1.0));
                 GpuRef {
                     a: [r.diamond as u32, r.key.depth as u32, r.cu, r.cv],
                     b: [dem.unwrap_or(0), line.unwrap_or(0), lw.unwrap_or(0), img.unwrap_or(0)],
-                    c: [flags, 0, 0, 0],
+                    c: [flags, ov.unwrap_or(0), 0, 0],
                     d: [base, step, r.jac[0], r.jac[1]],
                     e: [r.jac[2], r.jac[3], r.jac[4], 0.0],
                 }

@@ -50,7 +50,10 @@ const FLAG_LINE: u32 = 2u;
 const FLAG_LAND: u32 = 4u;
 const FLAG_WATER: u32 = 8u;
 const FLAG_IMG: u32 = 16u;
-const FLAG_VEC: u32 = 14u;
+const FLAG_OWN: u32 = 64u;
+const FLAG_MVUM: u32 = 128u;
+// Line, land, water, and the overlays: whatever a vector cell may carry.
+const FLAG_VEC: u32 = 206u;
 
 const M_DEM: u32 = 1u;
 const M_LAND: u32 = 2u;
@@ -63,6 +66,8 @@ const M_SLOPE: u32 = 128u;
 const M_INFRARED: u32 = 256u;
 const M_HYPSO: u32 = 512u;
 const M_BOUND: u32 = 1024u;
+const M_OWN: u32 = 2048u;
+const M_MVUM: u32 = 4096u;
 
 // Where the style tables sit in the LUT buffer after the 4096 hypsometric rows.
 const CLASS_BASE: u32 = 4096u;
@@ -70,6 +75,12 @@ const LAND_BASE: u32 = 4128u;
 const CLASS_MAX: u32 = 17u;
 const BOUNDARY_FIRST: u32 = 13u;
 const WATERWAY_CLASS: u32 = 12u;
+// The overlays' tables, the CPU's OWN_FILL, and the wilderness flag on an ownership class.
+const OWN_BASE: u32 = 4160u;
+const WILD_AT: u32 = 4176u;
+const MVUM_BASE: u32 = 4192u;
+const OWN_FILL: f32 = 0.2;
+const OWN_WILD: u32 = 16u;
 
 struct Uniforms {
     size: vec2<f32>,
@@ -118,6 +129,7 @@ struct Slot { tag: u32, cu: u32, cv: u32, index: u32 };
 @group(0) @binding(8) var img_tex: texture_2d_array<u32>;
 @group(0) @binding(9) var ink_tex: texture_2d_array<u32>;
 @group(0) @binding(10) var sel_tex: texture_2d_array<u32>;
+@group(0) @binding(11) var ov_tex: texture_2d_array<u32>;
 
 struct VOut {
     @builtin(position) pos: vec4<f32>,
@@ -454,6 +466,64 @@ fn view_normal(n: vec3<f32>, pos: vec2<f32>) -> vec3<f32> {
     return n.x * east + n.y * north + n.z * up;
 }
 
+// An ownership class's manager, without the wilderness flag.
+fn own_mgr(c: u32) -> u32 {
+    return select(c, c - OWN_WILD, c >= OWN_WILD);
+}
+
+// The ownership class of a neighbouring triangle (the selection's neighbours: the lower triangle's are the upper of its square and the uppers below and to the left; the upper's the lower of its square and the lowers above and to the right), or the texel's own where the neighbour is past the cell's edge, which is then no boundary.
+fn own_at(layer: i32, t: vec3<u32>, k: u32, own: u32) -> u32 {
+    let x = i32(t.x);
+    let y = i32(t.y);
+    var n: vec2<i32>;
+    if (t.z == 0u) {
+        n = select(select(vec2<i32>(2 * (x - 1) + 1, y), vec2<i32>(2 * x + 1, y - 1), k == 1u), vec2<i32>(2 * x + 1, y), k == 0u);
+    } else {
+        n = select(select(vec2<i32>(2 * (x + 1), y), vec2<i32>(2 * x, y + 1), k == 1u), vec2<i32>(2 * x, y), k == 0u);
+    }
+    if (n.x < 0 || n.y < 0 || n.x >= 512 || n.y >= 256) {
+        return own;
+    }
+    return textureLoad(ov_tex, n, layer, 0).x;
+}
+
+// The overlays over the ground and the water, under the map's own lines (the CPU's overlays): land ownership as a wash with its boundary and the wilderness over it, then motor vehicle use as a band the road or trail sits on.
+fn overlays(composed: Composed, ov: vec4<u32>, layer: i32, t: vec3<u32>) -> Composed {
+    var out = composed;
+    if (layer < 0) {
+        return out;
+    }
+    let mask = U.mask;
+    if ((mask & M_OWN) != 0u && ov.x != 0u && ov.y != 0u) {
+        let m = own_mgr(ov.x);
+        let col = lut[OWN_BASE + min(m, 12u)];
+        let wild = lut[WILD_AT];
+        let cov = f32(ov.y) / 255.0;
+        { let f = fold(Fold(out.k2, out.c2), unpack_rgb(col), unpack_a(col) * OWN_FILL * cov); out.k2 = f.k; out.c2 = f.c; }
+        if (ov.x >= OWN_WILD) {
+            { let f = fold(Fold(out.k2, out.c2), unpack_rgb(wild), unpack_a(wild) * OWN_FILL * cov); out.k2 = f.k; out.c2 = f.c; }
+        }
+        var edge = false;
+        var wild_edge = false;
+        for (var k = 0u; k < 3u; k++) {
+            let n = own_at(layer, t, k, ov.x);
+            edge = edge || own_mgr(n) != m;
+            wild_edge = wild_edge || (ov.x >= OWN_WILD && n < OWN_WILD);
+        }
+        if (edge) {
+            { let f = fold(Fold(out.k2, out.c2), unpack_rgb(col), unpack_a(col)); out.k2 = f.k; out.c2 = f.c; }
+        }
+        if (wild_edge) {
+            { let f = fold(Fold(out.k2, out.c2), unpack_rgb(wild), unpack_a(wild)); out.k2 = f.k; out.c2 = f.c; }
+        }
+    }
+    if ((mask & M_MVUM) != 0u && ov.z != 0u && ov.w != 0u) {
+        let col = lut[MVUM_BASE + min(ov.z, 14u)];
+        { let f = fold(Fold(out.k2, out.c2), unpack_rgb(col), f32(ov.w) / 255.0 * unpack_a(col)); out.k2 = f.k; out.c2 = f.c; }
+    }
+    return out;
+}
+
 // The user's marks over everything, from the finest user cell here (every cell carries what coarser ones have): the pen's ink in its colour, the selection as a wash with its edge. Applied at every exit of the composite, over imagery too, as the CPU's user_marks is.
 fn user_marks(composed: Composed, d: u32, u: u32, v: u32) -> Composed {
     var out = composed;
@@ -569,6 +639,9 @@ fn compose(d: u32, u: u32, v: u32, pos: vec2<f32>) -> Composed {
     let vi = find(d, U.depths.y, u, v, FLAG_VEC);
     var line = vec4<u32>(0u);
     var lw = vec4<u32>(0u);
+    var ov = vec4<u32>(0u);
+    var ov_layer = -1;
+    var ov_t = vec3<u32>(0u);
     var vflags = 0u;
     if (vi != NONE) {
         let r = refs[vi];
@@ -580,6 +653,11 @@ fn compose(d: u32, u: u32, v: u32, pos: vec2<f32>) -> Composed {
         }
         if ((vflags & (FLAG_LAND | FLAG_WATER)) != 0u) {
             lw = textureLoad(lw_tex, xy, i32(r.b.z), 0);
+        }
+        if ((vflags & (FLAG_OWN | FLAG_MVUM)) != 0u) {
+            ov_layer = i32(r.c.y);
+            ov_t = t;
+            ov = textureLoad(ov_tex, xy, ov_layer, 0);
         }
     }
     var seabed = false;
@@ -633,6 +711,7 @@ fn compose(d: u32, u: u32, v: u32, pos: vec2<f32>) -> Composed {
                 let ink = select(U.style_contour, U.style_contour_index, contour_index);
                 { let f = fold(Fold(out.k2, out.c2), ink.rgb, contour_cov * ink.a); out.k2 = f.k; out.c2 = f.c; }
             }
+            out = overlays(out, ov, ov_layer, ov_t);
             if (draw_line && line.x != WATERWAY_CLASS) {
                 { let f = fold(Fold(out.k2, out.c2), line_colour(line.x, line.z), line_alpha(line.x, line.y, line.z)); out.k2 = f.k; out.c2 = f.c; }
             }
@@ -655,6 +734,7 @@ fn compose(d: u32, u: u32, v: u32, pos: vec2<f32>) -> Composed {
         if ((mask & M_WATER) != 0u && lw.z != 0u) {
             out.water = f32(lw.z) / 255.0 * U.style_water.a * select(1.0, SEABED_GLAZE, seabed);
         }
+        out = overlays(out, ov, ov_layer, ov_t);
         if (draw_line && line.x != WATERWAY_CLASS) {
             { let f = fold(Fold(out.k2, out.c2), line_colour(line.x, line.z), line_alpha(line.x, line.y, line.z)); out.k2 = f.k; out.c2 = f.c; }
         }

@@ -666,7 +666,7 @@ pub mod themes {
         VsfBuilder::new()
             .add_section("theme", vec![("name".to_string(), VsfType::x(t.name.clone())), ("layers".to_string(), VsfType::u(t.layers.bits() as usize, false)), ("revision".to_string(), VsfType::u(t.revision as usize, false)), ("edited".to_string(), VsfType::u(t.edited as usize, false))])
             .add_section("hypso", vec![("metres".to_string(), VsfType::t_f5(Tensor::new(vec![stops.len()], stops))), ("rgb".to_string(), VsfType::t_u3(Tensor::new(vec![t.hypso.len(), 3], stop_rgb)))])
-            .add_section("tables", vec![("land".to_string(), table_t(&t.land)), ("line".to_string(), table_t(&t.line))])
+            .add_section("tables", vec![("land".to_string(), table_t(&t.land)), ("line".to_string(), table_t(&t.line)), ("ownership".to_string(), table_t(&t.own)), ("vehicleuse".to_string(), table_t(&t.mvum))])
             .add_section(
                 "inks",
                 vec![
@@ -677,6 +677,7 @@ pub mod themes {
                     ("water".to_string(), rgb_t(t.water)),
                     ("contour".to_string(), rgb_t(t.contour)),
                     ("index".to_string(), rgb_t(t.contour_index)),
+                    ("wilderness".to_string(), rgb_t(t.wild)),
                 ],
             )
             .add_section("light", vec![("sun".to_string(), VsfType::t_f5(Tensor::new(vec![3], t.sun.to_vec()))), ("sky".to_string(), VsfType::t_f5(Tensor::new(vec![3], t.sky.to_vec())))])
@@ -786,6 +787,10 @@ pub mod themes {
             water: rgba(get("inks", "water")?, 255)?,
             contour: rgba(get("inks", "contour")?, (contour_alpha[0] * 255.0).round() as u8)?,
             contour_index: rgba(get("inks", "index")?, (contour_alpha[1] * 255.0).round() as u8)?,
+            // Saved before the overlays: the shipped colours.
+            own: get("tables", "ownership").and_then(|v| table(v, 200)).unwrap_or(mahere_engine::theme::OWN),
+            wild: get("inks", "wilderness").and_then(|v| rgba(v, 230)).unwrap_or(mahere_engine::theme::WILD),
+            mvum: get("tables", "vehicleuse").and_then(|v| table(v, 220)).unwrap_or(mahere_engine::theme::MVUM),
             sun: [sun[0], sun[1], sun[2]],
             sky: [sky[0], sky[1], sky[2]],
             layers,

@@ -69,6 +69,8 @@ enum Layer {
     Dem,
     Hypso,
     Boundaries,
+    Own,
+    Mvum,
     Land,
     Water,
     Line,
@@ -87,13 +89,15 @@ enum Layer {
     Areas,
 }
 
-const LAYERS: [(Layer, &str); 22] = [
+const LAYERS: [(Layer, &str); 24] = [
     (Layer::Dem, "Terrain"),
     (Layer::Hypso, "Elevation tint"),
     (Layer::Land, "Land cover"),
     (Layer::Water, "Water"),
     (Layer::Line, "Lines"),
     (Layer::Boundaries, "Boundaries"),
+    (Layer::Own, "Land ownership"),
+    (Layer::Mvum, "Motor vehicle use"),
     (Layer::Contours, "Contours"),
     (Layer::Slope, "Slope bands"),
     (Layer::Imagery, "Imagery"),
@@ -135,6 +139,8 @@ fn get(mask: &LayerMask, ctl: &Controls, l: Layer) -> bool {
         Layer::Water => mask.water,
         Layer::Line => mask.line,
         Layer::Boundaries => mask.boundaries,
+        Layer::Own => mask.own,
+        Layer::Mvum => mask.mvum,
         Layer::Contours => mask.contours,
         Layer::Slope => mask.slope,
         Layer::Infrared => mask.infrared,
@@ -159,6 +165,8 @@ fn set(mask: &mut LayerMask, ctl: &mut Controls, l: Layer, v: bool) {
         Layer::Water => mask.water = v,
         Layer::Line => mask.line = v,
         Layer::Boundaries => mask.boundaries = v,
+        Layer::Own => mask.own = v,
+        Layer::Mvum => mask.mvum = v,
         Layer::Contours => mask.contours = v,
         Layer::Slope => mask.slope = v,
         Layer::Infrared => mask.infrared = v,
@@ -1200,6 +1208,8 @@ impl Panel {
                 Field::Sea | Field::Flat | Field::Bg | Field::NoDem => "ground",
                 Field::Land(_) => "land cover",
                 Field::Line(_) => "lines",
+                Field::Own(_) | Field::Wild => "land ownership",
+                Field::Mvum(_) => "motor vehicle use",
                 Field::Water | Field::Contour | Field::ContourIndex => "inks",
                 Field::Sun | Field::Sky => "light",
             };

@@ -15,6 +15,8 @@
 //! Files are zstd'd VSF at `{name}.vsf.zst` where the name is the cell's flattened VSF value (`u` depth, `wm` cell) in base64url: no delimiters, no numerals — a directory layout that is byte-for-byte the bucket.
 
 pub mod area;
+/// The ownership and motor vehicle use classes, for the renderers and the themes.
+pub use mahere_osm::landuse;
 pub mod pyr;
 pub mod tone;
 
@@ -421,6 +423,10 @@ pub struct Cell {
     pub land: Option<ClassCell>,
     pub water: Option<CovCell>,
     pub img: Option<ImgCell>,
+    /// Land ownership (PAD-US): a class per texel (`mahere_osm::landuse::own`), coverage the area fraction.
+    pub own: Option<ClassCell>,
+    /// Motor vehicle use (USFS MVUM): routes as lines, a class per texel (`mahere_osm::landuse::mvum`).
+    pub mvum: Option<ClassCell>,
 }
 
 // ==================== LINE LAYER ====================
@@ -568,9 +574,114 @@ pub fn bake_areas(
     )
 }
 
+// ==================== OVERLAYS: OWNERSHIP AND MOTOR VEHICLE USE ====================
+
+/// Rings of (lat, lon) as global texel coordinates at `depth`, with their diamond; None when they cross a diamond's edge (the prep clips to an area's box, which keeps them inside one).
+fn rings_to_grid(rings: &[Vec<(f64, f64)>], depth: u8) -> Option<(u8, Vec<Vec<(f64, f64)>>)> {
+    let mut diamond: Option<u8> = None;
+    let mut out = Vec::with_capacity(rings.len());
+    for ring in rings {
+        let mut r = Vec::with_capacity(ring.len());
+        for &(lat, lon) in ring {
+            let (d, gu, gv) = texel_of(Coord::from_lat_lon(lat, lon), depth);
+            if *diamond.get_or_insert(d) != d {
+                return None;
+            }
+            r.push((gu, gv));
+        }
+        out.push(r);
+    }
+    diamond.map(|d| (d, out))
+}
+
+/// Land ownership at base depth: the areas painted in order (a later one over an earlier), then `WILD` added wherever a wilderness lies over them, then the pyramid by dominant class. Only cells `keep` admits are made, so a piece of a large area holds only its own.
+pub fn bake_ownership(areas: &[mahere_osm::landuse::ClassedArea], wilderness: &[Vec<Vec<(f64, f64)>>], base_depth: u8, min_depth: u8, keep: &(dyn Fn(&CellKey) -> bool + Sync), under: Option<CellKey>) -> HashMap<CellKey, ClassCell> {
+    // Under one cell, the fill scans only that cell's texels at the base depth, and only in its diamond.
+    let window = under.map(|p| {
+        let (cu, cv) = p.grid();
+        let n = TEX << (base_depth - p.depth);
+        (cu as usize * n, (cu as usize + 1) * n, cv as usize * n, (cv as usize + 1) * n)
+    });
+    let in_diamond = |d: u8| under.is_none_or(|p| p.diamond() == d);
+    let mut cells: HashMap<CellKey, ClassCell> = HashMap::new();
+    let mut skipped = 0usize;
+    for a in areas {
+        let Some((d, rings)) = rings_to_grid(&a.rings, base_depth) else {
+            skipped += 1;
+            continue;
+        };
+        if !in_diamond(d) {
+            continue;
+        }
+        fill_rings_in(&rings, base_depth, window, |tx, ty, half| {
+            let key = CellKey::from_grid(d, base_depth, (tx / TEX) as u64, (ty / TEX) as u64);
+            if !keep(&key) {
+                return;
+            }
+            let cell = cells.entry(key).or_default();
+            let i = tri_idx(tx % TEX, ty % TEX, half);
+            cell.class[i] = a.class;
+            cell.cov[i] = 255;
+        });
+    }
+    let wild = mahere_osm::landuse::own::WILD;
+    for w in wilderness {
+        let Some((d, rings)) = rings_to_grid(w, base_depth) else {
+            skipped += 1;
+            continue;
+        };
+        if !in_diamond(d) {
+            continue;
+        }
+        fill_rings_in(&rings, base_depth, window, |tx, ty, half| {
+            let key = CellKey::from_grid(d, base_depth, (tx / TEX) as u64, (ty / TEX) as u64);
+            if !keep(&key) {
+                return;
+            }
+            let cell = cells.entry(key).or_default();
+            let i = tri_idx(tx % TEX, ty % TEX, half);
+            if cell.class[i] < wild {
+                cell.class[i] += wild;
+                cell.cov[i] = 255;
+            }
+        });
+    }
+    if skipped > 0 {
+        eprintln!("  (skipped {skipped} ownership areas across a diamond's edge)");
+    }
+    pyramid_class(cells, base_depth, min_depth, ClassMerge::Dominant)
+}
+
+/// Motor vehicle use routes at base depth, each at its class's width, then the pyramid as lines are built.
+pub fn bake_mvum(lines: &[mahere_osm::landuse::ClassedLine], base_depth: u8, min_depth: u8, keep: &(dyn Fn(&CellKey) -> bool + Sync)) -> HashMap<CellKey, ClassCell> {
+    let mut cells: HashMap<CellKey, ClassCell> = HashMap::new();
+    let tm = texel_m(base_depth);
+    for l in lines {
+        let r = (mahere_osm::landuse::mvum::width_m(l.class) as f64 / 2.0 / tm).max(0.5);
+        let mut prev: Option<(u8, f64, f64)> = None;
+        for &(lat, lon) in &l.pts {
+            let (d, gu, gv) = texel_of(Coord::from_lat_lon(lat, lon), base_depth);
+            if let Some((pd, pu, pv)) = prev {
+                if pd == d {
+                    stamp_segment(&mut cells, base_depth, d, (pu, pv), (gu, gv), r, l.class, 255, (255, 0));
+                }
+            }
+            prev = Some((d, gu, gv));
+        }
+    }
+    cells.retain(|k, _| keep(k));
+    pyramid_class(cells, base_depth, min_depth, ClassMerge::Major)
+}
+
 /// Even-odd scanline fill of rings given in global texel coordinates, visiting every triangle whose centroid is inside.
-fn fill_rings(rings: &[Vec<(f64, f64)>], depth: u8, mut visit: impl FnMut(usize, usize, usize)) {
+fn fill_rings(rings: &[Vec<(f64, f64)>], depth: u8, visit: impl FnMut(usize, usize, usize)) {
+    fill_rings_in(rings, depth, None, visit)
+}
+
+/// The fill, scanning only the texels in `window` (tx0, tx1, ty0, ty1, end exclusive) when given: a piece of a large area fills its own texels of a polygon that spans them all.
+fn fill_rings_in(rings: &[Vec<(f64, f64)>], depth: u8, window: Option<(usize, usize, usize, usize)>, mut visit: impl FnMut(usize, usize, usize)) {
     let extent = ((1u64 << depth) * TEX as u64) as f64;
+    let (wx0, wx1, wy0, wy1) = window.map_or((0.0, extent, 0.0, extent), |(a, b, c, d)| (a as f64, b as f64, c as f64, d as f64));
     let (mut v0, mut v1) = (f64::MAX, f64::MIN);
     for r in rings {
         for p in r {
@@ -581,8 +692,8 @@ fn fill_rings(rings: &[Vec<(f64, f64)>], depth: u8, mut visit: impl FnMut(usize,
     if v0 == f64::MAX {
         return;
     }
-    let ty0 = v0.floor().max(0.0) as i64;
-    let ty1 = v1.ceil().min(extent) as i64;
+    let ty0 = v0.floor().max(wy0) as i64;
+    let ty1 = v1.ceil().min(wy1) as i64;
     let mut xs: Vec<f64> = Vec::new();
     for ty in ty0..ty1 {
         for half in 0..2 {
@@ -606,8 +717,8 @@ fn fill_rings(rings: &[Vec<(f64, f64)>], depth: u8, mut visit: impl FnMut(usize,
                     break;
                 }
                 // Centroid u = tx + off inside [x0, x1).
-                let tx_min = ((pair[0] - off).ceil().max(0.0)) as i64;
-                let tx_max = ((pair[1] - off).ceil() - 1.0).min(extent - 1.0) as i64;
+                let tx_min = ((pair[0] - off).ceil().max(wx0)) as i64;
+                let tx_max = ((pair[1] - off).ceil() - 1.0).min(wx1 - 1.0) as i64;
                 for tx in tx_min..=tx_max {
                     visit(tx as usize, ty as usize, half);
                 }
@@ -1188,6 +1299,8 @@ pub struct CellPlanes {
     pub land: Option<ClassCell>,
     pub water: Option<CovCell>,
     pub img: Option<ImgCell>,
+    pub own: Option<ClassCell>,
+    pub mvum: Option<ClassCell>,
 }
 
 /// Decoded dem: elevation (NaN = no data) and the apron, memory order.
@@ -1455,6 +1568,8 @@ impl Cell {
             land: self.land.clone(),
             water: self.water.clone(),
             img: self.img.clone(),
+            own: self.own.clone(),
+            mvum: self.mvum.clone(),
         }
     }
 }
@@ -1463,7 +1578,27 @@ impl CellPlanes {
     /// Overlay `self` (a new bake) onto `old`. A bake's footprint is where it has elevation: inside it the new vector planes win, outside the old ones stay; without a dem the new planes replace wholesale.
     pub fn merge_over(self, old: CellPlanes) -> CellPlanes {
         let mut out = self;
-        let CellPlanes { dem: old_dem, line: old_line, land: old_land, water: old_water, img: old_img } = old;
+        let CellPlanes { dem: old_dem, line: old_line, land: old_land, water: old_water, img: old_img, own: old_own, mvum: old_mvum } = old;
+        // The overlays (ownership, motor vehicle use) come from their own pass and have no terrain footprint: the new where it has anything, the old elsewhere.
+        for (new, old) in [(&mut out.own, old_own), (&mut out.mvum, old_mvum)] {
+            match (new, old) {
+                (Some(n), Some(o)) => {
+                    let attrs = n.mag.len() == TRI && o.mag.len() == TRI;
+                    for i in 0..TRI {
+                        if n.cov[i] == 0 && o.cov[i] != 0 {
+                            n.class[i] = o.class[i];
+                            n.cov[i] = o.cov[i];
+                            if attrs {
+                                n.mag[i] = o.mag[i];
+                                n.uses[i] = o.uses[i];
+                            }
+                        }
+                    }
+                }
+                (n @ None, Some(o)) => *n = Some(o),
+                _ => {}
+            }
+        }
         let (mut old_line, mut old_land, mut old_water) = (old_line, old_land, old_water);
         match (&mut out.img, old_img) {
             (Some(n), Some(mut o)) => {
@@ -1583,7 +1718,7 @@ impl CellPlanes {
         } else if let Some(d) = &self.dem {
             b = b.add_section_direct(dem_section(d, loss));
         }
-        for (name, planes) in [("line", &self.line), ("land", &self.land)] {
+        for (name, planes) in [("line", &self.line), ("land", &self.land), ("own", &self.own), ("mvum", &self.mvum)] {
             if let Some(p) = planes {
                 let mut fields = vec![
                     ("class".to_string(), VsfType::t_u3(Tensor::new(vec![2, TEX * TEX], mem_to_disk(&p.class)))),
@@ -1695,15 +1830,16 @@ pub fn decode_cell(data: &[u8]) -> Result<CellPlanes, String> {
         let first = |name: &str| fields.get(name).and_then(|v| v.first());
         match s.name.as_str() {
             "dem" => out.dem = decode_dem(&fields),
-            "line" | "land" => {
+            "line" | "land" | "own" | "mvum" => {
                 if let (Some(class), Some(cov)) = (first("class").and_then(plane_u8_mem), first("cov").and_then(plane_u8_mem)) {
                     let mag = first("mag").and_then(plane_u8_mem).unwrap_or_default();
                     let uses = first("use").and_then(plane_u8_mem).unwrap_or_default();
                     let planes = Some(ClassCell { class, cov, mag, uses });
-                    if s.name == "line" {
-                        out.line = planes;
-                    } else {
-                        out.land = planes;
+                    match s.name.as_str() {
+                        "line" => out.line = planes,
+                        "land" => out.land = planes,
+                        "own" => out.own = planes,
+                        _ => out.mvum = planes,
                     }
                 }
             }
@@ -1923,7 +2059,7 @@ mod tests {
         line.cov[5] = 200;
         line.mag[5] = 77;
         line.uses[5] = 0b101;
-        let cell = Cell { dem: Some(dem.clone()), line: Some(line), land: Some(ClassCell::new()), water: None, img: None };
+        let cell = Cell { dem: Some(dem.clone()), line: Some(line), land: Some(ClassCell::new()), ..Default::default() };
         let bytes = cell.quantize().encode(&Loss::LOSSLESS).unwrap();
         let back = decode_cell(&bytes).unwrap();
         let d = back.dem.as_ref().unwrap();
@@ -1956,7 +2092,7 @@ mod tests {
         let mut line2 = ClassCell::new_line();
         line2.cov[5] = 1; // outside dem2's footprint: must NOT win
         line2.cov[TRI - 1] = 9;
-        let cell2 = Cell { dem: Some(dem2), line: Some(line2), land: None, water: None, img: None };
+        let cell2 = Cell { dem: Some(dem2), line: Some(line2), ..Default::default() };
         let merged = cell2.quantize().merge_over(back);
         let d = merged.dem.as_ref().unwrap();
         assert!((d.elev[3] - dem.elev[3]).abs() <= 0.03);
