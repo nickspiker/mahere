@@ -130,7 +130,7 @@ fn free_bytes(dir: &str) -> Option<u64> {
 
 impl AndroidApp {
     fn controls(&self) -> Controls {
-        Controls { real_sun: self.map.real_sun, real_light: self.map.real_light, follow_heading: self.map.follow_heading, lock_to_fix: self.map.lock_to_fix, cache_budget: self.cache_budget, theme: self.map.theme, compressed: self.map.compressed(), tool: self.map.tool as u8, pen: self.map.pen, clear_ink: false, clear_sel: false }
+        Controls { real_sun: self.map.real_sun, real_light: self.map.real_light, follow_heading: self.map.follow_heading, lock_to_fix: self.map.lock_to_fix, cache_budget: self.cache_budget, theme: self.map.theme, compressed: self.map.compressed(), tool: self.map.tool as u8, pen_rgba: self.map.pen_colour, clear_ink: false, clear_sel: false }
     }
 
     /// A pinch with the panel open: the finger distance's ratio to the last event's scales the UI.
@@ -205,7 +205,7 @@ impl AndroidApp {
             2 => mahere_engine::ink::Tool::Select,
             _ => mahere_engine::ink::Tool::None,
         });
-        self.map.set_pen(ctl.pen);
+        self.map.set_pen_colour(ctl.pen_rgba);
         if ctl.clear_ink {
             self.map.clear_ink();
         }

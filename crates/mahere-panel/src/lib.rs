@@ -27,7 +27,8 @@ pub struct Controls {
     pub compressed: bool,
     /// What a touch on the map does: 0 navigates, 1 draws with the pen, 2 draws a selection. The pen's colour, an index into the engine's pens.
     pub tool: u8,
-    pub pen: u8,
+    /// The pen's colour and opacity, VSF RGB at gamma 2.
+    pub pen_rgba: [u8; 4],
     /// One-shot asks: the ink or the selection cleared.
     pub clear_ink: bool,
     pub clear_sel: bool,
@@ -95,7 +96,7 @@ const LAYERS: [(Layer, &str); 21] = [
     (Layer::FollowHeading, "Follow heading"),
     (Layer::LockToFix, "Measure from me"),
     (Layer::Pen, "Pen"),
-    (Layer::PenColour, "Next pen colour"),
+    (Layer::PenColour, "Pen colour"),
     (Layer::Select, "Select area"),
     (Layer::ClearInk, "Clear ink"),
     (Layer::ClearSel, "Clear selection"),
@@ -155,7 +156,7 @@ fn set(mask: &mut LayerMask, ctl: &mut Controls, l: Layer, v: bool) {
         Layer::Debug => mask.debug = v,
         Layer::Pen => ctl.tool = if v { 1 } else { 0 },
         Layer::Select => ctl.tool = if v { 2 } else { 0 },
-        Layer::PenColour => ctl.pen = (ctl.pen + 1) % 8,
+        Layer::PenColour => {}
         Layer::ClearInk => ctl.clear_ink = true,
         Layer::ClearSel => ctl.clear_sel = true,
     }
@@ -197,6 +198,8 @@ enum Page {
     Edit,
     /// One field's sliders.
     Field(Field),
+    /// The pen's colour: a mixer of red, green, blue and opacity.
+    Pen,
 }
 
 /// What the editor asks of the host, polled after every tap and drag.
@@ -293,6 +296,13 @@ impl Panel {
         self.dirty = true;
     }
 
+    /// Open on the pen's mixer (the preview example).
+    pub fn show_pen(&mut self, rgba: [u8; 4]) {
+        self.open = true;
+        self.stack = vec![Page::Layers];
+        self.open_pen(rgba);
+    }
+
     /// What the editor changed since last asked.
     pub fn take_theme_edits(&mut self) -> Vec<ThemeEdit> {
         std::mem::take(&mut self.edits)
@@ -318,6 +328,15 @@ impl Panel {
     /// The rail's width when a page is stacked, else zero: the content starts after it.
     fn rail_w(&self) -> f32 {
         if self.stack.len() >= 2 { self.panel_w * RAIL } else { 0.0 }
+    }
+
+    /// Open the pen's mixer: four sliders from the pen's bytes.
+    fn open_pen(&mut self, rgba: [u8; 4]) {
+        self.field_vals = [rgba[0] as f32, rgba[1] as f32, rgba[2] as f32, rgba[3] as f32];
+        self.sliders = (0..4).map(|i| Slider::new(&mut self.hits, 0.0, 0.0, 10.0, 10.0, self.field_vals[i] / 255.0)).collect();
+        self.stack.push(Page::Pen);
+        self.held = None;
+        self.dirty = true;
     }
 
     /// Open a field's page: one slider per value, from the theme's own bytes.
@@ -476,6 +495,20 @@ impl Panel {
                 }
                 return true;
             }
+            Page::Pen => {
+                for (i, sl) in self.sliders.iter_mut().enumerate() {
+                    let b = sl.bbox();
+                    if y >= b.y - b.h * 0.5 && y <= b.y + b.h * 1.5 && x >= b.x - self.font && x <= b.x + b.w + self.font {
+                        sl.set_value_from_x(x);
+                        self.held = Some(i);
+                        self.field_vals[i] = (sl.value() * 255.0).round();
+                        ctl.pen_rgba[i] = self.field_vals[i] as u8;
+                        self.dirty = true;
+                        return true;
+                    }
+                }
+                return true;
+            }
             Page::Layers => {}
         }
         // The theme row above the layers opens the theme page.
@@ -487,6 +520,11 @@ impl Panel {
         }
         for (l, cb) in &mut self.checks {
             if cb.bbox().contains(x, y) {
+                if *l == Layer::PenColour {
+                    let rgba = ctl.pen_rgba;
+                    self.open_pen(rgba);
+                    return true;
+                }
                 // A row a dominating layer has greyed takes the tap but changes nothing.
                 if inert(mask, ctl, *l) {
                     return true;
@@ -581,6 +619,7 @@ impl Panel {
                     }
                 }
                 Page::Field(f) => Self::paint_field(&mut canvas, &mut self.text, font, rail, cw, self.gear, f, &mut self.sliders, self.field_vals, current),
+                Page::Pen => Self::paint_pen(&mut canvas, &mut self.text, font, rail, cw, self.gear, &mut self.sliders, self.field_vals),
                 Page::Layers => {}
             }
             paint::fill_rect(&mut canvas, rail as isize, 0, cw as isize, h as isize, PANEL_BG, None, None);
@@ -616,6 +655,12 @@ impl Panel {
                 paint::fill_rect(&mut canvas, b.x as isize, b.y as isize, b.w as isize, b.h as isize, PANEL_DIM, None, None);
             }
             cb.render_content_into(&mut canvas, &mut self.text, None, None);
+            // The pen colour row shows the colour it opens, at its opacity, at the row's right end.
+            if *l == Layer::PenColour {
+                let b = cb.bbox();
+                let side = b.h * 0.7;
+                paint::fill_rect(&mut canvas, (b.x + b.w - side - font * 0.6) as isize, (b.y + (b.h - side) * 0.5) as isize, side as isize, side as isize, pen_swatch(ctl.pen_rgba), None, None);
+            }
         }
         self.cache_max = r.cache_max;
         Self::paint_slider(&mut canvas, &mut self.text, font, self.slider, &ctl, r);
@@ -825,6 +870,15 @@ impl Panel {
             }
             return true;
         }
+        if let (Some(i), Page::Pen) = (self.held, self.page()) {
+            if let Some(sl) = self.sliders.get_mut(i) {
+                sl.set_value_from_x(x);
+                self.field_vals[i] = (sl.value() * 255.0).round();
+                ctl.pen_rgba[i] = self.field_vals[i] as u8;
+                self.dirty = true;
+            }
+            return true;
+        }
         if !self.slider_held {
             return false;
         }
@@ -1013,6 +1067,45 @@ impl Panel {
             y += font * 1.7;
         }
     }
+}
+
+impl Panel {
+    /// The pen's mixer: the colour as a swatch, then red, green, blue and opacity sliders.
+    fn paint_pen(canvas: &mut Canvas, text: &mut TextRenderer, font: f32, ox: f32, cw: f32, gear: (f32, f32, f32), sliders: &mut [Slider], vals: [f32; 4]) {
+        let x0 = ox + font * 0.9;
+        let mut y = gear.1 + gear.2 + font * 0.9 + font * 0.8;
+        let title = TextStyle::new(font, theme::TEXTBOX_TEXT);
+        let small = TextStyle::new(font * 0.8, READOUT);
+        let dim = TextStyle::new(font * 0.72, READOUT_DIM);
+        text.draw_text_left(canvas, "\u{2039}  Pen colour", x0, y, &title, None, None);
+        y += font * 1.6;
+        // The swatch: the colour at its opacity over the panel, as a stroke would sit over a dark ground.
+        let sw = cw - font * 1.8;
+        let blended = pen_swatch([vals[0] as u8, vals[1] as u8, vals[2] as u8, vals[3] as u8]);
+        paint::fill_rect(canvas, x0 as isize, y as isize, sw as isize, (font * 1.6) as isize, blended, None, None);
+        y += font * 2.4;
+        let labels = ["R", "G", "B", "A"];
+        for (i, sl) in sliders.iter_mut().enumerate() {
+            text.draw_text_left(canvas, labels[i], x0, y, &dim, None, None);
+            text.draw_text_left(canvas, &format!("{}", vals[i] as u8), x0 + font * 4.5, y, &small, None, None);
+            y += font * 0.9;
+            sl.set_rect(x0 + sw * 0.5, y, sw, font * 1.1);
+            sl.render_content_into(canvas, None, HIT_NONE);
+            y += font * 1.7;
+        }
+    }
+}
+
+/// The pen's colour as a swatch: the opaque swatch mixed over the panel by the pen's opacity, so a faint pen shows faint.
+fn pen_swatch(rgba: [u8; 4]) -> u32 {
+    let full = swatch([rgba[0], rgba[1], rgba[2]]);
+    let a = rgba[3] as f32 / 255.0;
+    let mix = |shift: u32| -> u32 {
+        let s = ((full >> shift) & 255) as f32;
+        let bg = ((PANEL_BG >> shift) & 255) as f32;
+        ((bg + (s - bg) * a).round() as u32) << shift
+    };
+    0xFF00_0000 | mix(16) | mix(8) | mix(0)
 }
 
 /// A legend swatch of an authored theme colour, as the map shows it unlit (through the same display encode), opaque, in fluor's stored form.

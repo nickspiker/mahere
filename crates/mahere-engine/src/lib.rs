@@ -296,6 +296,8 @@ pub struct MapCore {
     pub user: ink::UserLayer,
     pub tool: ink::Tool,
     pub pen: u8,
+    /// The pen's colour, VSF RGB at gamma 2, and its opacity (Nick 2026-10-10: a mixer, not a selector).
+    pub pen_colour: [u8; 4],
     pub pen_width: f32,
     stroke: Option<Stroke>,
     /// The selection being drawn, as a screen mask (w × h bytes, 255 inside the closed curve), and a version for a renderer to notice a change; empty when none.
@@ -366,6 +368,7 @@ impl MapCore {
             user: ink::UserLayer::default(),
             tool: ink::Tool::None,
             pen: 0,
+            pen_colour: [230, 40, 40, 255],
             pen_width: 6.0,
             stroke: None,
             preview: Vec::new(),
@@ -480,6 +483,12 @@ impl MapCore {
 
     pub fn set_pen(&mut self, pen: u8) {
         self.pen = pen % ink::PENS.len() as u8;
+        let c = ink::PENS[self.pen as usize];
+        self.pen_colour = [c[0], c[1], c[2], 255];
+    }
+
+    pub fn set_pen_colour(&mut self, rgba: [u8; 4]) {
+        self.pen_colour = rgba;
     }
 
     /// Where the user's cells are kept; loading what is there.
@@ -531,7 +540,8 @@ impl MapCore {
         self.user.begin_undo();
         self.stroke = Some(Stroke { pts: vec![(x, y, width)], depth, add });
         if self.tool == ink::Tool::Pen {
-            self.user.stroke(&self.cam, w, h, depth, &[(x, y, width)], ink::PENS[self.pen as usize], 1.0);
+            let c = self.pen_colour;
+            self.user.stroke(&self.cam, w, h, depth, &[(x, y, width)], [c[0], c[1], c[2]], c[3] as f32 / 255.0);
         }
         self.dirty = true;
     }
@@ -549,7 +559,8 @@ impl MapCore {
         match self.tool {
             ink::Tool::Pen => {
                 let seg = [last, (x, y, width)];
-                self.user.stroke(&self.cam, w, h, depth, &seg, ink::PENS[self.pen as usize], 1.0);
+                let c = self.pen_colour;
+                self.user.stroke(&self.cam, w, h, depth, &seg, [c[0], c[1], c[2]], c[3] as f32 / 255.0);
             }
             ink::Tool::Select => self.rebuild_preview(w, h),
             ink::Tool::None => {}

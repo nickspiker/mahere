@@ -117,15 +117,20 @@ fn main() {
     let overlay = map.overlay(w, h, true).to_vec();
     // MAHERE_PANEL=1 lays the open control panel over the GPU frame (the CPU frame has none, so the diff below is then meaningless).
     let panel_mode = std::env::var("MAHERE_PANEL").unwrap_or_default();
-    if panel_mode == "1" || panel_mode == "themes" {
+    if panel_mode == "1" || panel_mode == "themes" || panel_mode == "pen" {
         let mut panel = mahere_panel::Panel::new();
         panel.set_open(true);
         if panel_mode == "themes" {
             panel.show_themes();
         }
+        let mut controls = mahere_panel::Controls::default();
+        controls.pen_rgba = [230, 40, 40, 160];
+        if panel_mode == "pen" {
+            panel.show_pen(controls.pen_rgba);
+        }
         let c = map.cam;
         let readouts = mahere_panel::Readouts { lat: c.lat(), lon: c.lon(), elev: map.elevation_at(c.lat(), c.lon()), heading_deg: c.bearing().to_degrees(), m_per_px: 111_320.0 / c.ppd, frame_ms: cpu_ms, resident: map.pool().map.len(), phone_heading: None, cache_used: 0, cache_max: 1 << 30 };
-        panel.paint(w, h, map.layers(), mahere_panel::Controls::default(), &readouts, None, &map.themes, None);
+        panel.paint(w, h, map.layers(), controls, &readouts, None, &map.themes, None);
         let rgba = panel.overlay_rgba(&overlay, w, h);
         gpu.set_overlay_rgba(&device, &queue, w as u32, h as u32, &rgba);
     } else {
