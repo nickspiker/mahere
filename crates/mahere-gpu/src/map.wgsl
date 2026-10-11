@@ -68,6 +68,7 @@ const M_HYPSO: u32 = 512u;
 const M_BOUND: u32 = 1024u;
 const M_OWN: u32 = 2048u;
 const M_MVUM: u32 = 4096u;
+const M_RAW: u32 = 8192u;
 
 // Where the style tables sit in the LUT buffer after the 4096 hypsometric rows.
 const CLASS_BASE: u32 = 4096u;
@@ -110,6 +111,8 @@ struct Uniforms {
     globe: vec4<f32>,
     // The world's pole axis in view coordinates.
     pole: vec4<f32>,
+    // The raw elevation view's range: lowest and highest metres in view.
+    raw: vec4<f32>,
 };
 
 // a: diamond, depth, cu, cv. b: dem slot, line slot, land+water slot, img slot. c: flags. d: base, step, eu, nu. e: ev, nv, inv det.
@@ -579,7 +582,7 @@ fn compose(d: u32, u: u32, v: u32, pos: vec2<f32>) -> Composed {
     var is_sea = false;
     var elev_m = 0.0;
     // The terrain sample feeds the tint and light (terrain on), and the contours and slope bands on their own.
-    let want_dem = (mask & (M_DEM | M_CONTOURS | M_SLOPE)) != 0u;
+    let want_dem = (mask & (M_DEM | M_CONTOURS | M_SLOPE | M_RAW)) != 0u;
     if (want_dem) {
         let s = sample_dem(d, u, v);
         if (s.ok) {
@@ -587,6 +590,13 @@ fn compose(d: u32, u: u32, v: u32, pos: vec2<f32>) -> Composed {
             elev_m = s.elev;
             // The renderer's quantum: half-metre steps from 11 km below the sea (the CPU's ELEV_OFFSET and ELEV_STEP).
             let eq = u32(clamp((s.elev + 11000.0) * 2.0, 0.0, 65534.0));
+            // Raw elevation: grey across the range in view as a byte, unlit (the CPU's raw_grey, from the same quantum).
+            if ((mask & M_RAW) != 0u) {
+                let q = f32(eq) * 0.5 - 11000.0;
+                let t = clamp((q - U.raw.x) / max(U.raw.y - U.raw.x, 0.5), 0.0, 1.0);
+                out.base = dec(vec3<f32>(round(t * 255.0)));
+                out.ground = false;
+            }
             if ((mask & M_DEM) != 0u) {
                 out.n = view_normal(s.n, pos);
                 // The open sea: exactly zero and dead flat, which is how a global DEM writes the ocean (below-sea-level land keeps its colour).
@@ -631,7 +641,7 @@ fn compose(d: u32, u: u32, v: u32, pos: vec2<f32>) -> Composed {
                     have_band = true;
                 }
             }
-        } else if ((mask & M_DEM) != 0u) {
+        } else if ((mask & (M_DEM | M_RAW)) != 0u) {
             out.base = U.style_bg.rgb;
         }
     }

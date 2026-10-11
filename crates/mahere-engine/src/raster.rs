@@ -85,11 +85,13 @@ pub struct LayerMask {
     pub own: bool,
     /// Motor vehicle use (USFS MVUM): what may be driven on each Forest Service road and trail, a band under the map's own lines.
     pub mvum: bool,
+    /// Raw elevation: the ground as grey, black at the lowest elevation in view and white at the highest (the contours' range), unlit (Nick 2026-10-10).
+    pub raw: bool,
 }
 
 impl Default for LayerMask {
     fn default() -> Self {
-        LayerMask { dem: true, land: true, water: true, line: true, debug: false, imagery: false, contours: true, slope: false, infrared: false, hypso: true, boundaries: true, own: true, mvum: true }
+        LayerMask { dem: true, land: true, water: true, line: true, debug: false, imagery: false, contours: true, slope: false, infrared: false, hypso: true, boundaries: true, own: true, mvum: true, raw: false }
     }
 }
 
@@ -98,7 +100,9 @@ impl LayerMask {
     /// Imagery stands in for the ground where it exists, so land cover and slope bands are inert under it; contours and the water fill still draw over it, the terrain stays live as what shows where the imagery runs out, and the sea comes from it everywhere.
     pub fn inert(self) -> LayerMask {
         let im = self.imagery;
-        LayerMask { dem: false, land: im, water: false, line: false, debug: false, imagery: false, contours: false, slope: im, infrared: !im, hypso: self.land || !self.dem, boundaries: !self.line, own: false, mvum: false }
+        // Raw elevation stands in for the ground's whole colour and its light: the terrain shading, the tint, land cover, slope bands and imagery go quiet under it.
+        let raw = self.raw;
+        LayerMask { dem: raw, land: im || raw, water: false, line: false, debug: false, imagery: raw, contours: false, slope: im || raw, infrared: !im || raw, hypso: self.land || !self.dem || raw, boundaries: !self.line, own: false, mvum: false, raw: false }
     }
 
     /// The mask as bits, one per field in declaration order, for a shader or a settings document.
@@ -116,10 +120,11 @@ impl LayerMask {
             | (self.boundaries as u32) << 10
             | (self.own as u32) << 11
             | (self.mvum as u32) << 12
+            | (self.raw as u32) << 13
     }
 
     pub fn from_bits(b: u32) -> LayerMask {
-        LayerMask { dem: b & 1 != 0, land: b & 2 != 0, water: b & 4 != 0, line: b & 8 != 0, debug: b & 16 != 0, imagery: b & 32 != 0, contours: b & 64 != 0, slope: b & 128 != 0, infrared: b & 256 != 0, hypso: b & 512 != 0, boundaries: b & 1024 != 0, own: b & 2048 != 0, mvum: b & 4096 != 0 }
+        LayerMask { dem: b & 1 != 0, land: b & 2 != 0, water: b & 4 != 0, line: b & 8 != 0, debug: b & 16 != 0, imagery: b & 32 != 0, contours: b & 64 != 0, slope: b & 128 != 0, infrared: b & 256 != 0, hypso: b & 512 != 0, boundaries: b & 1024 != 0, own: b & 2048 != 0, mvum: b & 4096 != 0, raw: b & 8192 != 0 }
     }
 
     /// The mask as drawn: every inert row off.
@@ -131,7 +136,7 @@ impl LayerMask {
             water: self.water && !i.water,
             line: self.line,
             debug: self.debug,
-            imagery: self.imagery,
+            imagery: self.imagery && !i.imagery,
             contours: self.contours && !i.contours,
             slope: self.slope && !i.slope,
             infrared: self.infrared && !i.infrared,
@@ -139,6 +144,7 @@ impl LayerMask {
             boundaries: self.boundaries && !i.boundaries,
             own: self.own,
             mvum: self.mvum,
+            raw: self.raw,
         }
     }
 }
@@ -152,6 +158,17 @@ pub struct Contours {
     pub index_every: u32,
     /// Ground metres per screen pixel at the view's scale.
     pub m_per_px: f32,
+    /// The elevations in view, metres, lowest and highest, from the previous frame: the raw elevation view runs black to white across them.
+    pub lo_m: f32,
+    pub hi_m: f32,
+}
+
+/// The raw elevation view's grey at an elevation: the byte across the range in view, as a colour is authored, so the screen steps evenly from black to white.
+#[inline(always)]
+pub fn raw_grey(elev_m: f32, c: &Contours) -> [f32; 3] {
+    let t = ((elev_m - c.lo_m) / (c.hi_m - c.lo_m).max(0.5)).clamp(0.0, 1.0);
+    let b = (t * 255.0).round() as u8;
+    lin([b, b, b])
 }
 
 /// Elevation range seen while composing a frame (quantised units), reduced over row bands; next frame's contour interval is fit to it.
@@ -744,10 +761,13 @@ fn compose_rgb(dem: &DemRef, vec: &VecRef, pool: &Pool, diamond: u8, uq: i64, vq
     let mut contour = (0.0f32, false);
     let mut slope_band: Option<[u8; 3]> = None;
     // The terrain sample feeds the tint and light (terrain on), and the contours and slope bands on their own.
-    if mask.dem || mask.contours || mask.slope {
+    if mask.dem || mask.contours || mask.slope || mask.raw {
         if let Some(t) = dem_texel(dem, pool, diamond, uq, vq) {
             let eq = (t & 0xFFFF) as u16;
             range.see(eq);
+            if mask.raw {
+                tint = raw_grey(eq as f32 * ELEV_STEP - ELEV_OFFSET, &luts.contours);
+            }
             {
                 let nx = (t >> 16) as u16 as i16 as f32;
                 let ny = (t >> 32) as u16 as i16 as f32;
@@ -791,7 +811,7 @@ fn compose_rgb(dem: &DemRef, vec: &VecRef, pool: &Pool, diamond: u8, uq: i64, vq
                     }
                 }
             }
-        } else if mask.dem {
+        } else if mask.dem || mask.raw {
             tint = lin(rgb3(st.bg));
         }
     }
@@ -1132,7 +1152,7 @@ mod tests {
             sun: [0.0, 0.0, 1.0],
             mask: LayerMask { contours: false, ..LayerMask::default() }.effective(),
             dem_depth: 6,
-            contours: Contours { interval: 0.0, index_every: 5, m_per_px: 1.0 },
+            contours: Contours { interval: 0.0, index_every: 5, m_per_px: 1.0, lo_m: 0.0, hi_m: 4000.0 },
             light: crate::sh::Sh9::sun_and_sky(315.0, 40.0).quadratic((0.0, 1.0)),
             display: crate::colour::Display::default(),
             compressed: true,

@@ -71,6 +71,7 @@ enum Layer {
     Boundaries,
     Own,
     Mvum,
+    Raw,
     Land,
     Water,
     Line,
@@ -89,9 +90,10 @@ enum Layer {
     Areas,
 }
 
-const LAYERS: [(Layer, &str); 24] = [
+const LAYERS: [(Layer, &str); 25] = [
     (Layer::Dem, "Terrain"),
     (Layer::Hypso, "Elevation tint"),
+    (Layer::Raw, "Raw elevation"),
     (Layer::Land, "Land cover"),
     (Layer::Water, "Water"),
     (Layer::Line, "Lines"),
@@ -140,6 +142,7 @@ fn get(mask: &LayerMask, ctl: &Controls, l: Layer) -> bool {
         Layer::Line => mask.line,
         Layer::Boundaries => mask.boundaries,
         Layer::Own => mask.own,
+        Layer::Raw => mask.raw,
         Layer::Mvum => mask.mvum,
         Layer::Contours => mask.contours,
         Layer::Slope => mask.slope,
@@ -166,6 +169,7 @@ fn set(mask: &mut LayerMask, ctl: &mut Controls, l: Layer, v: bool) {
         Layer::Line => mask.line = v,
         Layer::Boundaries => mask.boundaries = v,
         Layer::Own => mask.own = v,
+        Layer::Raw => mask.raw = v,
         Layer::Mvum => mask.mvum = v,
         Layer::Contours => mask.contours = v,
         Layer::Slope => mask.slope = v,

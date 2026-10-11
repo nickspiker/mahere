@@ -324,7 +324,7 @@ impl MapCore {
                 sun: [0.0, 0.0, 1.0],
                 mask: LayerMask::default(),
                 dem_depth: DEM_BASE_DEPTH,
-                contours: Contours { interval: 0.0, index_every: 5, m_per_px: 1.0 },
+                contours: Contours { interval: 0.0, index_every: 5, m_per_px: 1.0, lo_m: 0.0, hi_m: 4000.0 },
                 light: sh::Sh9::sun_and_sky(315.0, 40.0).quadratic((0.0, 1.0)),
                 display: colour::Display::default(),
                 compressed: true,
@@ -1167,7 +1167,12 @@ impl MapCore {
             ((self.last_range.hi - self.last_range.lo) as f32 * 0.25 / self.contours_on_screen).max(0.5)
         };
         self.contour_interval = interval;
-        self.luts.contours = Contours { interval, index_every: 5, m_per_px: (111_320.0 / self.cam.ppd) as f32 };
+        let (lo_m, hi_m) = if self.last_range.is_empty() {
+            (0.0, 4000.0)
+        } else {
+            (self.last_range.lo as f32 * mahere_tiles::ELEV_STEP - mahere_tiles::ELEV_OFFSET, self.last_range.hi as f32 * mahere_tiles::ELEV_STEP - mahere_tiles::ELEV_OFFSET)
+        };
+        self.luts.contours = Contours { interval, index_every: 5, m_per_px: (111_320.0 / self.cam.ppd) as f32, lo_m, hi_m };
     }
 
     /// Render the full frame into `self.canvas` (visible 0xRRGGBB). Cheap by construction (fetch + composite), so it runs every host frame.

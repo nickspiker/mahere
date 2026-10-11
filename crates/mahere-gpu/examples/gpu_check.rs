@@ -37,6 +37,7 @@ fn main() {
         for tok in spec.split(',') {
             match tok.trim() {
                 "imagery" => m.imagery = true,
+                "raw" => m.raw = true,
                 "nocontours" => m.contours = false,
                 "nohypso" => m.hypso = false,
                 "nolines" => m.line = false,

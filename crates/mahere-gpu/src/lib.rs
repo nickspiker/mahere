@@ -90,6 +90,8 @@ struct Uniforms {
     globe: [f32; 4],
     // The world's pole axis in view coordinates.
     pole: [f32; 4],
+    // The raw elevation view's range: lowest and highest metres in view.
+    raw: [f32; 4],
 }
 
 /// The layer mask as the shader's bits.
@@ -879,6 +881,7 @@ impl GpuMap {
         let u = Uniforms {
             globe: [plan.globe[0] * sc, plan.globe[1] * sc, plan.globe[2] * plan.globe[2] * sc * sc, plan.globe[3]],
             pole: plan.pole,
+            raw: [luts.contours.lo_m, luts.contours.hi_m, 0.0, 0.0],
             size: [(w * self.scale.max(1)) as f32, (h * self.scale.max(1)) as f32],
             scale: self.scale.max(1) as f32,
             mask: mask_bits(luts.mask),

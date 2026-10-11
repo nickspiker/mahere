@@ -47,7 +47,7 @@ pub const LAND_NAMES: [&str; 14] = ["", "Grass", "Farmland", "Orchard", "Scrub",
 /// Line classes in table order (1-based ids; 0 is empty).
 pub const CLASS_NAMES: [&str; 18] = ["", "Motorway", "Trunk", "Primary", "Secondary", "Tertiary", "Residential", "Service", "Track", "Path", "Rail", "Power", "Waterway", "National park", "Wilderness", "National forest", "Protected", "County and state"];
 
-const ALL: LayerMask = LayerMask { dem: true, land: true, water: true, line: true, debug: false, imagery: false, contours: true, slope: false, infrared: false, hypso: true, boundaries: true, own: true, mvum: true };
+const ALL: LayerMask = LayerMask { dem: true, land: true, water: true, line: true, debug: false, imagery: false, contours: true, slope: false, infrared: false, hypso: true, boundaries: true, own: true, mvum: true, raw: false };
 
 /// The ownership colours every built-in starts from (Nick 2026-10-10): the agencies' customary map colours, Forest Service green, BLM yellow, Park Service purple, state blue, tribal brown; the alpha is the boundary's, the wash a fifth of it.
 pub const OWN: [[u8; 4]; 13] = [[0, 0, 0, 0], [70, 150, 70, 200], [236, 204, 70, 200], [150, 110, 200, 200], [70, 160, 180, 200], [160, 140, 120, 200], [80, 130, 226, 200], [90, 186, 150, 200], [70, 166, 206, 200], [200, 132, 74, 200], [214, 120, 156, 200], [150, 174, 90, 200], [170, 170, 170, 200]];
