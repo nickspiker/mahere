@@ -230,8 +230,12 @@ pub struct MapCore {
     res: Residency,
     luts: FrameLuts,
     luts_sun: (f32, f32, f64),
+    /// The map's own sun, fixed to the screen: azimuth clockwise from screen up, altitude. The real sun never touches these (it once did, and the session kept the almanac's last place as the map's own light; Nick 2026-10-10: "it's def lit from the left").
     pub sun_az: f32,
     pub sun_alt: f32,
+    /// The real sun's last azimuth and altitude from the almanac, true north and the horizon.
+    real_az: f32,
+    real_alt: f32,
     /// The sun as a direction in the world (the unit sphere), fixed while the ball turns under the camera; set from the azimuth and altitude at the camera point when they change, or by the almanac. The frame takes it into view space with the ball's basis, so no bearing is read, and the poles are nothing special (Nick 2026-10-10: the lighting jumped there).
     sun_world: [f64; 3],
     pub gps: Option<GpsFix>,
@@ -331,6 +335,8 @@ impl MapCore {
             luts_sun: (f32::NAN, f32::NAN, f64::NAN),
             sun_az: 315.0,
             sun_alt: 40.0,
+            real_az: f32::NAN,
+            real_alt: f32::NAN,
             sun_world: sun_world_at(home.lat(), home.lon(), 315.0, 40.0),
             gps: None,
             canvas: Vec::new(),
@@ -1103,10 +1109,10 @@ impl MapCore {
             let (az, alt) = sh::sun_position(lat, lon, now);
             // The clock moves the sun a few thousandths of a degree a second: follow it in steps too small to see, so a still screen is not relit every frame.
             let az = (az.rem_euclid(360.0)) as f32;
-            if (az - self.sun_az).abs() > 0.05 || (alt as f32 - self.sun_alt).abs() > 0.05 {
-                self.sun_az = az;
-                self.sun_alt = alt as f32;
-                self.sun_world = sun_world_at(lat, lon, self.sun_az, self.sun_alt);
+            if !((az - self.real_az).abs() <= 0.05 && (alt as f32 - self.real_alt).abs() <= 0.05) {
+                self.real_az = az;
+                self.real_alt = alt as f32;
+                self.sun_world = sun_world_at(lat, lon, self.real_az, self.real_alt);
             }
         }
         // Lighting lives in the view frame, where the normals now are (each turned by its own place on the ball). The map's own sun is fixed to the screen: its azimuth is clockwise from screen up and nothing about the view enters, so the lit side stays where the phone has it as the globe turns and a pole is nothing special (Nick 2026-10-10: phone-relative, not planet-relative). The real sun is a world direction, brought into view space by the basis. The key is the sun's view vector, to the thousandth, so a still screen is not relit every frame.
@@ -1117,7 +1123,7 @@ impl MapCore {
             let alt = (self.sun_alt as f64).to_radians();
             [(az.sin() * alt.cos()) as f32, (az.cos() * alt.cos()) as f32, alt.sin() as f32]
         };
-        let key = (self.sun_az, self.sun_alt, ((sv[0] * 1000.0).round() as f64) * 1.0e6 + ((sv[1] * 1000.0).round() as f64) * 1.0e3 + (sv[2] * 1000.0).round() as f64);
+        let key = (if self.real_sun { self.real_az } else { self.sun_az }, if self.real_sun { self.real_alt } else { self.sun_alt }, ((sv[0] * 1000.0).round() as f64) * 1.0e6 + ((sv[1] * 1000.0).round() as f64) * 1.0e3 + (sv[2] * 1000.0).round() as f64);
         if self.luts_sun != key {
             self.luts.sun = sv;
             if let (true, Some(env)) = (self.real_light, self.probe.as_ref()) {

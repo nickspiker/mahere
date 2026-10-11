@@ -578,10 +578,8 @@ pub extern "system" fn Java_nz_mahere_app_MahereActivity_nativeInit(
         map.set_user_store(std::sync::Arc::new(mahere_store::VaultUser::new(v.clone())));
         areas.set_store(std::sync::Arc::new(mahere_store::VaultAreas::new(v.clone())));
     }
-    if let Some(s) = session {
-        map.sun_az = s.sun_az as f32;
-        map.sun_alt = s.sun_alt as f32;
-    }
+    // The session's sun is not restored: the phone has no way to move the map's own sun, so it is always the default, and older sessions hold the real sun's last place in it.
+    let _ = session.map(|s| (s.sun_az, s.sun_alt));
     // Themes from the vault (the built-ins written on first launch), then the saved choice, then the saved layers over the theme's defaults.
     if let Some(v) = &store {
         map.set_themes(mahere_store::themes::load_all(v));
