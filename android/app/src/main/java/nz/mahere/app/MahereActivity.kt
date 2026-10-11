@@ -18,6 +18,7 @@ import android.location.LocationManager
 import android.content.BroadcastReceiver
 import android.content.Intent
 import android.content.IntentFilter
+import android.net.Uri
 import android.os.Bundle
 import android.view.Choreographer
 import android.view.MotionEvent
@@ -54,6 +55,7 @@ class MahereActivity : Activity(), SurfaceHolder.Callback, Choreographer.FrameCa
     private external fun nativePenOut(ptr: Long, out: Boolean)
     private external fun nativeOnLocation(ptr: Long, lat: Double, lon: Double, accuracy: Float)
     private external fun nativeGoTo(ptr: Long, lat: Double, lon: Double, ppd: Double)
+    private external fun nativeOpenArea(ptr: Long, bytes: ByteArray)
     private external fun nativeOnDeclination(ptr: Long, declinationDeg: Float)
     private external fun nativeOnOrientation(ptr: Long, r0: Float, r1: Float, r2: Float, r3: Float, r4: Float, r5: Float, r6: Float, r7: Float, r8: Float)
     private external fun nativeOnPause(ptr: Long)
@@ -86,6 +88,38 @@ class MahereActivity : Activity(), SurfaceHolder.Callback, Choreographer.FrameCa
     /// A place from a geo: intent, waiting for the native side to exist: latitude, longitude, pixels per degree (or -1 for the zoom the map has).
     private var pendingGeo: Triple<Double, Double, Double>? = null
 
+    /// An area document shared to the app, waiting for the native side to exist.
+    private var pendingArea: ByteArray? = null
+
+    /// Open the system's share sheet on a file the native side wrote under files/share (an area document), through the app's own provider. Called from native, on the UI thread.
+    fun shareFile(path: String) {
+        val f = java.io.File(path)
+        val uri = Uri.parse("content://nz.mahere.app.share/" + Uri.encode(f.name))
+        val send = Intent(Intent.ACTION_SEND).apply {
+            type = "application/vnd.mahere.area"
+            putExtra(Intent.EXTRA_STREAM, uri)
+            putExtra(Intent.EXTRA_SUBJECT, f.name.removeSuffix(".vsf.zst"))
+            putExtra(Intent.EXTRA_TEXT, "A mahere area: " + f.name.removeSuffix(".vsf.zst").replace('-', ' '))
+            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        }
+        runCatching { startActivity(Intent.createChooser(send, "Share area")) }
+    }
+
+    /// An area document sent or opened with the app: its bytes to the native side, or kept until it is up. Anything that does not decode is ignored there.
+    private fun takeArea(intent: Intent?) {
+        if (intent == null) return
+        val found: Uri? = when (intent.action) {
+            Intent.ACTION_SEND -> @Suppress("DEPRECATION") (intent.getParcelableExtra(Intent.EXTRA_STREAM) as? Uri)
+            Intent.ACTION_VIEW -> intent.data?.takeIf { it.scheme == "content" || it.scheme == "file" }
+            else -> null
+        }
+        val uri: Uri = found ?: return
+        val bytes = runCatching { contentResolver.openInputStream(uri)?.use { it.readBytes() } }.getOrNull() ?: return
+        if (bytes.size > 64 shl 20) return
+        val ptr = nativePtr
+        if (ptr != 0L) nativeOpenArea(ptr, bytes) else pendingArea = bytes
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         surfaceView = SurfaceView(this)
@@ -95,6 +129,7 @@ class MahereActivity : Activity(), SurfaceHolder.Callback, Choreographer.FrameCa
         setContentView(surfaceView)
         hideSystemBars()
         takeGeo(intent)
+        takeArea(intent)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             registerReceiver(penReceiver, IntentFilter("com.samsung.pen.INSERT"), Context.RECEIVER_EXPORTED)
         } else {
@@ -166,6 +201,8 @@ class MahereActivity : Activity(), SurfaceHolder.Callback, Choreographer.FrameCa
                     initInFlight = false
                     pendingGeo?.let { (lat, lon, ppd) -> nativeGoTo(ptr, lat, lon, ppd) }
                     pendingGeo = null
+                    pendingArea?.let { nativeOpenArea(ptr, it) }
+                    pendingArea = null
                     // The surface may have changed size during the long init.
                     pendingSize?.let { (pw, ph) ->
                         if (pw != w || ph != h) nativeResize(ptr, pw, ph)
@@ -224,6 +261,7 @@ class MahereActivity : Activity(), SurfaceHolder.Callback, Choreographer.FrameCa
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         takeGeo(intent)
+        takeArea(intent)
     }
 
     /// A geo: URI's place, applied now or once the native side is up. `geo:lat,lon`, `geo:0,0?q=lat,lon`, and `?z=` as a web zoom level (metres per pixel 156543 / 2^z at the equator, so pixels per degree 0.711 · 2^z).

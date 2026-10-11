@@ -12,9 +12,27 @@ fn main() {
     let pbf = arg(&args, "--pbf").expect("--pbf");
     let out = arg(&args, "--out").expect("--out");
     let out = Path::new(&out);
-    let bbox: Vec<f64> = arg(&args, "--bbox").expect("--bbox").split(',').map(|x| x.parse().unwrap()).collect();
+    // --area <file>: a shared area document; the dem and imagery bake only the cells its shape covers, and its bounds stand in for --bbox.
+    let area = arg(&args, "--area").map(|f| mahere_tiles::area::Area::decode(&std::fs::read(&f).expect("area file")).expect("area document"));
+    let bbox: Vec<f64> = match (arg(&args, "--bbox"), &area) {
+        (Some(b), _) => b.split(',').map(|x| x.parse().unwrap()).collect(),
+        (None, Some(a)) => {
+            let (lat0, lon0, lat1, lon1) = a.bounds().expect("an empty area");
+            vec![lat0, lon0, lat1, lon1]
+        }
+        (None, None) => panic!("--bbox or --area"),
+    };
     let (lat0, lon0, lat1, lon1) =
         (bbox[0].min(bbox[2]), bbox[1].min(bbox[3]), bbox[0].max(bbox[2]), bbox[1].max(bbox[3]));
+    let in_area = |keys: Vec<mahere_tiles::CellKey>, depth: u8| -> Vec<mahere_tiles::CellKey> {
+        match &area {
+            Some(a) => {
+                let wanted: std::collections::HashSet<mahere_tiles::CellKey> = a.cells_at(depth).into_iter().collect();
+                keys.into_iter().filter(|k| wanted.contains(k)).collect()
+            }
+            None => keys,
+        }
+    };
     let vec_base: u8 = arg(&args, "--vec-base").map(|v| v.parse().unwrap()).unwrap_or(13);
     let dem_base: u8 = arg(&args, "--dem-base").map(|v| v.parse().unwrap()).unwrap_or(11);
     let min_depth: u8 = arg(&args, "--min").map(|v| v.parse().unwrap()).unwrap_or(6);
@@ -83,7 +101,7 @@ fn main() {
     let dem = mahere_dem::DemStore::load(&tifs).expect("dem");
     eprintln!("dem source loaded ({} tiles) {:.1}s", dem.tile_count(), t.elapsed().as_secs_f32());
     let t = std::time::Instant::now();
-    let keys = mahere_tiles::cells_covering(lat0, lon0, lat1, lon1, dem_base);
+    let keys = in_area(mahere_tiles::cells_covering(lat0, lon0, lat1, lon1, dem_base), dem_base);
     let mut dem_cells = mahere_tiles::bake_dem(&dem, &keys);
     eprintln!("depth {dem_base}: {} dem cells sampled, {:.1}s", dem_cells.len(), t.elapsed().as_secs_f32());
     drop(dem);
@@ -100,7 +118,7 @@ fn main() {
         let t = std::time::Instant::now();
         let nir_store = if nir.is_empty() { None } else { Some(mahere_dem::ImgStore::load(&nir).expect("nir")) };
         let img_base = img_base_arg.unwrap_or(vec_base).min(mahere_tiles::IMG_MAX_DEPTH);
-        let keys = mahere_tiles::cells_covering(lat0, lon0, lat1, lon1, img_base);
+        let keys = in_area(mahere_tiles::cells_covering(lat0, lon0, lat1, lon1, img_base), img_base);
         img_cells = mahere_tiles::bake_img(naip_store.as_ref(), nir_store.as_ref(), &keys);
         eprintln!("depth {img_base}: {} img cells sampled, {:.1}s", img_cells.len(), t.elapsed().as_secs_f32());
         let pyramid = mahere_tiles::img_pyramid(&img_cells, min_depth);

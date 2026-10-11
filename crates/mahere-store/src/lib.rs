@@ -301,6 +301,8 @@ mod tests {
 pub struct VaultCells {
     store: Arc<FlatStorage>,
     index: std::sync::Mutex<CellIndex>,
+    /// Cells an area keeps on the device: never purged, and not counted against the budget.
+    pinned: std::sync::Mutex<std::collections::HashSet<(u8, u64)>>,
 }
 
 #[derive(Default)]
@@ -321,7 +323,7 @@ impl VaultCells {
         if let Ok(Some(bytes)) = store.read_device(&cells_index_key()) {
             index.entries = decode_cell_index(&bytes);
         }
-        VaultCells { store, index: std::sync::Mutex::new(index) }
+        VaultCells { store, index: std::sync::Mutex::new(index), pinned: std::sync::Mutex::new(Default::default()) }
     }
 
     fn touch(&self, key: mahere_tiles::CellKey, bytes: usize) {
@@ -349,17 +351,29 @@ impl VaultCells {
         let _ = n;
     }
 
-    /// Bytes of cells the index knows about.
+    /// Bytes of cells the index knows about, the pinned ones included.
     pub fn cached_bytes(&self) -> u64 {
         self.index.lock().unwrap().entries.values().map(|&(_, b)| b as u64).sum()
     }
 
-    /// Delete the least recently used cells until the cache fits `budget` bytes; returns how many went.
+    /// Bytes of pinned cells on the device.
+    pub fn pinned_bytes(&self) -> u64 {
+        let pinned = self.pinned.lock().unwrap();
+        self.index.lock().unwrap().entries.iter().filter(|(k, _)| pinned.contains(k)).map(|(_, &(_, b))| b as u64).sum()
+    }
+
+    /// The cells the areas keep: the whole set, replacing the last.
+    pub fn set_pinned(&self, keys: impl IntoIterator<Item = mahere_tiles::CellKey>) {
+        *self.pinned.lock().unwrap() = keys.into_iter().map(|k| (k.depth, k.raw())).collect();
+    }
+
+    /// Delete the least recently used unpinned cells until they fit `budget` bytes; returns how many went. The pinned cells stay whatever the budget.
     pub fn purge_to(&self, budget: u64) -> usize {
         let victims: Vec<(u8, u64)> = {
             let ix = self.index.lock().unwrap();
-            let mut total: u64 = ix.entries.values().map(|&(_, b)| b as u64).sum();
-            let mut by_age: Vec<(&(u8, u64), &(i64, u32))> = ix.entries.iter().collect();
+            let pinned = self.pinned.lock().unwrap();
+            let mut total: u64 = ix.entries.iter().filter(|(k, _)| !pinned.contains(k)).map(|(_, &(_, b))| b as u64).sum();
+            let mut by_age: Vec<(&(u8, u64), &(i64, u32))> = ix.entries.iter().filter(|(k, _)| !pinned.contains(k)).collect();
             by_age.sort_by_key(|(_, v)| v.0);
             let mut out = Vec::new();
             for (k, &(_, b)) in by_age {
@@ -505,6 +519,81 @@ impl mahere_engine::ink::UserStore for VaultUser {
                 (!bytes.is_empty()).then_some((key, bytes))
             })
             .collect()
+    }
+}
+
+// ==================== AREAS ====================
+
+/// The user's areas in the vault: one document each under (`d` area, `x` name), an index document (`d` area, `d` index) naming them.
+pub struct VaultAreas {
+    store: Arc<FlatStorage>,
+    names: std::sync::Mutex<Vec<String>>,
+}
+
+fn area_key(area_name: &str) -> String {
+    vault_key(&[name("area"), VsfType::x(area_name.to_string())])
+}
+
+fn area_index_key() -> String {
+    vault_key(&[name("area"), name("index")])
+}
+
+impl VaultAreas {
+    pub fn new(store: Arc<FlatStorage>) -> VaultAreas {
+        let names = store.read_device(&area_index_key()).ok().flatten().map(|b| decode_names(&b)).unwrap_or_default();
+        VaultAreas { store, names: std::sync::Mutex::new(names) }
+    }
+
+    fn flush(&self) {
+        let names = self.names.lock().unwrap().clone();
+        if let Some(b) = encode_names(&names) {
+            let _ = self.store.write_device(&area_index_key(), &b);
+        }
+    }
+}
+
+fn encode_names(names: &[String]) -> Option<Vec<u8>> {
+    VsfBuilder::new().add_section("areas", names.iter().enumerate().map(|(i, n)| (format!("a{i}"), VsfType::x(n.clone()))).collect()).build().ok()
+}
+
+fn decode_names(data: &[u8]) -> Vec<String> {
+    let mut out = Vec::new();
+    let Ok((header, end)) = vsf::VsfHeader::decode(data) else { return out };
+    let Ok(sections) = header.sections(data, end) else { return out };
+    for s in sections {
+        if s.name != "areas" {
+            continue;
+        }
+        for f in s.fields {
+            if let Some(VsfType::x(n) | VsfType::a(n)) = f.values.into_iter().next() {
+                out.push(n);
+            }
+        }
+    }
+    out
+}
+
+impl mahere_engine::areas::AreaStore for VaultAreas {
+    fn put(&self, area_name: &str, bytes: &[u8]) {
+        if self.store.write_device(&area_key(area_name), bytes).is_ok() {
+            let mut names = self.names.lock().unwrap();
+            if !names.iter().any(|n| n == area_name) {
+                names.push(area_name.to_string());
+            }
+            drop(names);
+            self.flush();
+        }
+    }
+
+    fn delete(&self, area_name: &str) {
+        let _ = self.store.write_device(&area_key(area_name), &[]);
+        self.names.lock().unwrap().retain(|n| n != area_name);
+        self.flush();
+    }
+
+    fn load_all(&self) -> Vec<Vec<u8>> {
+        let names = self.names.lock().unwrap().clone();
+        names.iter().filter_map(|n| self.store.read_device(&area_key(n)).ok().flatten()).filter(|b| !b.is_empty()).collect()
     }
 }
 

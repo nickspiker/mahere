@@ -7,6 +7,7 @@ use fluor::paint::{self, HitId, HIT_NONE};
 use fluor::text::{TextRenderer, TextStyle};
 use fluor::theme;
 use fluor::widgets::{Checkbox, Slider};
+pub use mahere_engine::areas::{AREA_MAX_DEPTH, AREA_MIN_DEPTH, AreaView, AreasView};
 use mahere_engine::theme::{Field, Theme};
 use mahere_engine::{LayerMask, MeasureView};
 
@@ -76,9 +77,11 @@ enum Layer {
     PenColour,
     ClearInk,
     ClearSel,
+    /// The areas page: saved selections, downloaded and shared.
+    Areas,
 }
 
-const LAYERS: [(Layer, &str); 21] = [
+const LAYERS: [(Layer, &str); 22] = [
     (Layer::Dem, "Terrain"),
     (Layer::Hypso, "Elevation tint"),
     (Layer::Land, "Land cover"),
@@ -100,6 +103,7 @@ const LAYERS: [(Layer, &str); 21] = [
     (Layer::Select, "Select area"),
     (Layer::ClearInk, "Clear ink"),
     (Layer::ClearSel, "Clear selection"),
+    (Layer::Areas, "Areas  \u{203a}"),
 ];
 
 /// A row that takes a tap but changes nothing: a layer another layer has greyed, or the one of real sun and real light the other has taken (the sun is either the almanac's or the camera's).
@@ -107,7 +111,7 @@ fn inert(mask: &LayerMask, ctl: &Controls, l: Layer) -> bool {
     match l {
         Layer::RealSun => ctl.real_light,
         Layer::RealLight => ctl.real_sun,
-        Layer::Linear | Layer::FollowHeading | Layer::LockToFix | Layer::Pen | Layer::Select | Layer::PenColour | Layer::ClearInk | Layer::ClearSel => false,
+        Layer::Linear | Layer::FollowHeading | Layer::LockToFix | Layer::Pen | Layer::Select | Layer::PenColour | Layer::ClearInk | Layer::ClearSel | Layer::Areas => false,
         _ => get(&mask.inert(), &Controls::default(), l),
     }
 }
@@ -132,7 +136,7 @@ fn get(mask: &LayerMask, ctl: &Controls, l: Layer) -> bool {
         Layer::Debug => mask.debug,
         Layer::Pen => ctl.tool == 1,
         Layer::Select => ctl.tool == 2,
-        Layer::PenColour | Layer::ClearInk | Layer::ClearSel => false,
+        Layer::PenColour | Layer::ClearInk | Layer::ClearSel | Layer::Areas => false,
     }
 }
 
@@ -156,7 +160,7 @@ fn set(mask: &mut LayerMask, ctl: &mut Controls, l: Layer, v: bool) {
         Layer::Debug => mask.debug = v,
         Layer::Pen => ctl.tool = if v { 1 } else { 0 },
         Layer::Select => ctl.tool = if v { 2 } else { 0 },
-        Layer::PenColour => {}
+        Layer::PenColour | Layer::Areas => {}
         Layer::ClearInk => ctl.clear_ink = true,
         Layer::ClearSel => ctl.clear_sel = true,
     }
@@ -200,6 +204,39 @@ enum Page {
     Field(Field),
     /// The pen's colour: a mixer of red, green, blue and opacity.
     Pen,
+    /// The saved areas, and one of them.
+    Areas,
+    Area(usize),
+}
+
+/// A row of the areas pages.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AreaRow {
+    Back,
+    Save,
+    Open(usize),
+    Download,
+    Cancel,
+    Refresh,
+    Share,
+    Show,
+    Delete,
+}
+
+/// What the areas pages ask of the host, polled after every tap and drag.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AreaAct {
+    /// The selection saved as a new area; the host opens it with [`Panel::show_area`].
+    Save,
+    SetDepth(usize, u8),
+    Download(usize),
+    Cancel(usize),
+    /// Download again, asking for what was absent before.
+    Refresh(usize),
+    Share(usize),
+    /// The area's shape shown as the selection.
+    Show(usize),
+    Delete(usize),
 }
 
 /// What the editor asks of the host, polled after every tap and drag.
@@ -265,6 +302,10 @@ pub struct Panel {
     /// The ruler strip's close button (centre and radius) while a measurement is shown, and whether a tap just hit it.
     strip_close: Option<(f32, f32, f32)>,
     clear_measure: bool,
+    /// The areas pages' rows from the last paint (centre y, half height, the row), what they asked, and what was shown.
+    area_rows: Vec<(f32, f32, AreaRow)>,
+    area_acts: Vec<AreaAct>,
+    areas: AreasView,
 }
 
 impl Default for Panel {
@@ -277,7 +318,7 @@ impl Panel {
     pub fn new() -> Panel {
         let mut hits: HitId = HIT_NONE;
         let checks = LAYERS.iter().map(|&(l, label)| (l, Checkbox::new(&mut hits, label, 0.0, 0.0, 10.0, 10.0, 10.0, false))).collect();
-        Panel { open: false, dirty: true, ru: 1.0, stack: vec![Page::Layers], theme_rows: Vec::new(), edit_rows: Vec::new(), edit_scroll: 0.0, edit_extent: 0.0, press: None, sliders: Vec::new(), field_vals: [0.0; 4], held: None, edits: Vec::new(), hits, checks, text: TextRenderer::new(), buf: Vec::new(), w: 0, h: 0, font: 16.0, gear: (0.0, 0.0, 0.0), panel_w: 0.0, theme_row: (0.0, 0.0, 0.0), slider: (0.0, 0.0, 0.0), slider_held: false, cache_max: CACHE_MIN + 1, strip_close: None, clear_measure: false }
+        Panel { open: false, dirty: true, ru: 1.0, stack: vec![Page::Layers], theme_rows: Vec::new(), edit_rows: Vec::new(), edit_scroll: 0.0, edit_extent: 0.0, press: None, sliders: Vec::new(), field_vals: [0.0; 4], held: None, edits: Vec::new(), hits, checks, text: TextRenderer::new(), buf: Vec::new(), w: 0, h: 0, font: 16.0, gear: (0.0, 0.0, 0.0), panel_w: 0.0, theme_row: (0.0, 0.0, 0.0), slider: (0.0, 0.0, 0.0), slider_held: false, cache_max: CACHE_MIN + 1, strip_close: None, clear_measure: false, area_rows: Vec::new(), area_acts: Vec::new(), areas: AreasView::default() }
     }
 
     pub fn is_open(&self) -> bool {
@@ -301,6 +342,39 @@ impl Panel {
         self.open = true;
         self.stack = vec![Page::Layers];
         self.open_pen(rgba);
+    }
+
+    /// Open on one area (a new one saved, or one shared in).
+    pub fn show_area(&mut self, i: usize, depth: u8) {
+        self.open = true;
+        self.stack = vec![Page::Layers, Page::Areas, Page::Area(i)];
+        self.open_area_slider(depth);
+    }
+
+    /// The area page's slider: the depth over its range.
+    fn open_area_slider(&mut self, depth: u8) {
+        self.field_vals = [depth as f32, 0.0, 0.0, 0.0];
+        self.sliders = vec![Slider::new(&mut self.hits, 0.0, 0.0, 10.0, 10.0, Self::depth_pos(depth))];
+        self.held = None;
+        self.dirty = true;
+    }
+
+    fn depth_pos(depth: u8) -> f32 {
+        (depth.clamp(AREA_MIN_DEPTH, AREA_MAX_DEPTH) - AREA_MIN_DEPTH) as f32 / (AREA_MAX_DEPTH - AREA_MIN_DEPTH) as f32
+    }
+
+    fn depth_of(pos: f32) -> u8 {
+        (AREA_MIN_DEPTH as f32 + pos.clamp(0.0, 1.0) * (AREA_MAX_DEPTH - AREA_MIN_DEPTH) as f32).round() as u8
+    }
+
+    /// Back one page (the preview example).
+    pub fn pop_page(&mut self) {
+        self.pop();
+    }
+
+    /// What the areas pages asked since last polled.
+    pub fn take_area_acts(&mut self) -> Vec<AreaAct> {
+        std::mem::take(&mut self.area_acts)
     }
 
     /// What the editor changed since last asked.
@@ -418,6 +492,7 @@ impl Panel {
             let gap = match l {
                 Layer::RealSun | Layer::RealLight | Layer::Linear | Layer::FollowHeading | Layer::LockToFix => row * 0.5,
                 Layer::Pen | Layer::PenColour | Layer::Select | Layer::ClearInk | Layer::ClearSel => row,
+                Layer::Areas => row * 1.5,
                 _ => 0.0,
             };
             let cy = top + row * (i as f32 + 0.5) + gap;
@@ -495,6 +570,65 @@ impl Panel {
                 }
                 return true;
             }
+            Page::Areas => {
+                let rows = self.area_rows.clone();
+                for (cy, hh, row) in rows {
+                    if (y - cy).abs() <= hh {
+                        match row {
+                            AreaRow::Back => self.pop(),
+                            AreaRow::Save => {
+                                if self.areas.has_selection {
+                                    self.area_acts.push(AreaAct::Save);
+                                }
+                            }
+                            AreaRow::Open(i) => {
+                                let depth = self.areas.areas.get(i).map_or(AREA_MAX_DEPTH, |a| a.depth);
+                                self.stack.push(Page::Area(i));
+                                self.open_area_slider(depth);
+                            }
+                            _ => {}
+                        }
+                        self.dirty = true;
+                        return true;
+                    }
+                }
+                return true;
+            }
+            Page::Area(i) => {
+                if let Some(sl) = self.sliders.first_mut() {
+                    let b = sl.bbox();
+                    if y >= b.y - b.h * 0.5 && y <= b.y + b.h * 1.5 && x >= b.x - self.font && x <= b.x + b.w + self.font {
+                        sl.set_value_from_x(x);
+                        self.held = Some(0);
+                        let d = Self::depth_of(sl.value());
+                        self.field_vals[0] = d as f32;
+                        self.area_acts.push(AreaAct::SetDepth(i, d));
+                        self.dirty = true;
+                        return true;
+                    }
+                }
+                let rows = self.area_rows.clone();
+                for (cy, hh, row) in rows {
+                    if (y - cy).abs() <= hh {
+                        match row {
+                            AreaRow::Back => self.pop(),
+                            AreaRow::Download => self.area_acts.push(AreaAct::Download(i)),
+                            AreaRow::Cancel => self.area_acts.push(AreaAct::Cancel(i)),
+                            AreaRow::Refresh => self.area_acts.push(AreaAct::Refresh(i)),
+                            AreaRow::Share => self.area_acts.push(AreaAct::Share(i)),
+                            AreaRow::Show => self.area_acts.push(AreaAct::Show(i)),
+                            AreaRow::Delete => {
+                                self.area_acts.push(AreaAct::Delete(i));
+                                self.pop();
+                            }
+                            _ => {}
+                        }
+                        self.dirty = true;
+                        return true;
+                    }
+                }
+                return true;
+            }
             Page::Pen => {
                 for (i, sl) in self.sliders.iter_mut().enumerate() {
                     let b = sl.bbox();
@@ -525,6 +659,11 @@ impl Panel {
                     self.open_pen(rgba);
                     return true;
                 }
+                if *l == Layer::Areas {
+                    self.stack.push(Page::Areas);
+                    self.dirty = true;
+                    return true;
+                }
                 // A row a dominating layer has greyed takes the tap but changes nothing.
                 if inert(mask, ctl, *l) {
                     return true;
@@ -544,8 +683,19 @@ impl Panel {
     }
 
     /// Paint for a `w × h` screen: the gear always (or, when `orb` gives one, the light as a ball in its place), the column when open. Returns the buffer in fluor's pixel convention.
-    pub fn paint(&mut self, w: usize, h: usize, mask: LayerMask, ctl: Controls, r: &Readouts, measure: Option<&MeasureView>, themes: &[Theme], orb: Option<&dyn Fn(usize) -> Option<Vec<[u8; 4]>>>) -> &[u32] {
+    #[allow(clippy::too_many_arguments)]
+    pub fn paint(&mut self, w: usize, h: usize, mask: LayerMask, ctl: Controls, r: &Readouts, measure: Option<&MeasureView>, themes: &[Theme], areas: &AreasView, orb: Option<&dyn Fn(usize) -> Option<Vec<[u8; 4]>>>) -> &[u32] {
         self.layout(w, h);
+        if self.areas != *areas {
+            self.areas = areas.clone();
+            self.dirty = true;
+        }
+        // An area gone from under its page: back to the list.
+        if let Page::Area(i) = self.page() {
+            if i >= self.areas.areas.len() {
+                self.pop();
+            }
+        }
         self.buf.clear();
         self.buf.resize(w * h, 0);
         if w == 0 || h == 0 {
@@ -620,6 +770,8 @@ impl Panel {
                 }
                 Page::Field(f) => Self::paint_field(&mut canvas, &mut self.text, font, rail, cw, self.gear, f, &mut self.sliders, self.field_vals, current),
                 Page::Pen => Self::paint_pen(&mut canvas, &mut self.text, font, rail, cw, self.gear, &mut self.sliders, self.field_vals),
+                Page::Areas => self.area_rows = Self::paint_areas(&mut canvas, &mut self.text, font, rail, cw, self.gear, &self.areas),
+                Page::Area(i) => self.area_rows = Self::paint_area(&mut canvas, &mut self.text, font, rail, cw, self.gear, &self.areas, i, &mut self.sliders, self.field_vals[0] as u8),
                 Page::Layers => {}
             }
             paint::fill_rect(&mut canvas, rail as isize, 0, cw as isize, h as isize, PANEL_BG, None, None);
@@ -634,6 +786,9 @@ impl Panel {
                         if let Some(t) = current {
                             let _ = Self::paint_edit(&mut canvas, &mut self.text, small, 0.0, rail, self.gear, h, t, 0.0);
                         }
+                    }
+                    Page::Areas => {
+                        let _ = Self::paint_areas(&mut canvas, &mut self.text, small, 0.0, rail, self.gear, &self.areas);
                     }
                     _ => {
                         self.text.draw_text_left(&mut canvas, "\u{2039}", font * 0.9, self.gear.1 + self.gear.2 + font * 1.7, &TextStyle::new(font, theme::TEXTBOX_TEXT), None, None);
@@ -870,6 +1025,18 @@ impl Panel {
             }
             return true;
         }
+        if let (Some(0), Page::Area(i)) = (self.held, self.page()) {
+            if let Some(sl) = self.sliders.first_mut() {
+                sl.set_value_from_x(x);
+                let d = Self::depth_of(sl.value());
+                if self.field_vals[0] != d as f32 {
+                    self.field_vals[0] = d as f32;
+                    self.area_acts.push(AreaAct::SetDepth(i, d));
+                }
+                self.dirty = true;
+            }
+            return true;
+        }
         if let (Some(i), Page::Pen) = (self.held, self.page()) {
             if let Some(sl) = self.sliders.get_mut(i) {
                 sl.set_value_from_x(x);
@@ -1070,6 +1237,98 @@ impl Panel {
 }
 
 impl Panel {
+    /// The areas list: the back row, a row to save the selection (dim without one), then every area with what is on the device.
+    fn paint_areas(canvas: &mut Canvas, text: &mut TextRenderer, font: f32, ox: f32, cw: f32, gear: (f32, f32, f32), areas: &AreasView) -> Vec<(f32, f32, AreaRow)> {
+        let x0 = ox + font * 0.9;
+        let right = ox + cw - font * 0.9;
+        let row = font * 1.6;
+        let mut y = gear.1 + gear.2 + font * 0.9 + row * 0.5;
+        let title = TextStyle::new(font, theme::TEXTBOX_TEXT);
+        let dim = TextStyle::new(font, READOUT_DIM);
+        let small = TextStyle::new(font * 0.75, READOUT_DIM);
+        let mut rows = Vec::new();
+        text.draw_text_left(canvas, "\u{2039}  Areas", x0, y, &title, None, None);
+        rows.push((y, row * 0.5, AreaRow::Back));
+        y += row * 1.2;
+        text.draw_text_left(canvas, "+  Save selection", x0, y, if areas.has_selection { &title } else { &dim }, None, None);
+        rows.push((y, row * 0.5, AreaRow::Save));
+        y += row * 1.2;
+        // Each area two lines: its name, then what is on the device, small.
+        for (i, a) in areas.areas.iter().enumerate() {
+            text.draw_text_left(canvas, &a.name, x0, y, &title, None, None);
+            let status = match (a.progress, a.fetched) {
+                (Some((done, total, _)), _) if total > 0 => format!("downloading  {}%", done * 100 / total),
+                (_, Some(b)) => format!("{} on this device", bytes_text(b)),
+                _ => "not downloaded".to_string(),
+            };
+            text.draw_text_left(canvas, &status, x0 + font * 0.4, y + font * 0.95, &small, None, None);
+            rows.push((y + font * 0.4, row * 0.75, AreaRow::Open(i)));
+            y += row * 1.5;
+        }
+        let _ = right;
+        rows
+    }
+
+    /// One area: its detail on a slider (texel size, cells and an estimate, or what is on the device), a download's progress, then its actions.
+    #[allow(clippy::too_many_arguments)]
+    fn paint_area(canvas: &mut Canvas, text: &mut TextRenderer, font: f32, ox: f32, cw: f32, gear: (f32, f32, f32), areas: &AreasView, i: usize, sliders: &mut [Slider], depth: u8) -> Vec<(f32, f32, AreaRow)> {
+        let x0 = ox + font * 0.9;
+        let sw = cw - font * 1.8;
+        let row = font * 1.6;
+        let mut y = gear.1 + gear.2 + font * 0.9 + row * 0.5;
+        let title = TextStyle::new(font, theme::TEXTBOX_TEXT);
+        let small = TextStyle::new(font * 0.8, READOUT);
+        let dim = TextStyle::new(font * 0.72, READOUT_DIM);
+        let mut rows = Vec::new();
+        let Some(a) = areas.areas.get(i) else { return rows };
+        text.draw_text_left(canvas, &format!("\u{2039}  {}", a.name), x0, y, &title, None, None);
+        rows.push((y, row * 0.5, AreaRow::Back));
+        y += row * 1.4;
+        // The detail: the texel's edge at the depth, the depth itself small beside it.
+        let m = mahere_tiles::texel_m(depth);
+        let edge = if m >= 10.0 { format!("{m:.0} m") } else { format!("{m:.1} m") };
+        text.draw_text_left(canvas, "Detail", x0, y, &dim, None, None);
+        text.draw_text_left(canvas, &format!("{edge} texels"), x0 + font * 3.2, y, &small, None, None);
+        y += font * 0.9;
+        if let Some(sl) = sliders.first_mut() {
+            sl.set_rect(x0 + sw * 0.5, y, sw, font * 1.1);
+            sl.render_content_into(canvas, None, HIT_NONE);
+        }
+        y += font * 1.6;
+        // Two short lines: the cells, then the bytes.
+        let (cells, bytes) = match (a.progress, a.fetched) {
+            (Some((done, total, bytes)), _) => (format!("{done} of {total} cells"), format!("{} so far", bytes_text(bytes))),
+            (None, Some(b)) => (format!("{} cells  \u{b7}  depth {depth}", a.cells), format!("{} on this device", bytes_text(b))),
+            (None, None) => (format!("{} cells  \u{b7}  depth {depth}", a.cells), format!("about {}", bytes_text(a.est_bytes))),
+        };
+        text.draw_text_left(canvas, &cells, x0, y, &small, None, None);
+        y += font * 0.9;
+        text.draw_text_left(canvas, &bytes, x0, y, &small, None, None);
+        y += font * 0.9;
+        // A download's progress as a bar.
+        if let Some((done, total, _)) = a.progress {
+            let th = (font * 0.28).max(3.0);
+            let t = if total > 0 { done as f32 / total as f32 } else { 0.0 };
+            paint::fill_rect(canvas, x0 as isize, (y - th * 0.5) as isize, (sw * t) as isize, th as isize, SLIDER_FILL, None, None);
+            paint::fill_rect(canvas, x0 as isize, (y - th * 0.5) as isize, sw as isize, th as isize, SLIDER_TRACK, None, None);
+            y += font * 0.9;
+        }
+        y += row * 0.6;
+        let actions: Vec<(&str, AreaRow)> = if a.progress.is_some() {
+            vec![("\u{25a0}  Cancel", AreaRow::Cancel)]
+        } else if a.fetched.is_some() {
+            vec![("\u{2193}  Download again", AreaRow::Refresh)]
+        } else {
+            vec![("\u{2193}  Download", AreaRow::Download)]
+        };
+        for (label, r) in actions.into_iter().chain([("\u{203a}  Share", AreaRow::Share), ("\u{25cb}  Show selection", AreaRow::Show), ("\u{2715}  Delete", AreaRow::Delete)]) {
+            text.draw_text_left(canvas, label, x0, y, &title, None, None);
+            rows.push((y, row * 0.5, r));
+            y += row;
+        }
+        rows
+    }
+
     /// The pen's mixer: the colour as a swatch, then red, green, blue and opacity sliders.
     fn paint_pen(canvas: &mut Canvas, text: &mut TextRenderer, font: f32, ox: f32, cw: f32, gear: (f32, f32, f32), sliders: &mut [Slider], vals: [f32; 4]) {
         let x0 = ox + font * 0.9;

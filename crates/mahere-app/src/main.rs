@@ -29,6 +29,7 @@ struct MahereApp {
     last_save: Instant,
     panel: Panel,
     cache_budget: u64,
+    areas: mahere_engine::areas::Areas,
 }
 
 impl MahereApp {
@@ -57,7 +58,7 @@ impl MahereApp {
         }
     }
 
-    fn new(map: MapCore) -> Self {
+    fn new(map: MapCore, areas: mahere_engine::areas::Areas) -> Self {
         let mut hit_counter: HitId = HIT_NONE;
         // The app orb: the paper-craft relief map (icon.jpeg, cropped to its disc), bundled as fluor's 256×256 VSF orb. A decode failure is non-fatal — the chrome just draws no orb.
         let orb = fluor::host::icon::Icon::from_vsf_bytes(include_bytes!("../assets/mahere_orb.vsf")).ok();
@@ -81,6 +82,45 @@ impl MahereApp {
             last_save: Instant::now(),
             panel: Panel::new(),
             cache_budget: 2 << 30,
+            areas,
+        }
+    }
+
+    /// What the areas pages asked. A share is a file under data/user/share, its path printed.
+    fn apply_area_acts(&mut self) {
+        use mahere_panel::AreaAct;
+        for act in self.panel.take_area_acts() {
+            match act {
+                AreaAct::Save => {
+                    let depth = self.map.area_depth();
+                    if let Some(i) = self.areas.save_selection(&self.map.user, depth) {
+                        self.panel.show_area(i, depth);
+                    }
+                }
+                AreaAct::SetDepth(i, d) => self.areas.set_depth(i, d),
+                AreaAct::Download(i) => self.areas.download(i, false),
+                AreaAct::Refresh(i) => self.areas.download(i, true),
+                AreaAct::Cancel(i) => self.areas.cancel(i),
+                AreaAct::Share(i) => {
+                    if let Some((name, bytes)) = self.areas.share_bytes(i) {
+                        let dir = std::path::PathBuf::from("data/user/share");
+                        let _ = std::fs::create_dir_all(&dir);
+                        let path = dir.join(format!("{}.vsf.zst", name.replace(' ', "-")));
+                        match std::fs::write(&path, &bytes) {
+                            Ok(()) => eprintln!("area shared: {}", path.display()),
+                            Err(e) => eprintln!("area share failed: {e}"),
+                        }
+                    }
+                }
+                AreaAct::Show(i) => {
+                    if let Some(e) = self.areas.list.get(i) {
+                        let planes = e.area.cells.clone();
+                        self.map.show_selection(planes);
+                        self.panel.close();
+                    }
+                }
+                AreaAct::Delete(i) => self.areas.delete(i),
+            }
         }
     }
 
@@ -183,6 +223,7 @@ impl FluorApp for MahereApp {
                 if self.panel.tap(cx as f32, cy as f32, w, h, &mut mask, &mut ctl, &self.map.themes) {
                     self.cache_budget = ctl.cache_budget;
                     self.apply_theme_edits();
+                    self.apply_area_acts();
                     if ctl.theme != self.map.theme {
                         self.map.set_theme(ctl.theme);
                     }
@@ -269,6 +310,7 @@ impl FluorApp for MahereApp {
                     self.cache_budget = ctl.cache_budget;
                     self.map.set_pen_colour(ctl.pen_rgba);
                     self.apply_theme_edits();
+                    self.apply_area_acts();
                     ctx.window.request_redraw();
                     self.last_cursor = (x, y);
                     return EventResponse::Handled;
@@ -400,6 +442,9 @@ impl FluorApp for MahereApp {
     }
 
     fn wake_at(&self) -> Option<Instant> {
+        if self.areas.downloading() {
+            return Some(Instant::now() + std::time::Duration::from_millis(200));
+        }
         if self.map.converged() { None } else { Some(Instant::now()) }
     }
 
@@ -427,7 +472,12 @@ impl FluorApp for MahereApp {
                 );
             }
         }
-        self.map.tick(w, h)
+        // A download's progress repaints the panel as it goes.
+        let areas_changed = self.areas.poll() || self.areas.downloading();
+        if areas_changed {
+            self.chrome.invalidate_bg();
+        }
+        self.map.tick(w, h) || areas_changed
     }
 
     fn render(&mut self, target: &mut [u32], ctx: &mut Context) {
@@ -447,7 +497,8 @@ impl FluorApp for MahereApp {
         let measure = self.map.measure_view(w, h, Panel::strip_samples(w));
         let themes = self.map.themes.clone();
         self.panel.set_ru(ctx.viewport.ru);
-        self.panel.paint(w, h, self.map.layers(), Controls { real_sun: self.map.real_sun, real_light: self.map.real_light, follow_heading: self.map.follow_heading, lock_to_fix: self.map.lock_to_fix, cache_budget: self.cache_budget, theme: self.map.theme, compressed: self.map.compressed(), tool: self.map.tool as u8, pen_rgba: self.map.pen_colour, clear_ink: false, clear_sel: false }, &readouts, measure.as_ref(), &themes, Some(&|n: usize| self.map.orb(n)));
+        let areas = self.areas.view(self.map.user.has_selection());
+        self.panel.paint(w, h, self.map.layers(), Controls { real_sun: self.map.real_sun, real_light: self.map.real_light, follow_heading: self.map.follow_heading, lock_to_fix: self.map.lock_to_fix, cache_budget: self.cache_budget, theme: self.map.theme, compressed: self.map.compressed(), tool: self.map.tool as u8, pen_rgba: self.map.pen_colour, clear_ink: false, clear_sel: false }, &readouts, measure.as_ref(), &themes, &areas, Some(&|n: usize| self.map.orb(n)));
         let mut map = self.map.canvas.clone();
         self.panel.composite_rgb(&mut map, w, h);
         self.chrome.rasterize_bg(ctx.damage, |c| {
@@ -503,11 +554,20 @@ fn main() {
         Some(s) => Camera::new(s.lat, s.lon, s.ppd, s.bearing),
         None => Camera::new(46.2000, -122.1900, 12_000.0, 0.0),
     };
+    let mut areas = mahere_engine::areas::Areas::new(store.clone());
     let mut map = MapCore::new(store, cam);
-    // The user's own cells, as files beside the data.
+    // The user's own cells, as files beside the data; the areas as files under them.
     let user_dir = std::path::PathBuf::from("data/user");
-    let _ = std::fs::create_dir_all(&user_dir);
+    let _ = std::fs::create_dir_all(user_dir.join("areas"));
+    areas.set_store(std::sync::Arc::new(DirAreas(user_dir.join("areas"))));
     map.set_user_store(std::sync::Arc::new(DirUser(user_dir)));
+    // MAHERE_AREA=<file>: a shared area document taken in at start.
+    if let Some(bytes) = std::env::var("MAHERE_AREA").ok().and_then(|f| std::fs::read(f).ok()) {
+        match areas.import(&bytes) {
+            Some(i) => eprintln!("area imported: {}", areas.list[i].area.name),
+            None => eprintln!("MAHERE_AREA: not an area document"),
+        }
+    }
     if let Some(s) = session {
         map.sun_az = s.sun_az as f32;
         map.sun_alt = s.sun_alt as f32;
@@ -515,10 +575,34 @@ fn main() {
     if let Some(v) = &vault {
         map.set_themes(mahere_store::themes::load_all(v));
     }
-    let mut app = MahereApp::new(map);
+    let mut app = MahereApp::new(map, areas);
     app.store = vault;
     app.cells = cells;
     run_app(app).expect("fluor event loop failed");
+}
+
+/// The user's areas as files in a directory, one per area by its name.
+struct DirAreas(std::path::PathBuf);
+
+impl DirAreas {
+    fn path(&self, name: &str) -> std::path::PathBuf {
+        self.0.join(format!("{}.vsf.zst", name.replace(' ', "-")))
+    }
+}
+
+impl mahere_engine::areas::AreaStore for DirAreas {
+    fn put(&self, name: &str, bytes: &[u8]) {
+        let _ = std::fs::write(self.path(name), bytes);
+    }
+
+    fn delete(&self, name: &str) {
+        let _ = std::fs::remove_file(self.path(name));
+    }
+
+    fn load_all(&self) -> Vec<Vec<u8>> {
+        let Ok(dir) = std::fs::read_dir(&self.0) else { return Vec::new() };
+        dir.flatten().filter_map(|e| std::fs::read(e.path()).ok()).collect()
+    }
 }
 
 /// The user's cells as files in a directory, one per cell by its name.

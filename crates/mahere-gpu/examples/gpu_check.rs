@@ -117,7 +117,7 @@ fn main() {
     let overlay = map.overlay(w, h, true).to_vec();
     // MAHERE_PANEL=1 lays the open control panel over the GPU frame (the CPU frame has none, so the diff below is then meaningless).
     let panel_mode = std::env::var("MAHERE_PANEL").unwrap_or_default();
-    if panel_mode == "1" || panel_mode == "themes" || panel_mode == "pen" {
+    if panel_mode == "1" || panel_mode == "themes" || panel_mode == "pen" || panel_mode == "areas" || panel_mode == "area" {
         let mut panel = mahere_panel::Panel::new();
         panel.set_open(true);
         if panel_mode == "themes" {
@@ -128,9 +128,27 @@ fn main() {
         if panel_mode == "pen" {
             panel.show_pen(controls.pen_rgba);
         }
+        // MAHERE_PANEL=areas lists two made-up areas; =area opens the second, mid-download.
+        let mut areas = mahere_panel::AreasView::default();
+        if panel_mode == "areas" || panel_mode == "area" {
+            areas.has_selection = true;
+            areas.areas = vec![
+                mahere_panel::AreaView { name: "spruce otter".into(), depth: 14, cells: 1234, est_bytes: 198_000_000, fetched: Some(176_000_000), progress: None },
+                mahere_panel::AreaView { name: "granite heron".into(), depth: 12, cells: 310, est_bytes: 52_000_000, fetched: None, progress: Some((120, 310, 19_000_000)) },
+            ];
+            panel.show_themes();
+            panel.show_area(1, 12);
+            if panel_mode == "areas" {
+                panel.show_themes();
+                panel.show_area(1, 12);
+                panel.pop_page();
+            }
+        }
         let c = map.cam;
         let readouts = mahere_panel::Readouts { lat: c.lat(), lon: c.lon(), elev: map.elevation_at(c.lat(), c.lon()), heading_deg: c.bearing().to_degrees(), m_per_px: 111_320.0 / c.ppd, frame_ms: cpu_ms, resident: map.pool().map.len(), phone_heading: None, cache_used: 0, cache_max: 1 << 30 };
-        panel.paint(w, h, map.layers(), controls, &readouts, None, &map.themes, None);
+        panel.paint(w, h, map.layers(), controls, &readouts, None, &map.themes, &areas, None);
+        // The areas view is compared on paint, so the page is painted once more with it known.
+        panel.paint(w, h, map.layers(), controls, &readouts, None, &map.themes, &areas, None);
         let rgba = panel.overlay_rgba(&overlay, w, h);
         gpu.set_overlay_rgba(&device, &queue, w as u32, h as u32, &rgba);
     } else {

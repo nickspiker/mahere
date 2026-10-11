@@ -74,6 +74,9 @@ pub struct AndroidApp {
     /// Bytes the cell cache may hold; purged to it at the pause moment.
     cache_budget: u64,
     data_dir: Option<String>,
+    /// The saved areas, and a file written for the share sheet, taken by the touch that asked for it.
+    areas: mahere_engine::areas::Areas,
+    share_file: Option<String>,
 }
 
 /// Vault writes, off the UI thread. The vault serialises every write through one queue, and the loader fills it with cells while the map streams: a settings save on the UI thread waited behind hundreds of them and the system killed the app as unresponsive. Touch, location and pause now hand their writes here and return at once.
@@ -215,6 +218,53 @@ impl AndroidApp {
         self.save_settings();
     }
 
+    /// What the areas pages asked: save the selection, change an area's detail, download, share, show, delete.
+    fn apply_area_acts(&mut self) {
+        use mahere_panel::AreaAct;
+        for act in self.panel.take_area_acts() {
+            match act {
+                AreaAct::Save => {
+                    let depth = self.map.area_depth();
+                    if let Some(i) = self.areas.save_selection(&self.map.user, depth) {
+                        self.panel.show_area(i, depth);
+                    }
+                }
+                AreaAct::SetDepth(i, d) => self.areas.set_depth(i, d),
+                AreaAct::Download(i) => self.areas.download(i, false),
+                AreaAct::Refresh(i) => self.areas.download(i, true),
+                AreaAct::Cancel(i) => self.areas.cancel(i),
+                AreaAct::Share(i) => {
+                    if let (Some(dir), Some((name, bytes))) = (&self.data_dir, self.areas.share_bytes(i)) {
+                        let share = std::path::PathBuf::from(dir).join("share");
+                        let _ = std::fs::create_dir_all(&share);
+                        let path = share.join(format!("{}.vsf.zst", name.replace(' ', "-")));
+                        if std::fs::write(&path, &bytes).is_ok() {
+                            self.share_file = Some(path.to_string_lossy().to_string());
+                        }
+                    }
+                }
+                AreaAct::Show(i) => {
+                    if let Some(e) = self.areas.list.get(i) {
+                        let planes = e.area.cells.clone();
+                        self.map.show_selection(planes);
+                        self.panel.close();
+                    }
+                }
+                AreaAct::Delete(i) => self.areas.delete(i),
+            }
+        }
+    }
+
+    /// A shared area document taken in: kept, and opened.
+    fn open_area(&mut self, bytes: &[u8]) {
+        if let Some(i) = self.areas.import(bytes) {
+            let depth = self.areas.list[i].area.depth;
+            self.panel.show_area(i, depth);
+        } else {
+            eprintln!("area: not an area document ({} bytes)", bytes.len());
+        }
+    }
+
     fn save_settings(&self) {
         if let Some(store) = &self.store {
             let s = mahere_store::Settings { cache_budget: self.cache_budget, layer_bits: self.map.layers().bits() as u64, real_sun: self.map.real_sun, real_light: self.map.real_light, follow_heading: self.map.follow_heading, lock_to_fix: self.map.lock_to_fix, theme: self.map.theme as u64, compressed: self.map.compressed(), ui_ru: self.ui_ru };
@@ -328,6 +378,7 @@ impl FluorApp for AndroidApp {
                 if self.panel.tap(ctx.cursor_x as f32, ctx.cursor_y as f32, self.w, self.h, &mut mask, &mut ctl, &self.map.themes) {
                     self.apply_controls(ctl, mask);
                     self.apply_theme_edits();
+                    self.apply_area_acts();
                     if self.panel.take_clear_measure() {
                         self.map.clear_measure();
                     }
@@ -379,6 +430,7 @@ impl FluorApp for AndroidApp {
                     let mask = self.map.layers();
                     self.apply_controls(ctl, mask);
                     self.apply_theme_edits();
+                    self.apply_area_acts();
                     self.last_cursor = (x, y);
                     return EventResponse::Handled;
                 }
@@ -517,9 +569,11 @@ pub extern "system" fn Java_nz_mahere_app_MahereActivity_nativeInit(
         _ => home,
     };
     eprintln!("camera: {:.5} {:.5} ppd {:.1} bearing {:.3}", cam.lat(), cam.lon(), cam.ppd, cam.bearing());
+    let mut areas = mahere_engine::areas::Areas::new(cell_store.clone());
     let mut map = MapCore::new(cell_store, cam);
     if let Some(v) = &store {
         map.set_user_store(std::sync::Arc::new(mahere_store::VaultUser::new(v.clone())));
+        areas.set_store(std::sync::Arc::new(mahere_store::VaultAreas::new(v.clone())));
     }
     if let Some(s) = session {
         map.sun_az = s.sun_az as f32;
@@ -572,6 +626,8 @@ pub extern "system" fn Java_nz_mahere_app_MahereActivity_nativeInit(
         panel: Panel::new(),
         cache_budget: settings.map_or(DEFAULT_CACHE_BUDGET, |s| if s.cache_budget == 0 { DEFAULT_CACHE_BUDGET } else { s.cache_budget }),
         data_dir: Some(dir.clone()),
+        areas,
+        share_file: None,
     };
     app.panel.set_ru(ui_ru);
     Box::into_raw(Box::new(AndroidShell::new(app, width as u32, height as u32))) as jlong
@@ -623,13 +679,15 @@ pub extern "system" fn Java_nz_mahere_app_MahereActivity_nativeDraw(
         }
         let stats = app.cache_stats();
         let ctl = app.controls();
+        app.areas.poll();
+        let areas = app.areas.view(app.map.user.has_selection());
         let AndroidApp { gpu: Some(g), map, panel, w, h, .. } = app else {
             return shell(ptr).draw(&window) as jboolean;
         };
         if g.ensure_window(&window) {
             // A fatal error inside wgpu panics; across the JNI boundary that is an abort. Caught here, the GPU host is dropped and made again on the next frame (a lost device comes back that way); after a few in a row the CPU present takes over.
             let (w, h) = (*w as u32, *h as u32);
-            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| g.draw(map, panel, ctl, stats, w, h))) {
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| g.draw(map, panel, ctl, stats, &areas, w, h))) {
                 Ok(drawn) => return drawn as jboolean,
                 Err(e) => {
                     let msg = e.downcast_ref::<String>().cloned().or_else(|| e.downcast_ref::<&str>().map(|s| s.to_string())).unwrap_or_default();
@@ -650,8 +708,8 @@ pub extern "system" fn Java_nz_mahere_app_MahereActivity_nativeDraw(
 
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_nz_mahere_app_MahereActivity_nativeOnTouch(
-    _env: JNIEnv,
-    _class: JClass,
+    mut env: JNIEnv,
+    activity: JObject,
     ptr: jlong,
     action: jint,
     count: jint,
@@ -700,7 +758,28 @@ pub extern "system" fn Java_nz_mahere_app_MahereActivity_nativeOnTouch(
         // Last finger of a pinch lifted or moved; close the gesture first.
         s.app().two_end();
     }
-    s.on_touch(action, x0, y0)
+    let r = s.on_touch(action, x0, y0);
+    // A share the panel asked for: the activity opens the system's share sheet on the file.
+    if let Some(path) = s.app().share_file.take() {
+        if let Ok(jpath) = env.new_string(&path) {
+            if let Err(e) = env.call_method(&activity, "shareFile", "(Ljava/lang/String;)V", &[jni::objects::JValue::Object(&jpath)]) {
+                eprintln!("share: {e}");
+                let _ = env.exception_clear();
+            }
+        }
+    }
+    r
+}
+
+/// A shared area document, from a file or link the activity received: kept with the areas and opened.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_nz_mahere_app_MahereActivity_nativeOpenArea(env: JNIEnv, _class: JClass, ptr: jlong, bytes: jni::objects::JByteArray) {
+    if ptr == 0 {
+        return;
+    }
+    if let Ok(b) = env.convert_byte_array(&bytes) {
+        shell(ptr).app().open_area(&b);
+    }
 }
 
 /// The phone says its pen is out or back in its slot (Samsung's broadcast), or a stylus is hovering (out, then).
@@ -793,7 +872,9 @@ pub extern "system" fn Java_nz_mahere_app_MahereActivity_nativeOnPause(
         }
         if let Some(c) = &app.cells_cache {
             let (c, budget) = (c.clone(), app.cache_budget);
+            let pinned = app.areas.pinned();
             app.persist.run(move || {
+                c.set_pinned(pinned);
                 c.purge_to(budget);
                 c.flush();
             });

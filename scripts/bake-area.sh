@@ -1,9 +1,21 @@
 #!/bin/sh
 # Bake one area into a fresh cell directory and swap it in. The area's box and sources are declared below; vectors and terrain at depth 14 (1.2 m texels) across the whole box, imagery wherever NAIP quads are present. Run after scripts/fetch-area.sh, then scripts/publish-cells.sh.
+# An area shared from the phone (a .vsf.zst area document) bakes only the cells its shape covers: `bake-area.sh <file.vsf.zst> <dem.tif>... [-- <naip.tif>...]`; its box comes from the shape (`cargo run -p mahere-tiles --example area -- <file> bbox` prints it, for fetching the sources).
 set -e
 cd "$(dirname "$0")/.."
 AREA=$1
 case "$AREA" in
+    *.vsf.zst)
+        cargo build --release -p mahere-tiles
+        BOX=$(target/release/examples/area "$AREA" bbox 2>/dev/null || cargo run --release -q -p mahere-tiles --example area -- "$AREA" bbox)
+        shift
+        DEMS=""
+        NAIP=""
+        while [ $# -gt 0 ] && [ "$1" != "--" ]; do DEMS="$DEMS $1"; shift; done
+        [ "$1" = "--" ] && shift
+        NAIP="$*"
+        AREA_FLAG="--area $AREA"
+        ;;
     leavenworth)
         BOX=47.412343,-120.859099,47.648857,-120.571077
         # The 2022 flight first, the 2019 one behind it: a sample takes the first tile with data there, and the 2022 tiles have no-data holes across the south-west that the 2019 flight fills (the two together cover the whole box).
@@ -12,13 +24,14 @@ case "$AREA" in
         ;;
     *) echo "unknown area $AREA" >&2; exit 2 ;;
 esac
+AREA_FLAG=${AREA_FLAG:-}
 cargo build --release -p mahere-tiles
 OUT=data/cells-next
 rm -rf "$OUT"
 IMAGERY=""
 [ -n "$NAIP" ] && IMAGERY="$IMAGERY --naip $NAIP"
 # shellcheck disable=SC2086
-target/release/mahere-load --pbf data/washington-latest.osm.pbf --out "$OUT" --bbox "$BOX" --vec-base 14 --dem-base 14 --min 6 --dem $DEMS $IMAGERY
+target/release/mahere-load --pbf data/washington-latest.osm.pbf --out "$OUT" --bbox "$BOX" $AREA_FLAG --vec-base 14 --dem-base 14 --min 6 --dem $DEMS $IMAGERY
 rm -rf data/cells-previous
 [ -d data/cells ] && mv data/cells data/cells-previous
 mv "$OUT" data/cells

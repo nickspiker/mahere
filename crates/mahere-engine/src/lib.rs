@@ -1,5 +1,6 @@
 //! mahere's host-independent map core — the #pagetable edition. A frame is fetches: 32 px block grid → diamond UV → page table → plane fetch → LUT composite. No vectors, no reservoir, no source data at runtime: the renderer's entire diet is baked cells served by a CellStore through the clipmap residency layer. Frontends feed input and blit `canvas`.
 
+pub mod areas;
 pub mod colour;
 pub mod ink;
 pub mod plan;
@@ -647,6 +648,19 @@ impl MapCore {
         self.user.clear_selection();
         self.save_user();
         self.dirty = true;
+    }
+
+    /// An area's shape shown as the selection, replacing what was selected.
+    pub fn show_selection(&mut self, planes: Vec<(mahere_tiles::CellKey, mahere_tiles::CovCell)>) {
+        self.cancel_stroke();
+        self.user.load_selection(planes);
+        self.save_user();
+        self.dirty = true;
+    }
+
+    /// The depth a selection would be drawn at now: what a new area asks for by default, clamped to what areas may ask.
+    pub fn area_depth(&self) -> u8 {
+        self.draw_depth().clamp(areas::AREA_MIN_DEPTH, areas::AREA_MAX_DEPTH)
     }
 
     pub fn go_home(&mut self, w: usize, h: usize) {

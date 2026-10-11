@@ -39,7 +39,7 @@ pub struct GpuHost {
 const MOVING_SCALE: u32 = 1;
 const STILL_SCALE: u32 = 3;
 
-type OverlayStamp = (u64, u64, u64, u64, Option<(u64, u64, u32)>, u32, u32, bool, u32, u64, u32);
+type OverlayStamp = (u64, u64, u64, u64, Option<(u64, u64, u32)>, u32, u32, bool, u32, u64, u32, u64);
 
 impl GpuHost {
     pub fn new(window: &NativeWindow) -> Option<GpuHost> {
@@ -119,7 +119,7 @@ impl GpuHost {
     }
 
     /// One frame: tick, plan, mirror the pool, marks when they changed, draw, present. Returns whether more frames are wanted (cells still arriving).
-    pub fn draw(&mut self, map: &mut MapCore, panel: &mut Panel, ctl: Controls, cache: (u64, u64), w: u32, h: u32) -> bool {
+    pub fn draw(&mut self, map: &mut MapCore, panel: &mut Panel, ctl: Controls, cache: (u64, u64), areas: &mahere_panel::AreasView, w: u32, h: u32) -> bool {
         if w == 0 || h == 0 {
             return false;
         }
@@ -191,7 +191,15 @@ impl GpuHost {
             self.overlay_stamp = None;
         }
         // The light version is in the stamp for the ball in the gear's place: it follows the sun, the camera and the phone's turning.
-        let stamp: OverlayStamp = (cam_part.0, cam_part.1, cam_part.2, c.bearing().to_bits(), measure_part, w, h, panel.is_open(), mask_bits | (map.real_sun as u32) << 20 | (map.follow_heading as u32) << 21 | (map.real_light as u32) << 31 | if panel.is_open() && map.have_rotation { (map.true_heading().round() as u32) << 22 } else { 0 }, if map.real_sun || map.real_light { map.light_version() } else { 0 }, panel.ru().to_bits());
+        let stamp: OverlayStamp = (cam_part.0, cam_part.1, cam_part.2, c.bearing().to_bits(), measure_part, w, h, panel.is_open(), mask_bits | (map.real_sun as u32) << 20 | (map.follow_heading as u32) << 21 | (map.real_light as u32) << 31 | if panel.is_open() && map.have_rotation { (map.true_heading().round() as u32) << 22 } else { 0 }, if map.real_sun || map.real_light { map.light_version() } else { 0 }, panel.ru().to_bits(), {
+            // The areas as shown: a download's progress repaints the panel.
+            use std::hash::{Hash, Hasher};
+            let mut hs = std::collections::hash_map::DefaultHasher::new();
+            if panel.is_open() {
+                areas.hash(&mut hs);
+            }
+            hs.finish()
+        });
         self.map.pin = map.gps_screen(w as usize, h as usize);
         self.map.measure = map.measure_view(w as usize, h as usize, 2).map(|m| (m.origin_px.0, m.origin_px.1, m.target_px.0, m.target_px.1));
         // A bearing or readout change repaints at most a few times a second (the orientation sensor would otherwise repaint the panel's text every frame); the panel opening, closing or a row flipping repaints at once.
@@ -205,7 +213,7 @@ impl GpuHost {
             let readouts = Readouts { lat: c.lat(), lon: c.lon(), elev: map.elevation_at(c.lat(), c.lon()), heading_deg: heading, m_per_px: 111_320.0 / c.ppd, frame_ms: map.last_frame_ms, resident: map.pool().map.len(), phone_heading: map.have_rotation.then(|| map.true_heading()), cache_used: cache.0, cache_max: cache.1 };
             let measure = map.measure_view(w as usize, h as usize, Panel::strip_samples(w as usize));
             let orb = |n: usize| map.orb(n);
-            panel.paint(w as usize, h as usize, mask, ctl, &readouts, measure.as_ref(), &map.themes, Some(&orb));
+            panel.paint(w as usize, h as usize, mask, ctl, &readouts, measure.as_ref(), &map.themes, areas, Some(&orb));
             let marks = map.overlay(w as usize, h as usize, false).to_vec();
             let rgba = panel.overlay_rgba(&marks, w as usize, h as usize);
             self.map.set_overlay_rgba(&self.device, &self.queue, w, h, &rgba);

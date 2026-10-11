@@ -665,6 +665,42 @@ impl UserLayer {
         }
     }
 
+    /// The selection as drawn: every drawn cell's selection plane (an area snapshots these).
+    pub fn drawn_selection(&self) -> Vec<(CellKey, CovCell)> {
+        self.drawn.keys().filter_map(|k| self.cells.get(k).and_then(|c| c.sel.clone()).filter(|s| !s.is_empty()).map(|s| (*k, s))).collect()
+    }
+
+    pub fn has_selection(&self) -> bool {
+        self.cells.values().any(|c| c.sel.as_ref().is_some_and(|s| !s.is_empty()))
+    }
+
+    /// The selection replaced by planes (an area shown again): each lands in its cell, and the drawn cells beneath take it resampled, as a new cell is seeded, so the finest cell still decides.
+    pub fn load_selection(&mut self, planes: Vec<(CellKey, CovCell)>) {
+        self.clear_selection();
+        let mut by_depth: FxHashMap<u8, FxHashSet<CellKey>> = FxHashMap::default();
+        for (key, cov) in planes {
+            let below: Vec<CellKey> = self.drawn.keys().filter(|k| k.depth > key.depth && k.ancestor(key.depth) == key).copied().collect();
+            for k in below {
+                let map = map_to_ancestor(k, key);
+                let mut s = CovCell::new();
+                for (i, &j) in map.iter().enumerate() {
+                    s.cov[i] = cov.cov[j];
+                }
+                let cell = self.cells.entry(k).or_default();
+                cell.sel = Some(s);
+                cell.version += 1;
+                by_depth.entry(k.depth).or_default().insert(k);
+            }
+            let cell = self.cells.entry(key).or_default();
+            cell.sel = Some(cov);
+            cell.version += 1;
+            by_depth.entry(key.depth).or_default().insert(key);
+        }
+        for (d, touched) in by_depth {
+            self.after_change(d, touched);
+        }
+    }
+
     /// The cells changed since the last call, cloned for saving elsewhere, None where one is gone.
     pub fn take_dirty_cells(&mut self) -> Vec<(CellKey, Option<UserCell>)> {
         let keys: Vec<CellKey> = self.dirty.drain().collect();

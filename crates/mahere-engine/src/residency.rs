@@ -20,6 +20,8 @@ pub enum Fetch {
 /// Where cell bytes come from, addressed by cell — a string path exists only where a filesystem or URL demands one.
 pub trait CellStore: Send + Sync + 'static {
     fn get(&self, key: CellKey) -> Fetch;
+    /// Forget every absence remembered, so cells baked since the last look are asked for again (an area's refresh).
+    fn forget_absent(&self) {}
 }
 
 pub struct DirStore(pub PathBuf);
@@ -414,6 +416,10 @@ impl TieredStore {
 }
 
 impl CellStore for TieredStore {
+    fn forget_absent(&self) {
+        self.missing.lock().unwrap().clear();
+    }
+
     fn get(&self, key: CellKey) -> Fetch {
         match self.cache.get(key) {
             Fetch::Bytes(b) => return Fetch::Bytes(b),

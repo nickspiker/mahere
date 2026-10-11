@@ -27,6 +27,21 @@
                 <category android:name="android.intent.category.BROWSABLE" />
                 <data android:scheme="geo" />
             </intent-filter>
+            <!-- A shared area document (.vsf.zst), sent to the app or opened with it; messaging apps type it as they please, so the plain types are taken too and anything that is not an area is ignored. -->
+            <intent-filter>
+                <action android:name="android.intent.action.SEND" />
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="application/vnd.mahere.area" />
+                <data android:mimeType="application/zstd" />
+                <data android:mimeType="application/octet-stream" />
+            </intent-filter>
         </activity>
+        <!-- The app's own files for the share sheet (an area document under files/share). -->
+        <provider
+            android:name=".ShareProvider"
+            android:authorities="nz.mahere.app.share"
+            android:exported="false"
+            android:grantUriPermissions="true" />
     </application>
 </manifest>
