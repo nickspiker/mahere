@@ -39,7 +39,7 @@ pub struct GpuHost {
 const MOVING_SCALE: u32 = 1;
 const STILL_SCALE: u32 = 3;
 
-type OverlayStamp = (u64, u64, u64, u64, Option<(u64, u64, u32)>, u32, u32, bool, u32, u64, u32, u64);
+type OverlayStamp = (u64, u64, u64, u64, Option<(u64, u64, u32)>, u32, u32, bool, u32, u64, u32, u64, u8);
 
 impl GpuHost {
     pub fn new(window: &NativeWindow) -> Option<GpuHost> {
@@ -199,11 +199,11 @@ impl GpuHost {
                 areas.hash(&mut hs);
             }
             hs.finish()
-        });
+        }, map.view_depth());
         self.map.pin = map.gps_screen(w as usize, h as usize);
         self.map.measure = map.measure_view(w as usize, h as usize, 2).map(|m| (m.origin_px.0, m.origin_px.1, m.target_px.0, m.target_px.1));
         // A bearing or readout change repaints at most a few times a second (the orientation sensor would otherwise repaint the panel's text every frame); the panel opening, closing or a row flipping repaints at once.
-        let structural = self.overlay_stamp.is_none_or(|s| (s.5, s.6, s.7, s.8, s.10) != (w, h, panel.is_open(), stamp.8, stamp.10));
+        let structural = self.overlay_stamp.is_none_or(|s| (s.5, s.6, s.7, s.8, s.10, s.12) != (w, h, panel.is_open(), stamp.8, stamp.10, stamp.12));
         if self.overlay_stamp != Some(stamp) && (structural || self.overlay_at.elapsed().as_millis() >= 150) {
             self.overlay_at = std::time::Instant::now();
             let mut heading = c.bearing().to_degrees().rem_euclid(360.0);

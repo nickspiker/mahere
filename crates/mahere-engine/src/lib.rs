@@ -1269,6 +1269,13 @@ impl MapCore {
         }
         let text = format!("{}", deg.round() as i64);
         draw_seven_seg(&mut self.canvas, w, h, &text, cx, cy + len + 30.0, 18.0, INK);
+        // The zoom: the depth of the cells the view is drawn from, under the heading (Nick 2026-10-10: to see the level and when it changes).
+        draw_seven_seg(&mut self.canvas, w, h, &format!("z{}", self.vec_depth), cx, cy + len + 58.0, 18.0, INK);
+    }
+
+    /// The depth of the cells the view is drawn from: what the corner shows as z.
+    pub fn view_depth(&self) -> u8 {
+        self.vec_depth
     }
 
     /// GPS pin: accuracy ring, crosshair, seven-segment elevation readout.
@@ -1375,10 +1382,15 @@ pub fn draw_seven_seg(
         let segs = match ch {
             '0'..='9' => GLYPHS[ch as usize - '0' as usize],
             '-' => 0b1000000,
+            // A z: the top and bottom bars, the diagonal drawn below.
+            'z' => 0b0001001,
             _ => 0,
         };
         let (x0, x1) = (cx, cx + sw);
         let (y0, ym, y1) = (y - size, y - size * 0.5, y);
+        if ch == 'z' {
+            draw_segment(canvas, w, h, x1, y0, x0, y1, hw, rgb);
+        }
         let lines = [
             (x0, y0, x1, y0),
             (x1, y0, x1, ym),
