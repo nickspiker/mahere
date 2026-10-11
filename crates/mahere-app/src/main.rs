@@ -16,6 +16,9 @@ use std::time::Instant;
 struct MahereApp {
     map: MapCore,
     chrome: DefaultChrome,
+    /// The app orb as decoded, put back in the chrome when no light mode shows its ball there; and the light version the ball was last drawn for.
+    app_orb: Option<fluor::host::icon::Icon>,
+    orb_light: Option<u64>,
     dragging: bool,
     /// A stroke of the pen or a selection in progress.
     drawing: bool,
@@ -61,17 +64,20 @@ impl MahereApp {
     fn new(map: MapCore, areas: mahere_engine::areas::Areas) -> Self {
         let mut hit_counter: HitId = HIT_NONE;
         // The app orb: the paper-craft relief map (icon.jpeg, cropped to its disc), bundled as fluor's 256×256 VSF orb. A decode failure is non-fatal — the chrome just draws no orb.
-        let orb = fluor::host::icon::Icon::from_vsf_bytes(include_bytes!("../assets/mahere_orb.vsf")).ok();
+        let orb = fluor::host::icon::Icon::from_vsf_bytes(mahere_panel::APP_ORB_VSF).ok();
         let chrome = DefaultChrome::new(
             Viewport::new(1280, 800),
-            "mahere",
+            mahere_panel::APP_NAME,
             orb,
             Some("drag pan · right-drag rotate · wheel zoom · A/D W/S sun · Q/E rotate · R home · 1-4 layers · 5 imagery · 6 contours · 7 slope · 8 infrared".to_string()),
             &mut hit_counter,
         );
+        let app_orb = chrome.app_icon.clone();
         MahereApp {
             map,
             chrome,
+            app_orb,
+            orb_light: None,
             dragging: false,
             drawing: false,
             travel: 0.0,
@@ -133,7 +139,7 @@ impl FluorApp for MahereApp {
     type UserEvent = ();
 
     fn title(&self) -> &str {
-        "mahere"
+        mahere_panel::APP_NAME
     }
 
     /// The OS window / taskbar icon: the same orb the chrome draws.
@@ -199,6 +205,13 @@ impl FluorApp for MahereApp {
                 let (cx, cy) = (ctx.cursor_x, ctx.cursor_y);
                 self.last_cursor = (cx as f64, cy as f64);
                 let hit = self.chrome.hit_at(cx, cy);
+                // The orb is the settings: it shows and hides the panel, as Photon's does.
+                if hit != HIT_NONE && hit == self.chrome.app_icon_btn.id() {
+                    self.panel.toggle();
+                    self.chrome.invalidate_bg();
+                    ctx.window.request_redraw();
+                    return EventResponse::Handled;
+                }
                 if hit != HIT_NONE {
                     return if hit == self.chrome.close_btn.id() {
                         EventResponse::Close
@@ -497,8 +510,25 @@ impl FluorApp for MahereApp {
         let measure = self.map.measure_view(w, h, Panel::strip_samples(w));
         let themes = self.map.themes.clone();
         self.panel.set_ru(ctx.viewport.ru);
+        // The chrome draws the orb and the name; the panel lays out under it and draws none of its own.
+        self.panel.set_host_orb(self.chrome.orb_geometry().map(|(x, y, r)| (x as f32, y as f32, r as f32)));
+        // With a light mode on, the orb is the light as a ball, redrawn when the light changes; otherwise the app orb.
+        let light = (self.map.real_sun || self.map.real_light).then(|| self.map.light_version());
+        if light != self.orb_light {
+            self.orb_light = light;
+            let ball = light.and_then(|_| self.map.orb(256));
+            self.chrome.app_icon = match ball {
+                Some(img) => Some(fluor::host::icon::Icon {
+                    width: 256,
+                    height: 256,
+                    pixels: img.iter().map(|p| if p[3] == 0 { 0xFFFF_FFFF } else { 0xFF00_0000 | ((255 - p[0] as u32) << 16) | ((255 - p[1] as u32) << 8) | (255 - p[2] as u32) }).collect(),
+                }),
+                None => self.app_orb.clone(),
+            };
+            self.chrome.invalidate_chrome();
+        }
         let areas = self.areas.view(self.map.user.has_selection());
-        self.panel.paint(w, h, self.map.layers(), Controls { real_sun: self.map.real_sun, real_light: self.map.real_light, follow_heading: self.map.follow_heading, lock_to_fix: self.map.lock_to_fix, cache_budget: self.cache_budget, theme: self.map.theme, compressed: self.map.compressed(), tool: self.map.tool as u8, pen_rgba: self.map.pen_colour, clear_ink: false, clear_sel: false }, &readouts, measure.as_ref(), &themes, &areas, Some(&|n: usize| self.map.orb(n)));
+        self.panel.paint(w, h, self.map.layers(), Controls { real_sun: self.map.real_sun, real_light: self.map.real_light, follow_heading: self.map.follow_heading, lock_to_fix: self.map.lock_to_fix, cache_budget: self.cache_budget, theme: self.map.theme, compressed: self.map.compressed(), tool: self.map.tool as u8, pen_rgba: self.map.pen_colour, clear_ink: false, clear_sel: false }, &readouts, measure.as_ref(), &themes, &areas, None);
         let mut map = self.map.canvas.clone();
         self.panel.composite_rgb(&mut map, w, h);
         self.chrome.rasterize_bg(ctx.damage, |c| {

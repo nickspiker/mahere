@@ -360,7 +360,7 @@ impl FluorApp for AndroidApp {
     type UserEvent = ();
 
     fn title(&self) -> &str {
-        "mahere"
+        mahere_panel::APP_NAME
     }
 
     fn init(&mut self, _ctx: &mut Context) {}

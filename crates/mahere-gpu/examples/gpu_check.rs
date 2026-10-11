@@ -117,9 +117,9 @@ fn main() {
     let overlay = map.overlay(w, h, true).to_vec();
     // MAHERE_PANEL=1 lays the open control panel over the GPU frame (the CPU frame has none, so the diff below is then meaningless).
     let panel_mode = std::env::var("MAHERE_PANEL").unwrap_or_default();
-    if panel_mode == "1" || panel_mode == "themes" || panel_mode == "pen" || panel_mode == "areas" || panel_mode == "area" {
+    if panel_mode == "1" || panel_mode == "closed" || panel_mode == "themes" || panel_mode == "pen" || panel_mode == "areas" || panel_mode == "area" {
         let mut panel = mahere_panel::Panel::new();
-        panel.set_open(true);
+        panel.set_open(panel_mode != "closed");
         if panel_mode == "themes" {
             panel.show_themes();
         }

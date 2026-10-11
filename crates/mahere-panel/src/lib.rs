@@ -8,6 +8,12 @@ use fluor::text::{TextRenderer, TextStyle};
 use fluor::theme;
 use fluor::widgets::{Checkbox, Slider};
 pub use mahere_engine::areas::{AREA_MAX_DEPTH, AREA_MIN_DEPTH, AreaView, AreasView};
+
+/// The app's name as shown beside the orb and as the window's title.
+pub const APP_NAME: &str = "Mahere";
+
+/// The app orb: the paper-craft relief map, fluor's 256 × 256 VSF orb. The orb is the settings button on every platform, as in Photon (Nick 2026-10-10): the chrome draws it on a desktop, the panel draws it on a phone.
+pub const APP_ORB_VSF: &[u8] = include_bytes!("../assets/mahere_orb.vsf");
 use mahere_engine::theme::{Field, Theme};
 use mahere_engine::{LayerMask, MeasureView};
 
@@ -306,6 +312,11 @@ pub struct Panel {
     area_rows: Vec<(f32, f32, AreaRow)>,
     area_acts: Vec<AreaAct>,
     areas: AreasView,
+    /// Where the host draws the orb itself (a desktop's chrome, with the title beside it): the panel then lays out under it, takes a tap there as the toggle, and paints no orb of its own.
+    host_orb: Option<(f32, f32, f32)>,
+    /// The app orb decoded once, and resampled to the last size asked, in fluor's stored form.
+    orb_icon: Option<fluor::host::icon::Icon>,
+    orb_scaled: (usize, Vec<u32>),
 }
 
 impl Default for Panel {
@@ -318,7 +329,7 @@ impl Panel {
     pub fn new() -> Panel {
         let mut hits: HitId = HIT_NONE;
         let checks = LAYERS.iter().map(|&(l, label)| (l, Checkbox::new(&mut hits, label, 0.0, 0.0, 10.0, 10.0, 10.0, false))).collect();
-        Panel { open: false, dirty: true, ru: 1.0, stack: vec![Page::Layers], theme_rows: Vec::new(), edit_rows: Vec::new(), edit_scroll: 0.0, edit_extent: 0.0, press: None, sliders: Vec::new(), field_vals: [0.0; 4], held: None, edits: Vec::new(), hits, checks, text: TextRenderer::new(), buf: Vec::new(), w: 0, h: 0, font: 16.0, gear: (0.0, 0.0, 0.0), panel_w: 0.0, theme_row: (0.0, 0.0, 0.0), slider: (0.0, 0.0, 0.0), slider_held: false, cache_max: CACHE_MIN + 1, strip_close: None, clear_measure: false, area_rows: Vec::new(), area_acts: Vec::new(), areas: AreasView::default() }
+        Panel { open: false, dirty: true, ru: 1.0, stack: vec![Page::Layers], theme_rows: Vec::new(), edit_rows: Vec::new(), edit_scroll: 0.0, edit_extent: 0.0, press: None, sliders: Vec::new(), field_vals: [0.0; 4], held: None, edits: Vec::new(), hits, checks, text: TextRenderer::new(), buf: Vec::new(), w: 0, h: 0, font: 16.0, gear: (0.0, 0.0, 0.0), panel_w: 0.0, theme_row: (0.0, 0.0, 0.0), slider: (0.0, 0.0, 0.0), slider_held: false, cache_max: CACHE_MIN + 1, strip_close: None, clear_measure: false, area_rows: Vec::new(), area_acts: Vec::new(), areas: AreasView::default(), host_orb: None, orb_icon: fluor::host::icon::Icon::from_vsf_bytes(APP_ORB_VSF).ok(), orb_scaled: (0, Vec::new()) }
     }
 
     pub fn is_open(&self) -> bool {
@@ -342,6 +353,51 @@ impl Panel {
         self.open = true;
         self.stack = vec![Page::Layers];
         self.open_pen(rgba);
+    }
+
+    /// The orb the host draws, (centre x, centre y, radius) in screen pixels, or None for the panel to draw its own.
+    pub fn set_host_orb(&mut self, orb: Option<(f32, f32, f32)>) {
+        if self.host_orb != orb {
+            self.host_orb = orb;
+            self.dirty = true;
+        }
+    }
+
+    /// Show or hide the panel (the host's orb was tapped).
+    pub fn toggle(&mut self) {
+        self.open = !self.open;
+        self.dirty = true;
+    }
+
+    /// The app orb at `size` pixels across, box-filtered from the decoded icon; empty when the icon did not decode.
+    fn orb_pixels(&mut self, size: usize) -> &[u32] {
+        if self.orb_scaled.0 != size {
+            let mut out = Vec::new();
+            if let Some(icon) = &self.orb_icon {
+                let (iw, ih) = (icon.width as usize, icon.height as usize);
+                out = vec![0u32; size * size];
+                for y in 0..size {
+                    for x in 0..size {
+                        let (sx0, sx1) = (x * iw / size, ((x + 1) * iw / size).max(x * iw / size + 1));
+                        let (sy0, sy1) = (y * ih / size, ((y + 1) * ih / size).max(y * ih / size + 1));
+                        let (mut r, mut g, mut b, mut n) = (0u32, 0u32, 0u32, 0u32);
+                        for sy in sy0..sy1.min(ih) {
+                            for sx in sx0..sx1.min(iw) {
+                                let p = icon.pixels[sy * iw + sx];
+                                r += (p >> 16) & 255;
+                                g += (p >> 8) & 255;
+                                b += p & 255;
+                                n += 1;
+                            }
+                        }
+                        let n = n.max(1);
+                        out[y * size + x] = 0xFF00_0000 | ((r / n) << 16) | ((g / n) << 8) | (b / n);
+                    }
+                }
+            }
+            self.orb_scaled = (size, out);
+        }
+        &self.orb_scaled.1
     }
 
     /// Open on one area (a new one saved, or one shared in).
@@ -483,7 +539,8 @@ impl Panel {
         self.font = (unit * 0.5).max(6.0);
         let r = self.font * 1.15;
         let pad = self.font * 0.6;
-        self.gear = (pad + r, pad + r, r);
+        self.gear = self.host_orb.unwrap_or((pad + r, pad + r, r));
+        let r = self.gear.2;
         self.panel_w = (self.font * 13.0).min(w as f32 * 0.7);
         let row = self.font * 1.7;
         let x0 = self.font * 0.8;
@@ -509,7 +566,7 @@ impl Panel {
         self.slider = (x0, last + row * 1.3, self.panel_w - x0 * 2.0);
     }
 
-    /// A tap at screen (x, y): true if the panel took it. The gear toggles the panel; a row flips its layer in `mask`.
+    /// A tap at screen (x, y): true if the panel took it. The orb toggles the panel; a row flips its layer in `mask`.
     pub fn tap(&mut self, x: f32, y: f32, w: usize, h: usize, mask: &mut LayerMask, ctl: &mut Controls, _themes: &[Theme]) -> bool {
         self.layout(w, h);
         if let Some((cx, cy, cr)) = self.strip_close {
@@ -687,7 +744,7 @@ impl Panel {
         x < self.panel_w
     }
 
-    /// Paint for a `w × h` screen: the gear always (or, when `orb` gives one, the light as a ball in its place), the column when open. Returns the buffer in fluor's pixel convention.
+    /// Paint for a `w × h` screen: the orb always (the app orb, or the light as a ball when `orb` gives one) with the app's name, unless the host draws its own; the column when open. Returns the buffer in fluor's pixel convention.
     #[allow(clippy::too_many_arguments)]
     pub fn paint(&mut self, w: usize, h: usize, mask: LayerMask, ctl: Controls, r: &Readouts, measure: Option<&MeasureView>, themes: &[Theme], areas: &AreasView, orb: Option<&dyn Fn(usize) -> Option<Vec<[u8; 4]>>>) -> &[u32] {
         self.layout(w, h);
@@ -709,45 +766,45 @@ impl Panel {
         let font = self.font;
         let (gx, gy, gr) = self.gear;
         let ink_col = theme::TEXTBOX_TEXT;
-        // The light as a ball where the gear sits, when a mode has one.
-        let ball = orb.and_then(|f| {
+        // The orb where the settings live: the light as a ball when a mode has one, the app orb otherwise, the app's name beside it. A host that draws its own orb (a desktop's chrome) draws both there instead.
+        if self.host_orb.is_none() {
             let size = (gr * 2.0) as usize;
-            f(size).map(|img| (size, img))
-        });
-        {
+            let ball: Option<Vec<u32>> = orb.and_then(|f| f(size)).map(|img| {
+                img.iter().map(|p| if p[3] == 0 { 0 } else { (theme::dark(theme::fmt(((p[0] as u32) << 16) | ((p[1] as u32) << 8) | p[2] as u32)) & 0x00FF_FFFF) | 0xFF00_0000 }).collect()
+            });
+            let px: Vec<u32> = match ball {
+                Some(b) => b,
+                None => self.orb_pixels(size).to_vec(),
+            };
+            let (x0, y0) = ((gx - gr) as isize, (gy - gr) as isize);
+            let rr = gr * gr;
+            if px.len() == size * size {
+                for py in 0..size {
+                    for qx in 0..size {
+                        let (dx, dy) = (qx as f32 + 0.5 - gr, py as f32 + 0.5 - gr);
+                        let p = px[py * size + qx];
+                        if dx * dx + dy * dy > rr || p == 0 {
+                            continue;
+                        }
+                        let (x, y) = (x0 + qx as isize, y0 + py as isize);
+                        if x < 0 || y < 0 || x as usize >= w || y as usize >= h {
+                            continue;
+                        }
+                        self.buf[y as usize * w + x as usize] = p;
+                    }
+                }
+            }
             let mut damage = Damage::new();
             let mut canvas = Canvas::new(&mut self.buf, w, h, &mut damage);
-            if ball.is_none() {
-                // Topmost first: the gear's hole, its ring and eight teeth, then the disc under them.
-                paint::circle_filled(&mut canvas, gx as isize, gy as isize, (gr * 0.18) as isize, GEAR_BG, None, None);
-                paint::circle_filled(&mut canvas, gx as isize, gy as isize, (gr * 0.36) as isize, ink_col, None, None);
-                for k in 0..8 {
-                    let a = k as f32 * core::f32::consts::FRAC_PI_4;
-                    let (s, c) = a.sin_cos();
-                    let (tx, ty) = (gx + c * gr * 0.58, gy + s * gr * 0.58);
-                    paint::circle_filled(&mut canvas, tx as isize, ty as isize, (gr * 0.17).max(2.0) as isize, ink_col, None, None);
-                }
-                paint::circle_filled(&mut canvas, gx as isize, gy as isize, (gr * 0.52) as isize, GEAR_BG, None, None);
-                paint::circle_filled(&mut canvas, gx as isize, gy as isize, (gr * 0.44) as isize, ink_col, None, None);
+            // The name, level with the orb's centre; topmost first, so the text, then a dark edge under it to read over any map.
+            let style = TextStyle::new(font * 1.05, ink_col);
+            let shade = TextStyle::new(font * 1.05, GEAR_BG);
+            let (nx, ny) = (gx + gr + font * 0.5, gy);
+            self.text.draw_text_left(&mut canvas, APP_NAME, nx, ny, &style, None, None);
+            for (ox, oy) in [(-1.0, 0.0), (1.0, 0.0), (0.0, -1.0), (0.0, 1.0), (1.0, 1.0)] {
+                self.text.draw_text_left(&mut canvas, APP_NAME, nx + ox, ny + oy, &shade, None, None);
             }
             paint::circle_filled(&mut canvas, gx as isize, gy as isize, gr as isize, GEAR_BG, None, None);
-        }
-        // The ball's display pixels straight into the buffer over the disc.
-        if let Some((size, img)) = &ball {
-            let (x0, y0) = ((gx - gr) as isize, (gy - gr) as isize);
-            for py in 0..*size {
-                for px in 0..*size {
-                    let p = img[py * size + px];
-                    if p[3] == 0 {
-                        continue;
-                    }
-                    let (x, y) = (x0 + px as isize, y0 + py as isize);
-                    if x < 0 || y < 0 || x as usize >= w || y as usize >= h {
-                        continue;
-                    }
-                    self.buf[y as usize * w + x as usize] = (theme::dark(theme::fmt(((p[0] as u32) << 16) | ((p[1] as u32) << 8) | p[2] as u32)) & 0x00FF_FFFF) | 0xFF00_0000;
-                }
-            }
         }
         let (page, rail, depth) = (self.page(), self.rail_w(), self.stack.len());
         let under = if depth >= 2 { self.stack[depth - 2] } else { Page::Layers };
