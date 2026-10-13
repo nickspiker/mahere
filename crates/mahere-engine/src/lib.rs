@@ -215,6 +215,8 @@ struct Stroke {
     pts: Vec<(f64, f64, f64)>,
     depth: u8,
     add: bool,
+    /// The stroke's job, fixed at its start: the S Pen inks with no tool picked.
+    tool: ink::Tool,
 }
 
 #[derive(Clone, Copy)]
@@ -541,15 +543,20 @@ impl MapCore {
 
     /// A touch down with a tool, at a pressure 0..1 (a finger passes 0.5): the pen stamps its first dot; the selection remembers where it started (inside the selection takes, outside adds).
     pub fn begin_stroke(&mut self, x: f64, y: f64, pressure: f64, w: usize, h: usize) {
-        if self.tool == ink::Tool::None {
+        self.begin_stroke_as(self.tool, x, y, pressure, w, h);
+    }
+
+    /// A touch down doing a given job, whatever tool is picked: a stylus inks even with none (Nick 2026-10-13: the pen always writes on the map).
+    pub fn begin_stroke_as(&mut self, tool: ink::Tool, x: f64, y: f64, pressure: f64, w: usize, h: usize) {
+        if tool == ink::Tool::None {
             return;
         }
         let depth = self.draw_depth();
         let add = !self.user.selected_at(&self.cam, w, h, depth, x, y);
         let width = self.brush_width(pressure);
         self.user.begin_undo();
-        self.stroke = Some(Stroke { pts: vec![(x, y, width)], depth, add });
-        if self.tool == ink::Tool::Pen {
+        self.stroke = Some(Stroke { pts: vec![(x, y, width)], depth, add, tool });
+        if tool == ink::Tool::Pen {
             let c = self.pen_colour;
             self.user.stroke(&self.cam, w, h, depth, &[(x, y, width)], [c[0], c[1], c[2]], c[3] as f32 / 255.0);
         }
@@ -566,7 +573,7 @@ impl MapCore {
         let width = self.pen_width as f64 * (0.4 + 1.2 * pressure.clamp(0.0, 1.0));
         st.pts.push((x, y, width));
         let depth = st.depth;
-        match self.tool {
+        match st.tool {
             ink::Tool::Pen => {
                 let seg = [last, (x, y, width)];
                 let c = self.pen_colour;
@@ -581,7 +588,7 @@ impl MapCore {
     /// The touch lifted: the pen's mark stands; the selection's curve is closed and applied. Either is saved.
     pub fn end_stroke(&mut self, w: usize, h: usize) {
         let Some(st) = self.stroke.take() else { return };
-        if self.tool == ink::Tool::Select && st.pts.len() >= 3 {
+        if st.tool == ink::Tool::Select && st.pts.len() >= 3 {
             let poly: Vec<(f64, f64)> = st.pts.iter().map(|p| (p.0, p.1)).collect();
             self.user.select(&self.cam, w, h, st.depth, &poly, st.add);
         }

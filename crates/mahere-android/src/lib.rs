@@ -409,10 +409,18 @@ impl FluorApp for AndroidApp {
                     self.travel = 0.0;
                     self.had_two = false;
                     self.last_cursor = (ctx.cursor_x as f64, ctx.cursor_y as f64);
-                    // With a tool on, the touch draws: the pen's, always; a finger's unless a pen touched in the last few seconds, which says the pen is out and fingers only navigate (Nick 2026-10-10).
-                    let pen_out = !self.stylus && self.pen_out.unwrap_or_else(|| self.stylus_seen.is_some_and(|t| t.elapsed() < std::time::Duration::from_secs(3)));
-                    if self.map.tool != mahere_engine::ink::Tool::None && !pen_out {
-                        self.map.begin_stroke(ctx.cursor_x as f64, ctx.cursor_y as f64, self.pressure as f64, self.w, self.h);
+                    // The S Pen always writes on the map: the tool picked, or the pen with none (Nick 2026-10-13).
+                    // A finger draws only with a tool on, and not while the pen is out (a pen touched in the last few seconds), when fingers only navigate (Nick 2026-10-10).
+                    use mahere_engine::ink::Tool;
+                    let pen_out = self.pen_out.unwrap_or_else(|| self.stylus_seen.is_some_and(|t| t.elapsed() < std::time::Duration::from_secs(3)));
+                    let job = match (self.stylus, self.map.tool) {
+                        (true, Tool::None) => Tool::Pen,
+                        (true, t) => t,
+                        (false, _) if pen_out => Tool::None,
+                        (false, t) => t,
+                    };
+                    if job != Tool::None {
+                        self.map.begin_stroke_as(job, ctx.cursor_x as f64, ctx.cursor_y as f64, self.pressure as f64, self.w, self.h);
                         self.drawing = true;
                         ctx.window.request_redraw();
                     }
