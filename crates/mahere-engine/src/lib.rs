@@ -1666,21 +1666,26 @@ impl MapCore {
         if let Some(d) = depth {
             let texel = |uq: i64, vq: i64| raster::tri_index(uq, vq, 16 + 22 - d as u32);
             let key_of = |raw: u64| CellKey { depth: d, prefix: raw >> (60 - 2 * d as u32) };
-            // Lines are thin: the nearest within about 14 px, in rings out from the point.
-            let mut line: Option<(u8, u8)> = None;
+            // Lines are thin: the nearest within about 14 px, in rings a pixel apart out from the point.
+            let mut line: Option<(u8, u8, Option<mahere_tiles::Named>)> = None;
             let mut route: Option<u8> = None;
-            'rings: for r in 0..=7 {
-                let rr = r as f64 * 2.0;
-                let n = if r == 0 { 1 } else { 8 * r };
+            let mut near: Vec<CellKey> = Vec::new();
+            'rings: for r in 0..=14 {
+                let rr = r as f64;
+                let n = if r == 0 { 1 } else { (std::f64::consts::TAU * rr).ceil() as usize };
                 for k in 0..n {
                     let a = k as f64 / n as f64 * std::f64::consts::TAU;
                     let Some((sraw, su, sv)) = at(x + rr * a.cos(), y + rr * a.sin()) else { continue };
                     let Some(p) = planes_of(key_of(sraw)) else { continue };
                     let i = texel(su, sv);
+                    let named = p.names.as_ref().and_then(|n| n.line_at(i));
+                    if !near.contains(&key_of(sraw)) {
+                        near.push(key_of(sraw));
+                    }
                     if line.is_none() {
                         if let Some(l) = &p.line {
                             if l.cov[i] >= 96 && l.class[i] != 0 {
-                                line = Some((l.class[i], l.uses_at(i)));
+                                line = Some((l.class[i], l.uses_at(i), named.filter(|e| !e.is_point()).cloned()));
                             }
                         }
                     }
@@ -1696,8 +1701,37 @@ impl MapCore {
                     }
                 }
             }
-            if let Some((class, uses)) = line {
+            // A named point is one texel, which can be under a pixel: the nearest within 14 px, from every point in the cells the rings touched.
+            let mut point: Option<(f64, mahere_tiles::Named)> = None;
+            for k in near {
+                let Some(p) = planes_of(k) else { continue };
+                let Some(n) = &p.names else { continue };
+                if !n.entries.iter().any(|e| e.is_point()) {
+                    continue;
+                }
+                for (i, &e) in n.line.iter().enumerate() {
+                    if e == 0 || !n.entries[e as usize - 1].is_point() {
+                        continue;
+                    }
+                    let (plat, plon) = k.texel_lat_lon(i);
+                    let (px, py) = self.cam.geo_to_screen(plat, plon, w, h);
+                    let dist = (px - x).hypot(py - y);
+                    if dist <= 14.0 && point.as_ref().is_none_or(|(d, _)| dist < *d) {
+                        point = Some((dist, n.entries[e as usize - 1].clone()));
+                    }
+                }
+            }
+            let point = point.map(|(_, e)| e);
+            if let Some(e) = &point {
+                let what = mahere_osm_point_name(e.kind);
+                out.push(format!("{} \u{b7} {what}", e.label()));
+            }
+            if let Some((class, uses, named)) = line {
                 let name = theme::CLASS_NAMES.get(class as usize).copied().unwrap_or("Line");
+                let name = match &named {
+                    Some(e) => format!("{} \u{b7} {name}", e.label()),
+                    None => name.to_string(),
+                };
                 use mahere_tiles::use_bits::*;
                 let mut how: Vec<&str> = Vec::new();
                 for (bit, word) in [(FOOT, "foot"), (BIKE, "bikes"), (HORSE, "horses"), (SKI, "ski"), (MOTOR, "motor vehicles"), (UNPAVED, "unpaved"), (RESTRICTED, "restricted")] {
@@ -1705,7 +1739,7 @@ impl MapCore {
                         how.push(word);
                     }
                 }
-                out.push(if how.is_empty() { name.to_string() } else { format!("{name}: {}", how.join(", ")) });
+                out.push(if how.is_empty() { name } else { format!("{name}: {}", how.join(", ")) });
             }
             if let Some(c) = route {
                 out.push(format!("Motor vehicle use: {}", mvum::NAMES.get(c as usize).copied().unwrap_or("")));
@@ -1722,13 +1756,20 @@ impl MapCore {
                         out.push("Private or unlisted land".to_string());
                     }
                 }
+                // The water or land cover here, by its name where it has one.
+                let area = p.names.as_ref().and_then(|n| n.area_at(i)).map(|e| e.label());
                 let wet = p.water.as_ref().is_some_and(|w| w.cov[i] >= 128);
-                if wet {
-                    out.push("Water".to_string());
-                } else if let Some(l) = &p.land {
-                    if l.cov[i] >= 128 && l.class[i] != 0 {
-                        out.push(theme::LAND_NAMES.get(l.class[i] as usize).copied().unwrap_or("").to_string());
-                    }
+                let cover = if wet {
+                    Some("Water")
+                } else {
+                    p.land.as_ref().filter(|l| l.cov[i] >= 128 && l.class[i] != 0).map(|l| theme::LAND_NAMES.get(l.class[i] as usize).copied().unwrap_or(""))
+                };
+                match (area, cover) {
+                    (Some(a), Some(c)) if wet => out.push(if a.to_lowercase().contains("lake") || a.to_lowercase().contains("river") { a } else { format!("{a} \u{b7} {c}") }),
+                    (Some(a), Some(c)) => out.push(format!("{a} \u{b7} {c}")),
+                    (Some(a), None) => out.push(a),
+                    (None, Some(c)) => out.push(c.to_string()),
+                    (None, None) => {}
                 }
             }
         }
@@ -1965,4 +2006,9 @@ mod globe_tests {
         let (dx, dy) = (px - 512.0, py - 384.0);
         assert!(((dx * dx + dy * dy).sqrt() - cam.radius()).abs() < 1e-3, "at the limb");
     }
+}
+
+/// What a named point is, by its kind in the name table.
+fn mahere_osm_point_name(kind: u8) -> &'static str {
+    mahere_tiles::names::POINT_NAMES.get(kind.saturating_sub(mahere_tiles::names::POINT) as usize).copied().unwrap_or("Place")
 }

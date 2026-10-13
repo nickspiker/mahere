@@ -31,7 +31,7 @@ pub fn load_hydrorivers(shp: &str, min_cms: f64) -> Result<Vec<Road>, String> {
         let weight = discharge_weight(cms);
         for pts in parts {
             if pts.len() >= 2 {
-                out.push(Road { class: RoadClass::Waterway, pts, weight, uses: 0 });
+                out.push(Road { class: RoadClass::Waterway, pts, weight, uses: 0, name: 0 });
             }
         }
     }

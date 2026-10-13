@@ -82,7 +82,7 @@ fn main() {
     };
 
     let t = std::time::Instant::now();
-    let feats = if terrain_only { mahere_osm::Features { roads: Vec::new(), areas: Vec::new() } } else { mahere_osm::load_features(&pbf).expect("pbf") };
+    let feats = if terrain_only { mahere_osm::Features::default() } else { mahere_osm::load_features(&pbf).expect("pbf") };
     // Lines are clipped to the box with a margin of a cell or so: a county line or a highway leaving the box would otherwise stamp lone-line cells along its whole length, eight objects for every one with terrain.
     let margin = 0.01;
     let clip = |la: f32, lo: f32| (la as f64) >= lat0 - margin && (la as f64) <= lat1 + margin && (lo as f64) >= lon0 - margin && (lo as f64) <= lon1 + margin;
@@ -98,13 +98,13 @@ fn main() {
                 run.push(p);
             }
             if !inside && !next_in && run.len() >= 2 {
-                roads.push(mahere_osm::Road { class: r.class, pts: std::mem::take(&mut run), weight: r.weight, uses: r.uses });
+                roads.push(mahere_osm::Road { class: r.class, pts: std::mem::take(&mut run), weight: r.weight, uses: r.uses, name: r.name });
             } else if !inside && !next_in {
                 run.clear();
             }
         }
         if run.len() >= 2 {
-            roads.push(mahere_osm::Road { class: r.class, pts: run, weight: r.weight, uses: r.uses });
+            roads.push(mahere_osm::Road { class: r.class, pts: run, weight: r.weight, uses: r.uses, name: r.name });
         }
     }
     // A polygon belongs to the box when its own box overlaps it, not when a vertex lies inside: a piece in the middle of a lake or a forest has none of its shoreline or edge, and dropped the whole polygon (Flathead Lake, 2026-10-11).
@@ -123,21 +123,28 @@ fn main() {
             la0 <= lat1 && la1 >= lat0 && lo0 <= lon1 && lo1 >= lon0
         })
         .collect();
-    eprintln!("{} lines, {} areas in box, {:.1}s", roads.len(), areas.len(), t.elapsed().as_secs_f32());
+    // Named points inside the box: places, summits, passes, trailheads.
+    let points: Vec<mahere_osm::names::Point> = feats.points.into_iter().filter(|p| in_box(p.lat, p.lon)).collect();
+    let names = feats.names;
+    eprintln!("{} lines, {} areas, {} named points in box, {} names, {:.1}s", roads.len(), areas.len(), points.len(), names.len().saturating_sub(1), t.elapsed().as_secs_f32());
 
     let t = std::time::Instant::now();
-    let mut line = mahere_tiles::bake_lines(&roads, vec_base, min_depth);
+    let (mut line, mut ids) = mahere_tiles::bake_lines_named(&roads, &points, &names, vec_base, min_depth);
     line.retain(|k, _| keep(k));
     eprintln!("line layer: {} cells, {:.1}s", line.len(), t.elapsed().as_secs_f32());
     let t = std::time::Instant::now();
-    let (mut land, mut water) = mahere_tiles::bake_areas(&areas, vec_base, min_depth);
+    let (mut land, mut water, area_ids) = mahere_tiles::bake_areas_named(&areas, &names, vec_base, min_depth);
     land.retain(|k, _| keep(k));
     water.retain(|k, _| keep(k));
-    eprintln!("land {} cells, water {} cells, {:.1}s", land.len(), water.len(), t.elapsed().as_secs_f32());
+    for (k, a) in area_ids {
+        ids.entry(k).or_default().area = a.area;
+    }
+    ids.retain(|k, _| keep(k));
+    eprintln!("land {} cells, water {} cells, {} named cells, {:.1}s", land.len(), water.len(), ids.len(), t.elapsed().as_secs_f32());
 
     if vectors_only {
         let t = std::time::Instant::now();
-        let cells = mahere_tiles::assemble(Vec::new(), line, land, water, Vec::new());
+        let cells = mahere_tiles::assemble_named(Vec::new(), line, land, water, Vec::new(), ids, &names);
         let n = cells.len();
         use rayon::prelude::*;
         cells.par_iter().for_each(|(key, cell)| {
@@ -183,7 +190,7 @@ fn main() {
     }
 
     let t = std::time::Instant::now();
-    let cells = mahere_tiles::assemble(dem_cells, line, land, water, img_cells);
+    let cells = mahere_tiles::assemble_named(dem_cells, line, land, water, img_cells, ids, &names);
     let n = cells.len();
     use rayon::prelude::*;
     cells.par_iter().for_each(|(key, cell)| {

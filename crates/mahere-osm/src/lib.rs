@@ -4,6 +4,7 @@
 
 pub mod hydro;
 pub mod landuse;
+pub mod names;
 use std::collections::HashMap;
 
 use mahere_coord::Coord;
@@ -222,6 +223,8 @@ pub struct Road {
     pub pts: Vec<(f32, f32)>,
     pub weight: f32,
     pub uses: u8,
+    /// Its entry in the extract's [`names::NameTable`]; 0 when it has no name.
+    pub name: u32,
 }
 
 /// What a way is for and how big it is, from its tags, for the non-waterway classes (waterways get their magnitude from the network pass).
@@ -337,16 +340,35 @@ impl Road {
 pub struct Area {
     pub class: AreaClass,
     pub rings: Vec<Vec<(f32, f32)>>,
+    /// Its entry in the extract's [`names::NameTable`]; 0 when it has no name.
+    pub name: u32,
 }
 
+#[derive(Default)]
 pub struct Features {
     pub roads: Vec<Road>,
     pub areas: Vec<Area>,
+    /// Every named thing, entry 0 meaning none; roads, areas and points point into it.
+    pub names: Vec<names::Named>,
+    pub points: Vec<names::Point>,
+}
+
+/// A feature's `name` and `ref` tags, empty when it has none.
+fn name_tags<'a>(tags: impl Iterator<Item = (&'a str, &'a str)>) -> (String, String) {
+    let (mut name, mut reference) = (String::new(), String::new());
+    for (k, v) in tags {
+        match k {
+            "name" => name = v.to_string(),
+            "ref" => reference = v.to_string(),
+            _ => {}
+        }
+    }
+    (name, reference)
 }
 
 enum WayRec {
-    Line(RoadClass, Vec<i64>, u8, f32),
-    Area(AreaClass, Vec<i64>),
+    Line(RoadClass, Vec<i64>, u8, f32, (String, String)),
+    Area(AreaClass, Vec<i64>, (String, String)),
     /// A multipolygon member, kept by id for ring assembly.
     Member(i64, Vec<i64>),
 }
@@ -354,7 +376,7 @@ enum WayRec {
 /// Load every drawable line and area from a .osm.pbf extract.
 pub fn load_features(path: &str) -> Result<Features, osmpbf::Error> {
     // Pass 1: relations — multipolygons with a drawable area class, and boundaries, which become rings of line.
-    let rels: Vec<(Option<AreaClass>, Option<RoadClass>, Vec<i64>)> = ElementReader::from_path(path)?.par_map_reduce(
+    let rels: Vec<(Option<AreaClass>, Option<RoadClass>, Vec<i64>, (String, String))> = ElementReader::from_path(path)?.par_map_reduce(
         |element| match element {
             Element::Relation(r) => {
                 let is_mp = r.tags().any(|(k, v)| k == "type" && v == "multipolygon");
@@ -368,7 +390,7 @@ pub fn load_features(path: &str) -> Result<Features, osmpbf::Error> {
                     .filter(|m| m.member_type == osmpbf::RelMemberType::Way)
                     .map(|m| m.member_id)
                     .collect();
-                vec![(area, bound, members)]
+                vec![(area, bound, members, name_tags(r.tags()))]
             }
             _ => Vec::new(),
         },
@@ -378,9 +400,9 @@ pub fn load_features(path: &str) -> Result<Features, osmpbf::Error> {
             a
         },
     )?;
-    let relations: Vec<(AreaClass, Vec<i64>)> = rels.iter().filter_map(|(a, _, m)| a.map(|a| (a, m.clone()))).collect();
-    let bounds: Vec<(RoadClass, Vec<i64>)> = rels.iter().filter_map(|(_, b, m)| b.map(|b| (b, m.clone()))).collect();
-    let mut member_ids: Vec<i64> = rels.iter().flat_map(|(_, _, m)| m.iter().copied()).collect();
+    let relations: Vec<(AreaClass, Vec<i64>, (String, String))> = rels.iter().filter_map(|(a, _, m, n)| a.map(|a| (a, m.clone(), n.clone()))).collect();
+    let bounds: Vec<(RoadClass, Vec<i64>, (String, String))> = rels.iter().filter_map(|(_, b, m, n)| b.map(|b| (b, m.clone(), n.clone()))).collect();
+    let mut member_ids: Vec<i64> = rels.iter().flat_map(|(_, _, m, _)| m.iter().copied()).collect();
     member_ids.sort_unstable();
     member_ids.dedup();
 
@@ -419,12 +441,12 @@ pub fn load_features(path: &str) -> Result<Features, osmpbf::Error> {
                 let street_furniture = w.tags().any(|(k, v)| k == "footway" && matches!(v, "sidewalk" | "crossing" | "traffic_island" | "access_aisle"));
                 if let Some(class) = line.filter(|_| !street_furniture) {
                     let (uses, mag) = uses_and_magnitude(class, w.tags());
-                    out.push(WayRec::Line(class, refs.clone(), uses, mag));
+                    out.push(WayRec::Line(class, refs.clone(), uses, mag, name_tags(w.tags())));
                 }
                 let closed = refs.len() >= 4 && refs.first() == refs.last();
                 if closed && !is_member {
                     if let Some(class) = AreaClass::from_tags(w.tags()) {
-                        out.push(WayRec::Area(class, refs));
+                        out.push(WayRec::Area(class, refs, name_tags(w.tags())));
                     }
                 }
                 out
@@ -441,25 +463,32 @@ pub fn load_features(path: &str) -> Result<Features, osmpbf::Error> {
     let mut needed: Vec<i64> = ways
         .iter()
         .flat_map(|r| match r {
-            WayRec::Line(_, refs, _, _) | WayRec::Area(_, refs) | WayRec::Member(_, refs) => refs.iter().copied(),
+            WayRec::Line(_, refs, _, _, _) | WayRec::Area(_, refs, _) | WayRec::Member(_, refs) => refs.iter().copied(),
         })
         .collect();
     needed.sort_unstable();
     needed.dedup();
 
-    // Pass 3: just the referenced node locations.
-    let mut located: Vec<(i64, f64, f64)> = ElementReader::from_path(path)?.par_map_reduce(
+    // Pass 3: the referenced node locations, and the named points (places, summits, passes, trailheads and the like).
+    enum NodeRec {
+        At(i64, f64, f64),
+        Point(names::PointKind, u32, (String, String), f64, f64),
+    }
+    let nodes: Vec<NodeRec> = ElementReader::from_path(path)?.par_map_reduce(
         |element| {
-            let (id, lat, lon) = match element {
-                Element::Node(n) => (n.id(), n.lat(), n.lon()),
-                Element::DenseNode(n) => (n.id(), n.lat(), n.lon()),
+            let (id, lat, lon, point) = match element {
+                Element::Node(n) => (n.id(), n.lat(), n.lon(), names::PointKind::from_tags(n.tags()).map(|p| (p, name_tags(n.tags())))),
+                Element::DenseNode(n) => (n.id(), n.lat(), n.lon(), names::PointKind::from_tags(n.tags()).map(|p| (p, name_tags(n.tags())))),
                 _ => return Vec::new(),
             };
+            let mut out = Vec::new();
             if needed.binary_search(&id).is_ok() {
-                vec![(id, lat, lon)]
-            } else {
-                Vec::new()
+                out.push(NodeRec::At(id, lat, lon));
             }
+            if let Some(((kind, rank), label)) = point.filter(|(_, (n, _))| !n.is_empty()) {
+                out.push(NodeRec::Point(kind, rank, label, lat, lon));
+            }
+            out
         },
         Vec::new,
         |mut a, mut b| {
@@ -467,6 +496,19 @@ pub fn load_features(path: &str) -> Result<Features, osmpbf::Error> {
             a
         },
     )?;
+    let mut table = names::NameTable::default();
+    let mut points = Vec::new();
+    let mut located: Vec<(i64, f64, f64)> = Vec::with_capacity(nodes.len());
+    for n in nodes {
+        match n {
+            NodeRec::At(id, lat, lon) => located.push((id, lat, lon)),
+            NodeRec::Point(kind, rank, (name, reference), lat, lon) => {
+                let (lat, lon) = Coord::from_lat_lon(lat, lon).to_lat_lon();
+                let name = table.intern(names::POINT + kind as u8, rank, &name, &reference);
+                points.push(names::Point { name, lat: lat as f32, lon: lon as f32 });
+            }
+        }
+    }
     located.sort_unstable_by_key(|(id, _, _)| *id);
     let locate = |id: i64| -> Option<(f32, f32)> {
         let i = located.binary_search_by_key(&id, |(id, _, _)| *id).ok()?;
@@ -478,19 +520,20 @@ pub fn load_features(path: &str) -> Result<Features, osmpbf::Error> {
 
     // Lines, with the waterway network weighted.
     let mut lines: Vec<(RoadClass, Vec<i64>)> = Vec::new();
-    let mut line_attrs: Vec<(u8, f32)> = Vec::new();
+    let mut line_attrs: Vec<(u8, f32, u32)> = Vec::new();
     let mut areas: Vec<Area> = Vec::new();
     let mut members: HashMap<i64, Vec<i64>> = HashMap::new();
     for rec in ways {
         match rec {
-            WayRec::Line(class, refs, uses, mag) => {
+            WayRec::Line(class, refs, uses, mag, (name, reference)) => {
                 lines.push((class, refs));
-                line_attrs.push((uses, mag));
+                line_attrs.push((uses, mag, table.intern(class as u8 + 1, 0, &name, &reference)));
             }
-            WayRec::Area(class, refs) => {
+            WayRec::Area(class, refs, (name, reference)) => {
                 let ring = locate_all(&refs);
                 if ring.len() >= 4 {
-                    areas.push(Area { class, rings: vec![ring] });
+                    let name = table.intern(names::AREA + class as u8, names::ring_area_m2(&ring).min(u32::MAX as f64) as u32, &name, &reference);
+                    areas.push(Area { class, rings: vec![ring], name });
                 }
             }
             WayRec::Member(id, refs) => {
@@ -503,25 +546,30 @@ pub fn load_features(path: &str) -> Result<Features, osmpbf::Error> {
     for (i, (class, refs)) in lines.into_iter().enumerate() {
         let pts = locate_all(&refs);
         if pts.len() >= 2 {
-            let (uses, mag) = line_attrs[i];
+            let (uses, mag, name) = line_attrs[i];
             let weight = if class == RoadClass::Waterway { weights[i] } else { mag };
-            roads.push(Road { class, pts, weight, uses });
+            // A river's rank is its catchment, so the Flathead outranks a creek where they meet.
+            if class == RoadClass::Waterway {
+                table.raise(name, (weight * 1_000_000.0) as u32);
+            }
+            roads.push(Road { class, pts, weight, uses, name });
         }
     }
 
     // Boundaries: each closed ring of a relation is a line of its class.
-    for (class, member_ids) in bounds {
+    for (class, member_ids, (name, reference)) in bounds {
         let parts: Vec<&Vec<i64>> = member_ids.iter().filter_map(|id| members.get(id)).collect();
+        let name = table.intern(class as u8 + 1, 0, &name, &reference);
         for ring in assemble_rings(&parts) {
             let pts = locate_all(&ring);
             if pts.len() >= 2 {
-                roads.push(Road { class, pts, weight: class.boundary_weight(), uses: 0 });
+                roads.push(Road { class, pts, weight: class.boundary_weight(), uses: 0, name });
             }
         }
     }
 
     // Multipolygons: assemble member ways into closed rings.
-    for (class, member_ids) in relations {
+    for (class, member_ids, (name, reference)) in relations {
         let parts: Vec<&Vec<i64>> = member_ids.iter().filter_map(|id| members.get(id)).collect();
         let rings: Vec<Vec<(f32, f32)>> = assemble_rings(&parts)
             .into_iter()
@@ -529,11 +577,13 @@ pub fn load_features(path: &str) -> Result<Features, osmpbf::Error> {
             .filter(|r| r.len() >= 4)
             .collect();
         if !rings.is_empty() {
-            areas.push(Area { class, rings });
+            let size = rings.iter().map(|r| names::ring_area_m2(r)).fold(0.0, f64::max);
+            let name = table.intern(names::AREA + class as u8, size.min(u32::MAX as f64) as u32, &name, &reference);
+            areas.push(Area { class, rings, name });
         }
     }
 
-    Ok(Features { roads, areas })
+    Ok(Features { roads, areas, names: table.list, points })
 }
 
 /// Join way fragments end-to-end by shared node ids into closed rings.

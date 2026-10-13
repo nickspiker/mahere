@@ -19,6 +19,9 @@ pub mod area;
 pub use mahere_osm::landuse;
 /// What a line is for, as the line plane's use bits carry it, for a reader naming them.
 pub use mahere_osm::use_bits;
+pub use mahere_osm::names::Named;
+pub use names::{IdCell, NameCell};
+pub mod names;
 pub mod pyr;
 pub mod tone;
 
@@ -171,6 +174,14 @@ impl CellKey {
         let (u0, v0, size) = self.uv_rect();
         let d = self.diamond();
         [uv_to_lat_lon(d, u0, v0), uv_to_lat_lon(d, u0 + size, v0), uv_to_lat_lon(d, u0, v0 + size), uv_to_lat_lon(d, u0 + size, v0 + size)]
+    }
+
+    /// Where a texel's centroid is, latitude and longitude, from its memory index.
+    pub fn texel_lat_lon(self, i: usize) -> (f64, f64) {
+        let (half, tx, ty) = (i & 1, (i >> 1) & (TEX - 1), i >> (1 + TEX_BITS));
+        let (u0, v0, size) = self.uv_rect();
+        let (cx, cy) = tri_centroid(tx, ty, half);
+        uv_to_lat_lon(self.diamond(), u0 + cx / TEX as f64 * size, v0 + cy / TEX as f64 * size)
     }
 
     /// Rhombus edge length of one UV square (texel) in this cell, meters.
@@ -429,18 +440,55 @@ pub struct Cell {
     pub own: Option<ClassCell>,
     /// Motor vehicle use (USFS MVUM): routes as lines, a class per texel (`mahere_osm::landuse::mvum`).
     pub mvum: Option<ClassCell>,
+    /// What the texels are called: lines and points, and the areas they lie in.
+    pub names: Option<NameCell>,
 }
 
 // ==================== LINE LAYER ====================
 
 /// Stamp every feature ONCE, at its physical width, into base-depth cells; the pyramid does the rest. Lines are measure-zero features, so a parent texel's coverage is the SUM of its four children (saturating): a road stays a texel wide at every depth instead of averaging away, and dense networks saturate into a glow. Major class wins per texel.
 pub fn bake_lines(feats: &[Road], base_depth: u8, min_depth: u8) -> HashMap<CellKey, ClassCell> {
+    stamp_lines(feats, base_depth, false).0.pipe(|cells| pyramid_class(cells, base_depth, min_depth, ClassMerge::Major))
+}
+
+/// The line layer with its names: each texel's line named as it is drawn (the line that wins the texel names it), the named points stamped over them a texel each, the higher-ranked where two share one, and both pyramided so a name follows what is drawn at every depth.
+pub fn bake_lines_named(feats: &[Road], points: &[mahere_osm::names::Point], names: &[Named], base_depth: u8, min_depth: u8) -> (HashMap<CellKey, ClassCell>, HashMap<CellKey, IdCell>) {
+    let (mut cells, mut ids) = stamp_lines(feats, base_depth, true);
+    for pt in points {
+        let (d, gu, gv) = texel_of(Coord::from_lat_lon(pt.lat as f64, pt.lon as f64), base_depth);
+        let (tx, ty, half) = tri_at(gu, gv);
+        let key = CellKey::from_grid(d, base_depth, (tx / TEX) as u64, (ty / TEX) as u64);
+        let i = tri_idx(tx % TEX, ty % TEX, half);
+        // The point's cell is a vector cell even with no line in it, so it is written and pyramided.
+        cells.entry(key).or_insert_with(ClassCell::new_line);
+        let id = ids.entry(key).or_default();
+        let held = id.line_at(i);
+        if held == 0 || !names[held as usize].is_point() || names[held as usize].rank < names[pt.name as usize].rank {
+            id.set_line(i, pt.name);
+        }
+    }
+    let cells = pyramid_class(cells, base_depth, min_depth, ClassMerge::Major);
+    let ids = names::pyramid_ids(ids, &cells, names, base_depth, min_depth);
+    (cells, ids)
+}
+
+trait Pipe: Sized {
+    fn pipe<T>(self, f: impl FnOnce(Self) -> T) -> T {
+        f(self)
+    }
+}
+impl<T> Pipe for T {}
+
+/// Every line stamped once at base depth, and with `named` each texel's name.
+fn stamp_lines(feats: &[Road], base_depth: u8, named: bool) -> (HashMap<CellKey, ClassCell>, HashMap<CellKey, IdCell>) {
     assert!(base_depth as u32 + TEX_BITS as u32 <= 30);
     let mut cells: HashMap<CellKey, ClassCell> = HashMap::new();
+    let mut ids: HashMap<CellKey, IdCell> = HashMap::new();
     let mut cross_diamond = 0usize;
     let tm = texel_m(base_depth);
     for road in feats {
         let class = road.class_id();
+        let fid = if named { road.name } else { 0 };
         let r = (road.width_m() as f64 / 2.0 / tm).max(0.5);
         let cov_max = road.cov_max();
         let attrs = (road.mag_byte(), road.uses);
@@ -450,7 +498,7 @@ pub fn bake_lines(feats: &[Road], base_depth: u8, min_depth: u8) -> HashMap<Cell
             let (d, gu, gv) = texel_of(c, base_depth);
             if let Some((pd, pu, pv)) = prev {
                 if pd == d {
-                    stamp_segment(&mut cells, base_depth, d, (pu, pv), (gu, gv), r, class, cov_max, attrs);
+                    stamp_segment(&mut cells, &mut ids, base_depth, d, (pu, pv), (gu, gv), r, class, cov_max, attrs, fid);
                 } else {
                     cross_diamond += 1;
                 }
@@ -461,13 +509,14 @@ pub fn bake_lines(feats: &[Road], base_depth: u8, min_depth: u8) -> HashMap<Cell
     if cross_diamond > 0 {
         eprintln!("  (skipped {cross_diamond} cross-diamond segments)");
     }
-    pyramid_class(cells, base_depth, min_depth, ClassMerge::Major)
+    (cells, ids)
 }
 
 /// Stamp a segment as a band of radius `r` texels (ground metric): walk the centreline in half-texel steps and cover every triangle whose centroid is within the band, coverage feathered over the last texel. Coverage combines by max; class follows the strongest coverage.
 #[allow(clippy::too_many_arguments)]
 fn stamp_segment(
     cells: &mut HashMap<CellKey, ClassCell>,
+    ids: &mut HashMap<CellKey, IdCell>,
     depth: u8,
     diamond: u8,
     a: (f64, f64),
@@ -476,6 +525,7 @@ fn stamp_segment(
     class: u8,
     cov_max: u8,
     attrs: (u8, u8),
+    fid: u32,
 ) {
     let extent = ((1u64 << depth) * TEX as u64) as f64;
     let len = uv_dist2(b.0 - a.0, b.1 - a.1).sqrt();
@@ -509,6 +559,12 @@ fn stamp_segment(
                         cell.cov[i] = cov;
                         cell.class[i] = class;
                         cell.mag[i] = attrs.0;
+                        // The texel's name follows the line that wins it, an unnamed one clearing it.
+                        if fid != 0 {
+                            ids.entry(key).or_default().set_line(i, fid);
+                        } else if let Some(n) = ids.get_mut(&key).filter(|n| !n.line.is_empty()) {
+                            n.line[i] = 0;
+                        }
                     }
                     cell.uses[i] |= attrs.1;
                 }
@@ -525,6 +581,30 @@ pub fn bake_areas(
     base_depth: u8,
     min_depth: u8,
 ) -> (HashMap<CellKey, ClassCell>, HashMap<CellKey, CovCell>) {
+    let (land, water, _) = bake_areas_with(areas, None, base_depth, min_depth);
+    (land, water)
+}
+
+/// The land cover and water layers with the name of the area each texel lies in (water over land, the higher land class over the lower, the smaller area over the larger), pyramided by most children.
+pub fn bake_areas_named(areas: &[Area], names: &[Named], base_depth: u8, min_depth: u8) -> (HashMap<CellKey, ClassCell>, HashMap<CellKey, CovCell>, HashMap<CellKey, IdCell>) {
+    bake_areas_with(areas, Some(names), base_depth, min_depth)
+}
+
+fn bake_areas_with(
+    areas: &[Area],
+    names: Option<&[Named]>,
+    base_depth: u8,
+    min_depth: u8,
+) -> (HashMap<CellKey, ClassCell>, HashMap<CellKey, CovCell>, HashMap<CellKey, IdCell>) {
+    let mut ids: HashMap<CellKey, IdCell> = HashMap::new();
+    let mut name_texel = |key: CellKey, i: usize, fid: u32| {
+        let Some(names) = names.filter(|_| fid != 0) else { return };
+        let cell = ids.entry(key).or_default();
+        let held = cell.area_at(i);
+        if held == 0 || names::area_beats(&names[fid as usize], &names[held as usize]) {
+            cell.set_area(i, fid);
+        }
+    };
     let mut land: HashMap<CellKey, ClassCell> = HashMap::new();
     let mut water: HashMap<CellKey, CovCell> = HashMap::new();
     let mut cross_diamond = 0usize;
@@ -553,7 +633,9 @@ pub fn bake_areas(
         if area.class == mahere_osm::AreaClass::Water {
             fill_rings(&rings, base_depth, |tx, ty, half| {
                 let key = CellKey::from_grid(d, base_depth, (tx / TEX) as u64, (ty / TEX) as u64);
-                water.entry(key).or_default().cov[tri_idx(tx % TEX, ty % TEX, half)] = 255;
+                let i = tri_idx(tx % TEX, ty % TEX, half);
+                water.entry(key).or_default().cov[i] = 255;
+                name_texel(key, i, area.name);
             });
         } else {
             fill_rings(&rings, base_depth, |tx, ty, half| {
@@ -564,16 +646,18 @@ pub fn bake_areas(
                     cell.class[i] = class;
                     cell.cov[i] = 255;
                 }
+                name_texel(key, i, area.name);
             });
         }
     }
     if cross_diamond > 0 {
         eprintln!("  (skipped {cross_diamond} cross-diamond areas)");
     }
-    (
-        pyramid_class(land, base_depth, min_depth, ClassMerge::Dominant),
-        pyramid_cov(water, base_depth, min_depth),
-    )
+    let ids = match names {
+        Some(names) if !ids.is_empty() => names::pyramid_ids(ids, &HashMap::new(), names, base_depth, min_depth),
+        _ => ids,
+    };
+    (pyramid_class(land, base_depth, min_depth, ClassMerge::Dominant), pyramid_cov(water, base_depth, min_depth), ids)
 }
 
 // ==================== OVERLAYS: OWNERSHIP AND MOTOR VEHICLE USE ====================
@@ -657,6 +741,7 @@ pub fn bake_ownership(areas: &[mahere_osm::landuse::ClassedArea], wilderness: &[
 /// Motor vehicle use routes at base depth, each at its class's width, then the pyramid as lines are built.
 pub fn bake_mvum(lines: &[mahere_osm::landuse::ClassedLine], base_depth: u8, min_depth: u8, keep: &(dyn Fn(&CellKey) -> bool + Sync)) -> HashMap<CellKey, ClassCell> {
     let mut cells: HashMap<CellKey, ClassCell> = HashMap::new();
+    let mut unnamed: HashMap<CellKey, IdCell> = HashMap::new();
     let tm = texel_m(base_depth);
     for l in lines {
         let r = (mahere_osm::landuse::mvum::width_m(l.class) as f64 / 2.0 / tm).max(0.5);
@@ -665,7 +750,7 @@ pub fn bake_mvum(lines: &[mahere_osm::landuse::ClassedLine], base_depth: u8, min
             let (d, gu, gv) = texel_of(Coord::from_lat_lon(lat, lon), base_depth);
             if let Some((pd, pu, pv)) = prev {
                 if pd == d {
-                    stamp_segment(&mut cells, base_depth, d, (pu, pv), (gu, gv), r, l.class, 255, (255, 0));
+                    stamp_segment(&mut cells, &mut unnamed, base_depth, d, (pu, pv), (gu, gv), r, l.class, 255, (255, 0), 0);
                 }
             }
             prev = Some((d, gu, gv));
@@ -1268,6 +1353,20 @@ pub fn assemble(
     water: HashMap<CellKey, CovCell>,
     img: Vec<(CellKey, ImgCell)>,
 ) -> HashMap<CellKey, Cell> {
+    assemble_named(dem, line, land, water, img, HashMap::new(), &[])
+}
+
+/// [`assemble`], with each vector cell's names: its own table made from the bake's, an empty one where nothing in it is named.
+pub fn assemble_named(
+    dem: Vec<(CellKey, DemCell)>,
+    line: HashMap<CellKey, ClassCell>,
+    land: HashMap<CellKey, ClassCell>,
+    water: HashMap<CellKey, CovCell>,
+    img: Vec<(CellKey, ImgCell)>,
+    ids: HashMap<CellKey, IdCell>,
+    names: &[Named],
+) -> HashMap<CellKey, Cell> {
+    let named = !names.is_empty();
     let mut cells: HashMap<CellKey, Cell> = HashMap::new();
     let dem = fill_aprons(dem);
     for (k, d) in dem {
@@ -1287,6 +1386,9 @@ pub fn assemble(
         c.line = Some(line.remove(&k).unwrap_or_else(ClassCell::new_line));
         c.land = Some(land.remove(&k).unwrap_or_default());
         c.water = Some(water.remove(&k).unwrap_or_default());
+        if named {
+            c.names = Some(ids.get(&k).map(|i| NameCell::from_ids(i, names)).unwrap_or_default());
+        }
     }
     cells
 }
@@ -1303,6 +1405,7 @@ pub struct CellPlanes {
     pub img: Option<ImgCell>,
     pub own: Option<ClassCell>,
     pub mvum: Option<ClassCell>,
+    pub names: Option<NameCell>,
 }
 
 /// Decoded dem: elevation (NaN = no data) and the apron, memory order.
@@ -1572,6 +1675,7 @@ impl Cell {
             img: self.img.clone(),
             own: self.own.clone(),
             mvum: self.mvum.clone(),
+            names: self.names.clone(),
         }
     }
 }
@@ -1580,7 +1684,7 @@ impl CellPlanes {
     /// Overlay `self` (a new bake) onto `old`. A bake's footprint is where it has elevation: inside it the new vector planes win, outside the old ones stay; without a dem the new planes replace wholesale.
     pub fn merge_over(self, old: CellPlanes) -> CellPlanes {
         let mut out = self;
-        let CellPlanes { dem: old_dem, line: old_line, land: old_land, water: old_water, img: old_img, own: old_own, mvum: old_mvum } = old;
+        let CellPlanes { dem: old_dem, line: old_line, land: old_land, water: old_water, img: old_img, own: old_own, mvum: old_mvum, names: old_names } = old;
         // The overlays (ownership, motor vehicle use) come from their own pass and have no terrain footprint: the new where it has anything, the old elsewhere.
         for (new, old) in [(&mut out.own, old_own), (&mut out.mvum, old_mvum)] {
             match (new, old) {
@@ -1618,6 +1722,12 @@ impl CellPlanes {
         }
         // The new bake's footprint, if it has one.
         let mask: Option<Vec<bool>> = out.dem.as_ref().map(|d| d.elev.iter().map(|e| !e.is_nan()).collect());
+        // Names as the vector planes go: inside a footprint the new bake's, outside it the old; without one the new where it names something, the old elsewhere. A bake without names leaves the old ones as they are.
+        out.names = match (out.names.take(), &mask) {
+            (None, _) => old_names,
+            (new, Some(m)) => NameCell::merge(new, old_names, &|i, _| m[i]),
+            (new, None) => NameCell::merge(new, old_names, &|_, v| v != 0),
+        };
         match (&mut out.dem, old_dem) {
             (Some(new), Some(old_dem)) => {
                 let mask = mask.as_ref().unwrap();
@@ -1746,6 +1856,9 @@ impl CellPlanes {
         } else if let Some(im) = &self.img {
             b = b.add_section_direct(img_section(im, loss));
         }
+        if let Some(s) = self.names.as_ref().and_then(NameCell::section) {
+            b = b.add_section_direct(s);
+        }
         b.build().map_err(|e| format!("cell build: {e:?}"))
     }
 }
@@ -1853,6 +1966,7 @@ pub fn decode_cell(data: &[u8]) -> Result<CellPlanes, String> {
             "img" => {
                 out.img = decode_img(&fields)
             }
+            "name" => out.names = NameCell::decode(&fields),
             _ => {}
         }
     }
@@ -1973,6 +2087,7 @@ mod tests {
             class,
             weight,
             uses: 0,
+            name: 0,
             pts: (0..200)
                 .map(|i| {
                     let t = i as f32 / 199.0;
@@ -2017,6 +2132,7 @@ mod tests {
         let area = Area {
             class: mahere_osm::AreaClass::Water,
             rings: vec![vec![(lat0, lon0), (lat0, lon1), (lat1, lon1), (lat1, lon0), (lat0, lon0)]],
+            name: 0,
         };
         let (_, water) = bake_areas(&[area], 12, 10);
         let sum = |d: u8| -> u64 {
