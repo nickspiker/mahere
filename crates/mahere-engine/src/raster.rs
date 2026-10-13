@@ -87,11 +87,13 @@ pub struct LayerMask {
     pub mvum: bool,
     /// Raw elevation: the ground as grey, black at the lowest elevation in view and white at the highest (the contours' range), unlit (Nick 2026-10-10).
     pub raw: bool,
+    /// Names lettered on the map (Nick 2026-10-13). Stored as its absence (bit 14 set = hidden), so settings and themes from before it show labels.
+    pub labels: bool,
 }
 
 impl Default for LayerMask {
     fn default() -> Self {
-        LayerMask { dem: true, land: true, water: true, line: true, debug: false, imagery: false, contours: true, slope: false, infrared: false, hypso: true, boundaries: true, own: true, mvum: true, raw: false }
+        LayerMask { dem: true, land: true, water: true, line: true, debug: false, imagery: false, contours: true, slope: false, infrared: false, hypso: true, boundaries: true, own: true, mvum: true, raw: false, labels: true }
     }
 }
 
@@ -102,7 +104,7 @@ impl LayerMask {
         let im = self.imagery;
         // Raw elevation stands in for the ground's whole colour and its light: the terrain shading, the tint, land cover, slope bands and imagery go quiet under it.
         let raw = self.raw;
-        LayerMask { dem: raw, land: im || raw, water: false, line: false, debug: false, imagery: raw, contours: false, slope: im || raw, infrared: !im || raw, hypso: self.land || !self.dem || raw, boundaries: !self.line, own: false, mvum: false, raw: false }
+        LayerMask { dem: raw, land: im || raw, water: false, line: false, debug: false, imagery: raw, contours: false, slope: im || raw, infrared: !im || raw, hypso: self.land || !self.dem || raw, boundaries: !self.line, own: false, mvum: false, raw: false, labels: false }
     }
 
     /// The mask as bits, one per field in declaration order, for a shader or a settings document.
@@ -121,10 +123,11 @@ impl LayerMask {
             | (self.own as u32) << 11
             | (self.mvum as u32) << 12
             | (self.raw as u32) << 13
+            | (!self.labels as u32) << 14
     }
 
     pub fn from_bits(b: u32) -> LayerMask {
-        LayerMask { dem: b & 1 != 0, land: b & 2 != 0, water: b & 4 != 0, line: b & 8 != 0, debug: b & 16 != 0, imagery: b & 32 != 0, contours: b & 64 != 0, slope: b & 128 != 0, infrared: b & 256 != 0, hypso: b & 512 != 0, boundaries: b & 1024 != 0, own: b & 2048 != 0, mvum: b & 4096 != 0, raw: b & 8192 != 0 }
+        LayerMask { dem: b & 1 != 0, land: b & 2 != 0, water: b & 4 != 0, line: b & 8 != 0, debug: b & 16 != 0, imagery: b & 32 != 0, contours: b & 64 != 0, slope: b & 128 != 0, infrared: b & 256 != 0, hypso: b & 512 != 0, boundaries: b & 1024 != 0, own: b & 2048 != 0, mvum: b & 4096 != 0, raw: b & 8192 != 0, labels: b & 16384 == 0 }
     }
 
     /// The mask as drawn: every inert row off.
@@ -145,6 +148,7 @@ impl LayerMask {
             own: self.own,
             mvum: self.mvum,
             raw: self.raw,
+            labels: self.labels,
         }
     }
 }

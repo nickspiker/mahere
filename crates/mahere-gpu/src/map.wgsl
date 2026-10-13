@@ -113,6 +113,8 @@ struct Uniforms {
     pole: vec4<f32>,
     // The raw elevation view's range: lowest and highest metres in view.
     raw: vec4<f32>,
+    // The labels' place: where this pixel was when they were drawn (rows of a 2×3 matrix); labels[0].w is 1 when there are labels.
+    labels: array<vec4<f32>, 2>,
 };
 
 // a: diamond, depth, cu, cv. b: dem slot, line slot, land+water slot, img slot. c: flags. d: base, step, eu, nu. e: ev, nv, inv det.
@@ -905,6 +907,26 @@ fn fs_relight(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
 @group(1) @binding(0) var map_tex: texture_2d<f32>;
 @group(1) @binding(1) var overlay_tex: texture_2d<f32>;
 @group(1) @binding(2) var preview_tex: texture_2d<f32>;
+@group(1) @binding(3) var labels_tex: texture_2d<f32>;
+
+// The lettering where this pixel was when it was drawn, bilinear between its pixels (the map has moved by a fraction of one, or turned, or scaled).
+fn labels_at(p: vec2<f32>) -> vec4<f32> {
+    let q = vec2<f32>(dot(U.labels[0].xyz, vec3<f32>(p, 1.0)), dot(U.labels[1].xyz, vec3<f32>(p, 1.0))) - 0.5;
+    let dim = vec2<i32>(textureDimensions(labels_tex));
+    let i = vec2<i32>(floor(q));
+    let f = q - floor(q);
+    var acc = vec4<f32>(0.0);
+    for (var k = 0; k < 4; k++) {
+        let o = vec2<i32>(k & 1, k >> 1u);
+        let at = i + o;
+        if (at.x < 0 || at.y < 0 || at.x >= dim.x || at.y >= dim.y) {
+            continue;
+        }
+        let wgt = select(1.0 - f.x, f.x, o.x == 1) * select(1.0 - f.y, f.y, o.y == 1);
+        acc += textureLoad(labels_tex, at, 0) * wgt;
+    }
+    return acc;
+}
 
 @vertex
 fn vs_present(@builtin(vertex_index) vi: u32) -> @builtin(position) vec4<f32> {
@@ -926,6 +948,11 @@ fn fs_present(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         }
     }
     c = sqrt(c / f32(s * s));
+    // The labels over the map, under the marks and the panel; premultiplied display values like the overlay.
+    if (U.labels[0].w > 0.5) {
+        let l = labels_at(pos.xy);
+        c = c * (1.0 - l.a) + l.rgb * (255.0 / 256.0);
+    }
     // The overlay is premultiplied display values: straight over.
     let o = textureLoad(overlay_tex, vec2<i32>(pos.xy), 0);
     var rgb = c * (1.0 - o.a) + o.rgb * (255.0 / 256.0);

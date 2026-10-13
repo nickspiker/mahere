@@ -3,6 +3,7 @@
 pub mod areas;
 pub mod colour;
 pub mod ink;
+pub mod labels;
 pub mod plan;
 pub mod probe;
 pub mod raster;
@@ -313,6 +314,8 @@ pub struct MapCore {
     user_store: Option<Arc<dyn ink::UserStore>>,
     /// What the last tap found at its point, for the measurement strip.
     tap_info: Vec<String>,
+    /// Cells' names as labels last read them; None for a resident cell with none.
+    names_cache: rustc_hash::FxHashMap<mahere_tiles::CellKey, Option<std::sync::Arc<mahere_tiles::NameCell>>>,
 }
 
 type PlanKey = (u64, u64, u64, u64, usize, usize, u64, u8, u8);
@@ -386,6 +389,7 @@ impl MapCore {
             preview_version: 0,
             user_store: None,
             tap_info: Vec::new(),
+            names_cache: Default::default(),
         }
     }
 
@@ -530,6 +534,11 @@ impl MapCore {
                 }
             });
         }
+    }
+
+    /// The depth the map draws its lines at.
+    pub fn vec_depth(&self) -> u8 {
+        self.vec_depth
     }
 
     pub fn stroke_active(&self) -> bool {
@@ -1630,6 +1639,16 @@ impl MapCore {
         self.dirty = true;
     }
 
+    /// A tap that landed on a label: the label's feature first in what the tap says, then the rest as a tap says it.
+    pub fn tap_label(&mut self, x: f64, y: f64, w: usize, h: usize, label: Option<&mahere_tiles::Named>) {
+        self.tap(x, y, w, h);
+        if let Some(n) = label {
+            let first = format!("{} \u{b7} {}", n.label(), named_kind(n));
+            self.tap_info.retain(|l| !l.starts_with(&format!("{} \u{b7}", n.label())) && *l != n.label());
+            self.tap_info.insert(0, first);
+        }
+    }
+
     pub fn clear_measure(&mut self) {
         self.measure = None;
         self.tap_info.clear();
@@ -1701,7 +1720,15 @@ impl MapCore {
                     }
                 }
             }
-            // A named point is one texel, which can be under a pixel: the nearest within 14 px, from every point in the cells the rings touched.
+            // A named point is one texel, which can be under a pixel: searched in every cell within reach of the finger, and its reach grows with its rank (Nick 2026-10-13), from 14 px for a spring or a trailhead to about 40 px for a big summit or a city; the nearest by its own reach wins.
+            for (dx, dy) in [(-40.0, -40.0), (0.0, -40.0), (40.0, -40.0), (-40.0, 0.0), (40.0, 0.0), (-40.0, 40.0), (0.0, 40.0), (40.0, 40.0)] {
+                if let Some((sraw, _, _)) = at(x + dx, y + dy) {
+                    if !near.contains(&key_of(sraw)) {
+                        near.push(key_of(sraw));
+                    }
+                }
+            }
+            let reach = |rank: u32| 14.0 + 26.0 * ((rank as f64 + 1.0).log10() / 5.5).clamp(0.0, 1.0);
             let mut point: Option<(f64, mahere_tiles::Named)> = None;
             for k in near {
                 let Some(p) = planes_of(k) else { continue };
@@ -1715,9 +1742,10 @@ impl MapCore {
                     }
                     let (plat, plon) = k.texel_lat_lon(i);
                     let (px, py) = self.cam.geo_to_screen(plat, plon, w, h);
-                    let dist = (px - x).hypot(py - y);
-                    if dist <= 14.0 && point.as_ref().is_none_or(|(d, _)| dist < *d) {
-                        point = Some((dist, n.entries[e as usize - 1].clone()));
+                    let entry = &n.entries[e as usize - 1];
+                    let near_by = (px - x).hypot(py - y) / reach(entry.rank);
+                    if near_by <= 1.0 && point.as_ref().is_none_or(|(d, _)| near_by < *d) {
+                        point = Some((near_by, entry.clone()));
                     }
                 }
             }
@@ -2011,4 +2039,15 @@ mod globe_tests {
 /// What a named point is, by its kind in the name table.
 fn mahere_osm_point_name(kind: u8) -> &'static str {
     mahere_tiles::names::POINT_NAMES.get(kind.saturating_sub(mahere_tiles::names::POINT) as usize).copied().unwrap_or("Place")
+}
+
+/// What a named thing is, in words: a point's kind, a line's class, an area's cover.
+pub fn named_kind(n: &mahere_tiles::Named) -> &'static str {
+    if n.is_point() {
+        mahere_osm_point_name(n.kind)
+    } else if n.is_area() {
+        theme::LAND_NAMES.get((n.kind - mahere_tiles::names::AREA + 1) as usize).copied().filter(|s| !s.is_empty()).unwrap_or("Area")
+    } else {
+        theme::CLASS_NAMES.get(n.kind as usize).copied().unwrap_or("Line")
+    }
 }

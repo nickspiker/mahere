@@ -92,6 +92,8 @@ struct Uniforms {
     pole: [f32; 4],
     // The raw elevation view's range: lowest and highest metres in view.
     raw: [f32; 4],
+    // The labels' place: where a screen pixel now was when they were drawn, x = row 0 · (x, y, 1) and y = row 1 · (x, y, 1); row 0's w is 1 when there are labels to show.
+    labels: [[f32; 4]; 2],
 }
 
 /// The layer mask as the shader's bits.
@@ -264,6 +266,10 @@ pub struct GpuMap {
     offscreen: Vec<(u32, wgpu::Texture, wgpu::TextureView, u32, u32)>,
     present_binds: FxHashMap<u32, wgpu::BindGroup>,
     overlay: Option<(wgpu::Texture, wgpu::TextureView, u32, u32)>,
+    /// The map's lettering, drawn when the camera rests, premultiplied RGBA of the screen's size.
+    labels_tex: Option<(wgpu::Texture, wgpu::TextureView, u32, u32)>,
+    /// Where the lettering is now: the map moved since it was drawn ([`mahere_panel`]'s `Labeller::transform`); None hides it.
+    pub labels_xf: Option<[f32; 6]>,
     /// The user's cells (ink and selection) as a plane of their own, and the selection being drawn as a screen mask.
     ink: Plane,
     sel: Plane,
@@ -320,6 +326,7 @@ impl GpuMap {
                 wgpu::BindGroupLayoutEntry { binding: 0, visibility: wgpu::ShaderStages::FRAGMENT, ty: float_tex, count: None },
                 wgpu::BindGroupLayoutEntry { binding: 1, visibility: wgpu::ShaderStages::FRAGMENT, ty: float_tex, count: None },
                 wgpu::BindGroupLayoutEntry { binding: 2, visibility: wgpu::ShaderStages::FRAGMENT, ty: float_tex, count: None },
+                wgpu::BindGroupLayoutEntry { binding: 3, visibility: wgpu::ShaderStages::FRAGMENT, ty: float_tex, count: None },
             ],
         });
         let relight_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -402,6 +409,8 @@ impl GpuMap {
             user_version: u64::MAX,
             ink_uploaded: FxHashMap::default(),
             preview: None,
+            labels_tex: None,
+            labels_xf: None,
             preview_version: u64::MAX,
             dem_scale: FxHashMap::default(),
             map_bind: None,
@@ -650,6 +659,29 @@ impl GpuMap {
         }
     }
 
+    /// The map's lettering as premultiplied RGBA bytes, `w × h`, drawn for the view [`GpuMap::labels_xf`] is measured from.
+    pub fn set_labels_rgba(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, w: u32, h: u32, rgba: &[u8]) {
+        if self.labels_tex.as_ref().is_none_or(|(_, _, lw, lh)| (*lw, *lh) != (w, h)) {
+            let t = device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("labels"),
+                size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba8Unorm,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            });
+            let v = t.create_view(&Default::default());
+            self.labels_tex = Some((t, v, w, h));
+            self.present_binds.clear();
+        }
+        let n = (w * h * 4) as usize;
+        if rgba.len() >= n {
+            write_layer(queue, &self.labels_tex.as_ref().unwrap().0, 0, w, h, 4, &rgba[..n]);
+        }
+    }
+
     /// The engine's marks alone: 0xRRGGBB over black, the ink's brightness its coverage, `w × h`.
     pub fn set_overlay(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, w: u32, h: u32, pixels: &[u32]) {
         let n = (w * h) as usize;
@@ -732,10 +764,25 @@ impl GpuMap {
             let v = t.create_view(&Default::default());
             self.preview = Some((t, v, 1, 1));
         }
+        if self.labels_tex.is_none() {
+            let t = device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("labels"),
+                size: wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba8Unorm,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            });
+            let v = t.create_view(&Default::default());
+            self.labels_tex = Some((t, v, 1, 1));
+        }
         if !self.present_binds.contains_key(&scale) {
             let (_, _, mv, _, _) = self.offscreen.iter().find(|(s, ..)| *s == scale).unwrap();
             let (_, ov, _, _) = self.overlay.as_ref().unwrap();
             let (_, pv, _, _) = self.preview.as_ref().unwrap();
+            let (_, lv, _, _) = self.labels_tex.as_ref().unwrap();
             let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("present"),
                 layout: &self.present_layout,
@@ -743,6 +790,7 @@ impl GpuMap {
                     wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(mv) },
                     wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(ov) },
                     wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(pv) },
+                    wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(lv) },
                 ],
             });
             self.present_binds.insert(scale, bind);
@@ -903,6 +951,10 @@ impl GpuMap {
             globe: [plan.globe[0] * sc, plan.globe[1] * sc, plan.globe[2] * plan.globe[2] * sc * sc, plan.globe[3]],
             pole: plan.pole,
             raw: [luts.contours.lo_m, luts.contours.hi_m, 0.0, 0.0],
+            labels: match (self.labels_xf, luts.mask.labels) {
+                (Some(m), true) => [[m[0], m[1], m[2], 1.0], [m[3], m[4], m[5], 0.0]],
+                _ => [[0.0; 4]; 2],
+            },
             size: [(w * self.scale.max(1)) as f32, (h * self.scale.max(1)) as f32],
             scale: self.scale.max(1) as f32,
             mask: mask_bits(luts.mask),

@@ -299,6 +299,17 @@ impl Residency {
         }
     }
 
+    /// A resident cell's names alone, read again from its store; None when it has none or is not resident.
+    pub fn read_names(&self, key: CellKey) -> Option<mahere_tiles::NameCell> {
+        if !self.pool.map.contains_key(&key) {
+            return None;
+        }
+        match self.store.get(key) {
+            Fetch::Bytes(b) => mahere_tiles::decode_names(&b),
+            _ => None,
+        }
+    }
+
     /// Cells asked for and not yet arrived.
     pub fn pending_count(&self) -> usize {
         self.pending.len()

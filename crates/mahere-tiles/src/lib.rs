@@ -1973,6 +1973,21 @@ pub fn decode_cell(data: &[u8]) -> Result<CellPlanes, String> {
     Ok(out)
 }
 
+/// Only a cell's names, from raw file bytes: what labels read for every cell in view, without decoding its terrain or imagery.
+pub fn decode_names(data: &[u8]) -> Option<NameCell> {
+    let plain: Vec<u8>;
+    let data = if data.starts_with(&[0x28, 0xB5, 0x2F, 0xFD]) {
+        plain = zstd::decode_all(data).ok()?;
+        &plain[..]
+    } else {
+        data
+    };
+    let (header, end) = vsf::VsfHeader::decode(data).ok()?;
+    let s = header.sections(data, end).ok()?.into_iter().find(|s| s.name == "name")?;
+    let fields: HashMap<String, Vec<VsfType>> = s.fields.into_iter().map(|f| (f.name, f.values)).collect();
+    NameCell::decode(&fields)
+}
+
 fn scalar_f32(v: &VsfType) -> Option<f32> {
     match v {
         VsfType::f5(x) => Some(*x),

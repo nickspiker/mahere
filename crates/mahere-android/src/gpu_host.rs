@@ -16,6 +16,8 @@ pub struct GpuHost {
     format: wgpu::TextureFormat,
     alpha: wgpu::CompositeAlphaMode,
     pub map: GpuMap,
+    /// The map's lettering, laid out when the view rests.
+    pub labeller: mahere_panel::labels::Labeller,
     configured: (u32, u32),
     overlay_stamp: Option<OverlayStamp>,
     overlay_at: std::time::Instant,
@@ -77,6 +79,7 @@ impl GpuHost {
             format,
             alpha,
             map,
+            labeller: mahere_panel::labels::Labeller::new(),
             configured: (0, 0),
             overlay_stamp: None,
             overlay_at: std::time::Instant::now(),
@@ -206,6 +209,16 @@ impl GpuHost {
             map.view_depth().hash(&mut hs);
             hs.finish()
         });
+        // Labels: lettered again once the view rests with its cells in, on the still frame; until then the last lettering rides along with the map, and hides when the zoom has changed it by more than half or double.
+        if mask.labels {
+            if !in_motion && map.converged() && self.labeller.stale(map, w as usize, h as usize) {
+                self.labeller.update(map, w as usize, h as usize, panel.font_px());
+                self.map.set_labels_rgba(&self.device, &self.queue, w, h, &self.labeller.rgba());
+            }
+            self.map.labels_xf = self.labeller.transform(&map.cam, w as usize, h as usize).filter(|m| (0.5..=2.0).contains(&m[0].hypot(m[3])));
+        } else {
+            self.map.labels_xf = None;
+        }
         self.map.pin = map.gps_screen(w as usize, h as usize);
         self.map.measure = map.measure_view(w as usize, h as usize, 2).map(|m| (m.origin_px.0, m.origin_px.1, m.target_px.0, m.target_px.1));
         // A bearing or readout change repaints at most a few times a second (the orientation sensor would otherwise repaint the panel's text every frame); the panel opening, closing or a row flipping repaints at once.

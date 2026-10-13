@@ -5,7 +5,7 @@ use std::collections::HashMap;
 
 use rayon::prelude::*;
 
-pub use mahere_osm::names::{POINT, POINT_NAMES};
+pub use mahere_osm::names::{AREA, POINT, POINT_NAMES};
 
 use super::{child_cell_texels, disk_to_mem, mem_to_disk, raw_u16, tri_idx, CellKey, ClassCell, Named, TEX, TRI};
 

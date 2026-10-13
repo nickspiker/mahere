@@ -31,6 +31,9 @@ struct MahereApp {
     cells: Option<std::sync::Arc<mahere_store::VaultCells>>,
     last_save: Instant,
     panel: Panel,
+    /// The map's lettering, and when the camera last moved: labels are laid out once it has rested a quarter second, and hidden while it moves.
+    labeller: mahere_panel::labels::Labeller,
+    label_cam: ((u64, u64, u64, u64), Instant),
     cache_budget: u64,
     areas: mahere_engine::areas::Areas,
 }
@@ -97,6 +100,8 @@ impl MahereApp {
             cells: None,
             last_save: Instant::now(),
             panel: Panel::new(),
+            labeller: mahere_panel::labels::Labeller::new(),
+            label_cam: ((0, 0, 0, 0), Instant::now()),
             cache_budget: 2 << 30,
             areas,
         }
@@ -322,7 +327,9 @@ impl FluorApp for MahereApp {
                 }
                 // A click that never travelled is a tap: a new measurement to that point.
                 if self.dragging && self.travel < 6.0 {
-                    self.map.tap(ctx.cursor_x as f64, ctx.cursor_y as f64, w, h);
+                    // A label under the pointer names what it letters first.
+                    let label = (!self.labeller.stale(&self.map, w, h)).then(|| self.labeller.hit(&self.map.cam, w, h, ctx.cursor_x as f32, ctx.cursor_y as f32).cloned()).flatten();
+                    self.map.tap_label(ctx.cursor_x as f64, ctx.cursor_y as f64, w, h, label.as_ref());
                     ctx.window.request_redraw();
                 }
                 self.dragging = false;
@@ -525,7 +532,9 @@ impl FluorApp for MahereApp {
         if areas_changed {
             self.chrome.invalidate_bg();
         }
-        self.map.tick(w, h) || areas_changed
+        // Labels waiting for the camera to rest keep the ticks coming until they are drawn.
+        let labels_due = self.map.layers().labels && self.map.converged() && self.labeller.stale(&self.map, w, h);
+        self.map.tick(w, h) || areas_changed || labels_due
     }
 
     fn render(&mut self, target: &mut [u32], ctx: &mut Context) {
@@ -565,6 +574,20 @@ impl FluorApp for MahereApp {
         let areas = self.areas.view(self.map.user.has_selection());
         self.panel.paint(w, h, self.map.layers(), Controls { real_sun: self.map.real_sun, real_light: self.map.real_light, follow_heading: self.map.follow_heading, lock_to_fix: self.map.lock_to_fix, cache_budget: self.cache_budget, theme: self.map.theme, compressed: self.map.compressed(), tool: self.map.tool as u8, pen_rgba: self.map.pen_colour, clear_ink: false, clear_sel: false }, &readouts, measure.as_ref(), &themes, &areas, None);
         let mut map = self.map.canvas.clone();
+        // The labels, laid out a quarter second after the camera stops with every cell in, over the map and under the panel.
+        let c = self.map.cam;
+        let cam_key = (c.lat().to_bits(), c.lon().to_bits(), c.ppd.to_bits(), c.bearing().to_bits());
+        if cam_key != self.label_cam.0 {
+            self.label_cam = (cam_key, Instant::now());
+        }
+        if self.map.layers().labels {
+            if self.map.converged() && self.label_cam.1.elapsed().as_millis() >= 250 && self.labeller.stale(&self.map, w, h) {
+                self.labeller.update(&mut self.map, w, h, self.panel.font_px());
+            }
+            if !self.labeller.stale(&self.map, w, h) {
+                self.labeller.composite_rgb(&mut map);
+            }
+        }
         self.panel.composite_rgb(&mut map, w, h);
         self.chrome.rasterize_bg(ctx.damage, |c| {
             let n = c.pixels.len().min(map.len());

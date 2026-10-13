@@ -2,6 +2,8 @@
 //!
 //! Painted with fluor's widgets and text into the panel's own buffer in fluor's pixel convention (α + darkness, topmost first), then composited by whichever renderer owns the screen: the GPU takes it as a premultiplied RGBA overlay over the engine's marks, the CPU frontend lays it over its canvas. Taps are routed here first; a tap the panel does not take is the map's.
 
+pub mod labels;
+
 use fluor::canvas::{Canvas, Damage};
 use fluor::paint::{self, HitId, HIT_NONE};
 use fluor::text::{TextRenderer, TextStyle};
@@ -75,6 +77,7 @@ enum Layer {
     Land,
     Water,
     Line,
+    Labels,
     Contours,
     Slope,
     Infrared,
@@ -90,13 +93,14 @@ enum Layer {
     Areas,
 }
 
-const LAYERS: [(Layer, &str); 25] = [
+const LAYERS: [(Layer, &str); 26] = [
     (Layer::Dem, "Terrain"),
     (Layer::Hypso, "Elevation tint"),
     (Layer::Raw, "Raw elevation"),
     (Layer::Land, "Land cover"),
     (Layer::Water, "Water"),
     (Layer::Line, "Lines"),
+    (Layer::Labels, "Labels"),
     (Layer::Boundaries, "Boundaries"),
     (Layer::Own, "Land ownership"),
     (Layer::Mvum, "Motor vehicle use"),
@@ -140,6 +144,7 @@ fn get(mask: &LayerMask, ctl: &Controls, l: Layer) -> bool {
         Layer::Land => mask.land,
         Layer::Water => mask.water,
         Layer::Line => mask.line,
+        Layer::Labels => mask.labels,
         Layer::Boundaries => mask.boundaries,
         Layer::Own => mask.own,
         Layer::Raw => mask.raw,
@@ -167,6 +172,7 @@ fn set(mask: &mut LayerMask, ctl: &mut Controls, l: Layer, v: bool) {
         Layer::Land => mask.land = v,
         Layer::Water => mask.water = v,
         Layer::Line => mask.line = v,
+        Layer::Labels => mask.labels = v,
         Layer::Boundaries => mask.boundaries = v,
         Layer::Own => mask.own = v,
         Layer::Raw => mask.raw = v,
@@ -986,6 +992,16 @@ impl Panel {
 
     /// One painted pixel as premultiplied visible (r, g, b, a): fluor stores accumulated darkness with `dark ≤ α`, so the premultiplied channel is `α − dark`; Android's theme bytes are R↔B swapped.
     #[inline]
+    /// A pixel of fluor's (α + darkness) as premultiplied RGBA in this platform's channel order.
+    pub fn premul_pub(p: u32) -> (u8, u8, u8, u8) {
+        Self::premul(p)
+    }
+
+    /// The panel's base font size, pixels, for anything lettered to match it.
+    pub fn font_px(&self) -> f32 {
+        self.font
+    }
+
     fn premul(p: u32) -> (u8, u8, u8, u8) {
         let a = (p >> 24) as u8;
         let c0 = a - ((p >> 16) & 255).min(a as u32) as u8;
