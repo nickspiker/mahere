@@ -279,7 +279,7 @@ impl AndroidApp {
 
     fn save_settings(&self) {
         if let Some(store) = &self.store {
-            let s = mahere_store::Settings { cache_budget: self.cache_budget, layer_bits: self.map.layers().bits() as u64, real_sun: self.map.real_sun, real_light: self.map.real_light, follow_heading: self.map.follow_heading, lock_to_fix: self.map.lock_to_fix, theme: self.map.theme as u64, compressed: self.map.compressed(), ui_ru: self.ui_ru };
+            let s = mahere_store::Settings { cache_budget: self.cache_budget, layer_bits: self.map.layers().bits() as u64, real_sun: self.map.real_sun, real_light: self.map.real_light, follow_heading: self.map.follow_heading, lock_to_fix: self.map.lock_to_fix, theme: self.map.theme as u64, compressed: self.map.compressed(), ui_ru: self.ui_ru, tool: self.map.tool as u8, pen_rgba: Some(self.map.pen_colour) };
             self.persist.settings(store.clone(), s);
         }
     }
@@ -609,6 +609,14 @@ pub extern "system" fn Java_nz_mahere_app_MahereActivity_nativeInit(
         map.set_compressed(s.compressed);
         map.set_follow_heading(s.follow_heading);
         map.set_lock_to_fix(s.lock_to_fix);
+        map.set_tool(match s.tool {
+            1 => mahere_engine::ink::Tool::Pen,
+            2 => mahere_engine::ink::Tool::Select,
+            _ => mahere_engine::ink::Tool::None,
+        });
+        if let Some(c) = s.pen_rgba {
+            map.set_pen_colour(c);
+        }
     }
     let recorder = store.clone().map(|s| std::sync::Arc::new(std::sync::Mutex::new(mahere_store::TrackRecorder::new(s))));
     let mut app = AndroidApp {
