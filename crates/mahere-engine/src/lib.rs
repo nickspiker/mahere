@@ -1154,6 +1154,10 @@ impl MapCore {
         self.dirty = false;
         self.res.frame += 1;
         self.res.drain();
+        // A cell replaced by a newer copy: its names are read again.
+        for k in std::mem::take(&mut self.res.reloaded) {
+            self.names_cache.remove(&k);
+        }
         self.canvas_w = w;
         self.canvas_h = h;
         // The real sun: azimuth and altitude from the clock and the position (the fix, or the view), as a screen-relative azimuth. Nothing is clamped: below the horizon it is below the horizon.

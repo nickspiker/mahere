@@ -401,6 +401,7 @@ impl VaultCells {
         for &(depth, raw) in &victims {
             let key = mahere_tiles::CellKey { depth, prefix: raw >> (60 - 2 * depth as u32) };
             let _ = self.store.delete_device(&cell_key(key));
+            let _ = self.store.delete_device(&tag_key(key));
             self.index.lock().unwrap().entries.remove(&(depth, raw));
         }
         if !victims.is_empty() {
@@ -468,6 +469,16 @@ fn decode_cell_index(data: &[u8]) -> std::collections::HashMap<(u8, u64), (i64, 
         }
     }
     out
+}
+
+/// Where a kept cell's source tag (the bucket's ETag) lives, beside the cell.
+fn tag_key(key: mahere_tiles::CellKey) -> String {
+    vault_key(&[
+        name("celltag"),
+        VsfType::u(mahere_engine::residency::CELL_EPOCH as usize, false),
+        VsfType::u(key.depth as usize, false),
+        VsfType::wm(vsf::types::WorldCell::from_raw(key.raw())),
+    ])
 }
 
 fn cell_key(key: mahere_tiles::CellKey) -> String {
@@ -629,6 +640,14 @@ impl mahere_engine::residency::CellCache for VaultCells {
         if self.store.write_device(&cell_key(key), bytes).is_ok() {
             self.touch(key, bytes.len());
         }
+    }
+
+    fn tag(&self, key: mahere_tiles::CellKey) -> Option<String> {
+        self.store.read_device(&tag_key(key)).ok().flatten().and_then(|b| String::from_utf8(b).ok())
+    }
+
+    fn set_tag(&self, key: mahere_tiles::CellKey, tag: &str) {
+        let _ = self.store.write_device(&tag_key(key), tag.as_bytes());
     }
 }
 

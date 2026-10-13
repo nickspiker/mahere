@@ -317,14 +317,14 @@ impl Labeller {
         Labeller { text: TextRenderer::new(), buf: Vec::new(), w: 0, h: 0, placed: Vec::new(), anchor: None, drawn_for: None, advance: HashMap::new() }
     }
 
-    /// Whether the lettering is out of date for this view: the camera, the depth or the cells in view changed since it was drawn.
+    /// Whether the lettering is out of date for this view: the camera, the depth or the cells resident changed since it was drawn (a cell arriving, leaving or replaced by a newer copy).
     pub fn stale(&self, map: &mahere_engine::MapCore, w: usize, h: usize) -> bool {
         self.drawn_for != Some(Self::view_key(map, w, h))
     }
 
     fn view_key(map: &mahere_engine::MapCore, w: usize, h: usize) -> (i64, i64, i64, i64, u8, usize) {
         let c = &map.cam;
-        ((c.lat() * 1e7) as i64, (c.lon() * 1e7) as i64, (c.ppd * 100.0) as i64, (c.bearing() * 1e5) as i64, map.vec_depth(), map.pool().map.len() ^ (w << 20) ^ (h << 40))
+        ((c.lat() * 1e7) as i64, (c.lon() * 1e7) as i64, (c.ppd * 100.0) as i64, (c.bearing() * 1e5) as i64, map.vec_depth(), map.pool_version() as usize ^ (w << 20) ^ (h << 40))
     }
 
     fn advance(&mut self, ch: char, size: f32, weight: u16) -> f32 {

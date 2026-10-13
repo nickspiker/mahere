@@ -165,7 +165,7 @@ impl Areas {
         self.list.get(i).map(|e| (e.area.name.clone(), e.area.encode(true)))
     }
 
-    /// Fetch every cell of the area down to its depth, on threads of their own, through the same store the view reads (so the vault keeps them). A refresh forgets what the store remembered as absent, so cells baked since are found.
+    /// Fetch every cell of the area down to its depth, on threads of their own, through the same store the view reads (so the vault keeps them). A refresh forgets what the store remembered as absent, so cells baked since are found, and checks every kept cell against the bucket, so cells baked again are taken anew.
     pub fn download(&mut self, i: usize, refresh: bool) {
         let Some(e) = self.list.get_mut(i) else { return };
         if e.download.as_ref().is_some_and(|p| !p.finished.load(Ordering::Relaxed)) {
@@ -179,7 +179,7 @@ impl Areas {
         progress.total.store(cells.len() as u64, Ordering::Relaxed);
         e.download = Some(progress.clone());
         let store = self.cells.clone();
-        std::thread::spawn(move || fetch_all(store, cells, progress));
+        std::thread::spawn(move || fetch_all(store, cells, progress, refresh));
     }
 
     pub fn cancel(&mut self, i: usize) {
@@ -236,7 +236,7 @@ impl Areas {
 }
 
 /// The fetch itself: depth by depth so a cell found absent spares its descendants, four cells at a time within a depth.
-fn fetch_all(store: Arc<dyn CellStore>, cells: Vec<CellKey>, progress: Arc<Progress>) {
+fn fetch_all(store: Arc<dyn CellStore>, cells: Vec<CellKey>, progress: Arc<Progress>, refresh: bool) {
     let absent = std::sync::Mutex::new(FxHashSet::<CellKey>::default());
     let max_depth = cells.iter().map(|k| k.depth).max().unwrap_or(0);
     'depths: for d in 0..=max_depth {
@@ -263,7 +263,8 @@ fn fetch_all(store: Arc<dyn CellStore>, cells: Vec<CellKey>, progress: Arc<Progr
                             absent.lock().unwrap().insert(key);
                             progress.absent.fetch_add(1, Ordering::Relaxed);
                         } else {
-                            match store.get(key) {
+                            // Download again checks every kept cell against the bucket and takes the newer copy (Nick 2026-10-13).
+                            match if refresh { store.refresh(key) } else { store.get(key) } {
                                 Fetch::Bytes(b) => {
                                     progress.bytes.fetch_add(b.len() as u64, Ordering::Relaxed);
                                 }

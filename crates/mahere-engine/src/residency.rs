@@ -22,6 +22,14 @@ pub trait CellStore: Send + Sync + 'static {
     fn get(&self, key: CellKey) -> Fetch;
     /// Forget every absence remembered, so cells baked since the last look are asked for again (an area's refresh).
     fn forget_absent(&self) {}
+    /// The cell as the source has it now, checked past any copy kept: an area's "Download again".
+    fn refresh(&self, key: CellKey) -> Fetch {
+        self.get(key)
+    }
+    /// Cells whose kept copy was found out of date and replaced since the last call, for residency to load again.
+    fn take_changed(&self) -> Vec<CellKey> {
+        Vec::new()
+    }
 }
 
 pub struct DirStore(pub PathBuf);
@@ -176,6 +184,8 @@ pub struct Residency {
     /// The last missing list sent to the loader, so an unchanged one is not sent again.
     last_sent: Vec<CellKey>,
     last_send_at: std::time::Instant,
+    /// Cells the store replaced with a newer copy, for whatever keeps something read from them to forget it.
+    pub reloaded: Vec<CellKey>,
 }
 
 const RETRY_AFTER: std::time::Duration = std::time::Duration::from_secs(3);
@@ -204,6 +214,7 @@ impl Residency {
             pool_version: 0,
             last_sent: Vec::new(),
             last_send_at: std::time::Instant::now(),
+            reloaded: Vec::new(),
         }
     }
 
@@ -211,9 +222,16 @@ impl Residency {
         self.pack_cpu.store(pack, std::sync::atomic::Ordering::Relaxed);
     }
 
-    /// Drain finished cells into the pool. Returns how many arrived.
+    /// Drain finished cells into the pool. Returns how many arrived. A resident cell its store found changed is dropped, so the view asks for it again and gets the new copy.
     pub fn drain(&mut self) -> usize {
         let mut n = 0;
+        for k in self.store.take_changed() {
+            self.reloaded.push(k);
+            if self.pool.map.remove(&k).is_some() {
+                self.pool_version += 1;
+                n += 1;
+            }
+        }
         while let Ok(l) = self.done_rx.try_recv() {
             self.pending.remove(&l.key);
             self.last_sent.retain(|k| *k != l.key);
@@ -425,26 +443,121 @@ pub const DEFAULT_CELLS_URL: &str = "https://brobdingnagian.holdmyoscilloscope.c
 /// Cell format epoch: bumped whenever the encoding changes incompatibly. It rides on the fetch URL as a query (so the CDN edge, which caches a key for hours, sees a new key) and in the vault key (so a cached cell of an older format is never read back as this one). Old clients keep fetching the old objects they understand.
 pub const CELL_EPOCH: u32 = 7;
 
-/// A store that can also keep what it's given (the vault).
+/// A store that can also keep what it's given (the vault), and the source's tag for each copy (its ETag), so a copy can be checked without fetching it again.
 pub trait CellCache: CellStore {
     fn put(&self, key: CellKey, bytes: &[u8]);
+    fn tag(&self, _key: CellKey) -> Option<String> {
+        None
+    }
+    fn set_tag(&self, _key: CellKey, _tag: &str) {}
+}
+
+/// What checking a kept copy against the source found.
+pub enum Checked {
+    /// The copy is the source's.
+    Same,
+    /// The source has other bytes, with their tag.
+    Changed(Vec<u8>, Option<String>),
+    /// The source no longer has the cell.
+    Gone,
+    Failed(String),
 }
 
 /// The far tier: the same outcomes as a store, over the network.
 pub trait RemoteStore: Send + Sync + 'static {
     fn fetch(&self, key: CellKey) -> Fetch;
+    /// The cell unless the source still has the copy with this tag; with no tag, the cell and its tag.
+    fn check(&self, key: CellKey, tag: Option<&str>) -> Checked {
+        let _ = tag;
+        match self.fetch(key) {
+            Fetch::Bytes(b) => Checked::Changed(b, None),
+            Fetch::Absent => Checked::Gone,
+            Fetch::Failed(e) => Checked::Failed(e),
+        }
+    }
 }
 
 /// Cache first, then the bucket, writing hits through. Definite misses are remembered for the process (most of the world isn't baked yet); failures are not, so a cell that couldn't be fetched is tried again the next time the view wants it.
+/// A kept copy is served at once and checked against the bucket behind it, once a session (Nick 2026-10-13: a rebake must reach a phone that already has the cell): unchanged costs a 304, changed is kept and handed to residency to load again.
 pub struct TieredStore {
     cache: Arc<dyn CellCache>,
     remote: Arc<dyn RemoteStore>,
     missing: std::sync::Mutex<FxHashSet<CellKey>>,
+    checks: Arc<Checks>,
+}
+
+/// The copies waiting to be checked, those checked this session, and those found changed.
+#[derive(Default)]
+struct Checks {
+    queue: std::sync::Mutex<std::collections::VecDeque<CellKey>>,
+    wake: std::sync::Condvar,
+    seen: std::sync::Mutex<FxHashSet<CellKey>>,
+    changed: std::sync::Mutex<Vec<CellKey>>,
+}
+
+/// Threads checking kept copies against the bucket.
+const CHECKERS: usize = 2;
+
+/// Check one kept copy against the source: the same, nothing to do; changed, kept with its tag and reported; gone or failed, left as it is.
+fn check_copy(cache: &dyn CellCache, remote: &dyn RemoteStore, key: CellKey) -> Option<Vec<u8>> {
+    match remote.check(key, cache.tag(key).as_deref()) {
+        Checked::Same => None,
+        Checked::Changed(b, tag) => {
+            let same = matches!(cache.get(key), Fetch::Bytes(old) if old == b);
+            if let Some(t) = &tag {
+                cache.set_tag(key, t);
+            }
+            if same {
+                return None;
+            }
+            cache.put(key, &b);
+            Some(b)
+        }
+        Checked::Gone | Checked::Failed(_) => None,
+    }
 }
 
 impl TieredStore {
     pub fn new(cache: Arc<dyn CellCache>, remote: Arc<dyn RemoteStore>) -> TieredStore {
-        TieredStore { cache, remote, missing: std::sync::Mutex::new(FxHashSet::default()) }
+        let checks = Arc::new(Checks::default());
+        for _ in 0..CHECKERS {
+            let (cache, remote, checks) = (cache.clone(), remote.clone(), checks.clone());
+            std::thread::spawn(move || loop {
+                let key = {
+                    let mut q = checks.queue.lock().unwrap();
+                    loop {
+                        if let Some(k) = q.pop_front() {
+                            break k;
+                        }
+                        q = checks.wake.wait(q).unwrap();
+                    }
+                };
+                if check_copy(cache.as_ref(), remote.as_ref(), key).is_some() {
+                    checks.changed.lock().unwrap().push(key);
+                }
+            });
+        }
+        TieredStore { cache, remote, missing: std::sync::Mutex::new(FxHashSet::default()), checks }
+    }
+
+    /// Fetch from the bucket and keep it with its tag.
+    fn fetch_and_keep(&self, key: CellKey) -> Fetch {
+        match self.remote.check(key, None) {
+            Checked::Changed(b, tag) => {
+                self.cache.put(key, &b);
+                if let Some(t) = &tag {
+                    self.cache.set_tag(key, t);
+                }
+                self.checks.seen.lock().unwrap().insert(key);
+                Fetch::Bytes(b)
+            }
+            Checked::Same => self.cache.get(key),
+            Checked::Gone => {
+                self.missing.lock().unwrap().insert(key);
+                Fetch::Absent
+            }
+            Checked::Failed(e) => Fetch::Failed(e),
+        }
     }
 }
 
@@ -455,24 +568,37 @@ impl CellStore for TieredStore {
 
     fn get(&self, key: CellKey) -> Fetch {
         match self.cache.get(key) {
-            Fetch::Bytes(b) => return Fetch::Bytes(b),
+            Fetch::Bytes(b) => {
+                // Served now; checked against the bucket behind it, once a session.
+                if self.checks.seen.lock().unwrap().insert(key) {
+                    self.checks.queue.lock().unwrap().push_back(key);
+                    self.checks.wake.notify_one();
+                }
+                return Fetch::Bytes(b);
+            }
             Fetch::Failed(e) => eprintln!("vault read {} failed: {e}", key.path()),
             Fetch::Absent => {}
         }
         if self.missing.lock().unwrap().contains(&key) {
             return Fetch::Absent;
         }
-        match self.remote.fetch(key) {
-            Fetch::Bytes(b) => {
-                self.cache.put(key, &b);
-                Fetch::Bytes(b)
-            }
-            Fetch::Absent => {
-                self.missing.lock().unwrap().insert(key);
-                Fetch::Absent
-            }
-            Fetch::Failed(e) => Fetch::Failed(e),
+        self.fetch_and_keep(key)
+    }
+
+    fn refresh(&self, key: CellKey) -> Fetch {
+        if !matches!(self.cache.get(key), Fetch::Bytes(_)) {
+            self.missing.lock().unwrap().remove(&key);
+            return self.fetch_and_keep(key);
         }
+        self.checks.seen.lock().unwrap().insert(key);
+        if check_copy(self.cache.as_ref(), self.remote.as_ref(), key).is_some() {
+            self.checks.changed.lock().unwrap().push(key);
+        }
+        self.cache.get(key)
+    }
+
+    fn take_changed(&self) -> Vec<CellKey> {
+        std::mem::take(&mut *self.checks.changed.lock().unwrap())
     }
 }
 
@@ -493,6 +619,31 @@ impl HttpStore {
 }
 
 impl RemoteStore for HttpStore {
+    fn check(&self, key: CellKey, tag: Option<&str>) -> Checked {
+        let url = format!("{}/{}?e={}", self.base, key.path(), CELL_EPOCH);
+        let mut req = self.agent.get(&url);
+        if let Some(t) = tag {
+            req = req.set("If-None-Match", t);
+        }
+        match req.call() {
+            Ok(resp) if resp.status() == 304 => Checked::Same,
+            Ok(resp) => {
+                let etag = resp.header("ETag").map(str::to_string);
+                let expect: Option<usize> = resp.header("Content-Length").and_then(|v| v.parse().ok());
+                let mut buf = Vec::new();
+                if let Err(e) = std::io::Read::read_to_end(&mut resp.into_reader(), &mut buf) {
+                    return Checked::Failed(e.to_string());
+                }
+                if expect.is_some_and(|n| n != buf.len()) {
+                    return Checked::Failed(format!("short body: {} of {:?} bytes", buf.len(), expect));
+                }
+                Checked::Changed(buf, etag)
+            }
+            Err(ureq::Error::Status(404, _)) => Checked::Gone,
+            Err(e) => Checked::Failed(e.to_string()),
+        }
+    }
+
     fn fetch(&self, key: CellKey) -> Fetch {
         let url = format!("{}/{}?e={}", self.base, key.path(), CELL_EPOCH);
         match self.agent.get(&url).call() {
@@ -543,6 +694,64 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(2));
         }
         panic!("loader never converged");
+    }
+
+    /// A kept copy is served at once, checked behind it, and replaced and reported when the source has changed; an unchanged one stays quiet.
+    #[test]
+    fn a_kept_copy_is_checked_and_replaced_when_the_source_changed() {
+        use std::sync::Mutex;
+        #[derive(Default)]
+        struct Kept(Mutex<FxHashMap<CellKey, (Vec<u8>, Option<String>)>>);
+        impl CellStore for Kept {
+            fn get(&self, key: CellKey) -> Fetch {
+                self.0.lock().unwrap().get(&key).map_or(Fetch::Absent, |(b, _)| Fetch::Bytes(b.clone()))
+            }
+        }
+        impl CellCache for Kept {
+            fn put(&self, key: CellKey, bytes: &[u8]) {
+                self.0.lock().unwrap().entry(key).or_default().0 = bytes.to_vec();
+            }
+            fn tag(&self, key: CellKey) -> Option<String> {
+                self.0.lock().unwrap().get(&key).and_then(|(_, t)| t.clone())
+            }
+            fn set_tag(&self, key: CellKey, tag: &str) {
+                self.0.lock().unwrap().entry(key).or_default().1 = Some(tag.to_string());
+            }
+        }
+        struct Source(FxHashMap<CellKey, (Vec<u8>, String)>);
+        impl RemoteStore for Source {
+            fn fetch(&self, key: CellKey) -> Fetch {
+                self.0.get(&key).map_or(Fetch::Absent, |(b, _)| Fetch::Bytes(b.clone()))
+            }
+            fn check(&self, key: CellKey, tag: Option<&str>) -> Checked {
+                match self.0.get(&key) {
+                    Some((_, t)) if Some(t.as_str()) == tag => Checked::Same,
+                    Some((b, t)) => Checked::Changed(b.clone(), Some(t.clone())),
+                    None => Checked::Gone,
+                }
+            }
+        }
+        let (old, same) = (CellKey { depth: 9, prefix: 1 }, CellKey { depth: 9, prefix: 2 });
+        let kept = Arc::new(Kept::default());
+        kept.put(old, b"old");
+        kept.set_tag(old, "v1");
+        kept.put(same, b"same");
+        kept.set_tag(same, "s1");
+        let source = Arc::new(Source([(old, (b"new".to_vec(), "v2".to_string())), (same, (b"same".to_vec(), "s1".to_string()))].into_iter().collect()));
+        let store = TieredStore::new(kept.clone(), source);
+        assert!(matches!(store.get(old), Fetch::Bytes(b) if b == b"old"), "the kept copy is served at once");
+        assert!(matches!(store.get(same), Fetch::Bytes(_)));
+        let mut changed = Vec::new();
+        for _ in 0..500 {
+            changed.extend(store.take_changed());
+            if !changed.is_empty() && kept.tag(old).as_deref() == Some("v2") {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert_eq!(changed, vec![old], "only the changed cell is reported");
+        assert!(matches!(store.get(old), Fetch::Bytes(b) if b == b"new"));
+        assert_eq!(kept.tag(old).as_deref(), Some("v2"));
     }
 
     #[test]
