@@ -45,6 +45,8 @@ pub struct Controls {
     /// One-shot asks: the ink or the selection cleared.
     pub clear_ink: bool,
     pub clear_sel: bool,
+    /// One-shot: the locate button was tapped, centre on the fix.
+    pub locate: bool,
 }
 
 /// What the readouts show.
@@ -65,6 +67,8 @@ pub struct Readouts {
     /// Bytes the cell cache holds now, and the most the slider may allow (what is cached plus the free space).
     pub cache_used: u64,
     pub cache_max: u64,
+    /// There is a GPS fix to go to.
+    pub has_fix: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -411,6 +415,8 @@ pub struct Panel {
     /// The app orb decoded once, and resampled to the last size asked, in fluor's stored form.
     orb_icon: Option<fluor::host::icon::Icon>,
     orb_scaled: (usize, Vec<u32>),
+    /// The locate button as last painted (centre, radius), for its tap.
+    locate_btn: Option<(f32, f32, f32)>,
 }
 
 impl Default for Panel {
@@ -423,7 +429,7 @@ impl Panel {
     pub fn new() -> Panel {
         let mut hits: HitId = HIT_NONE;
         let checks = LAYERS.iter().map(|&(l, label)| (l, Checkbox::new(&mut hits, label, 0.0, 0.0, 10.0, 10.0, 10.0, false))).collect();
-        Panel { open: false, dirty: true, ru: 1.0, stack: vec![Page::Layers], theme_rows: Vec::new(), edit_rows: Vec::new(), edit_scroll: 0.0, edit_extent: 0.0, press: None, sliders: Vec::new(), field_vals: [0.0; 4], held: None, edits: Vec::new(), hits, checks, text: TextRenderer::new(), buf: Vec::new(), w: 0, h: 0, font: 16.0, gear: (0.0, 0.0, 0.0), panel_w: 0.0, theme_row: (0.0, 0.0, 0.0), slider: (0.0, 0.0, 0.0), slider_held: false, cache_max: CACHE_MIN + 1, strip_close: None, clear_measure: false, area_rows: Vec::new(), area_acts: Vec::new(), areas: AreasView::default(), update_rows: Vec::new(), update_acts: Vec::new(), updates: UpdatesView::default(), host_orb: None, layers_scroll: 0.0, layers_extent: 0.0, layers_press: None, layers_band: (0.0, 0.0), orb_icon: fluor::host::icon::Icon::from_vsf_bytes(APP_ORB_VSF).ok(), orb_scaled: (0, Vec::new()) }
+        Panel { open: false, dirty: true, ru: 1.0, stack: vec![Page::Layers], theme_rows: Vec::new(), edit_rows: Vec::new(), edit_scroll: 0.0, edit_extent: 0.0, press: None, sliders: Vec::new(), field_vals: [0.0; 4], held: None, edits: Vec::new(), hits, checks, text: TextRenderer::new(), buf: Vec::new(), w: 0, h: 0, font: 16.0, gear: (0.0, 0.0, 0.0), panel_w: 0.0, theme_row: (0.0, 0.0, 0.0), slider: (0.0, 0.0, 0.0), slider_held: false, cache_max: CACHE_MIN + 1, strip_close: None, clear_measure: false, area_rows: Vec::new(), area_acts: Vec::new(), areas: AreasView::default(), update_rows: Vec::new(), update_acts: Vec::new(), updates: UpdatesView::default(), host_orb: None, layers_scroll: 0.0, layers_extent: 0.0, layers_press: None, layers_band: (0.0, 0.0), orb_icon: fluor::host::icon::Icon::from_vsf_bytes(APP_ORB_VSF).ok(), orb_scaled: (0, Vec::new()), locate_btn: None }
     }
 
     pub fn is_open(&self) -> bool {
@@ -594,6 +600,12 @@ impl Panel {
     /// Where a page's content starts: every page has the whole column (the rail that showed the page under it is gone, Nick 2026-10-11); its title row goes back.
     fn rail_w(&self) -> f32 {
         0.0
+    }
+
+    /// Whether a tap's height is on a page's title row ("‹  Title" goes back, Nick 2026-10-14: the pen and field pages had no way back but the phone's own).
+    fn on_title(&self, y: f32) -> bool {
+        let ty = self.gear.1 + self.gear.2 + self.font * 0.9 + self.font * 0.8;
+        (y - ty).abs() <= self.font * 0.8
     }
 
     /// Open the pen's mixer: four sliders from the pen's bytes.
@@ -771,6 +783,12 @@ impl Panel {
                 return true;
             }
         }
+        if let Some((bx, by, br)) = self.locate_btn {
+            if (x - bx).powi(2) + (y - by).powi(2) <= (br * 1.3).powi(2) {
+                ctl.locate = true;
+                return true;
+            }
+        }
         let (gx, gy, r) = self.gear;
         if (x - gx).powi(2) + (y - gy).powi(2) <= (r * 1.3).powi(2) {
             self.open = !self.open;
@@ -809,6 +827,10 @@ impl Panel {
                 return true;
             }
             Page::Field(f) => {
+                if self.on_title(y) {
+                    self.pop();
+                    return true;
+                }
                 for (i, sl) in self.sliders.iter_mut().enumerate() {
                     let b = sl.bbox();
                     if y >= b.y - b.h * 0.5 && y <= b.y + b.h * 1.5 && x >= b.x - self.font && x <= b.x + b.w + self.font {
@@ -904,6 +926,10 @@ impl Panel {
                 return true;
             }
             Page::Pen => {
+                if self.on_title(y) {
+                    self.pop();
+                    return true;
+                }
                 for (i, sl) in self.sliders.iter_mut().enumerate() {
                     let b = sl.bbox();
                     if y >= b.y - b.h * 0.5 && y <= b.y + b.h * 1.5 && x >= b.x - self.font && x <= b.x + b.w + self.font {
@@ -998,10 +1024,19 @@ impl Panel {
         let mut damage = Damage::new();
         let mut canvas = Canvas::new(&mut self.buf, w, h, &mut damage);
         self.strip_close = None;
+        let mut bottom = h as f32;
         if let Some(m) = measure {
             self.strip_close = Some(Self::paint_strip(&mut canvas, &mut self.text, w, h, font, m));
+            bottom -= Self::strip_band(font, m);
         }
+        // The locate button, bottom right above any strip; dim without a fix.
+        let br = gr * 0.8;
+        let (bx, by) = (w as f32 - br - font * 0.6, bottom - br - font * 0.6);
+        Self::paint_locate(&mut canvas, bx, by, br, r.has_fix);
+        self.locate_btn = Some((bx, by, br));
         if !self.open {
+            // The scale bar, bottom left; the open panel shows the scale itself.
+            Self::paint_scale(&mut canvas, &mut self.text, font, font * 0.8, bottom - font * 0.8, r.m_per_px, (w as f32 * 0.3).min(font * 10.0));
             return &self.buf;
         }
         if page != Page::Layers {
@@ -1188,10 +1223,62 @@ impl Panel {
 
     /// The measurement strip along the bottom: the elevation profile from origin to target as a filled area, with distance and bearing on the left and the elevations on the right.
     /// Returns the close button's centre and radius.
+    /// The measurement strip's height: what is at the point, a line each, above the distance and the profile.
+    fn strip_band(font: f32, m: &MeasureView) -> f32 {
+        font * 6.5 + m.info.len() as f32 * font * 1.05
+    }
+
+    /// The scale bar: the longest round distance (1, 2 or 5 of a power of ten metres) that fits in `max_px`, its length in metres or kilometres over it; text first, then the bar on a dark edge, as everything here paints top first.
+    #[allow(clippy::too_many_arguments)]
+    fn paint_scale(canvas: &mut Canvas, text: &mut TextRenderer, font: f32, x0: f32, y: f32, m_per_px: f64, max_px: f32) {
+        if !(m_per_px > 0.0) {
+            return;
+        }
+        let most = max_px as f64 * m_per_px;
+        let mut d = 10f64.powf(most.log10().floor());
+        for k in [5.0, 2.0] {
+            if d * k <= most {
+                d *= k;
+                break;
+            }
+        }
+        let px = (d / m_per_px) as f32;
+        let label = if d >= 1000.0 { format!("{} km", d / 1000.0) } else if d >= 1.0 { format!("{} m", d) } else { format!("{} cm", d * 100.0) };
+        let t = (font * 0.16).max(2.0);
+        let style = TextStyle::new(font * 0.75, theme::TEXTBOX_TEXT);
+        let shade = TextStyle::new(font * 0.75, GEAR_BG);
+        let ty = y - font * 0.55;
+        text.draw_text_left(canvas, &label, x0, ty, &style, None, None);
+        for (ox, oy) in [(-1.0, 0.0), (1.0, 0.0), (0.0, -1.0), (0.0, 1.0)] {
+            text.draw_text_left(canvas, &label, x0 + ox, ty + oy, &shade, None, None);
+        }
+        // The bar and its end ticks, then the dark edge under them.
+        let (xi, yi, pi, ti) = (x0 as isize, y as isize, px as isize, t as isize);
+        let tick = (font * 0.35) as isize;
+        paint::fill_rect(canvas, xi, yi - ti / 2, pi, ti, theme::TEXTBOX_TEXT, None, None);
+        paint::fill_rect(canvas, xi, yi - tick, ti, tick + ti / 2, theme::TEXTBOX_TEXT, None, None);
+        paint::fill_rect(canvas, xi + pi - ti, yi - tick, ti, tick + ti / 2, theme::TEXTBOX_TEXT, None, None);
+        paint::fill_rect(canvas, xi - 2, yi - tick - 2, pi + 4, tick + ti / 2 + 4, GEAR_BG, None, None);
+    }
+
+    /// The locate button: a crosshair (four arms and a dot) on the gear's dark disc, dim without a fix.
+    fn paint_locate(canvas: &mut Canvas, x: f32, y: f32, r: f32, live: bool) {
+        let ink = if live { theme::TEXTBOX_TEXT } else { READOUT_DIM };
+        let (xi, yi) = (x as isize, y as isize);
+        let t = (r * 0.12).max(2.0) as isize;
+        let (inner, outer) = ((r * 0.32) as isize, (r * 0.72) as isize);
+        paint::circle_filled(canvas, xi, yi, (r * 0.14).max(2.0) as isize, ink, None, None);
+        paint::fill_rect(canvas, xi - outer, yi - t / 2, outer - inner, t, ink, None, None);
+        paint::fill_rect(canvas, xi + inner, yi - t / 2, outer - inner, t, ink, None, None);
+        paint::fill_rect(canvas, xi - t / 2, yi - outer, t, outer - inner, ink, None, None);
+        paint::fill_rect(canvas, xi - t / 2, yi + inner, t, outer - inner, ink, None, None);
+        paint::circle_filled(canvas, xi, yi, r as isize, GEAR_BG, None, None);
+    }
+
     fn paint_strip(canvas: &mut Canvas, text: &mut TextRenderer, w: usize, h: usize, font: f32, m: &MeasureView) -> (f32, f32, f32) {
         // What is at the point, a line each, above the distance and the profile; the strip grows to hold them.
         let info_h = m.info.len() as f32 * font * 1.05;
-        let band = font * 6.5 + info_h;
+        let band = Self::strip_band(font, m);
         let strip_top = h as f32 - band;
         let margin = font;
         // The close button, top right of the strip: a cross in a disc.

@@ -140,7 +140,7 @@ fn free_bytes(dir: &str) -> Option<u64> {
 
 impl AndroidApp {
     fn controls(&self) -> Controls {
-        Controls { real_sun: self.map.real_sun, real_light: self.map.real_light, follow_heading: self.map.follow_heading, lock_to_fix: self.map.lock_to_fix, cache_budget: self.cache_budget, theme: self.map.theme, compressed: self.map.compressed(), tool: self.map.tool as u8, pen_rgba: self.map.pen_colour, travel: travel_code(self.map.travel), record: self.recording, clear_ink: false, clear_sel: false }
+        Controls { real_sun: self.map.real_sun, real_light: self.map.real_light, follow_heading: self.map.follow_heading, lock_to_fix: self.map.lock_to_fix, cache_budget: self.cache_budget, theme: self.map.theme, compressed: self.map.compressed(), tool: self.map.tool as u8, pen_rgba: self.map.pen_colour, travel: travel_code(self.map.travel), record: self.recording, clear_ink: false, clear_sel: false, locate: false }
     }
 
     /// A pinch with the panel open: the finger distance's ratio to the last event's scales the UI.
@@ -239,6 +239,9 @@ impl AndroidApp {
         }
         if ctl.clear_sel {
             self.map.clear_selection();
+        }
+        if ctl.locate {
+            self.map.locate(self.w, self.h);
         }
         self.save_settings();
     }

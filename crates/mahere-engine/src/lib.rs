@@ -492,6 +492,13 @@ impl MapCore {
     }
 
     /// Look at a place: the camera point goes there, north up, at the zoom given or the one it has.
+    /// The map centred on the GPS fix, the zoom kept (Nick 2026-10-14: a go-to-my-location button); false without a fix.
+    pub fn locate(&mut self, w: usize, h: usize) -> bool {
+        let Some(g) = self.gps else { return false };
+        self.go_to(g.lat, g.lon, None, w, h);
+        true
+    }
+
     pub fn go_to(&mut self, lat: f64, lon: f64, ppd: Option<f64>, w: usize, h: usize) {
         self.cam.look_at(lat, lon, 0.0);
         if let Some(p) = ppd {
