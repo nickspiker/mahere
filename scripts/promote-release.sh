@@ -6,5 +6,5 @@ tmp=$(mktemp -d)
 curl -sf -H "Cache-Control: no-cache" "$BASE/manifest-dev.vsf?v=$(date +%s%N)" -o "$tmp/dev.vsf"
 curl -sf -H "Cache-Control: no-cache" "$BASE/manifest-release.vsf?v=$(date +%s%N)" -o "$tmp/release.vsf" || true
 $MANIFEST promote "$tmp/dev.vsf" "$1" "$tmp/new.vsf" --merge "$tmp/release.vsf"
-put "$tmp/new.vsf" manifest-release.vsf application/octet-stream
+put "$tmp/new.vsf" manifest-release.vsf application/octet-stream no-cache
 rm -rf "$tmp"

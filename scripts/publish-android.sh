@@ -11,5 +11,5 @@ echo "mahere android $MAHERE_VERSION_NAME"
 APK=android/app/build/outputs/apk/release/app-release.apk
 ls -la "$APK"
 publish_dev_row "$APK" Android arm64 "android/mahere-$MAHERE_VERSION_CODE.apk"
-put "$APK" mahere.apk application/vnd.android.package-archive
+put "$APK" mahere.apk application/vnd.android.package-archive no-cache
 echo "published https://brobdingnagian.holdmyoscilloscope.com/mahere/mahere.apk ($MAHERE_VERSION_NAME), dev channel"

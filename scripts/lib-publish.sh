@@ -15,9 +15,9 @@ export WRANGLER_SEND_METRICS=false
 cargo build --release -q -p mahere-update --features publish --bin mahere-manifest
 MANIFEST=target/release/mahere-manifest
 
-# put <local file> <bucket path> <content type>
+# put <local file> <bucket path> <content type> [cache control]: a fixed name (mahere.apk, the manifests) goes up no-cache, or Cloudflare's edge keeps handing out the old file for hours (it caches .apk by default: build 178 was served after 183 was up, 2026-10-13); a build under its own number never changes and may be cached.
 put() {
-    timeout 900 wrangler r2 object put "$BUCKET/$2" --file "$1" --content-type "$3" --remote > /dev/null
+    timeout 900 wrangler r2 object put "$BUCKET/$2" --file "$1" --content-type "$3" --cache-control "${4:-public, max-age=31536000, immutable}" --remote > /dev/null
 }
 
 # publish_dev_row <file> <platform> <arch> <bucket path>: the build uploaded under its own name, then the dev manifest fetched, this platform's row replaced, signed and uploaded last.
@@ -27,6 +27,6 @@ publish_dev_row() {
     tmp=$(mktemp -d)
     curl -sf -H "Cache-Control: no-cache" "$BASE/manifest-dev.vsf?v=$(date +%s%N)" -o "$tmp/old.vsf" || true
     $MANIFEST write dev "$tmp/new.vsf" --merge "$tmp/old.vsf" --row "$2" "$3" "$MAHERE_VERSION_CODE" "$MAHERE_VERSION_NAME" "$BASE/$4" "$5" "$6"
-    put "$tmp/new.vsf" manifest-dev.vsf application/octet-stream
+    put "$tmp/new.vsf" manifest-dev.vsf application/octet-stream no-cache
     rm -rf "$tmp"
 }
