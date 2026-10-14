@@ -20,9 +20,11 @@ pub use mahere_osm::landuse;
 /// What a line is for, as the line plane's use bits carry it, for a reader naming them.
 pub use mahere_osm::use_bits;
 pub use mahere_osm::names::Named;
+pub use mahere_osm as osm;
 pub use names::{IdCell, NameCell};
 pub mod names;
 pub mod pyr;
+pub mod route;
 pub mod tone;
 
 use std::collections::HashMap;
@@ -442,6 +444,8 @@ pub struct Cell {
     pub mvum: Option<ClassCell>,
     /// What the texels are called: lines and points, and the areas they lie in.
     pub names: Option<NameCell>,
+    /// The ways a route can follow through the cell.
+    pub route: Option<route::RouteCell>,
 }
 
 // ==================== LINE LAYER ====================
@@ -1406,6 +1410,7 @@ pub struct CellPlanes {
     pub own: Option<ClassCell>,
     pub mvum: Option<ClassCell>,
     pub names: Option<NameCell>,
+    pub route: Option<route::RouteCell>,
 }
 
 /// Decoded dem: elevation (NaN = no data) and the apron, memory order.
@@ -1676,6 +1681,7 @@ impl Cell {
             own: self.own.clone(),
             mvum: self.mvum.clone(),
             names: self.names.clone(),
+            route: self.route.clone(),
         }
     }
 }
@@ -1684,7 +1690,11 @@ impl CellPlanes {
     /// Overlay `self` (a new bake) onto `old`. A bake's footprint is where it has elevation: inside it the new vector planes win, outside the old ones stay; without a dem the new planes replace wholesale.
     pub fn merge_over(self, old: CellPlanes) -> CellPlanes {
         let mut out = self;
-        let CellPlanes { dem: old_dem, line: old_line, land: old_land, water: old_water, img: old_img, own: old_own, mvum: old_mvum, names: old_names } = old;
+        let CellPlanes { dem: old_dem, line: old_line, land: old_land, water: old_water, img: old_img, own: old_own, mvum: old_mvum, names: old_names, route: old_route } = old;
+        // A bake's routing is whole for its cells: it replaces the old, or the old stays when this bake has none.
+        if out.route.is_none() {
+            out.route = old_route;
+        }
         // The overlays (ownership, motor vehicle use) come from their own pass and have no terrain footprint: the new where it has anything, the old elsewhere.
         for (new, old) in [(&mut out.own, old_own), (&mut out.mvum, old_mvum)] {
             match (new, old) {
@@ -1859,6 +1869,9 @@ impl CellPlanes {
         if let Some(s) = self.names.as_ref().and_then(NameCell::section) {
             b = b.add_section_direct(s);
         }
+        if let Some(s) = self.route.as_ref().and_then(route::RouteCell::section) {
+            b = b.add_section_direct(s);
+        }
         b.build().map_err(|e| format!("cell build: {e:?}"))
     }
 }
@@ -1967,6 +1980,7 @@ pub fn decode_cell(data: &[u8]) -> Result<CellPlanes, String> {
                 out.img = decode_img(&fields)
             }
             "name" => out.names = NameCell::decode(&fields),
+            "route" => out.route = route::RouteCell::decode(&fields),
             _ => {}
         }
     }
@@ -1986,6 +2000,21 @@ pub fn decode_names(data: &[u8]) -> Option<NameCell> {
     let s = header.sections(data, end).ok()?.into_iter().find(|s| s.name == "name")?;
     let fields: HashMap<String, Vec<VsfType>> = s.fields.into_iter().map(|f| (f.name, f.values)).collect();
     NameCell::decode(&fields)
+}
+
+/// Only a cell's routing, from raw file bytes: what a route search reads for every cell it passes through.
+pub fn decode_route(data: &[u8]) -> Option<route::RouteCell> {
+    let plain: Vec<u8>;
+    let data = if data.starts_with(&[0x28, 0xB5, 0x2F, 0xFD]) {
+        plain = zstd::decode_all(data).ok()?;
+        &plain[..]
+    } else {
+        data
+    };
+    let (header, end) = vsf::VsfHeader::decode(data).ok()?;
+    let s = header.sections(data, end).ok()?.into_iter().find(|s| s.name == "route")?;
+    let fields: HashMap<String, Vec<VsfType>> = s.fields.into_iter().map(|f| (f.name, f.values)).collect();
+    route::RouteCell::decode(&fields)
 }
 
 fn scalar_f32(v: &VsfType) -> Option<f32> {
@@ -2103,6 +2132,7 @@ mod tests {
             weight,
             uses: 0,
             name: 0,
+            travel: Default::default(),
             pts: (0..200)
                 .map(|i| {
                     let t = i as f32 / 199.0;

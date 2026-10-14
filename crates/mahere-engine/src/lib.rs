@@ -8,6 +8,7 @@ pub mod plan;
 pub mod probe;
 pub mod raster;
 pub mod residency;
+pub mod route;
 pub mod sh;
 pub mod theme;
 

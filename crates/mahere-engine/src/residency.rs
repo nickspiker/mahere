@@ -317,6 +317,11 @@ impl Residency {
         }
     }
 
+    /// The store cells come from, for work that reads cells the view has not asked for (a route search).
+    pub fn store(&self) -> Arc<dyn CellStore> {
+        self.store.clone()
+    }
+
     /// A resident cell's names alone, read again from its store; None when it has none or is not resident.
     pub fn read_names(&self, key: CellKey) -> Option<mahere_tiles::NameCell> {
         if !self.pool.map.contains_key(&key) {

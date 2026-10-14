@@ -225,6 +225,62 @@ pub struct Road {
     pub uses: u8,
     /// Its entry in the extract's [`names::NameTable`]; 0 when it has no name.
     pub name: u32,
+    /// How it is travelled, for routing.
+    pub travel: Travel,
+}
+
+/// How a way is travelled (Nick 2026-10-13: navigation by flood fill): its OSM id, so a route knows it across cells; its speed limit; whether it is one-way and which way; its layer, so a bridge never meets the road beneath it.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Travel {
+    pub way: i64,
+    /// The posted limit in km/h; 0 when none is tagged.
+    pub speed_kmh: u8,
+    /// 1 one-way along the way's own direction, -1 against it, 0 both ways.
+    pub oneway: i8,
+    /// OSM's layer: above 0 a bridge, below 0 a tunnel, an untagged bridge 1 and an untagged tunnel -1.
+    pub layer: i8,
+}
+
+impl RoadClass {
+    /// Ways a route may follow: the roads and the trails.
+    pub fn routable(self) -> bool {
+        self <= RoadClass::Path
+    }
+}
+
+/// A speed from an OSM `maxspeed` tag, km/h: "50", "35 mph", "50;30" (the first); 0 for what is not a number ("none", "walk", zone codes).
+pub fn parse_speed(v: &str) -> u8 {
+    let v = v.split(';').next().unwrap_or("").trim();
+    let (num, mph) = match v.strip_suffix("mph") {
+        Some(n) => (n.trim(), true),
+        None => (v.trim_end_matches("km/h").trim(), false),
+    };
+    num.parse::<f32>().map_or(0, |n| (if mph { n * 1.609_344 } else { n }).round().clamp(0.0, 255.0) as u8)
+}
+
+/// How a way of a class is travelled, from its tags.
+fn travel_of<'a>(class: RoadClass, way: i64, tags: impl Iterator<Item = (&'a str, &'a str)>) -> Travel {
+    let mut t = Travel { way, oneway: (class == RoadClass::Motorway) as i8, ..Default::default() };
+    let (mut layer, mut bridge, mut tunnel) = (None, false, false);
+    for (k, v) in tags {
+        match k {
+            "maxspeed" => t.speed_kmh = parse_speed(v),
+            "oneway" => {
+                t.oneway = match v {
+                    "yes" | "true" | "1" => 1,
+                    "-1" | "reverse" => -1,
+                    _ => 0,
+                }
+            }
+            "junction" if matches!(v, "roundabout" | "circular") => t.oneway = t.oneway.max(1),
+            "layer" => layer = v.trim().parse::<i8>().ok(),
+            "bridge" if v != "no" => bridge = true,
+            "tunnel" if v != "no" => tunnel = true,
+            _ => {}
+        }
+    }
+    t.layer = layer.unwrap_or(if bridge { 1 } else if tunnel { -1 } else { 0 }).clamp(-5, 5);
+    t
 }
 
 /// What a way is for and how big it is, from its tags, for the non-waterway classes (waterways get their magnitude from the network pass).
@@ -351,6 +407,8 @@ pub struct Features {
     /// Every named thing, entry 0 meaning none; roads, areas and points point into it.
     pub names: Vec<names::Named>,
     pub points: Vec<names::Point>,
+    /// Where routable ways truly meet: the nodes two or more of them share. A route changes ways only there.
+    pub junctions: Vec<(f32, f32)>,
 }
 
 /// A feature's `name` and `ref` tags, empty when it has none.
@@ -367,7 +425,7 @@ fn name_tags<'a>(tags: impl Iterator<Item = (&'a str, &'a str)>) -> (String, Str
 }
 
 enum WayRec {
-    Line(RoadClass, Vec<i64>, u8, f32, (String, String)),
+    Line(RoadClass, Vec<i64>, u8, f32, (String, String), Travel),
     Area(AreaClass, Vec<i64>, (String, String)),
     /// A multipolygon member, kept by id for ring assembly.
     Member(i64, Vec<i64>),
@@ -441,7 +499,7 @@ pub fn load_features(path: &str) -> Result<Features, osmpbf::Error> {
                 let street_furniture = w.tags().any(|(k, v)| k == "footway" && matches!(v, "sidewalk" | "crossing" | "traffic_island" | "access_aisle"));
                 if let Some(class) = line.filter(|_| !street_furniture) {
                     let (uses, mag) = uses_and_magnitude(class, w.tags());
-                    out.push(WayRec::Line(class, refs.clone(), uses, mag, name_tags(w.tags())));
+                    out.push(WayRec::Line(class, refs.clone(), uses, mag, name_tags(w.tags()), travel_of(class, w.id(), w.tags())));
                 }
                 let closed = refs.len() >= 4 && refs.first() == refs.last();
                 if closed && !is_member {
@@ -463,7 +521,7 @@ pub fn load_features(path: &str) -> Result<Features, osmpbf::Error> {
     let mut needed: Vec<i64> = ways
         .iter()
         .flat_map(|r| match r {
-            WayRec::Line(_, refs, _, _, _) | WayRec::Area(_, refs, _) | WayRec::Member(_, refs) => refs.iter().copied(),
+            WayRec::Line(_, refs, _, _, _, _) | WayRec::Area(_, refs, _) | WayRec::Member(_, refs) => refs.iter().copied(),
         })
         .collect();
     needed.sort_unstable();
@@ -520,14 +578,24 @@ pub fn load_features(path: &str) -> Result<Features, osmpbf::Error> {
 
     // Lines, with the waterway network weighted.
     let mut lines: Vec<(RoadClass, Vec<i64>)> = Vec::new();
-    let mut line_attrs: Vec<(u8, f32, u32)> = Vec::new();
+    let mut line_attrs: Vec<(u8, f32, u32, Travel)> = Vec::new();
+    // Nodes shared by two or more routable ways: the junctions.
+    let mut shared: HashMap<i64, (i64, bool)> = HashMap::new();
     let mut areas: Vec<Area> = Vec::new();
     let mut members: HashMap<i64, Vec<i64>> = HashMap::new();
     for rec in ways {
         match rec {
-            WayRec::Line(class, refs, uses, mag, (name, reference)) => {
+            WayRec::Line(class, refs, uses, mag, (name, reference), travel) => {
+                if class.routable() {
+                    for &n in &refs {
+                        let e = shared.entry(n).or_insert((travel.way, false));
+                        if e.0 != travel.way {
+                            e.1 = true;
+                        }
+                    }
+                }
                 lines.push((class, refs));
-                line_attrs.push((uses, mag, table.intern(class as u8 + 1, 0, &name, &reference)));
+                line_attrs.push((uses, mag, table.intern(class as u8 + 1, 0, &name, &reference), travel));
             }
             WayRec::Area(class, refs, (name, reference)) => {
                 let ring = locate_all(&refs);
@@ -546,13 +614,13 @@ pub fn load_features(path: &str) -> Result<Features, osmpbf::Error> {
     for (i, (class, refs)) in lines.into_iter().enumerate() {
         let pts = locate_all(&refs);
         if pts.len() >= 2 {
-            let (uses, mag, name) = line_attrs[i];
+            let (uses, mag, name, travel) = line_attrs[i];
             let weight = if class == RoadClass::Waterway { weights[i] } else { mag };
             // A river's rank is its catchment, so the Flathead outranks a creek where they meet.
             if class == RoadClass::Waterway {
                 table.raise(name, (weight * 1_000_000.0) as u32);
             }
-            roads.push(Road { class, pts, weight, uses, name });
+            roads.push(Road { class, pts, weight, uses, name, travel });
         }
     }
 
@@ -563,7 +631,7 @@ pub fn load_features(path: &str) -> Result<Features, osmpbf::Error> {
         for ring in assemble_rings(&parts) {
             let pts = locate_all(&ring);
             if pts.len() >= 2 {
-                roads.push(Road { class, pts, weight: class.boundary_weight(), uses: 0, name });
+                roads.push(Road { class, pts, weight: class.boundary_weight(), uses: 0, name, travel: Travel::default() });
             }
         }
     }
@@ -583,7 +651,8 @@ pub fn load_features(path: &str) -> Result<Features, osmpbf::Error> {
         }
     }
 
-    Ok(Features { roads, areas, names: table.list, points })
+    let junctions: Vec<(f32, f32)> = shared.into_iter().filter(|(_, (_, j))| *j).filter_map(|(n, _)| locate(n)).collect();
+    Ok(Features { roads, areas, names: table.list, points, junctions })
 }
 
 /// Join way fragments end-to-end by shared node ids into closed rings.
@@ -749,5 +818,23 @@ mod tests {
         let w = waterway_weights(&lines, &locate);
         assert!(w[0] > w[1] && w[0] > w[2], "receiver must outweigh tributaries: {w:?}");
         assert_eq!(w[3], 0.0);
+    }
+}
+
+#[cfg(test)]
+mod travel_tests {
+    use super::*;
+
+    #[test]
+    fn speeds_one_ways_and_layers_read_from_tags() {
+        assert_eq!(parse_speed("50"), 50);
+        assert_eq!(parse_speed("35 mph"), 56);
+        assert_eq!(parse_speed("none"), 0);
+        let t = travel_of(RoadClass::Primary, 7, [("maxspeed", "45 mph"), ("bridge", "yes")].into_iter());
+        assert_eq!((t.way, t.speed_kmh, t.oneway, t.layer), (7, 72, 0, 1));
+        assert_eq!(travel_of(RoadClass::Motorway, 1, std::iter::empty()).oneway, 1, "a motorway is one-way unless tagged otherwise");
+        assert_eq!(travel_of(RoadClass::Motorway, 1, [("oneway", "no")].into_iter()).oneway, 0);
+        assert_eq!(travel_of(RoadClass::Residential, 1, [("junction", "roundabout")].into_iter()).oneway, 1);
+        assert_eq!(travel_of(RoadClass::Secondary, 1, [("tunnel", "yes"), ("layer", "-2")].into_iter()).layer, -2);
     }
 }

@@ -98,13 +98,13 @@ fn main() {
                 run.push(p);
             }
             if !inside && !next_in && run.len() >= 2 {
-                roads.push(mahere_osm::Road { class: r.class, pts: std::mem::take(&mut run), weight: r.weight, uses: r.uses, name: r.name });
+                roads.push(mahere_osm::Road { class: r.class, pts: std::mem::take(&mut run), weight: r.weight, uses: r.uses, name: r.name, travel: r.travel });
             } else if !inside && !next_in {
                 run.clear();
             }
         }
         if run.len() >= 2 {
-            roads.push(mahere_osm::Road { class: r.class, pts: run, weight: r.weight, uses: r.uses, name: r.name });
+            roads.push(mahere_osm::Road { class: r.class, pts: run, weight: r.weight, uses: r.uses, name: r.name, travel: r.travel });
         }
     }
     // A polygon belongs to the box when its own box overlaps it, not when a vertex lies inside: a piece in the middle of a lake or a forest has none of its shoreline or edge, and dropped the whole polygon (Flathead Lake, 2026-10-11).
@@ -142,9 +142,21 @@ fn main() {
     ids.retain(|k, _| keep(k));
     eprintln!("land {} cells, water {} cells, {} named cells, {:.1}s", land.len(), water.len(), ids.len(), t.elapsed().as_secs_f32());
 
+    // The ways a route follows, a trixel wide at the base depth.
+    let t = std::time::Instant::now();
+    let mut routes = mahere_tiles::route::bake_routes(&roads, &names, &feats.junctions, vec_base);
+    routes.retain(|k, _| keep(k));
+    eprintln!("routes: {} cells, {} stacked, {} joins, {:.1}s", routes.len(), routes.values().map(|r| r.stack.len()).sum::<usize>(), routes.values().map(|r| r.joins.len()).sum::<usize>(), t.elapsed().as_secs_f32());
+    let with_routes = |mut cells: std::collections::HashMap<mahere_tiles::CellKey, mahere_tiles::Cell>| {
+        for (k, r) in routes {
+            cells.entry(k).or_default().route = Some(r);
+        }
+        cells
+    };
+
     if vectors_only {
         let t = std::time::Instant::now();
-        let cells = mahere_tiles::assemble_named(Vec::new(), line, land, water, Vec::new(), ids, &names);
+        let cells = with_routes(mahere_tiles::assemble_named(Vec::new(), line, land, water, Vec::new(), ids, &names));
         let n = cells.len();
         use rayon::prelude::*;
         cells.par_iter().for_each(|(key, cell)| {
@@ -190,7 +202,7 @@ fn main() {
     }
 
     let t = std::time::Instant::now();
-    let cells = mahere_tiles::assemble_named(dem_cells, line, land, water, img_cells, ids, &names);
+    let cells = with_routes(mahere_tiles::assemble_named(dem_cells, line, land, water, img_cells, ids, &names));
     let n = cells.len();
     use rayon::prelude::*;
     cells.par_iter().for_each(|(key, cell)| {
