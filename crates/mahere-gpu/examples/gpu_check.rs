@@ -205,17 +205,21 @@ fn main() {
     if std::env::var_os("MAHERE_LABELS").is_some() {
         let font = std::env::var("MAHERE_LABEL_FONT").ok().and_then(|s| s.parse().ok()).unwrap_or(15.0);
         labeller.update(&mut map, w, h, font);
-        gpu.set_labels_rgba(&device, &queue, w as u32, h as u32, &labeller.rgba());
         if let Ok(p) = std::env::var("MAHERE_LABEL_PAN") {
             let v: Vec<f64> = p.split(',').map(|x| x.parse().unwrap()).collect();
             map.pan(v[0], v[1], w, h);
             plan = map.plan(w, h);
             gpu.sync(&device, &queue, map.pool_mut(), false);
         }
-        gpu.labels_xf = labeller.transform(&map.cam, w, h);
-        for p in &labeller.placed {
-            println!("label: {}", p.name.label());
+        // MAHERE_LABEL_TURN=degrees turns the map after the layout: the line and area names must turn with it, the points stay level.
+        if let Some(deg) = std::env::var("MAHERE_LABEL_TURN").ok().and_then(|s| s.parse::<f64>().ok()) {
+            map.rotate_view(deg.to_radians());
+            plan = map.plan(w, h);
+            gpu.sync(&device, &queue, map.pool_mut(), false);
         }
+        let a = &labeller.atlas;
+        gpu.set_atlas(&device, &queue, a.side as u32, &a.rg, a.version);
+        gpu.set_labels(&device, &queue, &labeller.glyphs(&map.cam, w, h), &labeller.segments(&map.cam, w, h));
     }
     let luts = map.luts();
     // Time the second frame: the first pays for pipeline warm-up.
@@ -282,8 +286,8 @@ fn main() {
     println!("resident {} cells, {} blocks ({} straddle), {} refs; uploads {}; sync {sync_ms:.1} ms; CPU frame {cpu_ms:.2} ms; GPU frame {frame_ms:.2} ms (submit to idle, {}x supersampled)", map.pool().map.len(), plan.blocks.len(), plan.straddle_blocks, plan.refs.len(), gpu.uploads, gpu.scale);
     println!("difference: {:.2}% of pixels beyond 8 levels, worst {worst}, mean {:.3}", diff_px as f64 * 100.0 / (w * h) as f64, sum as f64 / (w * h) as f64);
     let mut cpu = cpu;
-    if std::env::var_os("MAHERE_LABELS").is_some() && std::env::var_os("MAHERE_LABEL_PAN").is_none() {
-        labeller.composite_rgb(&mut cpu);
+    if std::env::var_os("MAHERE_LABELS").is_some() && std::env::var_os("MAHERE_LABEL_PAN").is_none() && std::env::var_os("MAHERE_LABEL_TURN").is_none() {
+        labeller.draw_cpu(&mut cpu, &map.cam, w, h);
     }
     write_png(&format!("{out}_cpu.png"), w, h, |i| [(cpu[i] >> 16) as u8, (cpu[i] >> 8) as u8, cpu[i] as u8]);
     write_png(&format!("{out}_gpu.png"), w, h, |i| [(gpu_px[i] >> 16) as u8, (gpu_px[i] >> 8) as u8, gpu_px[i] as u8]);

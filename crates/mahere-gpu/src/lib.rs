@@ -92,8 +92,6 @@ struct Uniforms {
     pole: [f32; 4],
     // The raw elevation view's range: lowest and highest metres in view.
     raw: [f32; 4],
-    // The labels' place: where a screen pixel now was when they were drawn, x = row 0 · (x, y, 1) and y = row 1 · (x, y, 1); row 0's w is 1 when there are labels to show.
-    labels: [[f32; 4]; 2],
 }
 
 /// The layer mask as the shader's bits.
@@ -237,6 +235,18 @@ pub struct GpuMap {
     map_pipeline: wgpu::RenderPipeline,
     map_g_pipeline: wgpu::RenderPipeline,
     present_pipeline: wgpu::RenderPipeline,
+    /// The top layer (panel, pin, measurement, selection) blended over the map and its labels.
+    top_pipeline: wgpu::RenderPipeline,
+    /// Labels: a quad per letter from the glyph atlas, a quad per stretch of route (Nick 2026-10-13: no rendering to a bitmap).
+    glyph_pipeline: wgpu::RenderPipeline,
+    segment_pipeline: wgpu::RenderPipeline,
+    glyph_layout: wgpu::BindGroupLayout,
+    atlas_sampler: wgpu::Sampler,
+    atlas: Option<(wgpu::Texture, u64, wgpu::BindGroup)>,
+    glyphs: Option<(wgpu::Buffer, u64)>,
+    glyph_count: u32,
+    segments: Option<(wgpu::Buffer, u64)>,
+    segment_count: u32,
     relight_pipeline: wgpu::RenderPipeline,
     relight_layout: wgpu::BindGroupLayout,
     empty_bind: wgpu::BindGroup,
@@ -266,10 +276,6 @@ pub struct GpuMap {
     offscreen: Vec<(u32, wgpu::Texture, wgpu::TextureView, u32, u32)>,
     present_binds: FxHashMap<u32, wgpu::BindGroup>,
     overlay: Option<(wgpu::Texture, wgpu::TextureView, u32, u32)>,
-    /// The map's lettering, drawn when the camera rests, premultiplied RGBA of the screen's size.
-    labels_tex: Option<(wgpu::Texture, wgpu::TextureView, u32, u32)>,
-    /// Where the lettering is now: the map moved since it was drawn ([`mahere_panel`]'s `Labeller::transform`); None hides it.
-    pub labels_xf: Option<[f32; 6]>,
     /// The user's cells (ink and selection) as a plane of their own, and the selection being drawn as a screen mask.
     ink: Plane,
     sel: Plane,
@@ -326,7 +332,6 @@ impl GpuMap {
                 wgpu::BindGroupLayoutEntry { binding: 0, visibility: wgpu::ShaderStages::FRAGMENT, ty: float_tex, count: None },
                 wgpu::BindGroupLayoutEntry { binding: 1, visibility: wgpu::ShaderStages::FRAGMENT, ty: float_tex, count: None },
                 wgpu::BindGroupLayoutEntry { binding: 2, visibility: wgpu::ShaderStages::FRAGMENT, ty: float_tex, count: None },
-                wgpu::BindGroupLayoutEntry { binding: 3, visibility: wgpu::ShaderStages::FRAGMENT, ty: float_tex, count: None },
             ],
         });
         let relight_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -351,6 +356,36 @@ impl GpuMap {
         let map_pipeline = pipeline("map", &[&map_layout], "vs_map", "fs_map", &[wgpu::TextureFormat::Rgba8Unorm]);
         let map_g_pipeline = pipeline("map with g-buffer", &[&map_layout], "vs_map", "fs_map_g", &G_FORMATS);
         let present_pipeline = pipeline("present", &[&map_layout, &present_layout], "vs_present", "fs_present", &[present_format]);
+        // Premultiplied over: what the labels and the top layer cover, they cover by their own opacity.
+        let over = wgpu::BlendState { color: wgpu::BlendComponent { src_factor: wgpu::BlendFactor::One, dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha, operation: wgpu::BlendOperation::Add }, alpha: wgpu::BlendComponent { src_factor: wgpu::BlendFactor::One, dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha, operation: wgpu::BlendOperation::Add } };
+        let blended = |label: &str, layouts: &[&wgpu::BindGroupLayout], vs: &str, fs: &str, buffers: &[wgpu::VertexBufferLayout]| -> wgpu::RenderPipeline {
+            let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some(label), bind_group_layouts: layouts, immediate_size: 0 });
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(label),
+                layout: Some(&pl),
+                vertex: wgpu::VertexState { module: &shader, entry_point: Some(vs), compilation_options: Default::default(), buffers },
+                primitive: wgpu::PrimitiveState { topology: wgpu::PrimitiveTopology::TriangleList, cull_mode: None, ..Default::default() },
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                fragment: Some(wgpu::FragmentState { module: &shader, entry_point: Some(fs), compilation_options: Default::default(), targets: &[Some(wgpu::ColorTargetState { format: present_format, blend: Some(over), write_mask: wgpu::ColorWrites::ALL })] }),
+                multiview_mask: None,
+                cache: None,
+            })
+        };
+        let top_pipeline = blended("top", &[&map_layout, &present_layout], "vs_present", "fs_top", &[]);
+        let glyph_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("glyph atlas"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry { binding: 0, visibility: wgpu::ShaderStages::FRAGMENT, ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: true }, view_dimension: wgpu::TextureViewDimension::D2, multisampled: false }, count: None },
+                wgpu::BindGroupLayoutEntry { binding: 1, visibility: wgpu::ShaderStages::FRAGMENT, ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering), count: None },
+            ],
+        });
+        let atlas_sampler = device.create_sampler(&wgpu::SamplerDescriptor { label: Some("glyph atlas"), mag_filter: wgpu::FilterMode::Linear, min_filter: wgpu::FilterMode::Linear, ..Default::default() });
+        // A letter: centre and half extents, angle, atlas rectangle, letter colour, halo colour (20 floats); a stretch of route: its ends, half width, colour (12).
+        let glyph_attrs = wgpu::vertex_attr_array![0 => Float32x4, 1 => Float32x4, 2 => Float32x4, 3 => Float32x4, 4 => Float32x4];
+        let glyph_pipeline = blended("glyphs", &[&map_layout, &glyph_layout], "vs_glyph", "fs_glyph", &[wgpu::VertexBufferLayout { array_stride: 80, step_mode: wgpu::VertexStepMode::Instance, attributes: &glyph_attrs }]);
+        let segment_attrs = wgpu::vertex_attr_array![0 => Float32x4, 1 => Float32x4, 2 => Float32x4];
+        let segment_pipeline = blended("route", &[&map_layout], "vs_segment", "fs_segment", &[wgpu::VertexBufferLayout { array_stride: 48, step_mode: wgpu::VertexStepMode::Instance, attributes: &segment_attrs }]);
         // The relight pass reads the G-buffer at group 2 and must not bind the present group (it renders into that group's map texture), so group 1 is empty for it.
         let empty_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some("empty"), entries: &[] });
         let empty_bind = device.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("empty"), layout: &empty_layout, entries: &[] });
@@ -409,8 +444,16 @@ impl GpuMap {
             user_version: u64::MAX,
             ink_uploaded: FxHashMap::default(),
             preview: None,
-            labels_tex: None,
-            labels_xf: None,
+            top_pipeline,
+            glyph_pipeline,
+            segment_pipeline,
+            glyph_layout,
+            atlas_sampler,
+            atlas: None,
+            glyphs: None,
+            glyph_count: 0,
+            segments: None,
+            segment_count: 0,
             preview_version: u64::MAX,
             dem_scale: FxHashMap::default(),
             map_bind: None,
@@ -659,27 +702,53 @@ impl GpuMap {
         }
     }
 
-    /// The map's lettering as premultiplied RGBA bytes, `w × h`, drawn for the view [`GpuMap::labels_xf`] is measured from.
-    pub fn set_labels_rgba(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, w: u32, h: u32, rgba: &[u8]) {
-        if self.labels_tex.as_ref().is_none_or(|(_, _, lw, lh)| (*lw, *lh) != (w, h)) {
+    /// The glyph atlas (two bytes a texel: a letter's coverage, its halo's), uploaded when its version changed.
+    pub fn set_atlas(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, side: u32, rg: &[u8], version: u64) {
+        if self.atlas.as_ref().is_some_and(|(t, v, _)| *v == version && t.width() == side) {
+            return;
+        }
+        if self.atlas.as_ref().is_none_or(|(t, _, _)| t.width() != side) {
             let t = device.create_texture(&wgpu::TextureDescriptor {
-                label: Some("labels"),
-                size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+                label: Some("glyph atlas"),
+                size: wgpu::Extent3d { width: side, height: side, depth_or_array_layers: 1 },
                 mip_level_count: 1,
                 sample_count: 1,
                 dimension: wgpu::TextureDimension::D2,
-                format: wgpu::TextureFormat::Rgba8Unorm,
+                format: wgpu::TextureFormat::Rg8Unorm,
                 usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
                 view_formats: &[],
             });
-            let v = t.create_view(&Default::default());
-            self.labels_tex = Some((t, v, w, h));
-            self.present_binds.clear();
+            let view = t.create_view(&Default::default());
+            let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("glyph atlas"),
+                layout: &self.glyph_layout,
+                entries: &[wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&view) }, wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.atlas_sampler) }],
+            });
+            self.atlas = Some((t, 0, bind));
         }
-        let n = (w * h * 4) as usize;
-        if rgba.len() >= n {
-            write_layer(queue, &self.labels_tex.as_ref().unwrap().0, 0, w, h, 4, &rgba[..n]);
+        let (t, v, _) = self.atlas.as_mut().unwrap();
+        if rg.len() >= (side * side * 2) as usize {
+            write_layer(queue, t, 0, side, side, 2, &rg[..(side * side * 2) as usize]);
         }
+        *v = version;
+    }
+
+    /// The frame's letters and route stretches, as the labeller laid them out for where the camera is now.
+    pub fn set_labels(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, glyphs: &[[f32; 20]], segments: &[[f32; 12]]) {
+        fn fill(device: &wgpu::Device, queue: &wgpu::Queue, slot: &mut Option<(wgpu::Buffer, u64)>, bytes: &[u8], label: &str) {
+            if bytes.is_empty() {
+                return;
+            }
+            if slot.as_ref().is_none_or(|(_, cap)| *cap < bytes.len() as u64) {
+                let cap = (bytes.len() as u64).next_power_of_two().max(4096);
+                *slot = Some((device.create_buffer(&wgpu::BufferDescriptor { label: Some(label), size: cap, usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false }), cap));
+            }
+            queue.write_buffer(&slot.as_ref().unwrap().0, 0, bytes);
+        }
+        fill(device, queue, &mut self.glyphs, bytemuck::cast_slice(glyphs), "glyphs");
+        fill(device, queue, &mut self.segments, bytemuck::cast_slice(segments), "route");
+        self.glyph_count = glyphs.len() as u32;
+        self.segment_count = segments.len() as u32;
     }
 
     /// The engine's marks alone: 0xRRGGBB over black, the ink's brightness its coverage, `w × h`.
@@ -764,25 +833,10 @@ impl GpuMap {
             let v = t.create_view(&Default::default());
             self.preview = Some((t, v, 1, 1));
         }
-        if self.labels_tex.is_none() {
-            let t = device.create_texture(&wgpu::TextureDescriptor {
-                label: Some("labels"),
-                size: wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format: wgpu::TextureFormat::Rgba8Unorm,
-                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-                view_formats: &[],
-            });
-            let v = t.create_view(&Default::default());
-            self.labels_tex = Some((t, v, 1, 1));
-        }
         if !self.present_binds.contains_key(&scale) {
             let (_, _, mv, _, _) = self.offscreen.iter().find(|(s, ..)| *s == scale).unwrap();
             let (_, ov, _, _) = self.overlay.as_ref().unwrap();
             let (_, pv, _, _) = self.preview.as_ref().unwrap();
-            let (_, lv, _, _) = self.labels_tex.as_ref().unwrap();
             let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("present"),
                 layout: &self.present_layout,
@@ -790,7 +844,6 @@ impl GpuMap {
                     wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(mv) },
                     wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(ov) },
                     wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(pv) },
-                    wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(lv) },
                 ],
             });
             self.present_binds.insert(scale, bind);
@@ -951,10 +1004,6 @@ impl GpuMap {
             globe: [plan.globe[0] * sc, plan.globe[1] * sc, plan.globe[2] * plan.globe[2] * sc * sc, plan.globe[3]],
             pole: plan.pole,
             raw: [luts.contours.lo_m, luts.contours.hi_m, 0.0, 0.0],
-            labels: match (self.labels_xf, luts.mask.labels) {
-                (Some(m), true) => [[m[0], m[1], m[2], 1.0], [m[3], m[4], m[5], 0.0]],
-                _ => [[0.0; 4]; 2],
-            },
             size: [(w * self.scale.max(1)) as f32, (h * self.scale.max(1)) as f32],
             scale: self.scale.max(1) as f32,
             mask: mask_bits(luts.mask),
@@ -1062,6 +1111,25 @@ impl GpuMap {
             });
             pass.set_pipeline(&self.present_pipeline);
             pass.set_bind_group(0, self.map_bind.as_ref().unwrap(), &[]);
+            pass.set_bind_group(1, &self.present_binds[&scale], &[]);
+            pass.draw(0..3, 0..1);
+            // The route, then the letters, each a quad over the map; then the top layer.
+            if let (Some((buf, _)), n) = (&self.segments, self.segment_count) {
+                if n > 0 {
+                    pass.set_pipeline(&self.segment_pipeline);
+                    pass.set_vertex_buffer(0, buf.slice(..(n as u64 * 48)));
+                    pass.draw(0..6, 0..n);
+                }
+            }
+            if let (Some((buf, _)), Some((_, _, atlas)), n) = (&self.glyphs, &self.atlas, self.glyph_count) {
+                if n > 0 {
+                    pass.set_pipeline(&self.glyph_pipeline);
+                    pass.set_bind_group(1, atlas, &[]);
+                    pass.set_vertex_buffer(0, buf.slice(..(n as u64 * 80)));
+                    pass.draw(0..6, 0..n);
+                }
+            }
+            pass.set_pipeline(&self.top_pipeline);
             pass.set_bind_group(1, &self.present_binds[&scale], &[]);
             pass.draw(0..3, 0..1);
         }

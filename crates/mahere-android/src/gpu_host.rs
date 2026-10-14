@@ -212,16 +212,18 @@ impl GpuHost {
             map.view_depth().hash(&mut hs);
             hs.finish()
         });
-        // Labels: lettered again once the view rests with its cells in, on the still frame; until then the last lettering rides along with the map, and hides when the zoom has changed it by more than half or double.
+        // Labels: laid out again when the view rests; every frame each letter is a quad at its label's place on the map now.
         if mahere_panel::labels::Labeller::wanted(map) {
             if self.labeller.due(map, w as usize, h as usize, !in_motion, self.lettered) {
                 self.labeller.update(map, w as usize, h as usize, panel.font_px());
-                self.map.set_labels_rgba(&self.device, &self.queue, w, h, &self.labeller.rgba());
                 self.lettered = std::time::Instant::now();
             }
-            self.map.labels_xf = self.labeller.transform(&map.cam, w as usize, h as usize).filter(mahere_panel::labels::Labeller::carried);
+            let a = &self.labeller.atlas;
+            self.map.set_atlas(&self.device, &self.queue, a.side as u32, &a.rg, a.version);
+            let (glyphs, segments) = (self.labeller.glyphs(&map.cam, w as usize, h as usize), self.labeller.segments(&map.cam, w as usize, h as usize));
+            self.map.set_labels(&self.device, &self.queue, &glyphs, &segments);
         } else {
-            self.map.labels_xf = None;
+            self.map.set_labels(&self.device, &self.queue, &[], &[]);
         }
         self.map.pin = map.gps_screen(w as usize, h as usize);
         self.map.measure = map.measure_view(w as usize, h as usize, 2).map(|m| (m.origin_px.0, m.origin_px.1, m.target_px.0, m.target_px.1));

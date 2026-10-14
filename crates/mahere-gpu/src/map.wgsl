@@ -113,8 +113,6 @@ struct Uniforms {
     pole: vec4<f32>,
     // The raw elevation view's range: lowest and highest metres in view.
     raw: vec4<f32>,
-    // The labels' place: where this pixel was when they were drawn (rows of a 2×3 matrix); labels[0].w is 1 when there are labels.
-    labels: array<vec4<f32>, 2>,
 };
 
 // a: diamond, depth, cu, cv. b: dem slot, line slot, land+water slot, img slot. c: flags. d: base, step, eu, nu. e: ev, nv, inv det.
@@ -907,27 +905,6 @@ fn fs_relight(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
 @group(1) @binding(0) var map_tex: texture_2d<f32>;
 @group(1) @binding(1) var overlay_tex: texture_2d<f32>;
 @group(1) @binding(2) var preview_tex: texture_2d<f32>;
-@group(1) @binding(3) var labels_tex: texture_2d<f32>;
-
-// The lettering where this pixel was when it was drawn, bilinear between its pixels (the map has moved by a fraction of one, or turned, or scaled).
-fn labels_at(p: vec2<f32>) -> vec4<f32> {
-    let q = vec2<f32>(dot(U.labels[0].xyz, vec3<f32>(p, 1.0)), dot(U.labels[1].xyz, vec3<f32>(p, 1.0))) - 0.5;
-    let dim = vec2<i32>(textureDimensions(labels_tex));
-    let i = vec2<i32>(floor(q));
-    let f = q - floor(q);
-    var acc = vec4<f32>(0.0);
-    for (var k = 0; k < 4; k++) {
-        let o = vec2<i32>(k & 1, k >> 1u);
-        let at = i + o;
-        if (at.x < 0 || at.y < 0 || at.x >= dim.x || at.y >= dim.y) {
-            continue;
-        }
-        let wgt = select(1.0 - f.x, f.x, o.x == 1) * select(1.0 - f.y, f.y, o.y == 1);
-        acc += textureLoad(labels_tex, at, 0) * wgt;
-    }
-    return acc;
-}
-
 @vertex
 fn vs_present(@builtin(vertex_index) vi: u32) -> @builtin(position) vec4<f32> {
     let x = f32(i32(vi & 1u) * 4 - 1);
@@ -948,14 +925,20 @@ fn fs_present(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         }
     }
     c = sqrt(c / f32(s * s));
-    // The labels over the map, under the marks and the panel; premultiplied display values like the overlay.
-    if (U.labels[0].w > 0.5) {
-        let l = labels_at(pos.xy);
-        c = c * (1.0 - l.a) + l.rgb * (255.0 / 256.0);
-    }
-    // The overlay is premultiplied display values: straight over.
+    // Truncated to the code value, written exactly so the hardware's own rounding has nothing to do. The route, the labels and then the top layer are blended over it in the same pass.
+    return vec4<f32>(min(floor(c * 256.0), vec3<f32>(255.0)) / 255.0, 1.0);
+}
+
+// Premultiplied `top` of opacity `a` over what is gathered so far.
+fn over(acc: vec4<f32>, top: vec3<f32>, a: f32) -> vec4<f32> {
+    return vec4<f32>(top * a + acc.rgb * (1.0 - a), a + acc.a * (1.0 - a));
+}
+
+// The top layer, over the map and its labels: the overlay (the panel and the engine's marks), the GPS pin, the measurement, the selection being drawn. Premultiplied, blended over.
+@fragment
+fn fs_top(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     let o = textureLoad(overlay_tex, vec2<i32>(pos.xy), 0);
-    var rgb = c * (1.0 - o.a) + o.rgb * (255.0 / 256.0);
+    var acc = vec4<f32>(o.rgb * (255.0 / 256.0), o.a);
     // The GPS pin: an accuracy ring and a crosshair, feathered over a pixel, in the engine's pin blue.
     if (U.pin.w > 0.5) {
         let d = pos.xy - U.pin.xy;
@@ -963,7 +946,7 @@ fn fs_present(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         let ring = clamp(1.0 - abs(dist - U.pin.z) + 0.45, 0.0, 1.0);
         let cross = select(0.0, clamp(1.6 - min(abs(d.x), abs(d.y)) + 0.5, 0.0, 1.0), max(abs(d.x), abs(d.y)) <= 9.0);
         let cov = max(ring, cross);
-        rgb = mix(rgb, vec3<f32>(64.0, 156.0, 255.0) / 256.0, cov);
+        acc = over(acc, vec3<f32>(64.0, 156.0, 255.0) / 256.0, cov);
     }
     // The measurement: a line from origin to target and a crosshair on the target, feathered over a pixel.
     if (U.depths.w != 0u) {
@@ -977,7 +960,7 @@ fn fs_present(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         let dt = pos.xy - t;
         let cross = select(0.0, clamp(1.6 - min(abs(dt.x), abs(dt.y)) + 0.5, 0.0, 1.0), max(abs(dt.x), abs(dt.y)) <= 12.0 && min(abs(dt.x), abs(dt.y)) <= 1.6 && length(dt) > 3.0);
         let cov = max(line_cov * 0.85, cross);
-        rgb = mix(rgb, vec3<f32>(255.0, 196.0, 64.0) / 256.0, cov);
+        acc = over(acc, vec3<f32>(255.0, 196.0, 64.0) / 256.0, cov);
     }
     // The selection being drawn: a wash where its closed curve covers, and its edge stronger, in display terms.
     let pxy = vec2<i32>(pos.xy);
@@ -989,11 +972,92 @@ fn fs_present(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     if (pxy.y > 0) { pedge = pedge || textureLoad(preview_tex, pxy - vec2<i32>(0, 1), 0).r != pv; }
     if (pxy.y + 1 < pdim.y) { pedge = pedge || textureLoad(preview_tex, pxy + vec2<i32>(0, 1), 0).r != pv; }
     if (pv > 0.0) {
-        rgb = mix(rgb, sqrt(SEL_TINT), pv * SEL_ALPHA);
+        acc = over(acc, sqrt(SEL_TINT), pv * SEL_ALPHA);
     }
     if (pedge) {
-        rgb = mix(rgb, sqrt(SEL_TINT), SEL_EDGE_ALPHA);
+        acc = over(acc, sqrt(SEL_TINT), SEL_EDGE_ALPHA);
     }
-    // Truncated to the code value, written exactly so the hardware's own rounding has nothing to do.
-    return vec4<f32>(min(floor(rgb * 256.0), vec3<f32>(255.0)) / 255.0, 1.0);
+    return acc;
+}
+
+// ==================== LABELS: a quad per letter, a quad per stretch of route ====================
+
+@group(1) @binding(0) var atlas_tex: texture_2d<f32>;
+@group(1) @binding(1) var atlas_samp: sampler;
+
+struct GlyphOut {
+    @builtin(position) pos: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+    @location(1) text: vec4<f32>,
+    @location(2) halo: vec4<f32>,
+};
+
+// Screen pixels to clip space.
+fn clip_of(p: vec2<f32>) -> vec4<f32> {
+    let screen = U.size / U.scale;
+    return vec4<f32>(p.x / screen.x * 2.0 - 1.0, 1.0 - p.y / screen.y * 2.0, 0.0, 1.0);
+}
+
+// A letter: its quad about its centre (a.xy), half extents a.zw, turned by b.x (only what its glyph's rotation bin left over), sampling its atlas rectangle.
+@vertex
+fn vs_glyph(@builtin(vertex_index) vi: u32, @location(0) a: vec4<f32>, @location(1) b: vec4<f32>, @location(2) uv: vec4<f32>, @location(3) text: vec4<f32>, @location(4) halo: vec4<f32>) -> GlyphOut {
+    var corners = array<vec2<f32>, 6>(vec2<f32>(-1.0, -1.0), vec2<f32>(1.0, -1.0), vec2<f32>(-1.0, 1.0), vec2<f32>(-1.0, 1.0), vec2<f32>(1.0, -1.0), vec2<f32>(1.0, 1.0));
+    let corner = corners[vi];
+    let local = corner * a.zw;
+    let sn = sin(b.x);
+    let cs = cos(b.x);
+    var out: GlyphOut;
+    out.pos = clip_of(a.xy + vec2<f32>(local.x * cs - local.y * sn, local.x * sn + local.y * cs));
+    out.uv = mix(uv.xy, uv.zw, corner * 0.5 + 0.5);
+    out.text = text;
+    out.halo = halo;
+    return out;
+}
+
+// The letter over its halo, premultiplied (the atlas holds the letter's coverage in red, the halo's in green).
+@fragment
+fn fs_glyph(in: GlyphOut) -> @location(0) vec4<f32> {
+    let m = textureSample(atlas_tex, atlas_samp, in.uv);
+    let ta = m.r * in.text.a;
+    let ha = m.g * in.halo.a;
+    return vec4<f32>(in.text.rgb * ta + in.halo.rgb * ha * (1.0 - ta), ta + ha * (1.0 - ta));
+}
+
+struct SegOut {
+    @builtin(position) pos: vec4<f32>,
+    @location(0) at: vec2<f32>,
+    @location(1) ends: vec4<f32>,
+    @location(2) half: f32,
+    @location(3) colour: vec4<f32>,
+};
+
+// A stretch of the route: a quad around it a pixel past its half width, its coverage worked per pixel from the distance to the stretch.
+@vertex
+fn vs_segment(@builtin(vertex_index) vi: u32, @location(0) ends: vec4<f32>, @location(1) b: vec4<f32>, @location(2) colour: vec4<f32>) -> SegOut {
+    let p0 = ends.xy;
+    let p1 = ends.zw;
+    let len = length(p1 - p0);
+    var dir = vec2<f32>(1.0, 0.0);
+    if (len > 1e-4) { dir = (p1 - p0) / len; }
+    let nrm = vec2<f32>(-dir.y, dir.x);
+    let ext = b.x + 1.0;
+    var corners = array<vec2<f32>, 6>(vec2<f32>(0.0, -1.0), vec2<f32>(1.0, -1.0), vec2<f32>(0.0, 1.0), vec2<f32>(0.0, 1.0), vec2<f32>(1.0, -1.0), vec2<f32>(1.0, 1.0));
+    let c = corners[vi];
+    let p = mix(p0 - dir * ext, p1 + dir * ext, c.x) + nrm * c.y * ext;
+    var out: SegOut;
+    out.pos = clip_of(p);
+    out.at = p;
+    out.ends = ends;
+    out.half = b.x;
+    out.colour = colour;
+    return out;
+}
+
+@fragment
+fn fs_segment(in: SegOut) -> @location(0) vec4<f32> {
+    let ab = in.ends.zw - in.ends.xy;
+    let t = clamp(dot(in.at - in.ends.xy, ab) / max(dot(ab, ab), 1e-6), 0.0, 1.0);
+    let d = length(in.at - (in.ends.xy + ab * t));
+    let cov = clamp(in.half - d + 0.5, 0.0, 1.0) * in.colour.a;
+    return vec4<f32>(in.colour.rgb * cov, cov);
 }

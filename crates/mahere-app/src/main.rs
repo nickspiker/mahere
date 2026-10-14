@@ -625,7 +625,7 @@ impl FluorApp for MahereApp {
         let areas = self.areas.view(self.map.user.has_selection());
         self.panel.paint(w, h, self.map.layers(), Controls { real_sun: self.map.real_sun, real_light: self.map.real_light, follow_heading: self.map.follow_heading, lock_to_fix: self.map.lock_to_fix, cache_budget: self.cache_budget, theme: self.map.theme, compressed: self.map.compressed(), tool: self.map.tool as u8, pen_rgba: self.map.pen_colour, travel: travel_code(self.map.travel), clear_ink: false, clear_sel: false }, &readouts, measure.as_ref(), &themes, &areas, None);
         let mut map = self.map.canvas.clone();
-        // The labels, laid out a quarter second after the camera stops with every cell in, over the map and under the panel.
+        // The labels, laid out a quarter second after the camera stops, drawn every frame letter by letter over the map and under the panel.
         let c = self.map.cam;
         let cam_key = (c.lat().to_bits(), c.lon().to_bits(), c.ppd.to_bits(), c.bearing().to_bits());
         if cam_key != self.label_cam.0 {
@@ -636,9 +636,7 @@ impl FluorApp for MahereApp {
                 self.labeller.update(&mut self.map, w, h, self.panel.font_px());
                 self.lettered = Instant::now();
             }
-            if !self.labeller.stale(&self.map, w, h) {
-                self.labeller.composite_rgb(&mut map);
-            }
+            self.labeller.draw_cpu(&mut map, &self.map.cam, w, h);
         }
         self.panel.composite_rgb(&mut map, w, h);
         self.chrome.rasterize_bg(ctx.damage, |c| {

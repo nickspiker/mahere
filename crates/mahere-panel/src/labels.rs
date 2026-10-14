@@ -1,6 +1,6 @@
 //! Labels on the map (Nick 2026-10-13): laid out from what is drawn, never from stored label geometry. The engine hands over every named texel in view; here the points are lettered beside their mark, an area at the point deepest inside it (a distance fill) along its long axis when it is long, a line along the longest run of it straight enough for its name, with top always up. One priority order decides who goes first (places and summits, then lakes, highways, rivers, villages, trails and streets, other areas, the small marks), each label taking its room on a grid so none overlap. A label placed last time goes first in its tier, so labels hold still while the view settles.
 //!
-//! Drawn once when the camera rests into a buffer of the screen's size; while the camera moves a host carries that buffer with the map by [`Labeller::transform`] and draws it again at the next rest.
+//! Laid out when the camera rests; drawn every frame letter by letter (Nick 2026-10-13: no rendering to a bitmap). Each label keeps where it is on the globe and its letters' places about that point; each letter is a glyph fluor rasterised once into an atlas, its halo beside it. A frame turns the labels into quads at their anchors' places on the screen now (a line's or an area's name turns with the map, a point's stays level) for the GPU to draw, or the CPU frontend draws the same quads itself.
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use fluor::canvas::{Canvas, Damage};
@@ -23,11 +23,87 @@ const HALO: usize = 8;
 const ROUTE: usize = 9;
 const ROUTE_CASING: usize = 10;
 
-/// A theme colour (VSF RGB at gamma 2 with opacity) in fluor's stored form on this platform.
-fn stored(c: [u8; 4]) -> u32 {
-    let rgb = ((c[0] as u32) << 16) | ((c[1] as u32) << 8) | c[2] as u32;
-    (theme::dark(theme::fmt(theme::vsf(rgb))) & 0x00FF_FFFF) | ((c[3] as u32) << 24)
+/// A theme colour (VSF RGB at gamma 2 with opacity) as display values 0..1 with its opacity, the way the screen takes it.
+fn display(c: [u8; 4]) -> [f32; 4] {
+    let d = theme::vsf(((c[0] as u32) << 16) | ((c[1] as u32) << 8) | c[2] as u32);
+    [((d >> 16) & 255) as f32 / 255.0, ((d >> 8) & 255) as f32 / 255.0, (d & 255) as f32 / 255.0, c[3] as f32 / 255.0]
 }
+
+/// A rasterised glyph's identity: the character, its size, weight and lean, its halo's width (sizes in sixteenths of a pixel), and its rotation bin. As fluor's own rotation stack does, the outline is turned in font space to the bin's angle before it is rasterised, bins a pixel of arc apart at the glyph's size, so a letter at any angle has fluor's own edges and the quad turns only by what is left over (nothing, at rest).
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+struct GlyphKey {
+    ch: char,
+    size: u32,
+    weight: u16,
+    shear: u32,
+    halo: u32,
+    bin: i32,
+}
+
+/// A glyph's rotation bins, radians apart: one pixel of arc at half its size.
+fn bin_step(size: f32) -> f32 {
+    2.0 / size.max(4.0)
+}
+
+/// Where to ask fluor to draw a glyph turned by `angle` so it lands centred on `p`: fluor turns a glyph's position about the canvas's origin along with the glyph, so the position goes in turned back.
+fn unturn(p: [f32; 2], angle: f32) -> [f32; 2] {
+    let (s, c) = angle.sin_cos();
+    [p[0] * c + p[1] * s, -p[0] * s + p[1] * c]
+}
+
+/// The glyphs as one texture: two bytes a pixel, the letter's coverage and its halo's, packed in shelves. Grows to 4096 square, then starts again with what the labels in view use.
+pub struct Atlas {
+    pub side: usize,
+    pub rg: Vec<u8>,
+    /// Bumped whenever the texture changed, for a host to upload it again.
+    pub version: u64,
+    x: usize,
+    y: usize,
+    row: usize,
+    slots: HashMap<GlyphKey, [u16; 4]>,
+}
+
+impl Atlas {
+    fn new() -> Atlas {
+        Atlas { side: 1024, rg: vec![0; 1024 * 1024 * 2], version: 1, x: 0, y: 0, row: 0, slots: HashMap::new() }
+    }
+
+    fn clear(&mut self, side: usize) {
+        *self = Atlas { side, rg: vec![0; side * side * 2], version: self.version + 1, x: 0, y: 0, row: 0, slots: HashMap::new() };
+    }
+
+    /// Room for a glyph of this many pixels: the next place on the shelf, or on a new shelf; None when the texture is full.
+    fn place(&mut self, w: usize, h: usize) -> Option<(usize, usize)> {
+        if self.x + w + 1 > self.side {
+            self.x = 0;
+            self.y += self.row + 1;
+            self.row = 0;
+        }
+        if self.y + h + 1 > self.side {
+            return None;
+        }
+        let at = (self.x, self.y);
+        self.x += w + 1;
+        self.row = self.row.max(h);
+        Some(at)
+    }
+}
+
+/// A label as kept between layouts: where it is on the globe, its letters (atlas glyph, offset from the anchor in pixels, angle as laid out) as laid out, whether it turns with the map, its colour (an index into the theme's) and whether it has a halo.
+struct Kept {
+    name: Named,
+    anchor: (f64, f64),
+    letters: Vec<(GlyphKey, [f32; 2], f32)>,
+    turns: bool,
+    colour: usize,
+    halo: bool,
+}
+
+/// One letter for a frame: centre and half extents in screen pixels, angle, the atlas rectangle (0..1), the letter's colour and its halo's (display values, opacity last). As 20 floats, the GPU's instance layout.
+pub type GlyphQuad = [f32; 20];
+
+/// One stretch of the route for a frame: its ends in screen pixels, half its width, and its colour. As 12 floats, the GPU's instance layout.
+pub type Segment = [f32; 12];
 
 /// Water's names lean, as maps letter them: a shear of tan 12°.
 const ITALIC: f32 = 0.2126;
@@ -109,34 +185,31 @@ struct Laid {
     name: Named,
     glyphs: Vec<Glyph>,
     size: f32,
-    colour: u32,
+    colour: usize,
     weight: u16,
     shear: f32,
     /// A mark drawn at the point: a summit's triangle, a dot for the small marks.
     mark: Option<([f32; 2], bool)>,
 }
 
-/// What was drawn, for a tap to find: a label's name and the boxes of its glyphs, in the screen as it was when drawn.
-pub struct Placed {
-    pub name: Named,
-    pub boxes: Vec<[f32; 4]>,
-}
-
 pub struct Labeller {
     text: TextRenderer,
-    /// The lettering, the screen's size, in fluor's pixel convention.
-    pub buf: Vec<u32>,
     pub w: usize,
     pub h: usize,
-    pub placed: Vec<Placed>,
-    /// Two screen points of the drawn view and where on the globe they were, so the buffer can follow the map until the next rest.
-    anchor: Option<([f64; 2], [f64; 2], (f64, f64), (f64, f64))>,
-    /// The view the buffer was drawn for, to tell when it is out of date.
+    kept: Vec<Kept>,
+    pub atlas: Atlas,
+    /// Two screen points of the laid-out view and where on the globe they were: how far the map has turned since, which the turning labels follow.
+    reference: Option<([f64; 2], [f64; 2], (f64, f64), (f64, f64))>,
+    /// The view the layout is for, to tell when it is out of date.
     drawn_for: Option<(i64, i64, i64, i64, u8, usize, u64, bool, u64)>,
     advance: HashMap<(char, u16, u32), f32>,
-    /// The theme's label colours in fluor's form, and its look (size, glow, smoothing, spacing), as of the last lettering.
-    colours: [u32; 11],
+    /// The theme's label colours and its look (size, glow, smoothing, spacing), as of the last layout.
+    palette: [[u8; 4]; 11],
     look: [f32; 4],
+    /// The route, on the globe, and its width in pixels.
+    route: Vec<(f64, f64)>,
+    route_width: f32,
+    route_casing: f32,
 }
 
 impl Default for Labeller {
@@ -199,75 +272,6 @@ impl Room {
 fn glyph_box(g: &Glyph, size: f32, pad: f32) -> [f32; 4] {
     let r = size * 0.62 + pad;
     [g.at[0] - r, g.at[1] - r, g.at[0] + r, g.at[1] + r]
-}
-
-/// Where to ask fluor to draw a glyph turned by `angle` so it lands centred on `p`: fluor turns a glyph's position about the canvas's origin along with the glyph, so the position goes in turned back.
-fn unturn(p: [f32; 2], angle: f32) -> [f32; 2] {
-    let (s, c) = angle.sin_cos();
-    [p[0] * c + p[1] * s, -p[0] * s + p[1] * c]
-}
-
-/// A thick polyline under what a buffer already holds (fluor's α + darkness, front to back): each pixel's coverage by distance to the nearest segment, feathered over a pixel, added beneath.
-fn under_polyline(px: &mut [u32], w: usize, h: usize, pts: &[[f32; 2]], width: f32, colour: u32) {
-    if pts.len() < 2 {
-        return;
-    }
-    let half = width / 2.0;
-    let dark = colour & 0x00FF_FFFF;
-    let mut cover = vec![0u8; 0];
-    let (mut x0, mut y0, mut x1, mut y1) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
-    for p in pts {
-        x0 = x0.min(p[0]);
-        y0 = y0.min(p[1]);
-        x1 = x1.max(p[0]);
-        y1 = y1.max(p[1]);
-    }
-    let (bx0, by0) = ((x0 - half - 1.0).floor().max(0.0) as usize, (y0 - half - 1.0).floor().max(0.0) as usize);
-    let (bx1, by1) = (((x1 + half + 1.0).ceil() as i64).clamp(0, w as i64) as usize, ((y1 + half + 1.0).ceil() as i64).clamp(0, h as i64) as usize);
-    if bx0 >= bx1 || by0 >= by1 {
-        return;
-    }
-    let bw = bx1 - bx0;
-    cover.resize(bw * (by1 - by0), 0);
-    for seg in pts.windows(2) {
-        let (a, b) = (seg[0], seg[1]);
-        let sx0 = ((a[0].min(b[0]) - half - 1.0).floor().max(bx0 as f32)) as usize;
-        let sx1 = ((a[0].max(b[0]) + half + 1.0).ceil().min(bx1 as f32 - 1.0)).max(0.0) as usize;
-        let sy0 = ((a[1].min(b[1]) - half - 1.0).floor().max(by0 as f32)) as usize;
-        let sy1 = ((a[1].max(b[1]) + half + 1.0).ceil().min(by1 as f32 - 1.0)).max(0.0) as usize;
-        let (dx, dy) = (b[0] - a[0], b[1] - a[1]);
-        let len2 = (dx * dx + dy * dy).max(1e-6);
-        for y in sy0..=sy1 {
-            for x in sx0..=sx1 {
-                let (px_, py_) = (x as f32 + 0.5, y as f32 + 0.5);
-                let t = (((px_ - a[0]) * dx + (py_ - a[1]) * dy) / len2).clamp(0.0, 1.0);
-                let d = (px_ - (a[0] + dx * t)).hypot(py_ - (a[1] + dy * t));
-                let c = ((half - d + 0.5).clamp(0.0, 1.0) * 255.0) as u8;
-                let i = (y - by0) * bw + (x - bx0);
-                cover[i] = cover[i].max(c);
-            }
-        }
-    }
-    for y in by0..by1 {
-        for x in bx0..bx1 {
-            let a = cover[(y - by0) * bw + (x - bx0)] as u32;
-            if a == 0 {
-                continue;
-            }
-            let i = y * w + x;
-            let old = px[i];
-            let keep = 255 - (old >> 24);
-            // The new pixel premultiplied by its coverage, added under what is there by what that lets through.
-            let mut out = old;
-            for shift in [0u32, 8, 16] {
-                let n = ((dark >> shift) & 255) * a / 255;
-                let o = (old >> shift) & 255;
-                out = (out & !(255 << shift)) | ((o + n * keep / 255).min(255) << shift);
-            }
-            let alpha = ((old >> 24) + a * keep / 255).min(255);
-            px[i] = (out & 0x00FF_FFFF) | (alpha << 24);
-        }
-    }
 }
 
 /// A polyline's cumulative lengths.
@@ -421,7 +425,7 @@ fn centrelines(pts: &[[f32; 2]], bin: f32) -> Vec<Vec<[f32; 2]>> {
 
 impl Labeller {
     pub fn new() -> Labeller {
-        Labeller { text: TextRenderer::new(), buf: Vec::new(), w: 0, h: 0, placed: Vec::new(), anchor: None, drawn_for: None, advance: HashMap::new(), colours: [0; 11], look: mahere_engine::theme::LABEL_LOOK }
+        Labeller { text: TextRenderer::new(), w: 0, h: 0, kept: Vec::new(), atlas: Atlas::new(), reference: None, drawn_for: None, advance: HashMap::new(), palette: mahere_engine::theme::LABELS_LIGHT, look: mahere_engine::theme::LABEL_LOOK, route: Vec::new(), route_width: 4.0, route_casing: 6.0 }
     }
 
     /// Whether the lettering is out of date for this view: the camera, the depth or the cells resident changed since it was drawn (a cell arriving, leaving or replaced by a newer copy).
@@ -453,65 +457,271 @@ impl Labeller {
         s.chars().map(|c| self.advance(c, size, weight)).sum()
     }
 
-    /// Lay out and draw the labels for the view, `font` the panel's base font size in pixels.
+    /// Lay out the labels for the view, `font` the panel's base font size in pixels, and rasterise into the atlas any glyph they use that it lacks.
     pub fn update(&mut self, map: &mut mahere_engine::MapCore, w: usize, h: usize, font: f32) {
         let t = std::time::Instant::now();
         self.w = w;
         self.h = h;
         // The theme's colours and look; the size scales the base font.
         if let Some(th) = map.themes.get(map.theme) {
-            self.colours = th.label.map(stored);
+            self.palette = th.label;
             self.look = th.label_look;
         }
         let font = font * self.look[0];
         let texels = if map.layers().labels { map.gather_names(w, h) } else { NamedTexels::default() };
         let gathered = t.elapsed();
-        let previous: HashSet<(u8, String, String)> = self.placed.iter().map(|p| (p.name.kind, p.name.name.clone(), p.name.reference.clone())).collect();
+        let previous: HashSet<(u8, String, String)> = self.kept.iter().map(|k| (k.name.kind, k.name.name.clone(), k.name.reference.clone())).collect();
         let laid = self.layout(&texels, w, h, font, &previous);
-        // The route on the screen, a point every few pixels at most.
-        let route: Vec<[f32; 2]> = map.route_points().map_or(Vec::new(), |pts| {
-            pts.iter()
-                .map(|&(lat, lon)| {
-                    let (x, y) = map.cam.geo_to_screen(lat, lon, w, h);
-                    [x as f32, y as f32]
-                })
-                .collect()
-        });
-        self.draw(&laid, &route, font, w, h);
-        self.placed = laid.iter().map(|l| Placed { name: l.name.clone(), boxes: l.glyphs.iter().map(|g| glyph_box(g, l.size, 0.0)).collect() }).collect();
-        // Two points of this view, by where they are on the globe, so the buffer can be carried with the map.
+        self.keep(&laid, map, w, h);
+        self.route = map.route_points().map_or(Vec::new(), |p| p.to_vec());
+        self.route_width = (font * 0.32).max(3.0);
+        self.route_casing = self.route_width + (font * 0.14).max(1.5);
         let (a, b) = ([w as f64 * 0.25, h as f64 * 0.5], [w as f64 * 0.75, h as f64 * 0.5]);
-        self.anchor = Some((a, b, map.cam.screen_to_geo(a[0], a[1], w, h), map.cam.screen_to_geo(b[0], b[1], w, h)));
+        self.reference = Some((a, b, map.cam.screen_to_geo(a[0], a[1], w, h), map.cam.screen_to_geo(b[0], b[1], w, h)));
         self.drawn_for = Some(Self::view_key(map, w, h));
         if std::env::var_os("MAHERE_LABEL_LOG").is_some() {
-            eprintln!("labels: {} lines, {} areas, {} points gathered in {:.1} ms; {} placed, {:.1} ms in all", texels.lines.len(), texels.areas.len(), texels.points.len(), gathered.as_secs_f64() * 1e3, laid.len(), t.elapsed().as_secs_f64() * 1e3);
+            eprintln!("labels: {} lines, {} areas, {} points gathered in {:.1} ms; {} placed, {} glyphs in the atlas, {:.1} ms in all", texels.lines.len(), texels.areas.len(), texels.points.len(), gathered.as_secs_f64() * 1e3, laid.len(), self.atlas.slots.len(), t.elapsed().as_secs_f64() * 1e3);
         }
     }
 
-    /// The map moved since the lettering was drawn: where each pixel of the screen now was in the drawn buffer, as `[a, b, c, d, e, f]` with the buffer's x = a·x + b·y + c and y = d·x + e·y + f. A turn, a scale and a shift, near enough while the camera moves; the next rest draws it again. None when there is nothing drawn.
-    pub fn transform(&self, cam: &mahere_engine::Camera, w: usize, h: usize) -> Option<[f32; 6]> {
-        let (a, b, ga, gb) = self.anchor?;
+    /// The laid-out labels kept as anchors on the globe and letters about them, each letter's glyph in the atlas.
+    fn keep(&mut self, laid: &[Laid], map: &mahere_engine::MapCore, w: usize, h: usize) {
+        self.kept.clear();
+        for l in laid {
+            let n = l.glyphs.len().max(1) as f32;
+            let centre = l.glyphs.iter().fold([0.0f32; 2], |c, g| [c[0] + g.at[0] / n, c[1] + g.at[1] / n]);
+            let anchor = map.cam.screen_to_geo(centre[0] as f64, centre[1] as f64, w, h);
+            let halo = (l.size * self.look[1] * 16.0) as u32;
+            let letters = l.glyphs.iter().map(|g| (self.glyph(g.ch, l.size, l.weight, l.shear, halo, g.angle), [g.at[0] - centre[0], g.at[1] - centre[1]], g.angle)).collect();
+            // A point's name stays level; a line's and an area's turn with the map.
+            let turns = !l.name.is_point();
+            self.kept.push(Kept { name: l.name.clone(), anchor, letters, turns, colour: l.colour, halo: halo > 0 });
+            if let Some((p, summit)) = l.mark {
+                // A summit's triangle, point up; a dot for the small marks. Level, no halo.
+                let (ch, colour, scale) = if summit { ('\u{25B2}', SUMMIT, 0.7) } else { ('\u{2022}', MARK, 1.0) };
+                let key = self.glyph(ch, l.size * scale, 400, 0.0, 0, 0.0);
+                self.kept.push(Kept { name: l.name.clone(), anchor: map.cam.screen_to_geo(p[0] as f64, p[1] as f64, w, h), letters: vec![(key, [0.0, 0.0], 0.0)], turns: false, colour, halo: false });
+            }
+        }
+    }
+
+    /// A glyph's place in the atlas, rasterised by fluor the first time it is asked for, its outline turned to the angle's bin: the letter's coverage, and around it the halo, a distance out from the letter's edge.
+    fn glyph(&mut self, ch: char, size: f32, weight: u16, shear: f32, halo: u32, angle: f32) -> GlyphKey {
+        let bin = (angle / bin_step(size)).round() as i32;
+        let key = GlyphKey { ch, size: (size * 16.0) as u32, weight, shear: shear.to_bits(), halo, bin };
+        if self.atlas.slots.contains_key(&key) {
+            return key;
+        }
+        let r = halo as f32 / 16.0;
+        let adv = self.advance(ch, size, weight).max(size * 0.3);
+        // A square that holds the glyph at any angle, its halo around it.
+        // Even, so the glyph's centre is a pixel corner and every glyph of a label snaps to the grid alike (an odd one rounds half a pixel off its neighbours).
+        let side = ((adv + size * 0.4).hypot(size * 1.6) + 2.0 * r + 4.0).ceil() as usize;
+        let side = side + side % 2;
+        let (cw, chh) = (side, side);
+        let turn = bin as f32 * bin_step(size);
+        let mut px = vec![0u32; cw * chh];
+        {
+            let mut damage = Damage::new();
+            let mut canvas = Canvas::new(&mut px, cw, chh, &mut damage);
+            let style = TextStyle::new(size, 0xFF00_0000).weight(weight).shear(shear).rotation(turn);
+            let at = unturn([cw as f32 / 2.0, chh as f32 / 2.0], turn);
+            self.text.draw_text_center(&mut canvas, &ch.to_string(), at[0], at[1], &style, None, None);
+        }
+        let cover: Vec<u8> = px.iter().map(|p| (p >> 24) as u8).collect();
+        // The halo: the chamfer distance from the letter, feathered over a pixel, at least the letter itself.
+        let mut d: Vec<f32> = cover.iter().map(|&c| if c >= 128 { 0.0 } else { f32::MAX }).collect();
+        let (st, dg) = (1.0f32, std::f32::consts::SQRT_2);
+        for y in 0..chh {
+            for x in 0..cw {
+                let i = y * cw + x;
+                let mut v = d[i];
+                if x > 0 { v = v.min(d[i - 1] + st); }
+                if y > 0 { v = v.min(d[i - cw] + st); }
+                if x > 0 && y > 0 { v = v.min(d[i - cw - 1] + dg); }
+                if x + 1 < cw && y > 0 { v = v.min(d[i - cw + 1] + dg); }
+                d[i] = v;
+            }
+        }
+        for y in (0..chh).rev() {
+            for x in (0..cw).rev() {
+                let i = y * cw + x;
+                let mut v = d[i];
+                if x + 1 < cw { v = v.min(d[i + 1] + st); }
+                if y + 1 < chh { v = v.min(d[i + cw] + st); }
+                if x + 1 < cw && y + 1 < chh { v = v.min(d[i + cw + 1] + dg); }
+                if x > 0 && y + 1 < chh { v = v.min(d[i + cw - 1] + dg); }
+                d[i] = v;
+            }
+        }
+        // Trimmed to what the letter and its halo cover, its centre kept: less atlas, smaller quads.
+        let used = |x: usize, y: usize| cover[y * cw + x] > 0 || (r > 0.0 && d[y * cw + x] < r + 0.5);
+        let (mut tx0, mut ty0, mut tx1, mut ty1) = (cw, chh, 0, 0);
+        for y in 0..chh {
+            for x in 0..cw {
+                if used(x, y) {
+                    tx0 = tx0.min(x);
+                    ty0 = ty0.min(y);
+                    tx1 = tx1.max(x + 1);
+                    ty1 = ty1.max(y + 1);
+                }
+            }
+        }
+        if tx0 >= tx1 {
+            // A space: nothing to draw, a one-pixel slot.
+            (tx0, ty0, tx1, ty1) = (cw / 2, chh / 2, cw / 2 + 1, chh / 2 + 1);
+        }
+        // Symmetric about the centre, so the quad's centre is still the glyph's.
+        let (mx, my) = ((cw / 2 - tx0.min(cw / 2)).max(tx1.max(cw / 2) - cw / 2), (chh / 2 - ty0.min(chh / 2)).max(ty1.max(chh / 2) - chh / 2));
+        let (ox, oy) = (cw / 2 - mx, chh / 2 - my);
+        let (cw2, ch2) = ((2 * mx).min(cw - ox), (2 * my).min(chh - oy));
+        let place = match self.atlas.place(cw2, ch2) {
+            Some(p) => p,
+            None => {
+                // Full: a bigger texture up to 4096, else start again (the labels in view ask for theirs again as they are kept).
+                let side = (self.atlas.side * 2).min(4096);
+                self.atlas.clear(side);
+                self.atlas.place(cw2, ch2).unwrap_or((0, 0))
+            }
+        };
+        let side = self.atlas.side;
+        for y in 0..ch2.min(side - place.1) {
+            for x in 0..cw2.min(side - place.0) {
+                let i = (oy + y) * cw + ox + x;
+                let o = ((place.1 + y) * side + place.0 + x) * 2;
+                let c = cover[i];
+                let hv = if r > 0.0 { ((r + 0.5 - d[i]).clamp(0.0, 1.0) * 255.0) as u8 } else { 0 };
+                self.atlas.rg[o] = c;
+                self.atlas.rg[o + 1] = hv.max(if r > 0.0 { c } else { 0 });
+            }
+        }
+        self.atlas.slots.insert(key, [place.0 as u16, place.1 as u16, cw2 as u16, ch2 as u16]);
+        self.atlas.version += 1;
+        key
+    }
+
+    /// How far the map has turned on the screen since the layout, radians.
+    fn turned(&self, cam: &mahere_engine::Camera, w: usize, h: usize) -> f32 {
+        let Some((a, b, ga, gb)) = self.reference else { return 0.0 };
         let (ax, ay) = cam.geo_to_screen(ga.0, ga.1, w, h);
         let (bx, by) = cam.geo_to_screen(gb.0, gb.1, w, h);
-        // The similarity taking the points as they are now back to where they were drawn.
-        let (nx, ny) = (bx - ax, by - ay);
-        let (ox, oy) = (b[0] - a[0], b[1] - a[1]);
-        let n2 = nx * nx + ny * ny;
-        if n2 < 1e-6 {
-            return None;
-        }
-        let re = (ox * nx + oy * ny) / n2;
-        let im = (oy * nx - ox * ny) / n2;
-        let c = a[0] - (re * ax - im * ay);
-        let f = a[1] - (im * ax + re * ay);
-        Some([re as f32, -im as f32, c as f32, im as f32, re as f32, f as f32])
+        ((by - ay).atan2(bx - ax) - (b[1] - a[1]).atan2(b[0] - a[0])) as f32
     }
 
-    /// Whether lettering drawn for another view may still be shown carried along with the map: while the map has turned less than about ten degrees and zoomed less than half again either way since it was drawn. Past that the letters would stand crooked or swollen, so they hide until the map rests and is lettered again.
-    pub fn carried(m: &[f32; 6]) -> bool {
-        let scale = m[0].hypot(m[3]);
-        let turn = m[3].atan2(m[0]).abs();
-        (0.67..=1.5).contains(&scale) && turn < 10f32.to_radians()
+    /// The frame's letters, each a quad at its label's anchor as the camera has it now: a turning label's letters turned with the map about the anchor, a level one's as laid out.
+    pub fn glyphs(&self, cam: &mahere_engine::Camera, w: usize, h: usize) -> Vec<GlyphQuad> {
+        let phi = self.turned(cam, w, h);
+        let (sp, cp) = phi.sin_cos();
+        let halo = display(self.palette[HALO]);
+        let side = self.atlas.side as f32;
+        let mut out = Vec::new();
+        for k in &self.kept {
+            let (ax, ay) = cam.geo_to_screen(k.anchor.0, k.anchor.1, w, h);
+            let (ax, ay) = (ax as f32, ay as f32);
+            if ax < -(w as f32) || ay < -(h as f32) || ax > 2.0 * w as f32 || ay > 2.0 * h as f32 || !cam.on_globe(ax as f64, ay as f64, w, h) {
+                continue;
+            }
+            let text = display(self.palette[k.colour]);
+            let halo = if k.halo { halo } else { [0.0; 4] };
+            for (key, off, angle) in &k.letters {
+                let Some(slot) = self.atlas.slots.get(key) else { continue };
+                let (o, a) = if k.turns { ([off[0] * cp - off[1] * sp, off[0] * sp + off[1] * cp], angle + phi) } else { (*off, *angle) };
+                // The quad turns only by what the glyph's bin left over; with nothing left (at rest) it sits on the pixel grid, texel for pixel.
+                let residual = a - key.bin as f32 * bin_step(key.size as f32 / 16.0);
+                let (sx, sy, sw, sh) = (slot[0] as f32, slot[1] as f32, slot[2] as f32, slot[3] as f32);
+                let (mut cx, mut cy) = (ax + o[0], ay + o[1]);
+                if residual.abs() < 1e-3 {
+                    cx = (cx - sw / 2.0).round() + sw / 2.0;
+                    cy = (cy - sh / 2.0).round() + sh / 2.0;
+                }
+                out.push([cx, cy, sw / 2.0, sh / 2.0, residual, 0.0, 0.0, 0.0, sx / side, sy / side, (sx + sw) / side, (sy + sh) / side, text[0], text[1], text[2], text[3], halo[0], halo[1], halo[2], halo[3]]);
+            }
+        }
+        out
+    }
+
+    /// The frame's route: each stretch between its points on the screen now, the casing's stretches first (under), then the line's.
+    pub fn segments(&self, cam: &mahere_engine::Camera, w: usize, h: usize) -> Vec<Segment> {
+        if self.route.len() < 2 {
+            return Vec::new();
+        }
+        let pts: Vec<(f32, f32)> = self.route.iter().map(|&(la, lo)| {
+            let (x, y) = cam.geo_to_screen(la, lo, w, h);
+            (x as f32, y as f32)
+        }).collect();
+        let mut out = Vec::with_capacity(2 * pts.len());
+        for (width, colour) in [(self.route_casing, ROUTE_CASING), (self.route_width, ROUTE)] {
+            let c = display(self.palette[colour]);
+            for s in pts.windows(2) {
+                out.push([s[0].0, s[0].1, s[1].0, s[1].1, width / 2.0, 0.0, 0.0, 0.0, c[0], c[1], c[2], c[3]]);
+            }
+        }
+        out
+    }
+
+    /// For a CPU frontend: the frame's route and letters drawn straight into a display 0xRRGGBB canvas.
+    pub fn draw_cpu(&self, canvas: &mut [u32], cam: &mahere_engine::Camera, w: usize, h: usize) {
+        let blend = |canvas: &mut [u32], i: usize, c: [f32; 3], a: f32| {
+            if a <= 0.0 {
+                return;
+            }
+            let p = canvas[i];
+            let mix = |shift: u32, v: f32| -> u32 { ((((p >> shift) & 255) as f32 * (1.0 - a) + v * 255.0 * a).round() as u32).min(255) };
+            canvas[i] = (mix(16, c[0]) << 16) | (mix(8, c[1]) << 8) | mix(0, c[2]);
+        };
+        for s in self.segments(cam, w, h) {
+            let (a, b, half) = ([s[0], s[1]], [s[2], s[3]], s[4]);
+            let (x0, x1) = ((a[0].min(b[0]) - half - 1.0).floor().max(0.0) as usize, ((a[0].max(b[0]) + half + 1.0).ceil().max(0.0) as usize).min(w));
+            let (y0, y1) = ((a[1].min(b[1]) - half - 1.0).floor().max(0.0) as usize, ((a[1].max(b[1]) + half + 1.0).ceil().max(0.0) as usize).min(h));
+            let (dx, dy) = (b[0] - a[0], b[1] - a[1]);
+            let len2 = (dx * dx + dy * dy).max(1e-6);
+            for y in y0..y1 {
+                for x in x0..x1 {
+                    let (px, py) = (x as f32 + 0.5, y as f32 + 0.5);
+                    let t = (((px - a[0]) * dx + (py - a[1]) * dy) / len2).clamp(0.0, 1.0);
+                    let d = (px - (a[0] + dx * t)).hypot(py - (a[1] + dy * t));
+                    blend(canvas, y * w + x, [s[8], s[9], s[10]], (half - d + 0.5).clamp(0.0, 1.0) * s[11]);
+                }
+            }
+        }
+        let side = self.atlas.side;
+        let sample = |u: f32, v: f32| -> (f32, f32) {
+            let (fx, fy) = (u * side as f32 - 0.5, v * side as f32 - 0.5);
+            let (x0, y0) = (fx.floor(), fy.floor());
+            let (tx, ty) = (fx - x0, fy - y0);
+            let at = |x: f32, y: f32| -> (f32, f32) {
+                if x < 0.0 || y < 0.0 || x >= side as f32 || y >= side as f32 {
+                    return (0.0, 0.0);
+                }
+                let o = (y as usize * side + x as usize) * 2;
+                (self.atlas.rg[o] as f32 / 255.0, self.atlas.rg[o + 1] as f32 / 255.0)
+            };
+            let (a, b, c, d) = (at(x0, y0), at(x0 + 1.0, y0), at(x0, y0 + 1.0), at(x0 + 1.0, y0 + 1.0));
+            let l = |p: f32, q: f32, t: f32| p + (q - p) * t;
+            (l(l(a.0, b.0, tx), l(c.0, d.0, tx), ty), l(l(a.1, b.1, tx), l(c.1, d.1, tx), ty))
+        };
+        for g in self.glyphs(cam, w, h) {
+            let (cx, cy, hx, hy, ang) = (g[0], g[1], g[2], g[3], g[4]);
+            let (sa, ca) = ang.sin_cos();
+            let reach = hx.hypot(hy) + 1.0;
+            let (x0, x1) = ((cx - reach).floor().max(0.0) as usize, ((cx + reach).ceil().max(0.0) as usize).min(w));
+            let (y0, y1) = ((cy - reach).floor().max(0.0) as usize, ((cy + reach).ceil().max(0.0) as usize).min(h));
+            for y in y0..y1 {
+                for x in x0..x1 {
+                    // Back into the glyph's own frame: unturned, then where in its atlas rectangle.
+                    let (dx, dy) = (x as f32 + 0.5 - cx, y as f32 + 0.5 - cy);
+                    let (lx, ly) = (dx * ca + dy * sa, -dx * sa + dy * ca);
+                    if lx.abs() > hx || ly.abs() > hy {
+                        continue;
+                    }
+                    let (u, v) = (g[8] + (lx / hx * 0.5 + 0.5) * (g[10] - g[8]), g[9] + (ly / hy * 0.5 + 0.5) * (g[11] - g[9]));
+                    let (ta, ha) = sample(u, v);
+                    let i = y * w + x;
+                    blend(canvas, i, [g[16], g[17], g[18]], ha * g[19]);
+                    blend(canvas, i, [g[12], g[13], g[14]], ta * g[15]);
+                }
+            }
+        }
     }
 
     /// Whether to letter the view now: it is stale and the camera is at rest, and either every cell is in or a second has passed since the last lettering (so a cell that keeps failing or arriving never holds the labels back). `last` is when this host last lettered.
@@ -521,9 +731,16 @@ impl Labeller {
 
     /// The label under a screen point, as the screen is now.
     pub fn hit(&self, cam: &mahere_engine::Camera, w: usize, h: usize, x: f32, y: f32) -> Option<&Named> {
-        let m = self.transform(cam, w, h)?;
-        let (bx, by) = (m[0] * x + m[1] * y + m[2], m[3] * x + m[4] * y + m[5]);
-        self.placed.iter().find(|p| p.boxes.iter().any(|b| bx >= b[0] && bx <= b[2] && by >= b[1] && by <= b[3])).map(|p| &p.name)
+        let phi = self.turned(cam, w, h);
+        let (sp, cp) = phi.sin_cos();
+        self.kept.iter().find(|k| {
+            let (ax, ay) = cam.geo_to_screen(k.anchor.0, k.anchor.1, w, h);
+            k.letters.iter().any(|(key, off, _)| {
+                let o = if k.turns { [off[0] * cp - off[1] * sp, off[0] * sp + off[1] * cp] } else { *off };
+                let r = self.atlas.slots.get(key).map_or(8.0, |s| s[3] as f32 / 2.0);
+                (x - (ax as f32 + o[0])).hypot(y - (ay as f32 + o[1])) <= r
+            })
+        }).map(|k| &k.name)
     }
 
     fn layout(&mut self, texels: &NamedTexels, w: usize, h: usize, font: f32, previous: &HashSet<(u8, String, String)>) -> Vec<Laid> {
@@ -558,7 +775,6 @@ impl Labeller {
                 continue;
             }
             let (rel, colour, weight, shear) = style_of(n);
-            let colour = self.colours[colour];
             let size = font * rel;
             let laid: Vec<Laid> = match shape {
                 Shape::Point(p) => self.point(n, &label, p, size, colour, weight, &room, pad).into_iter().collect(),
@@ -576,7 +792,7 @@ impl Labeller {
 
     /// A point's label: beside its mark, right of it first, then left, above and below; a town's name centred on it.
     #[allow(clippy::too_many_arguments)]
-    fn point(&mut self, n: &Named, label: &str, p: [f32; 2], size: f32, colour: u32, weight: u16, room: &Room, pad: f32) -> Option<Laid> {
+    fn point(&mut self, n: &Named, label: &str, p: [f32; 2], size: f32, colour: usize, weight: u16, room: &Room, pad: f32) -> Option<Laid> {
         let place = n.kind <= HAMLET;
         let summit = n.kind == PEAK || n.kind == VOLCANO;
         let width = self.width(label, size, weight);
@@ -608,7 +824,7 @@ impl Labeller {
 
     /// An area's label: at the point deepest inside it (a distance fill over its samples), along its long axis when it is long, as large as fits inside it up to its kind's size.
     #[allow(clippy::too_many_arguments)]
-    fn area(&mut self, n: &Named, label: &str, pts: &[[f32; 2]], step: f32, size: f32, colour: u32, weight: u16, shear: f32, room: &Room, pad: f32) -> Option<Laid> {
+    fn area(&mut self, n: &Named, label: &str, pts: &[[f32; 2]], step: f32, size: f32, colour: usize, weight: u16, shear: f32, room: &Room, pad: f32) -> Option<Laid> {
         if pts.len() < 4 {
             return None;
         }
@@ -735,7 +951,7 @@ impl Labeller {
 
     /// A line's labels: on each long enough run, the stretch straight enough for the name nearest the run's middle, and on a long run more of them at least a screen's third apart, each letter turned to the line, top up.
     #[allow(clippy::too_many_arguments)]
-    fn line(&mut self, n: &Named, label: &str, pts: &[[f32; 2]], texel_px: f32, size: f32, colour: u32, weight: u16, shear: f32, room: &mut Room, pad: f32) -> Vec<Laid> {
+    fn line(&mut self, n: &Named, label: &str, pts: &[[f32; 2]], texel_px: f32, size: f32, colour: usize, weight: u16, shear: f32, room: &mut Room, pad: f32) -> Vec<Laid> {
         let advances: Vec<(char, f32)> = label.chars().map(|c| (c, self.advance(c, size, weight))).collect();
         let width: f32 = advances.iter().map(|a| a.1).sum();
         let bin = (texel_px * 3.0).max(6.0);
@@ -803,75 +1019,5 @@ impl Labeller {
             }
         }
         out
-    }
-
-    fn draw(&mut self, laid: &[Laid], route: &[[f32; 2]], font: f32, w: usize, h: usize) {
-        self.w = w;
-        self.h = h;
-        self.buf.clear();
-        self.buf.resize(w * h, 0);
-        let mut damage = Damage::new();
-        let mut canvas = Canvas::new(&mut self.buf, w, h, &mut damage);
-        // Fluor composites front to back: every label's letters first, then the marks, then all the halos under them, so no halo covers a neighbour's letters.
-        for l in laid {
-            for g in &l.glyphs {
-                let style = TextStyle::new(l.size, l.colour).weight(l.weight).shear(l.shear).rotation(g.angle);
-                let at = unturn(g.at, g.angle);
-                self.text.draw_text_center(&mut canvas, &g.ch.to_string(), at[0], at[1], &style, None, None);
-            }
-        }
-        for l in laid {
-            if let Some((p, summit)) = l.mark {
-                // A summit's triangle, point up; a dot for the small marks.
-                let (glyph, fill, scale) = if summit { ("\u{25B2}", self.colours[SUMMIT], 0.7) } else { ("\u{2022}", self.colours[MARK], 1.0) };
-                self.text.draw_text_center(&mut canvas, glyph, p[0], p[1], &TextStyle::new(l.size * scale, fill), None, None);
-            }
-        }
-        // The halos: each letter again in the paper's colour, a little around it (the route goes under them, after).
-        for l in laid {
-            let r = l.size * self.look[1];
-            if r < 0.25 {
-                continue;
-            }
-            for g in &l.glyphs {
-                let style = TextStyle::new(l.size, self.colours[HALO]).weight(l.weight).shear(l.shear).rotation(g.angle);
-                for k in 0..8 {
-                    let a = k as f32 * std::f32::consts::FRAC_PI_4;
-                    let at = unturn([g.at[0] + r * a.cos(), g.at[1] + r * a.sin()], g.angle);
-                    self.text.draw_text_center(&mut canvas, &g.ch.to_string(), at[0], at[1], &style, None, None);
-                }
-            }
-        }
-        // The route under everything lettered: its line, then its casing under that.
-        let width = (font * 0.32).max(3.0);
-        under_polyline(canvas.pixels, w, h, route, width, self.colours[ROUTE]);
-        under_polyline(canvas.pixels, w, h, route, width + (font * 0.14).max(1.5), self.colours[ROUTE_CASING]);
-    }
-
-    /// The lettering as premultiplied RGBA bytes for a GPU host.
-    pub fn rgba(&self) -> Vec<u8> {
-        let mut out = vec![0u8; self.buf.len() * 4];
-        for (i, &p) in self.buf.iter().enumerate() {
-            let (r, g, b, a) = crate::Panel::premul_pub(p);
-            out[4 * i] = r;
-            out[4 * i + 1] = g;
-            out[4 * i + 2] = b;
-            out[4 * i + 3] = a;
-        }
-        out
-    }
-
-    /// For a CPU frontend: the lettering over a visible 0xRRGGBB canvas, in place.
-    pub fn composite_rgb(&self, canvas: &mut [u32]) {
-        for (i, &p) in self.buf.iter().enumerate() {
-            if p >> 24 == 0 || i >= canvas.len() {
-                continue;
-            }
-            let (r, g, b, a) = crate::Panel::premul_pub(p);
-            let keep = 255 - a as u32;
-            let c = canvas[i];
-            let mix = |cv: u32, v: u8| (v as u32 + cv * keep / 255).min(255);
-            canvas[i] = (mix((c >> 16) & 255, r) << 16) | (mix((c >> 8) & 255, g) << 8) | mix(c & 255, b);
-        }
     }
 }
