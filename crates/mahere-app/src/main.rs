@@ -667,6 +667,17 @@ impl FluorApp for MahereApp {
 }
 
 fn main() {
+    // The program checks its own signature before anything else (after Photon's): a published build must carry the author's; `mahere verify` checks and says so, for an install script.
+    let verify_only = std::env::args().nth(1).as_deref() == Some("verify");
+    if let Err(e) = mahere_update::verify_self() {
+        eprintln!("Mahere's own signature failed: {e}");
+        eprintln!("The download was cut short or damaged, the disk is failing, or the program was changed. Download it again from https://holdmyoscilloscope.com/mahere");
+        std::process::exit(1);
+    }
+    if verify_only {
+        println!("OK");
+        return;
+    }
     let vault = mahere_store::open(None).ok();
     // A local bake (argv[1], or data/cells) serves directly; otherwise cells come from the bucket through the vault, like the phone.
     let local = std::env::args().nth(1).map(std::path::PathBuf::from).unwrap_or_else(|| "data/cells".into());

@@ -1,5 +1,6 @@
 //! The publish side of updates. Usage:
 //!   mahere-manifest hash <file>                       its BLAKE3 and size, for a script
+//!   mahere-manifest sign <file>                       a desktop binary signed in place (the author's signature over its BLAKE3, appended)
 //!   mahere-manifest write <channel> <out> [--merge <existing manifest>] --row <platform> <arch> <build> <name> <url> <b3 hex> <size> [--row ...]
 //!   mahere-manifest promote <dev manifest> <build> <out> [--merge <existing release manifest>]   every row of that build from dev into release
 //! A new row replaces the merged manifest's row for the same platform and architecture; the others are kept. Signed with the author's key ($MAHERE_SIGNING_KEY, else the key Photon's builds are signed with), and read back as the app reads it before anything is written.
@@ -51,6 +52,10 @@ fn main() {
             let b = std::fs::read(arg(1)).unwrap_or_else(|e| fail(&e.to_string()));
             println!("{} {}", mahere_update::hex(blake3::hash(&b).as_bytes()), b.len());
         }
+        Some("sign") => {
+            mahere_update::sign_binary(std::path::Path::new(&arg(1)), &key()).unwrap_or_else(|e| fail(&e));
+            println!("signed {}", arg(1));
+        }
         Some("write") => {
             let channel = Channel::parse(&arg(1)).unwrap_or_else(|| fail("channel is release or dev"));
             let mut rows = Vec::new();
@@ -80,6 +85,6 @@ fn main() {
                 println!("release {} {} {} build {}", r.platform, r.arch, r.name, r.build);
             }
         }
-        _ => fail("hash, write or promote"),
+        _ => fail("hash, sign, write or promote"),
     }
 }

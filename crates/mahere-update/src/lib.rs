@@ -170,9 +170,50 @@ pub fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
 }
 
-/// A desktop build swapped in for the running one: the verified file made executable and renamed over the program (Windows first moves the running one aside). Returns the program's path, for the caller to start again.
+/// A desktop binary's own signature checked, without running it (after Photon's): its last 64 bytes are the author's Ed25519 signature over the BLAKE3 of everything before them.
+pub fn verify_file(path: &Path) -> Result<(), String> {
+    use ed25519_dalek::Verifier;
+    let mut data = std::fs::read(path).map_err(|e| format!("read {}: {e}", path.display()))?;
+    if data.len() < 64 {
+        return Err("too small to carry a signature".into());
+    }
+    let sig = data.split_off(data.len() - 64);
+    if sig.iter().all(|&b| b == 0) {
+        return Err("not signed".into());
+    }
+    let sig = ed25519_dalek::Signature::from_bytes(sig.as_slice().try_into().map_err(|_| "bad signature")?);
+    let key = ed25519_dalek::VerifyingKey::from_bytes(&AUTHOR_PUBKEY).map_err(|e| format!("author key: {e}"))?;
+    key.verify(blake3::hash(&data).as_bytes(), &sig).map_err(|_| "the signature does not match: the file is damaged or was changed".to_string())
+}
+
+/// This program's own signature, checked as it starts. A local build (no build number stamped) carries none and is let through, so a build from source runs; a published build must be signed by the author.
+pub fn verify_self() -> Result<(), String> {
+    if our_build() == 0 {
+        return Ok(());
+    }
+    verify_file(&std::env::current_exe().map_err(|e| format!("where am I: {e}"))?)
+}
+
+/// Sign a desktop binary in place: the author's signature over its BLAKE3 appended (the publish tool's side).
+#[cfg(feature = "publish")]
+pub fn sign_binary(path: &Path, key: &[u8; 32]) -> Result<(), String> {
+    use ed25519_dalek::Signer;
+    let mut data = std::fs::read(path).map_err(|e| format!("read {}: {e}", path.display()))?;
+    let k = ed25519_dalek::SigningKey::from_bytes(key);
+    if k.verifying_key().to_bytes() != AUTHOR_PUBKEY {
+        return Err("that key is not the author's".into());
+    }
+    let sig = k.sign(blake3::hash(&data).as_bytes());
+    data.extend_from_slice(&sig.to_bytes());
+    std::fs::write(path, &data).map_err(|e| format!("write: {e}"))?;
+    verify_file(path)
+}
+
+/// A desktop build swapped in for the running one: the verified file (its signature checked again) made executable and renamed over the program (Windows first moves the running one aside). Returns the program's path, for the caller to start again.
 #[cfg(not(target_os = "android"))]
 pub fn install_desktop(staged: &Path) -> Result<PathBuf, String> {
+    // Its own signature as well as the manifest's hash: nothing is swapped in that the author did not sign.
+    verify_file(staged)?;
     let exe = std::env::current_exe().map_err(|e| format!("where am I: {e}"))?;
     // After an earlier swap the running image's path reads "... (deleted)".
     let exe = PathBuf::from(exe.to_string_lossy().trim_end_matches(" (deleted)"));
@@ -399,5 +440,28 @@ impl Updater {
     /// A downloaded, verified build for the host to install, once.
     pub fn take_ready(&mut self) -> Option<PathBuf> {
         self.ready.take()
+    }
+}
+
+#[cfg(all(test, feature = "publish"))]
+mod binary_tests {
+    use super::*;
+
+    #[test]
+    fn a_signed_binary_verifies_and_a_changed_one_does_not() {
+        let Ok(k) = std::fs::read("/mnt/Harbor/Code/keys/photon-signing-key") else { return };
+        let key: [u8; 32] = k.try_into().unwrap();
+        let dir = std::env::temp_dir().join(format!("mahere-sign-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("bin");
+        std::fs::write(&f, b"a program's bytes").unwrap();
+        assert!(verify_file(&f).is_err(), "an unsigned file passed");
+        sign_binary(&f, &key).unwrap();
+        assert!(verify_file(&f).is_ok());
+        let mut b = std::fs::read(&f).unwrap();
+        b[0] ^= 1;
+        std::fs::write(&f, &b).unwrap();
+        assert!(verify_file(&f).is_err(), "a changed file passed");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
