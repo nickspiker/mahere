@@ -287,6 +287,42 @@ fn along(path: &[[f32; 2]], len: &[f32], s: f32) -> ([f32; 2], f32) {
     ([a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t], (b[1] - a[1]).atan2(b[0] - a[0]))
 }
 
+/// A letter on a curve between two arc lengths (the second before the first runs it backwards, top up the other way): centred on the curve halfway, turned along the chord from where it starts to where it ends, as maps letter a bend, so the letters neither crowd on the inside nor splay on the outside.
+fn letter(path: &[[f32; 2]], len: &[f32], ch: char, from: f32, to: f32) -> Glyph {
+    let (a, _) = along(path, len, from);
+    let (b, _) = along(path, len, to);
+    let (mid, _) = along(path, len, (from + to) / 2.0);
+    Glyph { ch, at: mid, angle: (b[1] - a[1]).atan2(b[0] - a[0]) }
+}
+
+/// A polyline resampled every `step` pixels along its length and smoothed by a Gaussian of `sigma` pixels, its ends held: a smooth curve through a line's texels at the scale a label reads it.
+fn smooth(path: &[[f32; 2]], step: f32, sigma: f32) -> Vec<[f32; 2]> {
+    let len = lengths(path);
+    let total = *len.last().unwrap_or(&0.0);
+    if path.len() < 3 || total < step * 3.0 {
+        return path.to_vec();
+    }
+    let n = (total / step).ceil() as usize + 1;
+    let even: Vec<[f32; 2]> = (0..n).map(|k| along(path, &len, (k as f32 * step).min(total)).0).collect();
+    let r = ((sigma / step) * 2.5).ceil() as i64;
+    let weights: Vec<f32> = (-r..=r).map(|k| (-0.5 * (k as f32 * step / sigma).powi(2)).exp()).collect();
+    (0..n)
+        .map(|i| {
+            // Near an end the window is cut to what is there on both sides, so the end stays where it is.
+            let reach = r.min(i as i64).min((n - 1 - i) as i64);
+            let (mut x, mut y, mut wsum) = (0.0, 0.0, 0.0);
+            for k in -reach..=reach {
+                let w = weights[(k + r) as usize];
+                let p = even[(i as i64 + k) as usize];
+                x += p[0] * w;
+                y += p[1] * w;
+                wsum += w;
+            }
+            [x / wsum, y / wsum]
+        })
+        .collect()
+}
+
 /// The smallest turn between two directions, radians.
 fn turn(a: f32, b: f32) -> f32 {
     let d = (b - a).rem_euclid(std::f32::consts::TAU);
@@ -682,6 +718,8 @@ impl Labeller {
         let mut out = Vec::new();
         let repeat = (self.w.max(self.h) as f32 / 3.0).max(width * 2.0);
         for path in centrelines(pts, bin).into_iter().take(4) {
+            // The curve fit at the label's own scale: wiggles under half a letter cannot twist the name.
+            let path = smooth(&path, 2.0, size * 0.5);
             let len = lengths(&path);
             let total = *len.last().unwrap_or(&0.0);
             if total < width * 1.15 + size {
@@ -707,13 +745,13 @@ impl Labeller {
                 let mut bends = 0.0;
                 let mut worst = 0.0f32;
                 for &(ch, a) in &advances {
-                    let (p, dir) = along(&path, &len, at + a / 2.0);
+                    let g = letter(&path, &len, ch, at, at + a);
                     if let Some(last) = glyphs.last() {
-                        let t = turn(last.angle, dir);
+                        let t = turn(last.angle, g.angle);
                         bends += t;
                         worst = worst.max(t);
                     }
-                    glyphs.push(Glyph { ch, at: p, angle: dir });
+                    glyphs.push(g);
                     at += a;
                 }
                 if worst > 0.45 || bends > 1.0 {
@@ -727,8 +765,7 @@ impl Labeller {
                     let mut at = s + width;
                     glyphs.clear();
                     for &(ch, a) in &advances {
-                        let (p, dir) = along(&path, &len, at - a / 2.0);
-                        glyphs.push(Glyph { ch, at: p, angle: dir + std::f32::consts::PI });
+                        glyphs.push(letter(&path, &len, ch, at, at - a));
                         at -= a;
                     }
                 }
