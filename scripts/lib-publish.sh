@@ -17,7 +17,8 @@ MANIFEST=target/release/mahere-manifest
 
 # put <local file> <bucket path> <content type> [cache control]: a fixed name (mahere.apk, the manifests) goes up no-cache, or Cloudflare's edge keeps handing out the old file for hours (it caches .apk by default: build 178 was served after 183 was up, 2026-10-13); a build under its own number never changes and may be cached.
 put() {
-    timeout 900 wrangler r2 object put "$BUCKET/$2" --file "$1" --content-type "$3" --cache-control "${4:-public, max-age=31536000, immutable}" --remote > /dev/null
+    # rclone, which retries: wrangler's single fetch failed outright with the uplink full of cell uploads (build 191, 2026-10-13).
+    rclone copyto "$1" "r2:$BUCKET/$2" --retries 10 --low-level-retries 20 --s3-no-check-bucket --header-upload "Content-Type: $3" --header-upload "Cache-Control: ${4:-public, max-age=31536000, immutable}"
 }
 
 # publish_dev_row <file> <platform> <arch> <bucket path>: the build uploaded under its own name, then the dev manifest fetched, this platform's row replaced, signed and uploaded last.
