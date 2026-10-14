@@ -1938,7 +1938,10 @@ fn write_file(path: &Path, bytes: &[u8]) -> Result<(), String> {
     }
     // Whole-file zstd: VSF internals untouched, the bucket keeps the .vsf.zst names, and empty planes shrink to nothing.
     let z = zstd::encode_all(bytes, 3).map_err(|e| e.to_string())?;
-    std::fs::write(path, z).map_err(|e| format!("{}: {e}", path.display()))
+    // Written whole beside it and renamed over it: a crash mid-write (the machine went down mid-bake, 2026-10-13) leaves the old cell or the new one, never half of one.
+    let part = path.with_extension(format!("part{}", std::process::id()));
+    std::fs::write(&part, z).map_err(|e| format!("{}: {e}", part.display()))?;
+    std::fs::rename(&part, path).map_err(|e| format!("{}: {e}", path.display()))
 }
 
 /// Decode a cell from raw file bytes (zstd or plain VSF) — the loader thread's entry point; no filesystem coupling. Width-agnostic reads.
