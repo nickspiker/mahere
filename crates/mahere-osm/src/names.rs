@@ -24,8 +24,11 @@ impl Named {
         (AREA..POINT).contains(&self.kind)
     }
 
-    /// What a reader calls it: the name, the ref where there is no name, both where both say something.
+    /// What a reader calls it: the name, the ref where there is no name, both where both say something; a point by its name alone (a summit's ref is a survey number).
     pub fn label(&self) -> String {
+        if self.is_point() && !self.name.is_empty() {
+            return self.name.clone();
+        }
         match (self.name.is_empty(), self.reference.is_empty()) {
             (false, true) => self.name.clone(),
             (true, false) => self.reference.clone(),
@@ -211,5 +214,7 @@ mod tests {
         assert_eq!(n("", "US 93"), "US 93");
         assert_eq!(n("Icicle Creek Trail", "1551"), "Icicle Creek Trail (1551)");
         assert_eq!(n("US Highway 93", "93"), "US Highway 93");
+        let peak = Named { kind: POINT + PointKind::Volcano as u8, rank: 0, name: "Mauna Kea".into(), reference: "332030".into() };
+        assert_eq!(peak.label(), "Mauna Kea");
     }
 }

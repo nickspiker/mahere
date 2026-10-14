@@ -28,10 +28,11 @@ fn main() {
     println!("  here  line: {}, area: {}", n.line_at(i).map_or("-".into(), |e| e.label()), n.area_at(i).map_or("-".into(), |e| e.label()));
     let mut list: Vec<&mahere_tiles::Named> = n.entries.iter().collect();
     list.sort_by_key(|e| (!e.is_point(), e.kind, std::cmp::Reverse(e.rank)));
-    for e in list.iter().take(40) {
+    let shown: usize = std::env::var("CELL_INFO_ALL").map_or(40, |_| usize::MAX);
+    for e in list.iter().take(shown) {
         println!("    kind {:3} rank {:>9}  {}", e.kind, e.rank, e.label());
     }
-    if list.len() > 40 {
-        println!("    ... {} more", list.len() - 40);
+    if list.len() > shown {
+        println!("    ... {} more", list.len() - shown);
     }
 }

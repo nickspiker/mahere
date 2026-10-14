@@ -5,6 +5,7 @@
 //! `--top` builds the depths above the regions from the region cells already written, once every region is done.
 //!
 //! Bathymetry: `--bathy <dir of GEBCO GeoTIFFs>` (see `bathymetry`).
+//! Names: `--osm <dir> --names` runs the region pass again with names (roads, rail, power and boundaries by their names and refs, the named places, summits and passes as points, the named lakes' names over the WorldCover water), finished regions in `<out>/.global-names-done`; `--osm <dir> --top` then carries lines and names above the regions, a point outranking a line and a higher-ranked point a lower one, so the coarsest levels keep the greatest summits and cities.
 //! Imagery: `--img <tile dir> --img-index <tile list>` bakes the imagery layer instead, into the same cells (their terrain carried over untouched), from one-degree four-band tiles (the ESA WorldCover Sentinel-2 composite's 37 m level, pulled by `cog-level`): every texel box-filtered from sixteen samples, regions over open sea skipped, finished regions in `<out>/.global-img-done`; with `--top` it builds the imagery above the regions. `--img-loss` sets the codec's loss (default 16 levels).
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
@@ -95,7 +96,7 @@ fn main() {
         if args.iter().any(|a| a == "--top") {
             top_vectors(&out, region_depth);
         } else {
-            osm_lines(&out, &dir, depth, region_depth, bbox_arg(&args));
+            osm_lines(&out, &dir, depth, region_depth, bbox_arg(&args), args.iter().any(|a| a == "--names"));
         }
         return;
     }
@@ -600,6 +601,26 @@ fn write_lines(out: &Path, roads: &[mahere_osm::Road], depth: u8, region_depth: 
     n
 }
 
+/// Lines and their names, the named points, and the named lakes' names, written over the cells (lines merged as [`write_lines`] does; the land and water planes left as they are).
+fn write_named(out: &Path, roads: &[mahere_osm::Road], points: &[mahere_osm::names::Point], lakes: &[mahere_osm::Area], names: &[mahere_tiles::Named], depth: u8, region_depth: u8) -> usize {
+    let (lines, mut ids) = mahere_tiles::bake_lines_named(roads, points, names, depth, region_depth);
+    let (_, _, lake_ids) = mahere_tiles::bake_areas_named(lakes, names, depth, region_depth);
+    for (k, a) in lake_ids {
+        ids.entry(k).or_default().area = a.area;
+    }
+    let mut cells: HashMap<CellKey, Cell> = HashMap::new();
+    for (k, l) in lines {
+        cells.entry(k).or_default().line = Some(l);
+    }
+    for (k, i) in &ids {
+        cells.entry(*k).or_default().names = Some(mahere_tiles::NameCell::from_ids(i, names));
+    }
+    let n = cells.len();
+    use rayon::prelude::*;
+    cells.into_par_iter().for_each(|(k, c)| mahere_tiles::write_cell(out, k, &c, &Loss { dem_m: 0.0, img: 0 }).expect("write cell"));
+    n
+}
+
 /// The rivers: every HydroRIVERS reach with a discharge of a hundredth of a cubic metre a second or more, bucketed into the regions its points' one-degree squares belong to, baked per region.
 fn rivers(out: &Path, shp: &str, depth: u8, region_depth: u8, bbox: Option<Vec<f64>>) {
     let t = std::time::Instant::now();
@@ -649,9 +670,9 @@ fn rivers(out: &Path, shp: &str, depth: u8, region_depth: u8, bbox: Option<Vec<f
     eprintln!("rivers: {baked} regions baked");
 }
 
-/// Every line but the waterways (those are HydroRIVERS') from a region's OSM extract, `<dir>/<diamond>-<cu>-<cv>.osm.pbf`.
-fn osm_lines(out: &Path, dir: &str, depth: u8, region_depth: u8, bbox: Option<Vec<f64>>) {
-    let done_path = out.join(".global-osm-done");
+/// Every line but the waterways (those are HydroRIVERS') from a region's OSM extract, `<dir>/<diamond>-<cu>-<cv>.osm.pbf`; with `named` their names too, the region's named points, and its named lakes' names (the water itself is WorldCover's).
+fn osm_lines(out: &Path, dir: &str, depth: u8, region_depth: u8, bbox: Option<Vec<f64>>, named: bool) {
+    let done_path = out.join(if named { ".global-names-done" } else { ".global-osm-done" });
     let done = done_list(&done_path);
     let mut done_file = std::fs::OpenOptions::new().create(true).append(true).open(&done_path).unwrap();
     let (mut baked, mut missing) = (0, 0);
@@ -669,7 +690,14 @@ fn osm_lines(out: &Path, dir: &str, depth: u8, region_depth: u8, bbox: Option<Ve
         // At a hundred metres a texel the fine classes (streets, service roads, tracks, paths) are noise, and the waterways are HydroRIVERS': the roads that carry a map at this scale, rail, power and the boundaries.
         use mahere_osm::RoadClass as C;
         let roads: Vec<mahere_osm::Road> = feats.roads.into_iter().filter(|r| !matches!(r.class, C::Residential | C::Service | C::Track | C::Path | C::Waterway)).collect();
-        let n = if roads.is_empty() { 0 } else { write_lines(out, &roads, depth, region_depth) };
+        let n = if named {
+            let lakes: Vec<mahere_osm::Area> = feats.areas.into_iter().filter(|a| a.name != 0 && a.class == mahere_osm::AreaClass::Water).collect();
+            write_named(out, &roads, &feats.points, &lakes, &feats.names, depth, region_depth)
+        } else if roads.is_empty() {
+            0
+        } else {
+            write_lines(out, &roads, depth, region_depth)
+        };
         baked += 1;
         eprintln!("osm region {baked} {diamond}/{cu}/{cv}: {} lines, {n} cells, {:.1}s", roads.len(), t.elapsed().as_secs_f32());
         writeln!(done_file, "{} {}", region.depth, region.prefix).unwrap();
@@ -682,9 +710,25 @@ fn top_vectors(out: &Path, region_depth: u8) {
     let mut line: HashMap<CellKey, mahere_tiles::ClassCell> = HashMap::new();
     let mut land: HashMap<CellKey, mahere_tiles::ClassCell> = HashMap::new();
     let mut water: HashMap<CellKey, mahere_tiles::CovCell> = HashMap::new();
+    // The region cells' names in one table, each cell's planes pointing into it.
+    let mut table: Vec<mahere_tiles::Named> = vec![mahere_tiles::Named::default()];
+    let mut index: HashMap<mahere_tiles::Named, u32> = HashMap::new();
+    let mut ids: HashMap<CellKey, mahere_tiles::IdCell> = HashMap::new();
     for (_, _, _, k) in regions(region_depth) {
         let Ok(bytes) = std::fs::read(out.join(k.path())) else { continue };
         if let Ok(p) = mahere_tiles::decode_cell(&bytes) {
+            if let Some(n) = &p.names {
+                let global: Vec<u32> = std::iter::once(0)
+                    .chain(n.entries.iter().map(|e| {
+                        *index.entry(e.clone()).or_insert_with(|| {
+                            table.push(e.clone());
+                            table.len() as u32 - 1
+                        })
+                    }))
+                    .collect();
+                let plane = |p: &[u16]| -> Vec<u32> { p.iter().map(|&i| global[i as usize]).collect() };
+                ids.insert(k, mahere_tiles::IdCell { line: plane(&n.line), area: plane(&n.area) });
+            }
             if let Some(l) = p.line {
                 line.insert(k, l);
             }
@@ -700,7 +744,12 @@ fn top_vectors(out: &Path, region_depth: u8) {
     let line = mahere_tiles::pyramid_class(line, region_depth, 0, mahere_tiles::ClassMerge::Major);
     let land = mahere_tiles::pyramid_class(land, region_depth, 0, mahere_tiles::ClassMerge::Dominant);
     let water = mahere_tiles::pyramid_cov(water, region_depth, 0);
+    eprintln!("{} names in {} named region cells", table.len() - 1, ids.len());
+    let ids = mahere_tiles::names::pyramid_ids(ids, &line, &table, region_depth, 0);
     let mut cells: HashMap<CellKey, Cell> = HashMap::new();
+    for (k, i) in ids.iter().filter(|(k, _)| k.depth < region_depth) {
+        cells.entry(*k).or_default().names = Some(mahere_tiles::NameCell::from_ids(i, &table));
+    }
     for (k, l) in line.into_iter().filter(|(k, _)| k.depth < region_depth) {
         cells.entry(k).or_default().line = Some(l);
     }
