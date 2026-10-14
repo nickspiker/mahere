@@ -446,6 +446,8 @@ pub struct Cell {
     pub names: Option<NameCell>,
     /// The ways a route can follow through the cell.
     pub route: Option<route::RouteCell>,
+    /// The geoid's height above the WGS84 ellipsoid per texel, centimetres (EGM2008; Nick 2026-10-13: GPS heights to sea level, and the Earth's gravity to look at). Baked at depth 2, means above.
+    pub geoid: Option<Vec<i16>>,
 }
 
 // ==================== LINE LAYER ====================
@@ -1411,6 +1413,7 @@ pub struct CellPlanes {
     pub mvum: Option<ClassCell>,
     pub names: Option<NameCell>,
     pub route: Option<route::RouteCell>,
+    pub geoid: Option<Vec<i16>>,
 }
 
 /// Decoded dem: elevation (NaN = no data) and the apron, memory order.
@@ -1682,6 +1685,7 @@ impl Cell {
             mvum: self.mvum.clone(),
             names: self.names.clone(),
             route: self.route.clone(),
+            geoid: self.geoid.clone(),
         }
     }
 }
@@ -1690,7 +1694,11 @@ impl CellPlanes {
     /// Overlay `self` (a new bake) onto `old`. A bake's footprint is where it has elevation: inside it the new vector planes win, outside the old ones stay; without a dem the new planes replace wholesale.
     pub fn merge_over(self, old: CellPlanes) -> CellPlanes {
         let mut out = self;
-        let CellPlanes { dem: old_dem, line: old_line, land: old_land, water: old_water, img: old_img, own: old_own, mvum: old_mvum, names: old_names, route: old_route } = old;
+        let CellPlanes { dem: old_dem, line: old_line, land: old_land, water: old_water, img: old_img, own: old_own, mvum: old_mvum, names: old_names, route: old_route, geoid: old_geoid } = old;
+        // The geoid comes from its own pass: the new where it has one, else the old.
+        if out.geoid.is_none() {
+            out.geoid = old_geoid;
+        }
         // A bake's routing is whole for its cells: it replaces the old, or the old stays when this bake has none.
         if out.route.is_none() {
             out.route = old_route;
@@ -1872,6 +1880,9 @@ impl CellPlanes {
         if let Some(s) = self.route.as_ref().and_then(route::RouteCell::section) {
             b = b.add_section_direct(s);
         }
+        if let Some(g) = &self.geoid {
+            b = b.add_section("geoid", vec![("cm".to_string(), VsfType::t_i4(Tensor::new(vec![2, TEX * TEX], mem_to_disk(g))))]);
+        }
         b.build().map_err(|e| format!("cell build: {e:?}"))
     }
 }
@@ -1984,6 +1995,7 @@ pub fn decode_cell(data: &[u8]) -> Result<CellPlanes, String> {
             }
             "name" => out.names = NameCell::decode(&fields),
             "route" => out.route = route::RouteCell::decode(&fields),
+            "geoid" => out.geoid = decode_geoid(&fields),
             _ => {}
         }
     }
@@ -2012,6 +2024,20 @@ fn section_alone(data: &[u8], name: &str) -> Option<HashMap<String, Vec<VsfType>
 /// Only a cell's names, from raw file bytes: what labels read for every cell in view, its terrain and imagery never parsed.
 pub fn decode_names(data: &[u8]) -> Option<NameCell> {
     NameCell::decode(&section_alone(data, "name")?)
+}
+
+fn decode_geoid(fields: &HashMap<String, Vec<VsfType>>) -> Option<Vec<i16>> {
+    let disk = match fields.get("cm")?.first()? {
+        VsfType::t_i4(t) => t.data.clone(),
+        VsfType::v_i4(t) => t.data.clone(),
+        _ => return None,
+    };
+    (disk.len() == TRI).then(|| disk_to_mem(&disk))
+}
+
+/// Only a cell's geoid, centimetres per texel, from raw file bytes.
+pub fn decode_geoid_only(data: &[u8]) -> Option<Vec<i16>> {
+    decode_geoid(&section_alone(data, "geoid")?)
 }
 
 /// Only a cell's routing, from raw file bytes: what a route search reads for every cell it passes through, its terrain and imagery never parsed.

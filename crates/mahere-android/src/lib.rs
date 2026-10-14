@@ -1038,9 +1038,11 @@ pub extern "system" fn Java_nz_mahere_app_MahereActivity_nativeOnLocation(
     lat: jdouble,
     lon: jdouble,
     accuracy: jfloat,
+    height: jdouble,
+    v_accuracy: jfloat,
 ) {
     if ptr != 0 {
-        shell(ptr).app().on_gps(GpsFix { lat, lon, accuracy_m: accuracy });
+        shell(ptr).app().on_gps(GpsFix { lat, lon, accuracy_m: accuracy, height_m: height.is_finite().then_some(height as f32), v_accuracy_m: v_accuracy.is_finite().then_some(v_accuracy) });
     }
 }
 
@@ -1227,6 +1229,6 @@ pub extern "system" fn Java_nz_mahere_app_MahereTrackService_nativeOnTrackFixes<
         }
     }
     if n > 0 {
-        app.on_gps(GpsFix { lat: la[n - 1], lon: lo[n - 1], accuracy_m: ac[n - 1] });
+        app.on_gps(GpsFix { lat: la[n - 1], lon: lo[n - 1], accuracy_m: ac[n - 1], height_m: ht[n - 1].is_finite().then_some(ht[n - 1] as f32), v_accuracy_m: va[n - 1].is_finite().then_some(va[n - 1]) });
     }
 }

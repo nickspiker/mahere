@@ -226,6 +226,9 @@ pub struct GpsFix {
     pub lat: f64,
     pub lon: f64,
     pub accuracy_m: f32,
+    /// Height above the WGS84 ellipsoid, as the receiver gives it, and its vertical accuracy; None where it gave none.
+    pub height_m: Option<f32>,
+    pub v_accuracy_m: Option<f32>,
 }
 
 /// The map: all state and rendering, no host. Frontends call the input methods, drive `tick` until `converged`, and blit `canvas` (0xRRGGBB, row-major) after `render`.
@@ -317,6 +320,8 @@ pub struct MapCore {
     tap_info: Vec<String>,
     /// Cells' names as labels last read them; None for a resident cell with none.
     names_cache: rustc_hash::FxHashMap<mahere_tiles::CellKey, Option<std::sync::Arc<mahere_tiles::NameCell>>>,
+    /// The geoid of the depth-2 cell last looked in, centimetres per texel (one cell covers a few hundred kilometres).
+    geoid_cell: Option<(mahere_tiles::CellKey, Arc<Vec<i16>>)>,
     /// Cells replaced by a newer copy since a label worker last asked, for it to forget their names.
     names_reloaded: Vec<mahere_tiles::CellKey>,
     /// Navigation (Nick 2026-10-13): how a tap routes there, if it does; the route found and its version; the search running.
@@ -399,6 +404,7 @@ impl MapCore {
             tap_info: Vec::new(),
             names_cache: Default::default(),
             names_reloaded: Vec::new(),
+            geoid_cell: None,
             travel: None,
             route: None,
             route_version: 0,
@@ -721,6 +727,30 @@ impl MapCore {
     }
 
     /// A fix redraws only when the pin is on screen and has moved by a pixel (Nick 2026-10-06): a phone sitting still gets no frame per second from its GPS.
+    /// The geoid's height above the WGS84 ellipsoid at a place, metres (EGM2008, baked into the planet's depth-2 cells): from the device alone, never the network.
+    pub fn geoid_at(&mut self, lat: f64, lon: f64) -> Option<f32> {
+        const DEPTH: u8 = 2;
+        let c = Coord::from_lat_lon(lat, lon);
+        let key = mahere_tiles::CellKey { depth: DEPTH, prefix: c.raw() >> (60 - 2 * DEPTH as u32) };
+        if self.geoid_cell.as_ref().is_none_or(|(k, _)| *k != key) {
+            let plane = match self.res.store().get_local(key) {
+                residency::Fetch::Bytes(b) => mahere_tiles::decode_geoid_only(&b)?,
+                _ => return None,
+            };
+            self.geoid_cell = Some((key, Arc::new(plane)));
+        }
+        let (iu, iv) = c.uv();
+        let i = raster::tri_index((iu as i64) << 16, (iv as i64) << 16, 16 + (22 - DEPTH as u32));
+        self.geoid_cell.as_ref().and_then(|(_, p)| p.get(i)).map(|&cm| cm as f32 / 100.0)
+    }
+
+    /// The fix's height above sea level, the receiver's height less the geoid, with its vertical accuracy (Nick 2026-10-13: the GPS readout above sea level).
+    pub fn gps_sea_level(&mut self) -> Option<(f32, Option<f32>)> {
+        let g = self.gps?;
+        let h = g.height_m?;
+        Some((h - self.geoid_at(g.lat, g.lon)?, g.v_accuracy_m))
+    }
+
     pub fn set_gps(&mut self, fix: GpsFix) {
         self.gps = Some(fix);
         let (w, h) = (self.canvas_w, self.canvas_h);

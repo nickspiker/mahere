@@ -231,7 +231,7 @@ impl GpuHost {
             if heading > 180.0 {
                 heading -= 360.0;
             }
-            let readouts = Readouts { lat: c.lat(), lon: c.lon(), elev: map.elevation_at(c.lat(), c.lon()), heading_deg: heading, m_per_px: 111_320.0 / c.ppd, frame_ms: map.last_frame_ms, resident: map.pool().map.len(), phone_heading: map.have_rotation.then(|| map.true_heading()), cache_used: cache.0, cache_max: cache.1 };
+            let readouts = Readouts { lat: c.lat(), lon: c.lon(), gps_height: map.gps_sea_level(), elev: map.elevation_at(c.lat(), c.lon()), heading_deg: heading, m_per_px: 111_320.0 / c.ppd, frame_ms: map.last_frame_ms, resident: map.pool().map.len(), phone_heading: map.have_rotation.then(|| map.true_heading()), cache_used: cache.0, cache_max: cache.1 };
             let measure = map.measure_view(w as usize, h as usize, Panel::strip_samples(w as usize));
             let orb = |n: usize| map.orb(n);
             panel.paint(w as usize, h as usize, mask, ctl, &readouts, measure.as_ref(), &map.themes, areas, Some(&orb));

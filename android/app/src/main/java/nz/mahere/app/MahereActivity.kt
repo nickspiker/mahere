@@ -56,7 +56,7 @@ class MahereActivity : Activity(), SurfaceHolder.Callback, Choreographer.FrameCa
         tool: Int, pressure: Float,
     ): Int
     private external fun nativePenOut(ptr: Long, out: Boolean)
-    private external fun nativeOnLocation(ptr: Long, lat: Double, lon: Double, accuracy: Float)
+    private external fun nativeOnLocation(ptr: Long, lat: Double, lon: Double, accuracy: Float, height: Double, vAccuracy: Float)
     private external fun nativeGoTo(ptr: Long, lat: Double, lon: Double, ppd: Double)
     private external fun nativeOpenArea(ptr: Long, bytes: ByteArray)
     private external fun nativeBack(ptr: Long): Boolean
@@ -452,7 +452,7 @@ class MahereActivity : Activity(), SurfaceHolder.Callback, Choreographer.FrameCa
 
     private val locationListener = LocationListener { loc: Location ->
         if (nativePtr != 0L) {
-            nativeOnLocation(nativePtr, loc.latitude, loc.longitude, loc.accuracy)
+            nativeOnLocation(nativePtr, loc.latitude, loc.longitude, loc.accuracy, if (loc.hasAltitude()) loc.altitude else Double.NaN, if (loc.hasVerticalAccuracy()) loc.verticalAccuracyMeters else Float.NaN)
             // The sensor's north is magnetic; the engine needs the local declination to light by the true sun.
             val field = GeomagneticField(loc.latitude.toFloat(), loc.longitude.toFloat(), loc.altitude.toFloat(), System.currentTimeMillis())
             nativeOnDeclination(nativePtr, field.declination)

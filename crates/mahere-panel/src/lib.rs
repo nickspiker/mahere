@@ -53,6 +53,8 @@ pub struct Readouts {
     pub lat: f64,
     pub lon: f64,
     pub elev: Option<f32>,
+    /// The GPS's own height above sea level (its height less the geoid) and its vertical accuracy, when there is a fix with a height.
+    pub gps_height: Option<(f32, Option<f32>)>,
     /// Degrees the screen's up is turned from true north, clockwise positive, -180..180.
     pub heading_deg: f64,
     pub m_per_px: f64,
@@ -1027,9 +1029,13 @@ impl Panel {
         let mut y = self.slider.1 + font * 1.4;
         let small = TextStyle::new(font * 0.82, READOUT);
         let dim = TextStyle::new(font * 0.72, READOUT_DIM);
-        let rows: [(&str, String); 6] = [
+        let rows: [(&str, String); 7] = [
             ("position", format!("{:.5}  {:.5}", r.lat, r.lon)),
             ("elevation", r.elev.map_or("\u{2014}".into(), |e| format!("{} m", e.round() as i64))),
+            ("GPS height", r.gps_height.map_or("\u{2014}".into(), |(h, v)| match v {
+                Some(v) => format!("{} m  \u{b1}{}", h.round() as i64, v.round() as i64),
+                None => format!("{} m", h.round() as i64),
+            })),
             ("heading", format!("{:+}\u{b0}", r.heading_deg.round() as i64)),
             ("phone", r.phone_heading.map_or("\u{2014}".into(), |h| format!("{}\u{b0}", h.round() as i64))),
             ("scale", format!("{:.2} m/px", r.m_per_px)),

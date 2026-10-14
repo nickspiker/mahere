@@ -599,7 +599,7 @@ impl FluorApp for MahereApp {
             heading -= 360.0;
         }
         let used = self.cells.as_ref().map_or(0, |c| c.cached_bytes());
-        let readouts = Readouts { lat: c.lat(), lon: c.lon(), elev: self.map.elevation_at(c.lat(), c.lon()), heading_deg: heading, m_per_px: 111_320.0 / c.ppd, frame_ms: self.map.last_frame_ms, resident: self.map.pool().map.len(), phone_heading: None, cache_used: used, cache_max: used + (8u64 << 30) };
+        let readouts = Readouts { lat: c.lat(), lon: c.lon(), gps_height: self.map.gps_sea_level(), elev: self.map.elevation_at(c.lat(), c.lon()), heading_deg: heading, m_per_px: 111_320.0 / c.ppd, frame_ms: self.map.last_frame_ms, resident: self.map.pool().map.len(), phone_heading: None, cache_used: used, cache_max: used + (8u64 << 30) };
         let measure = self.map.measure_view(w, h, Panel::strip_samples(w));
         let themes = self.map.themes.clone();
         self.panel.set_ru(ctx.viewport.ru);

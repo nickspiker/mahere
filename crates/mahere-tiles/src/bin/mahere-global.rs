@@ -6,6 +6,7 @@
 //!
 //! Bathymetry: `--bathy <dir of GEBCO GeoTIFFs>` (see `bathymetry`).
 //! Names: `--osm <dir> --names` runs the region pass again with names (roads, rail, power and boundaries by their names and refs, the named places, summits and passes as points, the named lakes' names over the WorldCover water), finished regions in `<out>/.global-names-done`; `--osm <dir> --top` then carries lines and names above the regions, a point outranking a line and a higher-ranked point a lower one, so the coarsest levels keep the greatest summits and cities.
+//! Geoid: `--geoid <EGM2008 GeoTIFF>` bakes the geoid's height above the ellipsoid (centimetres) into every depth-2 cell, sampled at each texel's centre, with means up to depth 0 (Nick 2026-10-13).
 //! Imagery: `--img <tile dir> --img-index <tile list>` bakes the imagery layer instead, into the same cells (their terrain carried over untouched), from one-degree four-band tiles (the ESA WorldCover Sentinel-2 composite's 37 m level, pulled by `cog-level`): every texel box-filtered from sixteen samples, regions over open sea skipped, finished regions in `<out>/.global-img-done`; with `--top` it builds the imagery above the regions. `--img-loss` sets the codec's loss (default 16 levels).
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
@@ -86,6 +87,10 @@ fn main() {
         } else {
             land_cover(&out, &dir, &arg(&args, "--land-index").expect("--land-index"), depth, region_depth, bbox_arg(&args));
         }
+        return;
+    }
+    if let Some(tif) = arg(&args, "--geoid") {
+        geoid(&out, &tif);
         return;
     }
     if let Some(shp) = arg(&args, "--rivers") {
@@ -763,4 +768,68 @@ fn top_vectors(out: &Path, region_depth: u8) {
     for (k, c) in cells {
         mahere_tiles::write_cell(out, k, &c, &Loss { dem_m: 0.0, img: 0 }).expect("write cell");
     }
+}
+
+/// The geoid (EGM2008's 2.5' grid, about 4.6 km) into the planet's cells: depth 2's trixels are 6.9 km on an edge, the source about half that, as Nick's rule asks; each texel the grid's value at its centre, centimetres, and each level above the mean of its four children.
+fn geoid(out: &Path, tif: &str) {
+    use rayon::prelude::*;
+    let store = mahere_dem::DemStore::load(&[tif.to_string()]).expect("geoid grid");
+    let depth = 2u8;
+    let mut keys = Vec::new();
+    for d in 0..10u8 {
+        for cu in 0..(1u64 << depth) {
+            for cv in 0..(1u64 << depth) {
+                keys.push(CellKey::from_grid(d, depth, cu, cv));
+            }
+        }
+    }
+    let mut level: HashMap<CellKey, Vec<f32>> = keys
+        .par_iter()
+        .map(|&k| {
+            let v: Vec<f32> = (0..mahere_tiles::TRI)
+                .map(|i| {
+                    let (lat, lon) = k.texel_lat_lon(i);
+                    store.elevation(lat, lon).unwrap_or(0.0)
+                })
+                .collect();
+            (k, v)
+        })
+        .collect();
+    let mut all: Vec<(CellKey, Vec<f32>)> = level.iter().map(|(k, v)| (*k, v.clone())).collect();
+    for d in (0..depth).rev() {
+        let mut parents: Vec<CellKey> = level.keys().map(|k| k.parent()).collect();
+        parents.sort();
+        parents.dedup();
+        let next: HashMap<CellKey, Vec<f32>> = parents
+            .par_iter()
+            .map(|&p| {
+                let kids: [Option<&Vec<f32>>; 4] = std::array::from_fn(|q| level.get(&p.child(q as u64)));
+                let mut v = vec![0.0f32; mahere_tiles::TRI];
+                for ty in 0..mahere_tiles::TEX {
+                    for tx in 0..mahere_tiles::TEX {
+                        for half in 0..2 {
+                            let (mut sum, mut n) = (0.0f32, 0);
+                            for (q, i) in mahere_tiles::child_cell_texels(tx, ty, half) {
+                                if let Some(k) = kids[q as usize] {
+                                    sum += k[i];
+                                    n += 1;
+                                }
+                            }
+                            v[mahere_tiles::tri_idx(tx, ty, half)] = if n > 0 { sum / n as f32 } else { 0.0 };
+                        }
+                    }
+                }
+                (p, v)
+            })
+            .collect();
+        let _ = d;
+        all.extend(next.iter().map(|(k, v)| (*k, v.clone())));
+        level = next;
+    }
+    let n = all.len();
+    all.into_par_iter().for_each(|(k, v)| {
+        let cell = Cell { geoid: Some(v.iter().map(|m| (m * 100.0).round().clamp(-32767.0, 32767.0) as i16).collect()), ..Default::default() };
+        mahere_tiles::write_cell(out, k, &cell, &Loss { dem_m: 0.0, img: 0 }).expect("write cell");
+    });
+    eprintln!("geoid: {n} cells written");
 }

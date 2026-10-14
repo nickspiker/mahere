@@ -17,7 +17,7 @@ fn main() {
         let dst = into.join(name);
         // Through the baker's own merge: the cell as a bake, written over whatever is there.
         let key = mahere_tiles::CellKey::from_name(name.to_str().unwrap()).expect("cell name");
-        let cell = mahere_tiles::Cell { dem: planes.dem.map(|d| mahere_tiles::DemCell { elev: d.elev, apron: d.apron }), line: planes.line, land: planes.land, water: planes.water, img: planes.img, own: planes.own, mvum: planes.mvum, names: planes.names, route: planes.route };
+        let cell = mahere_tiles::Cell { dem: planes.dem.map(|d| mahere_tiles::DemCell { elev: d.elev, apron: d.apron }), line: planes.line, land: planes.land, water: planes.water, img: planes.img, own: planes.own, mvum: planes.mvum, names: planes.names, route: planes.route, geoid: planes.geoid };
         mahere_tiles::write_cell(&into, key, &cell, &loss).expect("write");
         if dst.exists() {
             merged.fetch_add(1, Ordering::Relaxed);
