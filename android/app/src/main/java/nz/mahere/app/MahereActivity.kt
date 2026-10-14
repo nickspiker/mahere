@@ -170,9 +170,8 @@ class MahereActivity : Activity(), SurfaceHolder.Callback, Choreographer.FrameCa
                 arrayOf(Manifest.permission.ACCESS_FINE_LOCATION),
                 LOCATION_PERMISSION_REQUEST,
             )
-        } else {
-            startLocation()
         }
+        // With the permission held, the GPS starts in onResume, as the app comes forward.
     }
 
     private fun hideSystemBars() {
@@ -354,11 +353,13 @@ class MahereActivity : Activity(), SurfaceHolder.Callback, Choreographer.FrameCa
         hideSystemBars()
         startFrames()
         startHeading()
+        startLocation()
     }
 
     override fun onPause() {
         super.onPause()
         stopHeading()
+        stopLocation()
         probe.stop()
         Choreographer.getInstance().removeFrameCallback(this)
         if (nativePtr != 0L) nativeOnPause(nativePtr)
@@ -429,12 +430,18 @@ class MahereActivity : Activity(), SurfaceHolder.Callback, Choreographer.FrameCa
         }
     }
 
+    /// The GPS runs only while the app is in front: started as it comes forward, stopped as it goes away (Nick 2026-10-13: respect the battery with the screen off). Without the permission yet, nothing; the permission's answer starts it.
     private fun startLocation() {
+        if (checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED) return
         val lm = getSystemService(Context.LOCATION_SERVICE) as LocationManager
         try {
             lm.requestLocationUpdates(LocationManager.GPS_PROVIDER, 1000L, 0f, locationListener)
         } catch (_: SecurityException) {
         }
+    }
+
+    private fun stopLocation() {
+        (getSystemService(Context.LOCATION_SERVICE) as LocationManager).removeUpdates(locationListener)
     }
 
     override fun onRequestPermissionsResult(
