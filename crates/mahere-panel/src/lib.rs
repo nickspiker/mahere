@@ -501,7 +501,8 @@ impl Panel {
                             }
                         }
                         let n = n.max(1);
-                        out[y * size + x] = 0xFF00_0000 | ((r / n) << 16) | ((g / n) << 8) | (b / n);
+                        // The icon's pixels are canonical 0xAARRGGBB; the buffer is the platform's order (red and blue swapped on Android, where the orb showed them swapped, 2026-10-14).
+                        out[y * size + x] = theme::fmt(0xFF00_0000 | ((r / n) << 16) | ((g / n) << 8) | (b / n));
                     }
                 }
             }
