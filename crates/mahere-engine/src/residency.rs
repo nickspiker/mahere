@@ -30,6 +30,10 @@ pub trait CellStore: Send + Sync + 'static {
     fn take_changed(&self) -> Vec<CellKey> {
         Vec::new()
     }
+    /// The cell from what is on the device alone, never the network: for anything on the drawing thread (labels, a tap), which must not wait on a connection (the hang of 2026-10-13: a label layout fetched cells from the bucket mid-frame).
+    fn get_local(&self, key: CellKey) -> Fetch {
+        self.get(key)
+    }
 }
 
 pub struct DirStore(pub PathBuf);
@@ -308,10 +312,11 @@ impl Residency {
 
     /// A resident cell's planes, decoded again from its store (the vault on a phone, so no network): for reading what a GPU host no longer keeps on the CPU.
     pub fn read_planes(&self, key: CellKey) -> Option<mahere_tiles::CellPlanes> {
-        if !self.pool.map.contains_key(&key) {
+        // Resident with something in it (not a cell known to be absent), and read from the device only.
+        if self.pool.map.get(&key).is_none_or(|e| e.present == 0) {
             return None;
         }
-        match self.store.get(key) {
+        match self.store.get_local(key) {
             Fetch::Bytes(b) => mahere_tiles::decode_cell(&b).ok(),
             _ => None,
         }
@@ -324,10 +329,10 @@ impl Residency {
 
     /// A resident cell's names alone, read again from its store; None when it has none or is not resident.
     pub fn read_names(&self, key: CellKey) -> Option<mahere_tiles::NameCell> {
-        if !self.pool.map.contains_key(&key) {
+        if self.pool.map.get(&key).is_none_or(|e| e.present == 0) {
             return None;
         }
-        match self.store.get(key) {
+        match self.store.get_local(key) {
             Fetch::Bytes(b) => mahere_tiles::decode_names(&b),
             _ => None,
         }
@@ -604,6 +609,10 @@ impl CellStore for TieredStore {
 
     fn take_changed(&self) -> Vec<CellKey> {
         std::mem::take(&mut *self.checks.changed.lock().unwrap())
+    }
+
+    fn get_local(&self, key: CellKey) -> Fetch {
+        self.cache.get(key)
     }
 }
 

@@ -90,6 +90,7 @@ impl Atlas {
 }
 
 /// A label as kept between layouts: where it is on the globe, its letters (atlas glyph, offset from the anchor in pixels, angle as laid out) as laid out, whether it turns with the map, its colour (an index into the theme's) and whether it has a halo.
+#[derive(Clone)]
 struct Kept {
     name: Named,
     anchor: (f64, f64),
@@ -192,24 +193,66 @@ struct Laid {
     mark: Option<([f32; 2], bool)>,
 }
 
-pub struct Labeller {
-    text: TextRenderer,
-    pub w: usize,
-    pub h: usize,
+/// The view a layout is for: the camera, the depth and the resident cells, the route, the labels layer and the theme. A different key is a stale layout.
+type ViewKey = (i64, i64, i64, i64, u8, usize, u64, bool, u64);
+
+/// A finished layout, what each frame draws from: the labels as anchors and letters, the atlas their glyphs are in, where the view was, the theme's colours, and the route.
+#[derive(Clone)]
+pub struct Lettering {
     kept: Vec<Kept>,
-    pub atlas: Atlas,
+    pub atlas: std::sync::Arc<Atlas>,
     /// Two screen points of the laid-out view and where on the globe they were: how far the map has turned since, which the turning labels follow.
     reference: Option<([f64; 2], [f64; 2], (f64, f64), (f64, f64))>,
-    /// The view the layout is for, to tell when it is out of date.
-    drawn_for: Option<(i64, i64, i64, i64, u8, usize, u64, bool, u64)>,
-    advance: HashMap<(char, u16, u32), f32>,
-    /// The theme's label colours and its look (size, glow, smoothing, spacing), as of the last layout.
+    drawn_for: Option<ViewKey>,
     palette: [[u8; 4]; 11],
-    look: [f32; 4],
     /// The route, on the globe, and its width in pixels.
     route: Vec<(f64, f64)>,
     route_width: f32,
     route_casing: f32,
+}
+
+impl Default for Lettering {
+    fn default() -> Self {
+        Lettering { kept: Vec::new(), atlas: std::sync::Arc::new(Atlas::new()), reference: None, drawn_for: None, palette: mahere_engine::theme::LABELS_LIGHT, route: Vec::new(), route_width: 4.0, route_casing: 6.0 }
+    }
+}
+
+/// What the worker lays out from: the map's names job (None with labels off), the panel's font, the theme's colours and look, the route, and the key of the view.
+struct LabelJob {
+    names: Option<mahere_engine::labels::NameJob>,
+    cam: mahere_engine::Camera,
+    w: usize,
+    h: usize,
+    font: f32,
+    palette: [[u8; 4]; 11],
+    look: [f32; 4],
+    route: Vec<(f64, f64)>,
+    key: ViewKey,
+}
+
+/// The worker's side: the text renderer, the master atlas, the advances measured, the last layout's names (placed first again), and the cells' names read so far.
+struct Letterer {
+    text: TextRenderer,
+    w: usize,
+    h: usize,
+    atlas: Atlas,
+    /// The atlas version last handed to the drawing thread.
+    sent: u64,
+    shared: std::sync::Arc<Atlas>,
+    advance: HashMap<(char, u16, u32), f32>,
+    look: [f32; 4],
+    previous: HashSet<(u8, String, String)>,
+    names: mahere_engine::labels::NamesCache,
+}
+
+/// Labels (Nick 2026-10-13): laid out on a worker thread, never the drawing thread (a layout once fetched cells mid-frame and hung the app); each frame draws from the latest finished layout.
+pub struct Labeller {
+    tx: std::sync::mpsc::Sender<LabelJob>,
+    rx: std::sync::mpsc::Receiver<Lettering>,
+    shown: Lettering,
+    busy: bool,
+    asked: Option<ViewKey>,
+    last: std::time::Instant,
 }
 
 impl Default for Labeller {
@@ -425,15 +468,116 @@ fn centrelines(pts: &[[f32; 2]], bin: f32) -> Vec<Vec<[f32; 2]>> {
 
 impl Labeller {
     pub fn new() -> Labeller {
-        Labeller { text: TextRenderer::new(), w: 0, h: 0, kept: Vec::new(), atlas: Atlas::new(), reference: None, drawn_for: None, advance: HashMap::new(), palette: mahere_engine::theme::LABELS_LIGHT, look: mahere_engine::theme::LABEL_LOOK, route: Vec::new(), route_width: 4.0, route_casing: 6.0 }
+        let (tx, jobs) = std::sync::mpsc::channel::<LabelJob>();
+        let (done, rx) = std::sync::mpsc::channel::<Lettering>();
+        std::thread::Builder::new()
+            .name("labels".into())
+            .spawn(move || {
+                let mut l = Letterer { text: TextRenderer::new(), w: 0, h: 0, atlas: Atlas::new(), sent: 0, shared: std::sync::Arc::new(Atlas::new()), advance: HashMap::new(), look: mahere_engine::theme::LABEL_LOOK, previous: HashSet::new(), names: Default::default() };
+                while let Ok(mut job) = jobs.recv() {
+                    // Only the newest job matters: a camera that moved on has made the others stale.
+                    while let Ok(newer) = jobs.try_recv() {
+                        job = newer;
+                    }
+                    if done.send(l.lay_out(job)).is_err() {
+                        break;
+                    }
+                }
+            })
+            .expect("labels thread");
+        Labeller { tx, rx, shown: Lettering::default(), busy: false, asked: None, last: std::time::Instant::now() }
     }
 
-    /// Whether the lettering is out of date for this view: the camera, the depth or the cells resident changed since it was drawn (a cell arriving, leaving or replaced by a newer copy).
+    /// Whether the lettering shown is out of date for this view: the camera, the depth or the cells resident changed since it was laid out (a cell arriving, leaving or replaced by a newer copy).
     pub fn stale(&self, map: &mahere_engine::MapCore, w: usize, h: usize) -> bool {
-        self.drawn_for != Some(Self::view_key(map, w, h))
+        self.shown.drawn_for != Some(Self::view_key(map, w, h))
     }
 
-    fn view_key(map: &mahere_engine::MapCore, w: usize, h: usize) -> (i64, i64, i64, i64, u8, usize, u64, bool, u64) {
+    /// Whether a layout is running or due: a host keeps drawing frames until it lands.
+    pub fn pending(&self, map: &mahere_engine::MapCore, w: usize, h: usize) -> bool {
+        self.busy || (Self::wanted(map) && self.stale(map, w, h))
+    }
+
+    fn job(map: &mut mahere_engine::MapCore, w: usize, h: usize, font: f32) -> LabelJob {
+        let (palette, look) = map.themes.get(map.theme).map_or((mahere_engine::theme::LABELS_LIGHT, mahere_engine::theme::LABEL_LOOK), |t| (t.label, t.label_look));
+        let key = Self::view_key(map, w, h);
+        let names = map.layers().labels.then(|| map.name_job(w, h));
+        LabelJob { names, cam: map.cam, w, h, font, palette, look, route: map.route_points().map_or(Vec::new(), |p| p.to_vec()), key }
+    }
+
+    /// Ask the worker for a layout when one is due: the view rests, the lettering is stale, none is running, and every cell is in or a second has passed since the last ask (so cells still arriving never hold the labels back). Never waits.
+    pub fn ask(&mut self, map: &mut mahere_engine::MapCore, w: usize, h: usize, font: f32, at_rest: bool) {
+        if !Self::wanted(map) {
+            if !self.shown.kept.is_empty() || !self.shown.route.is_empty() {
+                self.shown = Lettering { atlas: self.shown.atlas.clone(), ..Lettering::default() };
+            }
+            return;
+        }
+        let key = Self::view_key(map, w, h);
+        if self.busy || !at_rest || self.shown.drawn_for == Some(key) || self.asked == Some(key) {
+            return;
+        }
+        if !map.converged() && self.last.elapsed() < std::time::Duration::from_secs(1) {
+            return;
+        }
+        let job = Self::job(map, w, h, font);
+        if self.tx.send(job).is_ok() {
+            self.busy = true;
+            self.asked = Some(key);
+            self.last = std::time::Instant::now();
+        }
+    }
+
+    /// A finished layout, if one landed: true when the frame should be drawn again with it.
+    pub fn poll(&mut self) -> bool {
+        let mut landed = false;
+        while let Ok(l) = self.rx.try_recv() {
+            self.shown = l;
+            landed = true;
+        }
+        if landed {
+            self.busy = false;
+        }
+        landed
+    }
+
+    /// Lay out the view now and wait for it (a check or a test).
+    pub fn update(&mut self, map: &mut mahere_engine::MapCore, w: usize, h: usize, font: f32) {
+        let job = Self::job(map, w, h, font);
+        let key = job.key;
+        if self.tx.send(job).is_ok() {
+            while let Ok(l) = self.rx.recv() {
+                let done = l.drawn_for == Some(key);
+                self.shown = l;
+                if done {
+                    break;
+                }
+            }
+        }
+        self.busy = false;
+    }
+
+    pub fn atlas(&self) -> &Atlas {
+        &self.shown.atlas
+    }
+
+    pub fn glyphs(&self, cam: &mahere_engine::Camera, w: usize, h: usize) -> Vec<GlyphQuad> {
+        self.shown.glyphs(cam, w, h)
+    }
+
+    pub fn segments(&self, cam: &mahere_engine::Camera, w: usize, h: usize) -> Vec<Segment> {
+        self.shown.segments(cam, w, h)
+    }
+
+    pub fn draw_cpu(&self, canvas: &mut [u32], cam: &mahere_engine::Camera, w: usize, h: usize) {
+        self.shown.draw_cpu(canvas, cam, w, h)
+    }
+
+    pub fn hit(&self, cam: &mahere_engine::Camera, w: usize, h: usize, x: f32, y: f32) -> Option<&Named> {
+        self.shown.hit(cam, w, h, x, y)
+    }
+
+    fn view_key(map: &mahere_engine::MapCore, w: usize, h: usize) -> ViewKey {
         let c = &map.cam;
         ((c.lat() * 1e7) as i64, (c.lon() * 1e7) as i64, (c.ppd * 100.0) as i64, (c.bearing() * 1e5) as i64, map.vec_depth(), map.pool_version() as usize ^ (w << 20) ^ (h << 40), map.route_version, map.layers().labels, map.style_version())
     }
@@ -442,7 +586,9 @@ impl Labeller {
     pub fn wanted(map: &mahere_engine::MapCore) -> bool {
         map.layers().labels || map.route_points().is_some()
     }
+}
 
+impl Letterer {
     fn advance(&mut self, ch: char, size: f32, weight: u16) -> f32 {
         let key = (ch, weight, (size * 16.0) as u32);
         if let Some(&a) = self.advance.get(&key) {
@@ -457,52 +603,64 @@ impl Labeller {
         s.chars().map(|c| self.advance(c, size, weight)).sum()
     }
 
-    /// Lay out the labels for the view, `font` the panel's base font size in pixels, and rasterise into the atlas any glyph they use that it lacks.
-    pub fn update(&mut self, map: &mut mahere_engine::MapCore, w: usize, h: usize, font: f32) {
+    /// Lay out the labels for a job, rasterising into the atlas any glyph they use that it lacks: a finished layout for the drawing thread.
+    fn lay_out(&mut self, job: LabelJob) -> Lettering {
         let t = std::time::Instant::now();
+        let (w, h) = (job.w, job.h);
         self.w = w;
         self.h = h;
-        // The theme's colours and look; the size scales the base font.
-        if let Some(th) = map.themes.get(map.theme) {
-            self.palette = th.label;
-            self.look = th.label_look;
-        }
-        let font = font * self.look[0];
-        let texels = if map.layers().labels { map.gather_names(w, h) } else { NamedTexels::default() };
+        self.look = job.look;
+        let font = job.font * self.look[0];
+        let texels = match &job.names {
+            Some(n) => mahere_engine::labels::gather(n, &mut self.names),
+            None => NamedTexels::default(),
+        };
         let gathered = t.elapsed();
-        let previous: HashSet<(u8, String, String)> = self.kept.iter().map(|k| (k.name.kind, k.name.name.clone(), k.name.reference.clone())).collect();
+        let previous = std::mem::take(&mut self.previous);
         let laid = self.layout(&texels, w, h, font, &previous);
-        self.keep(&laid, map, w, h);
-        self.route = map.route_points().map_or(Vec::new(), |p| p.to_vec());
-        self.route_width = (font * 0.32).max(3.0);
-        self.route_casing = self.route_width + (font * 0.14).max(1.5);
+        let kept = self.keep(&laid, &job.cam, w, h);
+        self.previous = kept.iter().map(|k| (k.name.kind, k.name.name.clone(), k.name.reference.clone())).collect();
+        if self.atlas.version != self.sent {
+            self.shared = std::sync::Arc::new(Atlas { side: self.atlas.side, rg: self.atlas.rg.clone(), version: self.atlas.version, x: self.atlas.x, y: self.atlas.y, row: self.atlas.row, slots: self.atlas.slots.clone() });
+            self.sent = self.atlas.version;
+        }
+        let route_width = (font * 0.32).max(3.0);
         let (a, b) = ([w as f64 * 0.25, h as f64 * 0.5], [w as f64 * 0.75, h as f64 * 0.5]);
-        self.reference = Some((a, b, map.cam.screen_to_geo(a[0], a[1], w, h), map.cam.screen_to_geo(b[0], b[1], w, h)));
-        self.drawn_for = Some(Self::view_key(map, w, h));
         if std::env::var_os("MAHERE_LABEL_LOG").is_some() {
             eprintln!("labels: {} lines, {} areas, {} points gathered in {:.1} ms; {} placed, {} glyphs in the atlas, {:.1} ms in all", texels.lines.len(), texels.areas.len(), texels.points.len(), gathered.as_secs_f64() * 1e3, laid.len(), self.atlas.slots.len(), t.elapsed().as_secs_f64() * 1e3);
+        }
+        Lettering {
+            kept,
+            atlas: self.shared.clone(),
+            reference: Some((a, b, job.cam.screen_to_geo(a[0], a[1], w, h), job.cam.screen_to_geo(b[0], b[1], w, h))),
+            drawn_for: Some(job.key),
+            palette: job.palette,
+            route: job.route,
+            route_width,
+            route_casing: route_width + (font * 0.14).max(1.5),
         }
     }
 
     /// The laid-out labels kept as anchors on the globe and letters about them, each letter's glyph in the atlas.
-    fn keep(&mut self, laid: &[Laid], map: &mahere_engine::MapCore, w: usize, h: usize) {
-        self.kept.clear();
+    fn keep(&mut self, laid: &[Laid], cam: &mahere_engine::Camera, w: usize, h: usize) -> Vec<Kept> {
+        let mut kept = Vec::new();
         for l in laid {
             let n = l.glyphs.len().max(1) as f32;
             let centre = l.glyphs.iter().fold([0.0f32; 2], |c, g| [c[0] + g.at[0] / n, c[1] + g.at[1] / n]);
-            let anchor = map.cam.screen_to_geo(centre[0] as f64, centre[1] as f64, w, h);
+            let anchor = cam.screen_to_geo(centre[0] as f64, centre[1] as f64, w, h);
             let halo = (l.size * self.look[1] * 16.0) as u32;
             let letters = l.glyphs.iter().map(|g| (self.glyph(g.ch, l.size, l.weight, l.shear, halo, g.angle), [g.at[0] - centre[0], g.at[1] - centre[1]], g.angle)).collect();
             // A point's name stays level; a line's and an area's turn with the map.
             let turns = !l.name.is_point();
-            self.kept.push(Kept { name: l.name.clone(), anchor, letters, turns, colour: l.colour, halo: halo > 0 });
+            kept.push(Kept { name: l.name.clone(), anchor, letters, turns, colour: l.colour, halo: halo > 0 });
             if let Some((p, summit)) = l.mark {
                 // A summit's triangle, point up; a dot for the small marks. Level, no halo.
                 let (ch, colour, scale) = if summit { ('\u{25B2}', SUMMIT, 0.7) } else { ('\u{2022}', MARK, 1.0) };
                 let key = self.glyph(ch, l.size * scale, 400, 0.0, 0, 0.0);
-                self.kept.push(Kept { name: l.name.clone(), anchor: map.cam.screen_to_geo(p[0] as f64, p[1] as f64, w, h), letters: vec![(key, [0.0, 0.0], 0.0)], turns: false, colour, halo: false });
+                kept.push(Kept { name: l.name.clone(), anchor: cam.screen_to_geo(p[0] as f64, p[1] as f64, w, h), letters: vec![(key, [0.0, 0.0], 0.0)], turns: false, colour, halo: false });
             }
         }
+        kept
     }
 
     /// A glyph's place in the atlas, rasterised by fluor the first time it is asked for, its outline turned to the angle's bin: the letter's coverage, and around it the halo, a distance out from the letter's edge.
@@ -598,149 +756,6 @@ impl Labeller {
         self.atlas.slots.insert(key, [place.0 as u16, place.1 as u16, cw2 as u16, ch2 as u16]);
         self.atlas.version += 1;
         key
-    }
-
-    /// How far the map has turned on the screen since the layout, radians.
-    fn turned(&self, cam: &mahere_engine::Camera, w: usize, h: usize) -> f32 {
-        let Some((a, b, ga, gb)) = self.reference else { return 0.0 };
-        let (ax, ay) = cam.geo_to_screen(ga.0, ga.1, w, h);
-        let (bx, by) = cam.geo_to_screen(gb.0, gb.1, w, h);
-        ((by - ay).atan2(bx - ax) - (b[1] - a[1]).atan2(b[0] - a[0])) as f32
-    }
-
-    /// The frame's letters, each a quad at its label's anchor as the camera has it now: a turning label's letters turned with the map about the anchor, a level one's as laid out.
-    pub fn glyphs(&self, cam: &mahere_engine::Camera, w: usize, h: usize) -> Vec<GlyphQuad> {
-        let phi = self.turned(cam, w, h);
-        let (sp, cp) = phi.sin_cos();
-        let halo = display(self.palette[HALO]);
-        let side = self.atlas.side as f32;
-        let mut out = Vec::new();
-        for k in &self.kept {
-            let (ax, ay) = cam.geo_to_screen(k.anchor.0, k.anchor.1, w, h);
-            let (ax, ay) = (ax as f32, ay as f32);
-            if ax < -(w as f32) || ay < -(h as f32) || ax > 2.0 * w as f32 || ay > 2.0 * h as f32 || !cam.on_globe(ax as f64, ay as f64, w, h) {
-                continue;
-            }
-            let text = display(self.palette[k.colour]);
-            let halo = if k.halo { halo } else { [0.0; 4] };
-            for (key, off, angle) in &k.letters {
-                let Some(slot) = self.atlas.slots.get(key) else { continue };
-                let (o, a) = if k.turns { ([off[0] * cp - off[1] * sp, off[0] * sp + off[1] * cp], angle + phi) } else { (*off, *angle) };
-                // The quad turns only by what the glyph's bin left over; with nothing left (at rest) it sits on the pixel grid, texel for pixel.
-                let residual = a - key.bin as f32 * bin_step(key.size as f32 / 16.0);
-                let (sx, sy, sw, sh) = (slot[0] as f32, slot[1] as f32, slot[2] as f32, slot[3] as f32);
-                let (mut cx, mut cy) = (ax + o[0], ay + o[1]);
-                if residual.abs() < 1e-3 {
-                    cx = (cx - sw / 2.0).round() + sw / 2.0;
-                    cy = (cy - sh / 2.0).round() + sh / 2.0;
-                }
-                out.push([cx, cy, sw / 2.0, sh / 2.0, residual, 0.0, 0.0, 0.0, sx / side, sy / side, (sx + sw) / side, (sy + sh) / side, text[0], text[1], text[2], text[3], halo[0], halo[1], halo[2], halo[3]]);
-            }
-        }
-        out
-    }
-
-    /// The frame's route: each stretch between its points on the screen now, the casing's stretches first (under), then the line's.
-    pub fn segments(&self, cam: &mahere_engine::Camera, w: usize, h: usize) -> Vec<Segment> {
-        if self.route.len() < 2 {
-            return Vec::new();
-        }
-        let pts: Vec<(f32, f32)> = self.route.iter().map(|&(la, lo)| {
-            let (x, y) = cam.geo_to_screen(la, lo, w, h);
-            (x as f32, y as f32)
-        }).collect();
-        let mut out = Vec::with_capacity(2 * pts.len());
-        for (width, colour) in [(self.route_casing, ROUTE_CASING), (self.route_width, ROUTE)] {
-            let c = display(self.palette[colour]);
-            for s in pts.windows(2) {
-                out.push([s[0].0, s[0].1, s[1].0, s[1].1, width / 2.0, 0.0, 0.0, 0.0, c[0], c[1], c[2], c[3]]);
-            }
-        }
-        out
-    }
-
-    /// For a CPU frontend: the frame's route and letters drawn straight into a display 0xRRGGBB canvas.
-    pub fn draw_cpu(&self, canvas: &mut [u32], cam: &mahere_engine::Camera, w: usize, h: usize) {
-        let blend = |canvas: &mut [u32], i: usize, c: [f32; 3], a: f32| {
-            if a <= 0.0 {
-                return;
-            }
-            let p = canvas[i];
-            let mix = |shift: u32, v: f32| -> u32 { ((((p >> shift) & 255) as f32 * (1.0 - a) + v * 255.0 * a).round() as u32).min(255) };
-            canvas[i] = (mix(16, c[0]) << 16) | (mix(8, c[1]) << 8) | mix(0, c[2]);
-        };
-        for s in self.segments(cam, w, h) {
-            let (a, b, half) = ([s[0], s[1]], [s[2], s[3]], s[4]);
-            let (x0, x1) = ((a[0].min(b[0]) - half - 1.0).floor().max(0.0) as usize, ((a[0].max(b[0]) + half + 1.0).ceil().max(0.0) as usize).min(w));
-            let (y0, y1) = ((a[1].min(b[1]) - half - 1.0).floor().max(0.0) as usize, ((a[1].max(b[1]) + half + 1.0).ceil().max(0.0) as usize).min(h));
-            let (dx, dy) = (b[0] - a[0], b[1] - a[1]);
-            let len2 = (dx * dx + dy * dy).max(1e-6);
-            for y in y0..y1 {
-                for x in x0..x1 {
-                    let (px, py) = (x as f32 + 0.5, y as f32 + 0.5);
-                    let t = (((px - a[0]) * dx + (py - a[1]) * dy) / len2).clamp(0.0, 1.0);
-                    let d = (px - (a[0] + dx * t)).hypot(py - (a[1] + dy * t));
-                    blend(canvas, y * w + x, [s[8], s[9], s[10]], (half - d + 0.5).clamp(0.0, 1.0) * s[11]);
-                }
-            }
-        }
-        let side = self.atlas.side;
-        let sample = |u: f32, v: f32| -> (f32, f32) {
-            let (fx, fy) = (u * side as f32 - 0.5, v * side as f32 - 0.5);
-            let (x0, y0) = (fx.floor(), fy.floor());
-            let (tx, ty) = (fx - x0, fy - y0);
-            let at = |x: f32, y: f32| -> (f32, f32) {
-                if x < 0.0 || y < 0.0 || x >= side as f32 || y >= side as f32 {
-                    return (0.0, 0.0);
-                }
-                let o = (y as usize * side + x as usize) * 2;
-                (self.atlas.rg[o] as f32 / 255.0, self.atlas.rg[o + 1] as f32 / 255.0)
-            };
-            let (a, b, c, d) = (at(x0, y0), at(x0 + 1.0, y0), at(x0, y0 + 1.0), at(x0 + 1.0, y0 + 1.0));
-            let l = |p: f32, q: f32, t: f32| p + (q - p) * t;
-            (l(l(a.0, b.0, tx), l(c.0, d.0, tx), ty), l(l(a.1, b.1, tx), l(c.1, d.1, tx), ty))
-        };
-        for g in self.glyphs(cam, w, h) {
-            let (cx, cy, hx, hy, ang) = (g[0], g[1], g[2], g[3], g[4]);
-            let (sa, ca) = ang.sin_cos();
-            let reach = hx.hypot(hy) + 1.0;
-            let (x0, x1) = ((cx - reach).floor().max(0.0) as usize, ((cx + reach).ceil().max(0.0) as usize).min(w));
-            let (y0, y1) = ((cy - reach).floor().max(0.0) as usize, ((cy + reach).ceil().max(0.0) as usize).min(h));
-            for y in y0..y1 {
-                for x in x0..x1 {
-                    // Back into the glyph's own frame: unturned, then where in its atlas rectangle.
-                    let (dx, dy) = (x as f32 + 0.5 - cx, y as f32 + 0.5 - cy);
-                    let (lx, ly) = (dx * ca + dy * sa, -dx * sa + dy * ca);
-                    if lx.abs() > hx || ly.abs() > hy {
-                        continue;
-                    }
-                    let (u, v) = (g[8] + (lx / hx * 0.5 + 0.5) * (g[10] - g[8]), g[9] + (ly / hy * 0.5 + 0.5) * (g[11] - g[9]));
-                    let (ta, ha) = sample(u, v);
-                    let i = y * w + x;
-                    blend(canvas, i, [g[16], g[17], g[18]], ha * g[19]);
-                    blend(canvas, i, [g[12], g[13], g[14]], ta * g[15]);
-                }
-            }
-        }
-    }
-
-    /// Whether to letter the view now: it is stale and the camera is at rest, and either every cell is in or a second has passed since the last lettering (so a cell that keeps failing or arriving never holds the labels back). `last` is when this host last lettered.
-    pub fn due(&self, map: &mahere_engine::MapCore, w: usize, h: usize, at_rest: bool, last: std::time::Instant) -> bool {
-        at_rest && self.stale(map, w, h) && (map.converged() || last.elapsed() >= std::time::Duration::from_secs(1))
-    }
-
-    /// The label under a screen point, as the screen is now.
-    pub fn hit(&self, cam: &mahere_engine::Camera, w: usize, h: usize, x: f32, y: f32) -> Option<&Named> {
-        let phi = self.turned(cam, w, h);
-        let (sp, cp) = phi.sin_cos();
-        self.kept.iter().find(|k| {
-            let (ax, ay) = cam.geo_to_screen(k.anchor.0, k.anchor.1, w, h);
-            k.letters.iter().any(|(key, off, _)| {
-                let o = if k.turns { [off[0] * cp - off[1] * sp, off[0] * sp + off[1] * cp] } else { *off };
-                let r = self.atlas.slots.get(key).map_or(8.0, |s| s[3] as f32 / 2.0);
-                (x - (ax as f32 + o[0])).hypot(y - (ay as f32 + o[1])) <= r
-            })
-        }).map(|k| &k.name)
     }
 
     fn layout(&mut self, texels: &NamedTexels, w: usize, h: usize, font: f32, previous: &HashSet<(u8, String, String)>) -> Vec<Laid> {
@@ -1019,5 +1034,145 @@ impl Labeller {
             }
         }
         out
+    }
+}
+
+impl Lettering {
+    /// How far the map has turned on the screen since the layout, radians.
+    fn turned(&self, cam: &mahere_engine::Camera, w: usize, h: usize) -> f32 {
+        let Some((a, b, ga, gb)) = self.reference else { return 0.0 };
+        let (ax, ay) = cam.geo_to_screen(ga.0, ga.1, w, h);
+        let (bx, by) = cam.geo_to_screen(gb.0, gb.1, w, h);
+        ((by - ay).atan2(bx - ax) - (b[1] - a[1]).atan2(b[0] - a[0])) as f32
+    }
+
+    /// The frame's letters, each a quad at its label's anchor as the camera has it now: a turning label's letters turned with the map about the anchor, a level one's as laid out.
+    pub fn glyphs(&self, cam: &mahere_engine::Camera, w: usize, h: usize) -> Vec<GlyphQuad> {
+        let phi = self.turned(cam, w, h);
+        let (sp, cp) = phi.sin_cos();
+        let halo = display(self.palette[HALO]);
+        let side = self.atlas.side as f32;
+        let mut out = Vec::new();
+        for k in &self.kept {
+            let (ax, ay) = cam.geo_to_screen(k.anchor.0, k.anchor.1, w, h);
+            let (ax, ay) = (ax as f32, ay as f32);
+            if ax < -(w as f32) || ay < -(h as f32) || ax > 2.0 * w as f32 || ay > 2.0 * h as f32 || !cam.on_globe(ax as f64, ay as f64, w, h) {
+                continue;
+            }
+            let text = display(self.palette[k.colour]);
+            let halo = if k.halo { halo } else { [0.0; 4] };
+            for (key, off, angle) in &k.letters {
+                let Some(slot) = self.atlas.slots.get(key) else { continue };
+                let (o, a) = if k.turns { ([off[0] * cp - off[1] * sp, off[0] * sp + off[1] * cp], angle + phi) } else { (*off, *angle) };
+                // The quad turns only by what the glyph's bin left over; with nothing left (at rest) it sits on the pixel grid, texel for pixel.
+                let residual = a - key.bin as f32 * bin_step(key.size as f32 / 16.0);
+                let (sx, sy, sw, sh) = (slot[0] as f32, slot[1] as f32, slot[2] as f32, slot[3] as f32);
+                let (mut cx, mut cy) = (ax + o[0], ay + o[1]);
+                if residual.abs() < 1e-3 {
+                    cx = (cx - sw / 2.0).round() + sw / 2.0;
+                    cy = (cy - sh / 2.0).round() + sh / 2.0;
+                }
+                out.push([cx, cy, sw / 2.0, sh / 2.0, residual, 0.0, 0.0, 0.0, sx / side, sy / side, (sx + sw) / side, (sy + sh) / side, text[0], text[1], text[2], text[3], halo[0], halo[1], halo[2], halo[3]]);
+            }
+        }
+        out
+    }
+
+    /// The frame's route: each stretch between its points on the screen now, the casing's stretches first (under), then the line's.
+    pub fn segments(&self, cam: &mahere_engine::Camera, w: usize, h: usize) -> Vec<Segment> {
+        if self.route.len() < 2 {
+            return Vec::new();
+        }
+        let pts: Vec<(f32, f32)> = self.route.iter().map(|&(la, lo)| {
+            let (x, y) = cam.geo_to_screen(la, lo, w, h);
+            (x as f32, y as f32)
+        }).collect();
+        let mut out = Vec::with_capacity(2 * pts.len());
+        for (width, colour) in [(self.route_casing, ROUTE_CASING), (self.route_width, ROUTE)] {
+            let c = display(self.palette[colour]);
+            for s in pts.windows(2) {
+                out.push([s[0].0, s[0].1, s[1].0, s[1].1, width / 2.0, 0.0, 0.0, 0.0, c[0], c[1], c[2], c[3]]);
+            }
+        }
+        out
+    }
+
+    /// For a CPU frontend: the frame's route and letters drawn straight into a display 0xRRGGBB canvas.
+    pub fn draw_cpu(&self, canvas: &mut [u32], cam: &mahere_engine::Camera, w: usize, h: usize) {
+        let blend = |canvas: &mut [u32], i: usize, c: [f32; 3], a: f32| {
+            if a <= 0.0 {
+                return;
+            }
+            let p = canvas[i];
+            let mix = |shift: u32, v: f32| -> u32 { ((((p >> shift) & 255) as f32 * (1.0 - a) + v * 255.0 * a).round() as u32).min(255) };
+            canvas[i] = (mix(16, c[0]) << 16) | (mix(8, c[1]) << 8) | mix(0, c[2]);
+        };
+        for s in self.segments(cam, w, h) {
+            let (a, b, half) = ([s[0], s[1]], [s[2], s[3]], s[4]);
+            let (x0, x1) = ((a[0].min(b[0]) - half - 1.0).floor().max(0.0) as usize, ((a[0].max(b[0]) + half + 1.0).ceil().max(0.0) as usize).min(w));
+            let (y0, y1) = ((a[1].min(b[1]) - half - 1.0).floor().max(0.0) as usize, ((a[1].max(b[1]) + half + 1.0).ceil().max(0.0) as usize).min(h));
+            let (dx, dy) = (b[0] - a[0], b[1] - a[1]);
+            let len2 = (dx * dx + dy * dy).max(1e-6);
+            for y in y0..y1 {
+                for x in x0..x1 {
+                    let (px, py) = (x as f32 + 0.5, y as f32 + 0.5);
+                    let t = (((px - a[0]) * dx + (py - a[1]) * dy) / len2).clamp(0.0, 1.0);
+                    let d = (px - (a[0] + dx * t)).hypot(py - (a[1] + dy * t));
+                    blend(canvas, y * w + x, [s[8], s[9], s[10]], (half - d + 0.5).clamp(0.0, 1.0) * s[11]);
+                }
+            }
+        }
+        let side = self.atlas.side;
+        let sample = |u: f32, v: f32| -> (f32, f32) {
+            let (fx, fy) = (u * side as f32 - 0.5, v * side as f32 - 0.5);
+            let (x0, y0) = (fx.floor(), fy.floor());
+            let (tx, ty) = (fx - x0, fy - y0);
+            let at = |x: f32, y: f32| -> (f32, f32) {
+                if x < 0.0 || y < 0.0 || x >= side as f32 || y >= side as f32 {
+                    return (0.0, 0.0);
+                }
+                let o = (y as usize * side + x as usize) * 2;
+                (self.atlas.rg[o] as f32 / 255.0, self.atlas.rg[o + 1] as f32 / 255.0)
+            };
+            let (a, b, c, d) = (at(x0, y0), at(x0 + 1.0, y0), at(x0, y0 + 1.0), at(x0 + 1.0, y0 + 1.0));
+            let l = |p: f32, q: f32, t: f32| p + (q - p) * t;
+            (l(l(a.0, b.0, tx), l(c.0, d.0, tx), ty), l(l(a.1, b.1, tx), l(c.1, d.1, tx), ty))
+        };
+        for g in self.glyphs(cam, w, h) {
+            let (cx, cy, hx, hy, ang) = (g[0], g[1], g[2], g[3], g[4]);
+            let (sa, ca) = ang.sin_cos();
+            let reach = hx.hypot(hy) + 1.0;
+            let (x0, x1) = ((cx - reach).floor().max(0.0) as usize, ((cx + reach).ceil().max(0.0) as usize).min(w));
+            let (y0, y1) = ((cy - reach).floor().max(0.0) as usize, ((cy + reach).ceil().max(0.0) as usize).min(h));
+            for y in y0..y1 {
+                for x in x0..x1 {
+                    // Back into the glyph's own frame: unturned, then where in its atlas rectangle.
+                    let (dx, dy) = (x as f32 + 0.5 - cx, y as f32 + 0.5 - cy);
+                    let (lx, ly) = (dx * ca + dy * sa, -dx * sa + dy * ca);
+                    if lx.abs() > hx || ly.abs() > hy {
+                        continue;
+                    }
+                    let (u, v) = (g[8] + (lx / hx * 0.5 + 0.5) * (g[10] - g[8]), g[9] + (ly / hy * 0.5 + 0.5) * (g[11] - g[9]));
+                    let (ta, ha) = sample(u, v);
+                    let i = y * w + x;
+                    blend(canvas, i, [g[16], g[17], g[18]], ha * g[19]);
+                    blend(canvas, i, [g[12], g[13], g[14]], ta * g[15]);
+                }
+            }
+        }
+    }
+
+    /// The label under a screen point, as the screen is now.
+    pub fn hit(&self, cam: &mahere_engine::Camera, w: usize, h: usize, x: f32, y: f32) -> Option<&Named> {
+        let phi = self.turned(cam, w, h);
+        let (sp, cp) = phi.sin_cos();
+        self.kept.iter().find(|k| {
+            let (ax, ay) = cam.geo_to_screen(k.anchor.0, k.anchor.1, w, h);
+            k.letters.iter().any(|(key, off, _)| {
+                let o = if k.turns { [off[0] * cp - off[1] * sp, off[0] * sp + off[1] * cp] } else { *off };
+                let r = self.atlas.slots.get(key).map_or(8.0, |s| s[3] as f32 / 2.0);
+                (x - (ax as f32 + o[0])).hypot(y - (ay as f32 + o[1])) <= r
+            })
+        }).map(|k| &k.name)
     }
 }

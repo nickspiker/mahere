@@ -317,6 +317,8 @@ pub struct MapCore {
     tap_info: Vec<String>,
     /// Cells' names as labels last read them; None for a resident cell with none.
     names_cache: rustc_hash::FxHashMap<mahere_tiles::CellKey, Option<std::sync::Arc<mahere_tiles::NameCell>>>,
+    /// Cells replaced by a newer copy since a label worker last asked, for it to forget their names.
+    names_reloaded: Vec<mahere_tiles::CellKey>,
     /// Navigation (Nick 2026-10-13): how a tap routes there, if it does; the route found and its version; the search running.
     pub travel: Option<route::Travel>,
     route: Option<Arc<route::Route>>,
@@ -396,6 +398,7 @@ impl MapCore {
             user_store: None,
             tap_info: Vec::new(),
             names_cache: Default::default(),
+            names_reloaded: Vec::new(),
             travel: None,
             route: None,
             route_version: 0,
@@ -1238,9 +1241,10 @@ impl MapCore {
         self.dirty = false;
         self.res.frame += 1;
         self.res.drain();
-        // A cell replaced by a newer copy: its names are read again.
+        // A cell replaced by a newer copy: its names are read again, here and by a label worker.
         for k in std::mem::take(&mut self.res.reloaded) {
             self.names_cache.remove(&k);
+            self.names_reloaded.push(k);
         }
         self.canvas_w = w;
         self.canvas_h = h;

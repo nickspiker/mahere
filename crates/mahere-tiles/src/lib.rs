@@ -1990,8 +1990,8 @@ pub fn decode_cell(data: &[u8]) -> Result<CellPlanes, String> {
     Ok(out)
 }
 
-/// Only a cell's names, from raw file bytes: what labels read for every cell in view, without decoding its terrain or imagery.
-pub fn decode_names(data: &[u8]) -> Option<NameCell> {
+/// One section of a cell file, read alone through the header's table of contents: the others (a cell's terrain and imagery are most of it) are not parsed at all.
+fn section_alone(data: &[u8], name: &str) -> Option<HashMap<String, Vec<VsfType>>> {
     let plain: Vec<u8>;
     let data = if data.starts_with(&[0x28, 0xB5, 0x2F, 0xFD]) {
         plain = zstd::decode_all(data).ok()?;
@@ -2000,24 +2000,23 @@ pub fn decode_names(data: &[u8]) -> Option<NameCell> {
         data
     };
     let (header, end) = vsf::VsfHeader::decode(data).ok()?;
-    let s = header.sections(data, end).ok()?.into_iter().find(|s| s.name == "name")?;
-    let fields: HashMap<String, Vec<VsfType>> = s.fields.into_iter().map(|f| (f.name, f.values)).collect();
-    NameCell::decode(&fields)
+    let entry = header.fields.iter().find(|f| f.name == name && f.size_bytes > 0)?;
+    let mut ptr = if entry.offset_bytes != 0 { entry.offset_bytes } else { end };
+    if data.get(ptr) != Some(&b'[') {
+        return None;
+    }
+    let s = vsf::VsfSection::parse(data, &mut ptr).ok()?;
+    Some(s.fields.into_iter().map(|f| (f.name, f.values)).collect())
 }
 
-/// Only a cell's routing, from raw file bytes: what a route search reads for every cell it passes through.
+/// Only a cell's names, from raw file bytes: what labels read for every cell in view, its terrain and imagery never parsed.
+pub fn decode_names(data: &[u8]) -> Option<NameCell> {
+    NameCell::decode(&section_alone(data, "name")?)
+}
+
+/// Only a cell's routing, from raw file bytes: what a route search reads for every cell it passes through, its terrain and imagery never parsed.
 pub fn decode_route(data: &[u8]) -> Option<route::RouteCell> {
-    let plain: Vec<u8>;
-    let data = if data.starts_with(&[0x28, 0xB5, 0x2F, 0xFD]) {
-        plain = zstd::decode_all(data).ok()?;
-        &plain[..]
-    } else {
-        data
-    };
-    let (header, end) = vsf::VsfHeader::decode(data).ok()?;
-    let s = header.sections(data, end).ok()?.into_iter().find(|s| s.name == "route")?;
-    let fields: HashMap<String, Vec<VsfType>> = s.fields.into_iter().map(|f| (f.name, f.values)).collect();
-    route::RouteCell::decode(&fields)
+    route::RouteCell::decode(&section_alone(data, "route")?)
 }
 
 fn scalar_f32(v: &VsfType) -> Option<f32> {

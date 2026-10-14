@@ -18,8 +18,6 @@ pub struct GpuHost {
     pub map: GpuMap,
     /// The map's lettering, laid out when the view rests.
     pub labeller: mahere_panel::labels::Labeller,
-    /// When the view was last lettered.
-    lettered: std::time::Instant,
     configured: (u32, u32),
     overlay_stamp: Option<OverlayStamp>,
     overlay_at: std::time::Instant,
@@ -82,7 +80,6 @@ impl GpuHost {
             alpha,
             map,
             labeller: mahere_panel::labels::Labeller::new(),
-            lettered: std::time::Instant::now(),
             configured: (0, 0),
             overlay_stamp: None,
             overlay_at: std::time::Instant::now(),
@@ -157,7 +154,9 @@ impl GpuHost {
         if panel_dirty {
             self.overlay_stamp = None;
         }
-        let changed = map.tick(w as usize, h as usize) || fresh || panel_dirty;
+        // A layout the label worker finished is a frame to draw.
+        let lettered = self.labeller.poll();
+        let changed = map.tick(w as usize, h as usize) || fresh || panel_dirty || lettered;
         let quiet = std::time::Duration::from_millis(250);
         if !changed && (self.settled || self.last_low.elapsed() < quiet) {
             self.device.poll(wgpu::PollType::Poll).ok();
@@ -214,11 +213,8 @@ impl GpuHost {
         });
         // Labels: laid out again when the view rests; every frame each letter is a quad at its label's place on the map now.
         if mahere_panel::labels::Labeller::wanted(map) {
-            if self.labeller.due(map, w as usize, h as usize, !in_motion, self.lettered) {
-                self.labeller.update(map, w as usize, h as usize, panel.font_px());
-                self.lettered = std::time::Instant::now();
-            }
-            let a = &self.labeller.atlas;
+            self.labeller.ask(map, w as usize, h as usize, panel.font_px(), !in_motion);
+            let a = self.labeller.atlas();
             self.map.set_atlas(&self.device, &self.queue, a.side as u32, &a.rg, a.version);
             let (glyphs, segments) = (self.labeller.glyphs(&map.cam, w as usize, h as usize), self.labeller.segments(&map.cam, w as usize, h as usize));
             self.map.set_labels(&self.device, &self.queue, &glyphs, &segments);
@@ -278,7 +274,7 @@ impl GpuHost {
             self.report = std::time::Instant::now();
         }
         // Lettering held back by cells still arriving needs another frame once its second is up.
-        !map.converged() || (mahere_panel::labels::Labeller::wanted(map) && self.labeller.stale(map, w as usize, h as usize))
+        !map.converged() || self.labeller.pending(map, w as usize, h as usize)
     }
 }
 

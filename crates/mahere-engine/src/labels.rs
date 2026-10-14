@@ -30,60 +30,96 @@ fn identity(n: &Named) -> (u8, String, String) {
     (n.kind, n.name.clone(), n.reference.clone())
 }
 
+/// What a label layout needs from the map, taken on the drawing thread and read on another (Nick 2026-10-13: the layout must never hold up a frame): the camera, the screen, the depth the lines are drawn at, which cells are resident with something in them, where their bytes are, and which were replaced by a newer copy since the last job.
+pub struct NameJob {
+    pub cam: crate::Camera,
+    pub w: usize,
+    pub h: usize,
+    pub depth: u8,
+    resident: rustc_hash::FxHashSet<CellKey>,
+    store: Arc<dyn crate::residency::CellStore>,
+    pub reloaded: Vec<CellKey>,
+}
+
+/// A worker's cache of cells' names; None for a cell with none.
+pub type NamesCache = rustc_hash::FxHashMap<CellKey, Option<Arc<NameCell>>>;
+
 impl MapCore {
-    /// A cell's names, from the cache or read from its store.
-    fn cell_names(&mut self, key: CellKey) -> Option<Arc<NameCell>> {
-        if let Some(n) = self.names_cache.get(&key) {
-            return n.clone();
-        }
-        if self.names_cache.len() >= NAMES_KEPT {
-            self.names_cache.clear();
-        }
-        let n = self.res.read_names(key).map(Arc::new);
-        // A cell not resident yet is not remembered as nameless: it may arrive.
-        if self.res.pool.map.contains_key(&key) {
-            self.names_cache.insert(key, n.clone());
-        }
-        n
+    /// The inputs of a label layout for the view, for another thread to gather from.
+    pub fn name_job(&mut self, w: usize, h: usize) -> NameJob {
+        let resident = self.res.pool.map.iter().filter(|(_, e)| e.present != 0).map(|(k, _)| *k).collect();
+        NameJob { cam: self.cam, w, h, depth: self.vec_depth, resident, store: self.res.store(), reloaded: std::mem::take(&mut self.names_reloaded) }
     }
 
-    /// Every named texel in view at the depth the lines are drawn, a cell missing there read from its nearest resident ancestor within three levels.
+    /// Every named texel in view, gathered here and now (a host that letters on its drawing thread, or a check).
     pub fn gather_names(&mut self, w: usize, h: usize) -> NamedTexels {
-        let depth = self.vec_depth;
-        let mut keys: Vec<CellKey> = Vec::new();
-        let step = 32usize;
-        for gy in (0..=h + step).step_by(step) {
-            for gx in (0..=w + step).step_by(step) {
-                let (x, y) = (gx.min(w) as f64, gy.min(h) as f64);
-                if !self.cam.on_globe(x, y, w, h) {
-                    continue;
-                }
-                let (lat, lon) = self.cam.screen_to_geo(x, y, w, h);
-                let k = CellKey::containing(Coord::from_lat_lon(lat, lon), depth);
-                if !keys.contains(&k) {
-                    keys.push(k);
-                }
+        let job = self.name_job(w, h);
+        let mut cache = std::mem::take(&mut self.names_cache);
+        let out = gather(&job, &mut cache);
+        self.names_cache = cache;
+        out
+    }
+}
+
+/// A cell's names, from the cache or read from the device (never the network); a cell not resident is not looked at.
+fn cell_names(job: &NameJob, cache: &mut NamesCache, key: CellKey) -> Option<Arc<NameCell>> {
+    if !job.resident.contains(&key) {
+        return None;
+    }
+    if let Some(n) = cache.get(&key) {
+        return n.clone();
+    }
+    if cache.len() >= NAMES_KEPT {
+        cache.clear();
+    }
+    let n = match job.store.get_local(key) {
+        crate::residency::Fetch::Bytes(b) => mahere_tiles::decode_names(&b).map(Arc::new),
+        _ => None,
+    };
+    cache.insert(key, n.clone());
+    n
+}
+
+/// Every named texel in view at the depth the lines are drawn, a cell missing there read from its nearest resident ancestor within three levels. Runs on any thread.
+pub fn gather(job: &NameJob, cache: &mut NamesCache) -> NamedTexels {
+    for k in &job.reloaded {
+        cache.remove(k);
+    }
+    let (w, h, depth) = (job.w, job.h, job.depth);
+    let mut keys: Vec<CellKey> = Vec::new();
+    let step = 32usize;
+    for gy in (0..=h + step).step_by(step) {
+        for gx in (0..=w + step).step_by(step) {
+            let (x, y) = (gx.min(w) as f64, gy.min(h) as f64);
+            if !job.cam.on_globe(x, y, w, h) {
+                continue;
+            }
+            let (lat, lon) = job.cam.screen_to_geo(x, y, w, h);
+            let k = CellKey::containing(Coord::from_lat_lon(lat, lon), depth);
+            if !keys.contains(&k) {
+                keys.push(k);
             }
         }
-        let mut cells: Vec<(CellKey, Arc<NameCell>)> = Vec::new();
-        for k in keys {
-            for up in 0..=3u8 {
-                if k.depth < up {
-                    break;
+    }
+    let mut cells: Vec<(CellKey, Arc<NameCell>)> = Vec::new();
+    for k in keys {
+        for up in 0..=3u8 {
+            if k.depth < up {
+                break;
+            }
+            let a = k.ancestor(k.depth - up);
+            if let Some(n) = cell_names(job, cache, a) {
+                if !cells.iter().any(|(c, _)| *c == a) {
+                    cells.push((a, n));
                 }
-                let a = k.ancestor(k.depth - up);
-                if let Some(n) = self.cell_names(a) {
-                    if !cells.iter().any(|(c, _)| *c == a) {
-                        cells.push((a, n));
-                    }
-                    break;
-                }
-                if self.res.pool.map.contains_key(&a) {
-                    // Resident and nameless: nothing named here at this depth.
-                    break;
-                }
+                break;
+            }
+            if job.resident.contains(&a) {
+                // Resident and nameless: nothing named here at this depth.
+                break;
             }
         }
+    }
         let (fw, fh) = (w as f32, h as f32);
         let on_screen = |p: [f32; 2]| p[0] >= -MARGIN && p[1] >= -MARGIN && p[0] <= fw + MARGIN && p[1] <= fh + MARGIN;
         let mut lines: HashMap<(u8, String, String), (Named, Vec<[f32; 2]>)> = HashMap::new();
@@ -94,7 +130,7 @@ impl MapCore {
         for (key, names) in cells {
             // The cell's square on the screen from its corners: a texel's place is the bilinear blend, near enough over one cell.
             let c = key.corners().map(|(lat, lon)| {
-                let (x, y) = self.cam.geo_to_screen(lat, lon, w, h);
+                let (x, y) = job.cam.geo_to_screen(lat, lon, w, h);
                 [x as f32, y as f32]
             });
             let place = |u: f32, v: f32| -> [f32; 2] {
@@ -151,5 +187,4 @@ impl MapCore {
         out.texel_px = if tpx_n > 0 { tpx_sum / tpx_n as f32 } else { 1.0 };
         out.area_step_px = area_step.max(1.0);
         out
-    }
 }

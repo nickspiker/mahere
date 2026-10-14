@@ -217,7 +217,7 @@ fn main() {
             plan = map.plan(w, h);
             gpu.sync(&device, &queue, map.pool_mut(), false);
         }
-        let a = &labeller.atlas;
+        let a = labeller.atlas();
         gpu.set_atlas(&device, &queue, a.side as u32, &a.rg, a.version);
         gpu.set_labels(&device, &queue, &labeller.glyphs(&map.cam, w, h), &labeller.segments(&map.cam, w, h));
     }

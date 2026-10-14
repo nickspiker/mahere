@@ -34,7 +34,6 @@ struct MahereApp {
     /// The map's lettering, and when the camera last moved: labels are laid out once it has rested a quarter second, and hidden while it moves.
     labeller: mahere_panel::labels::Labeller,
     label_cam: ((u64, u64, u64, u64), Instant),
-    lettered: Instant,
     cache_budget: u64,
     areas: mahere_engine::areas::Areas,
     /// Updates (after Photon's): a verified build is swapped in for this one, which then starts again as it.
@@ -105,7 +104,6 @@ impl MahereApp {
             panel: Panel::new(),
             labeller: mahere_panel::labels::Labeller::new(),
             label_cam: ((0, 0, 0, 0), Instant::now()),
-            lettered: Instant::now(),
             cache_budget: 2 << 30,
             areas,
             updater: mahere_update::Updater::new(std::path::PathBuf::from("data/user")),
@@ -350,7 +348,7 @@ impl FluorApp for MahereApp {
                 // A click that never travelled is a tap: a new measurement to that point.
                 if self.dragging && self.travel < 6.0 {
                     // A label under the pointer names what it letters first.
-                    let label = (!self.labeller.stale(&self.map, w, h)).then(|| self.labeller.hit(&self.map.cam, w, h, ctx.cursor_x as f32, ctx.cursor_y as f32).cloned()).flatten();
+                    let label = self.labeller.hit(&self.map.cam, w, h, ctx.cursor_x as f32, ctx.cursor_y as f32).cloned();
                     self.map.tap_label(ctx.cursor_x as f64, ctx.cursor_y as f64, w, h, label.as_ref());
                     ctx.window.request_redraw();
                 }
@@ -584,7 +582,7 @@ impl FluorApp for MahereApp {
             self.chrome.invalidate_bg();
         }
         // Labels waiting for the camera to rest keep the ticks coming until they are drawn.
-        let labels_due = mahere_panel::labels::Labeller::wanted(&self.map) && self.labeller.stale(&self.map, w, h);
+        let labels_due = self.labeller.poll() || self.labeller.pending(&self.map, w, h);
         self.map.tick(w, h) || areas_changed || labels_due
     }
 
@@ -632,10 +630,8 @@ impl FluorApp for MahereApp {
             self.label_cam = (cam_key, Instant::now());
         }
         if mahere_panel::labels::Labeller::wanted(&self.map) {
-            if self.labeller.due(&self.map, w, h, self.label_cam.1.elapsed().as_millis() >= 250, self.lettered) {
-                self.labeller.update(&mut self.map, w, h, self.panel.font_px());
-                self.lettered = Instant::now();
-            }
+            let at_rest = self.label_cam.1.elapsed().as_millis() >= 250;
+            self.labeller.ask(&mut self.map, w, h, self.panel.font_px(), at_rest);
             self.labeller.draw_cpu(&mut map, &self.map.cam, w, h);
         }
         self.panel.composite_rgb(&mut map, w, h);
