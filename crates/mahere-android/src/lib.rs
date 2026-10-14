@@ -58,6 +58,8 @@ pub struct AndroidApp {
     /// The dated cell cache, flushed at the pause moment.
     cells_cache: Option<std::sync::Arc<mahere_store::VaultCells>>,
     recorder: Option<std::sync::Arc<std::sync::Mutex<mahere_store::TrackRecorder>>>,
+    /// Recording a track (Nick 2026-10-13): fixes go to the recorder only while this is on, and the activity runs the track service, which owns the GPS meanwhile.
+    recording: bool,
     fixes_since_save: u32,
     persist: Persist,
     /// The GPU path, created on the first draw; None after a failure means the CPU present is in use.
@@ -138,7 +140,7 @@ fn free_bytes(dir: &str) -> Option<u64> {
 
 impl AndroidApp {
     fn controls(&self) -> Controls {
-        Controls { real_sun: self.map.real_sun, real_light: self.map.real_light, follow_heading: self.map.follow_heading, lock_to_fix: self.map.lock_to_fix, cache_budget: self.cache_budget, theme: self.map.theme, compressed: self.map.compressed(), tool: self.map.tool as u8, pen_rgba: self.map.pen_colour, travel: travel_code(self.map.travel), clear_ink: false, clear_sel: false }
+        Controls { real_sun: self.map.real_sun, real_light: self.map.real_light, follow_heading: self.map.follow_heading, lock_to_fix: self.map.lock_to_fix, cache_budget: self.cache_budget, theme: self.map.theme, compressed: self.map.compressed(), tool: self.map.tool as u8, pen_rgba: self.map.pen_colour, travel: travel_code(self.map.travel), record: self.recording, clear_ink: false, clear_sel: false }
     }
 
     /// A pinch with the panel open: the finger distance's ratio to the last event's scales the UI.
@@ -218,6 +220,14 @@ impl AndroidApp {
             self.map.set_theme(ctl.theme);
         }
         self.map.set_travel(travel_of(ctl.travel));
+        if ctl.record != self.recording {
+            self.recording = ctl.record;
+            // Each recording a track of its own.
+            if let (true, Some(rec)) = (self.recording, &self.recorder) {
+                let rec = rec.clone();
+                self.persist.run(move || rec.lock().unwrap().begin());
+            }
+        }
         self.map.set_tool(match ctl.tool {
             1 => mahere_engine::ink::Tool::Pen,
             2 => mahere_engine::ink::Tool::Select,
@@ -335,7 +345,7 @@ impl AndroidApp {
 
     fn save_settings(&self) {
         if let Some(store) = &self.store {
-            let s = mahere_store::Settings { cache_budget: self.cache_budget, layer_bits: self.map.layers().bits() as u64, real_sun: self.map.real_sun, real_light: self.map.real_light, follow_heading: self.map.follow_heading, lock_to_fix: self.map.lock_to_fix, theme: self.map.theme as u64, compressed: self.map.compressed(), ui_ru: self.ui_ru, tool: self.map.tool as u8, pen_rgba: Some(self.map.pen_colour), travel: travel_code(self.map.travel), auto_update: self.updater.auto };
+            let s = mahere_store::Settings { cache_budget: self.cache_budget, layer_bits: self.map.layers().bits() as u64, real_sun: self.map.real_sun, real_light: self.map.real_light, follow_heading: self.map.follow_heading, lock_to_fix: self.map.lock_to_fix, theme: self.map.theme as u64, compressed: self.map.compressed(), ui_ru: self.ui_ru, tool: self.map.tool as u8, pen_rgba: Some(self.map.pen_colour), travel: travel_code(self.map.travel), auto_update: self.updater.auto, record: self.recording };
             self.persist.settings(store.clone(), s);
         }
     }
@@ -396,12 +406,7 @@ impl AndroidApp {
             self.map.camera_moved(self.w, self.h);
         }
         self.map.set_gps(fix);
-        // Track recording: every fix into the vault (chunk-flushed), the session (camera + sun) refreshed every tenth fix.
-        if let Some(rec) = &self.recorder {
-            let elev = self.map.gps_elevation().unwrap_or(f32::NAN) as f64;
-            let rec = rec.clone();
-            self.persist.run(move || rec.lock().unwrap().on_fix(fix.lat, fix.lon, elev));
-        }
+        // The session (camera and sun) refreshed every tenth fix; fixes are recorded by the track service's path while recording.
         self.fixes_since_save += 1;
         if self.fixes_since_save >= 10 {
             self.fixes_since_save = 0;
@@ -711,6 +716,7 @@ pub extern "system" fn Java_nz_mahere_app_MahereActivity_nativeInit(
         store,
         cells_cache,
         recorder,
+        recording: settings.is_some_and(|s| s.record),
         fixes_since_save: 0,
         persist: Persist::new(),
         gpu: None,
@@ -1170,5 +1176,44 @@ pub extern "system" fn Java_nz_mahere_app_MahereActivity_nativeTakeInstall<'a>(e
 pub extern "system" fn Java_nz_mahere_app_MahereActivity_nativeSetUnmetered(_env: JNIEnv, _class: JClass, ptr: jlong, unmetered: jboolean) {
     if ptr != 0 {
         shell(ptr).app().updater.unmetered = unmetered != 0;
+    }
+}
+
+/// Whether a track is being recorded: the activity keeps the track service running while it is.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_nz_mahere_app_MahereActivity_nativeWantsRecording(_env: JNIEnv, _class: JClass, ptr: jlong) -> jboolean {
+    if ptr == 0 {
+        return 0;
+    }
+    shell(ptr).app().recording as jboolean
+}
+
+/// The track service's fixes, one or a batch (a batch arrives a minute or more after it was measured): each into the track at the time it was taken, the newest onto the map.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_nz_mahere_app_MahereTrackService_nativeOnTrackFixes<'a>(env: JNIEnv<'a>, _class: JClass, ptr: jlong, lats: jni::objects::JDoubleArray<'a>, lons: jni::objects::JDoubleArray<'a>, accs: jni::objects::JFloatArray<'a>, times: jni::objects::JLongArray<'a>) {
+    if ptr == 0 {
+        return;
+    }
+    let n = env.get_array_length(&lats).unwrap_or(0).max(0) as usize;
+    let (mut la, mut lo, mut ac, mut tm) = (vec![0.0f64; n], vec![0.0f64; n], vec![0.0f32; n], vec![0i64; n]);
+    if env.get_double_array_region(&lats, 0, &mut la).is_err() || env.get_double_array_region(&lons, 0, &mut lo).is_err() || env.get_float_array_region(&accs, 0, &mut ac).is_err() || env.get_long_array_region(&times, 0, &mut tm).is_err() {
+        return;
+    }
+    let app = shell(ptr).app();
+    if app.recording {
+        if let Some(rec) = &app.recorder {
+            let rec = rec.clone();
+            let elev: Vec<f64> = (0..n).map(|i| app.map.elevation_at(la[i], lo[i]).map_or(f64::NAN, |e| e as f64)).collect();
+            let fixes: Vec<(f64, f64, f64, f64)> = (0..n).map(|i| (la[i], lo[i], elev[i], tm[i] as f64 / 1000.0)).collect();
+            app.persist.run(move || {
+                let mut r = rec.lock().unwrap();
+                for (lat, lon, e, t) in fixes {
+                    r.on_fix_at(lat, lon, e, t);
+                }
+            });
+        }
+    }
+    if n > 0 {
+        app.on_gps(GpsFix { lat: la[n - 1], lon: lo[n - 1], accuracy_m: ac[n - 1] });
     }
 }

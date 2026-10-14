@@ -42,6 +42,9 @@ class MahereActivity : Activity(), SurfaceHolder.Callback, Choreographer.FrameCa
         }
         private const val LOCATION_PERMISSION_REQUEST = 1
         private const val CAMERA_PERMISSION_REQUEST = 2
+        private const val NOTIFICATION_PERMISSION_REQUEST = 3
+        /// The engine, for the track service to hand its fixes to; 0 until it is made.
+        @Volatile var sharedPtr = 0L
     }
 
     private external fun nativeInit(width: Int, height: Int, dataDir: String): Long
@@ -58,6 +61,7 @@ class MahereActivity : Activity(), SurfaceHolder.Callback, Choreographer.FrameCa
     private external fun nativeOpenArea(ptr: Long, bytes: ByteArray)
     private external fun nativeBack(ptr: Long): Boolean
     private external fun nativeTakeInstall(ptr: Long): String?
+    private external fun nativeWantsRecording(ptr: Long): Boolean
     private external fun nativeSetUnmetered(ptr: Long, unmetered: Boolean)
     private external fun nativeOnDeclination(ptr: Long, declinationDeg: Float)
     private external fun nativeOnOrientation(ptr: Long, r0: Float, r1: Float, r2: Float, r3: Float, r4: Float, r5: Float, r6: Float, r7: Float, r8: Float)
@@ -205,6 +209,7 @@ class MahereActivity : Activity(), SurfaceHolder.Callback, Choreographer.FrameCa
                 val ptr = nativeInit(w, h, filesDir.absolutePath)
                 runOnUiThread {
                     nativePtr = ptr
+                    sharedPtr = ptr
                     initInFlight = false
                     pendingGeo?.let { (lat, lon, ppd) -> nativeGoTo(ptr, lat, lon, ppd) }
                     pendingGeo = null
@@ -245,6 +250,7 @@ class MahereActivity : Activity(), SurfaceHolder.Callback, Choreographer.FrameCa
             nativeDraw(nativePtr, surfaceView.holder.surface)
             syncProbe()
             nativeTakeInstall(nativePtr)?.let { installApk(it) }
+            syncRecording()
             Choreographer.getInstance().postFrameCallback(this)
         }
     }
@@ -290,6 +296,27 @@ class MahereActivity : Activity(), SurfaceHolder.Callback, Choreographer.FrameCa
         override fun onLost(network: android.net.Network) {
             val ptr = nativePtr
             if (ptr != 0L) nativeSetUnmetered(ptr, false)
+        }
+    }
+
+    // ---- Recording a track: the service runs while the engine wants it, and owns the GPS meanwhile ----
+
+    private var notificationAsked = false
+
+    private fun syncRecording() {
+        val wants = nativeWantsRecording(nativePtr)
+        if (wants && !MahereTrackService.running) {
+            // Android 13 and later show the service's notification only with this permission; recording goes ahead either way.
+            if (Build.VERSION.SDK_INT >= 33 && !notificationAsked && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
+                notificationAsked = true
+                requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), NOTIFICATION_PERMISSION_REQUEST)
+            }
+            stopLocation()
+            startForegroundService(Intent(this, MahereTrackService::class.java))
+            MahereTrackService.setLive(true)
+        } else if (!wants && MahereTrackService.running) {
+            stopService(Intent(this, MahereTrackService::class.java))
+            startLocation()
         }
     }
 
@@ -353,13 +380,15 @@ class MahereActivity : Activity(), SurfaceHolder.Callback, Choreographer.FrameCa
         hideSystemBars()
         startFrames()
         startHeading()
-        startLocation()
+        // Recording, the service has the GPS and goes live; else the app's own, while it is in front.
+        if (MahereTrackService.running) MahereTrackService.setLive(true) else startLocation()
     }
 
     override fun onPause() {
         super.onPause()
         stopHeading()
         stopLocation()
+        if (MahereTrackService.running) MahereTrackService.setLive(false)
         probe.stop()
         Choreographer.getInstance().removeFrameCallback(this)
         if (nativePtr != 0L) nativeOnPause(nativePtr)

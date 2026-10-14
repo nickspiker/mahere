@@ -4,6 +4,10 @@
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.CAMERA" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <!-- Recording a track with the screen off: a foreground service of the location type, with its notification. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_LOCATION" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <!-- Updates: Mahere installs its own new builds (after Photon's), without asking once it is its own installer of record. -->
     <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
     <uses-permission android:name="android.permission.UPDATE_PACKAGES_WITHOUT_USER_ACTION" />
@@ -41,6 +45,11 @@
                 <data android:mimeType="application/octet-stream" />
             </intent-filter>
         </activity>
+        <!-- Recording a track, the screen on or off. -->
+        <service
+            android:name=".MahereTrackService"
+            android:exported="false"
+            android:foregroundServiceType="location" />
         <!-- The package installer's answer to an update: the first time, the system's confirm. -->
         <receiver
             android:name=".MahereInstallReceiver"
