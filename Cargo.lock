@@ -1854,6 +1854,7 @@ dependencies = [
  "fluor",
  "jni 0.21.1",
  "libc",
+ "mahere-coord",
  "mahere-engine",
  "mahere-gpu",
  "mahere-panel",
@@ -1948,10 +1949,12 @@ version = "0.1.0"
 dependencies = [
  "blake3",
  "kete",
+ "mahere-coord",
  "mahere-engine",
  "mahere-tiles",
  "rand",
  "vsf",
+ "zstd",
 ]
 
 [[package]]
