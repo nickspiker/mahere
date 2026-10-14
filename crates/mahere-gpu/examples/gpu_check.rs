@@ -174,6 +174,29 @@ fn main() {
     // MAHERE_LABELS=1 letters the view (MAHERE_LABEL_FONT the base size, default 15 px): the GPU draws it through its labels texture, the CPU frame has it laid over below. MAHERE_LABEL_PAN=dx,dy then pans the map before the GPU frame, which must carry the lettering with it.
     let mut labeller = mahere_panel::labels::Labeller::new();
     let mut plan = plan;
+    // MAHERE_ROUTE=car|bike|foot,x,y routes from the screen centre to that pixel and prints what the strip says; with MAHERE_LABELS the line is drawn.
+    if let Ok(spec) = std::env::var("MAHERE_ROUTE") {
+        let v: Vec<&str> = spec.split(',').collect();
+        map.set_travel(Some(match v[0] {
+            "bike" => mahere_engine::route::Travel::Bike,
+            "foot" => mahere_engine::route::Travel::Foot,
+            _ => mahere_engine::route::Travel::Car,
+        }));
+        map.tap(v[1].parse().unwrap(), v[2].parse().unwrap(), w, h);
+        let t = std::time::Instant::now();
+        while map.route().is_none() && t.elapsed().as_secs() < 60 {
+            map.tick(w, h);
+            if map.measure_view(w, h, 2).is_some_and(|m| m.info.iter().any(|l| l.starts_with("No route"))) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        if let Some(m) = map.measure_view(w, h, 2) {
+            for l in &m.info {
+                println!("strip: {l}");
+            }
+        }
+    }
     if std::env::var_os("MAHERE_LABELS").is_some() {
         let font = std::env::var("MAHERE_LABEL_FONT").ok().and_then(|s| s.parse().ok()).unwrap_or(15.0);
         labeller.update(&mut map, w, h, font);

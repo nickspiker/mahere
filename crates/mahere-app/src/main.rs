@@ -134,6 +134,7 @@ impl MahereApp {
         if ctl.lock_to_fix != self.map.lock_to_fix {
             self.map.set_lock_to_fix(ctl.lock_to_fix);
         }
+        self.map.set_travel(travel_of(ctl.travel));
         self.map.set_tool(match ctl.tool {
             1 => mahere_engine::ink::Tool::Pen,
             2 => mahere_engine::ink::Tool::Select,
@@ -287,7 +288,7 @@ impl FluorApp for MahereApp {
                     return EventResponse::StartWindowDrag;
                 }
                 let mut mask = self.map.layers();
-                let mut ctl = Controls { real_sun: self.map.real_sun, real_light: self.map.real_light, follow_heading: self.map.follow_heading, lock_to_fix: self.map.lock_to_fix, cache_budget: self.cache_budget, theme: self.map.theme, compressed: self.map.compressed(), tool: self.map.tool as u8, pen_rgba: self.map.pen_colour, clear_ink: false, clear_sel: false };
+                let mut ctl = Controls { real_sun: self.map.real_sun, real_light: self.map.real_light, follow_heading: self.map.follow_heading, lock_to_fix: self.map.lock_to_fix, cache_budget: self.cache_budget, theme: self.map.theme, compressed: self.map.compressed(), tool: self.map.tool as u8, pen_rgba: self.map.pen_colour, travel: travel_code(self.map.travel), clear_ink: false, clear_sel: false };
                 let was_open = self.panel.is_open();
                 if self.panel.tap(cx as f32, cy as f32, w, h, &mut mask, &mut ctl, &self.map.themes) {
                     self.apply_controls(ctl, mask);
@@ -313,7 +314,7 @@ impl FluorApp for MahereApp {
             FEvent::MouseInput { state: ElementState::Released, button: MouseButton::Left } => {
                 // A press on the layer list acts when it lifts without having scrolled.
                 let mut mask = self.map.layers();
-                let mut ctl = Controls { real_sun: self.map.real_sun, real_light: self.map.real_light, follow_heading: self.map.follow_heading, lock_to_fix: self.map.lock_to_fix, cache_budget: self.cache_budget, theme: self.map.theme, compressed: self.map.compressed(), tool: self.map.tool as u8, pen_rgba: self.map.pen_colour, clear_ink: false, clear_sel: false };
+                let mut ctl = Controls { real_sun: self.map.real_sun, real_light: self.map.real_light, follow_heading: self.map.follow_heading, lock_to_fix: self.map.lock_to_fix, cache_budget: self.cache_budget, theme: self.map.theme, compressed: self.map.compressed(), tool: self.map.tool as u8, pen_rgba: self.map.pen_colour, travel: travel_code(self.map.travel), clear_ink: false, clear_sel: false };
                 if self.panel.release(&mut mask, &mut ctl) {
                     self.apply_controls(ctl, mask);
                     ctx.window.request_redraw();
@@ -346,7 +347,7 @@ impl FluorApp for MahereApp {
                     ctx.window.request_redraw();
                 }
                 let (x, y) = (hx as f64, hy as f64);
-                let mut ctl = Controls { real_sun: self.map.real_sun, real_light: self.map.real_light, follow_heading: self.map.follow_heading, lock_to_fix: self.map.lock_to_fix, cache_budget: self.cache_budget, theme: self.map.theme, compressed: self.map.compressed(), tool: self.map.tool as u8, pen_rgba: self.map.pen_colour, clear_ink: false, clear_sel: false };
+                let mut ctl = Controls { real_sun: self.map.real_sun, real_light: self.map.real_light, follow_heading: self.map.follow_heading, lock_to_fix: self.map.lock_to_fix, cache_budget: self.cache_budget, theme: self.map.theme, compressed: self.map.compressed(), tool: self.map.tool as u8, pen_rgba: self.map.pen_colour, travel: travel_code(self.map.travel), clear_ink: false, clear_sel: false };
                 if self.panel.drag(hx, hy, &mut ctl) {
                     self.cache_budget = ctl.cache_budget;
                     self.map.set_pen_colour(ctl.pen_rgba);
@@ -533,7 +534,7 @@ impl FluorApp for MahereApp {
             self.chrome.invalidate_bg();
         }
         // Labels waiting for the camera to rest keep the ticks coming until they are drawn.
-        let labels_due = self.map.layers().labels && self.map.converged() && self.labeller.stale(&self.map, w, h);
+        let labels_due = mahere_panel::labels::Labeller::wanted(&self.map) && self.map.converged() && self.labeller.stale(&self.map, w, h);
         self.map.tick(w, h) || areas_changed || labels_due
     }
 
@@ -572,7 +573,7 @@ impl FluorApp for MahereApp {
             self.chrome.invalidate_chrome();
         }
         let areas = self.areas.view(self.map.user.has_selection());
-        self.panel.paint(w, h, self.map.layers(), Controls { real_sun: self.map.real_sun, real_light: self.map.real_light, follow_heading: self.map.follow_heading, lock_to_fix: self.map.lock_to_fix, cache_budget: self.cache_budget, theme: self.map.theme, compressed: self.map.compressed(), tool: self.map.tool as u8, pen_rgba: self.map.pen_colour, clear_ink: false, clear_sel: false }, &readouts, measure.as_ref(), &themes, &areas, None);
+        self.panel.paint(w, h, self.map.layers(), Controls { real_sun: self.map.real_sun, real_light: self.map.real_light, follow_heading: self.map.follow_heading, lock_to_fix: self.map.lock_to_fix, cache_budget: self.cache_budget, theme: self.map.theme, compressed: self.map.compressed(), tool: self.map.tool as u8, pen_rgba: self.map.pen_colour, travel: travel_code(self.map.travel), clear_ink: false, clear_sel: false }, &readouts, measure.as_ref(), &themes, &areas, None);
         let mut map = self.map.canvas.clone();
         // The labels, laid out a quarter second after the camera stops with every cell in, over the map and under the panel.
         let c = self.map.cam;
@@ -580,7 +581,7 @@ impl FluorApp for MahereApp {
         if cam_key != self.label_cam.0 {
             self.label_cam = (cam_key, Instant::now());
         }
-        if self.map.layers().labels {
+        if mahere_panel::labels::Labeller::wanted(&self.map) {
             if self.map.converged() && self.label_cam.1.elapsed().as_millis() >= 250 && self.labeller.stale(&self.map, w, h) {
                 self.labeller.update(&mut self.map, w, h, self.panel.font_px());
             }
@@ -715,5 +716,26 @@ impl mahere_engine::ink::UserStore for DirUser {
                 Some((key, bytes))
             })
             .collect()
+    }
+}
+
+/// The panel's navigation code (0 off, 1 car, 2 bike, 3 foot) and the engine's travel, each way.
+fn travel_of(code: u8) -> Option<mahere_engine::route::Travel> {
+    use mahere_engine::route::Travel;
+    match code {
+        1 => Some(Travel::Car),
+        2 => Some(Travel::Bike),
+        3 => Some(Travel::Foot),
+        _ => None,
+    }
+}
+
+fn travel_code(t: Option<mahere_engine::route::Travel>) -> u8 {
+    use mahere_engine::route::Travel;
+    match t {
+        Some(Travel::Car) => 1,
+        Some(Travel::Bike) => 2,
+        Some(Travel::Foot) => 3,
+        None => 0,
     }
 }

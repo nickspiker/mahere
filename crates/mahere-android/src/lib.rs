@@ -135,7 +135,7 @@ fn free_bytes(dir: &str) -> Option<u64> {
 
 impl AndroidApp {
     fn controls(&self) -> Controls {
-        Controls { real_sun: self.map.real_sun, real_light: self.map.real_light, follow_heading: self.map.follow_heading, lock_to_fix: self.map.lock_to_fix, cache_budget: self.cache_budget, theme: self.map.theme, compressed: self.map.compressed(), tool: self.map.tool as u8, pen_rgba: self.map.pen_colour, clear_ink: false, clear_sel: false }
+        Controls { real_sun: self.map.real_sun, real_light: self.map.real_light, follow_heading: self.map.follow_heading, lock_to_fix: self.map.lock_to_fix, cache_budget: self.cache_budget, theme: self.map.theme, compressed: self.map.compressed(), tool: self.map.tool as u8, pen_rgba: self.map.pen_colour, travel: travel_code(self.map.travel), clear_ink: false, clear_sel: false }
     }
 
     /// A pinch with the panel open: the finger distance's ratio to the last event's scales the UI.
@@ -214,6 +214,7 @@ impl AndroidApp {
         if ctl.theme != self.map.theme {
             self.map.set_theme(ctl.theme);
         }
+        self.map.set_travel(travel_of(ctl.travel));
         self.map.set_tool(match ctl.tool {
             1 => mahere_engine::ink::Tool::Pen,
             2 => mahere_engine::ink::Tool::Select,
@@ -279,7 +280,7 @@ impl AndroidApp {
 
     fn save_settings(&self) {
         if let Some(store) = &self.store {
-            let s = mahere_store::Settings { cache_budget: self.cache_budget, layer_bits: self.map.layers().bits() as u64, real_sun: self.map.real_sun, real_light: self.map.real_light, follow_heading: self.map.follow_heading, lock_to_fix: self.map.lock_to_fix, theme: self.map.theme as u64, compressed: self.map.compressed(), ui_ru: self.ui_ru, tool: self.map.tool as u8, pen_rgba: Some(self.map.pen_colour) };
+            let s = mahere_store::Settings { cache_budget: self.cache_budget, layer_bits: self.map.layers().bits() as u64, real_sun: self.map.real_sun, real_light: self.map.real_light, follow_heading: self.map.follow_heading, lock_to_fix: self.map.lock_to_fix, theme: self.map.theme as u64, compressed: self.map.compressed(), ui_ru: self.ui_ru, tool: self.map.tool as u8, pen_rgba: Some(self.map.pen_colour), travel: travel_code(self.map.travel) };
             self.persist.settings(store.clone(), s);
         }
     }
@@ -627,6 +628,7 @@ pub extern "system" fn Java_nz_mahere_app_MahereActivity_nativeInit(
         if let Some(c) = s.pen_rgba {
             map.set_pen_colour(c);
         }
+        map.set_travel(travel_of(s.travel));
     }
     let recorder = store.clone().map(|s| std::sync::Arc::new(std::sync::Mutex::new(mahere_store::TrackRecorder::new(s))));
     let mut app = AndroidApp {
@@ -1048,5 +1050,26 @@ pub extern "system" fn Java_nz_mahere_app_MahereActivity_nativeOnProbe(
         let sum = rgb.iter().fold([0u64; 3], |a, p| [a[0] + p[0] as u64, a[1] + p[1] as u64, a[2] + p[2] as u64]);
         let mean = [sum[0] / n, sum[1] / n, sum[2] / n];
         eprintln!("probe: clipped {:.5} p999 {:.3} filled {filled} bins from the bracket; stop {stop} (short {}), bin {bin_ms:.1} ms; mean {mean:?}; sphere {:.0}% painted; {:?} = (level, light on world up, on the screen, brightest triangle)", st.clipped, st.p999, app.probe_short.as_ref().map_or(0, |s| s.0), app.map.probe_coverage() * 100.0, app.map.probe_report());
+    }
+}
+
+/// The panel's navigation code (0 off, 1 car, 2 bike, 3 foot) and the engine's travel, each way.
+fn travel_of(code: u8) -> Option<mahere_engine::route::Travel> {
+    use mahere_engine::route::Travel;
+    match code {
+        1 => Some(Travel::Car),
+        2 => Some(Travel::Bike),
+        3 => Some(Travel::Foot),
+        _ => None,
+    }
+}
+
+fn travel_code(t: Option<mahere_engine::route::Travel>) -> u8 {
+    use mahere_engine::route::Travel;
+    match t {
+        Some(Travel::Car) => 1,
+        Some(Travel::Bike) => 2,
+        Some(Travel::Foot) => 3,
+        None => 0,
     }
 }

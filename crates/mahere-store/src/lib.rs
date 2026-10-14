@@ -138,6 +138,8 @@ pub struct Settings {
     pub tool: u8,
     /// The pen's colour and opacity, RGBA; None when the settings predate it, and the map keeps its default.
     pub pen_rgba: Option<[u8; 4]>,
+    /// How a tap routes there: 0 it doesn't, 1 car, 2 bike, 3 foot; 0 when the settings predate it.
+    pub travel: u8,
 }
 
 fn settings_key() -> String {
@@ -148,7 +150,7 @@ pub fn save_settings(store: &FlatStorage, s: &Settings) -> Result<(), StorageErr
     let flags = (s.real_sun as u64) | (s.follow_heading as u64) << 1 | (s.lock_to_fix as u64) << 2 | (!s.compressed as u64) << 3 | (s.real_light as u64) << 4;
     // The pen's colour is stored one more than its packed RGBA, so 0 says there is none.
     let pen = s.pen_rgba.map_or(0, |c| u32::from_be_bytes(c) as u64 + 1);
-    let t = VsfType::t_u6(Tensor::new(vec![7], vec![s.cache_budget, s.layer_bits, flags, s.theme, (s.ui_ru * 1000.0).round() as u64, s.tool as u64, pen]));
+    let t = VsfType::t_u6(Tensor::new(vec![8], vec![s.cache_budget, s.layer_bits, flags, s.theme, (s.ui_ru * 1000.0).round() as u64, s.tool as u64, pen, s.travel as u64]));
     store.write_device(&settings_key(), &t.flatten())
 }
 
@@ -163,7 +165,7 @@ pub fn load_settings(store: &FlatStorage) -> Option<Settings> {
     if d.len() < 3 {
         return None;
     }
-    Some(Settings { cache_budget: d[0], layer_bits: d[1], real_sun: d[2] & 1 != 0, follow_heading: d[2] & 2 != 0, lock_to_fix: d[2] & 4 != 0, theme: d.get(3).copied().unwrap_or(0), compressed: d[2] & 8 == 0, real_light: d[2] & 16 != 0, ui_ru: d.get(4).map_or(1.0, |&v| v as f32 / 1000.0), tool: d.get(5).map_or(0, |&v| v.min(2) as u8), pen_rgba: d.get(6).filter(|&&v| v != 0).map(|&v| ((v - 1) as u32).to_be_bytes()) })
+    Some(Settings { cache_budget: d[0], layer_bits: d[1], real_sun: d[2] & 1 != 0, follow_heading: d[2] & 2 != 0, lock_to_fix: d[2] & 4 != 0, theme: d.get(3).copied().unwrap_or(0), compressed: d[2] & 8 == 0, real_light: d[2] & 16 != 0, ui_ru: d.get(4).map_or(1.0, |&v| v as f32 / 1000.0), tool: d.get(5).map_or(0, |&v| v.min(2) as u8), pen_rgba: d.get(6).filter(|&&v| v != 0).map(|&v| ((v - 1) as u32).to_be_bytes()), travel: d.get(7).map_or(0, |&v| v.min(3) as u8) })
 }
 
 /// Width-agnostic float-array read, per VSF doctrine.
@@ -278,7 +280,7 @@ mod tests {
 
         // The settings keep the tool and the pen's colour, a fully transparent black pen included.
         for pen in [Some([230, 40, 40, 255]), Some([0, 0, 0, 0]), None] {
-            let set = Settings { cache_budget: 1 << 30, layer_bits: 0b1011, real_sun: true, compressed: true, ui_ru: 1.25, tool: 1, pen_rgba: pen, ..Default::default() };
+            let set = Settings { cache_budget: 1 << 30, layer_bits: 0b1011, real_sun: true, compressed: true, ui_ru: 1.25, tool: 1, pen_rgba: pen, travel: 2, ..Default::default() };
             save_settings(&store, &set).unwrap();
             assert_eq!(load_settings(&store), Some(set));
         }

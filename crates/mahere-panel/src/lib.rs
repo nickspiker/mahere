@@ -38,6 +38,8 @@ pub struct Controls {
     pub tool: u8,
     /// The pen's colour and opacity, VSF RGB at gamma 2.
     pub pen_rgba: [u8; 4],
+    /// How a tap on the map routes there: 0 it doesn't, 1 by car, 2 by bike, 3 on foot.
+    pub travel: u8,
     /// One-shot asks: the ink or the selection cleared.
     pub clear_ink: bool,
     pub clear_sel: bool,
@@ -91,9 +93,13 @@ enum Layer {
     ClearSel,
     /// The areas page: saved selections, downloaded and shared.
     Areas,
+    /// Navigation: a tap routes there by car, by bike or on foot (one at a time).
+    Drive,
+    Ride,
+    Walk,
 }
 
-const LAYERS: [(Layer, &str); 26] = [
+const LAYERS: [(Layer, &str); 29] = [
     (Layer::Dem, "Terrain"),
     (Layer::Hypso, "Elevation tint"),
     (Layer::Raw, "Raw elevation"),
@@ -114,6 +120,9 @@ const LAYERS: [(Layer, &str); 26] = [
     (Layer::Linear, "Linear highlights"),
     (Layer::FollowHeading, "Follow heading"),
     (Layer::LockToFix, "Measure from me"),
+    (Layer::Drive, "Navigate by car"),
+    (Layer::Ride, "Navigate by bike"),
+    (Layer::Walk, "Navigate on foot"),
     (Layer::Pen, "Pen"),
     (Layer::PenColour, "Pen colour"),
     (Layer::Select, "Select area"),
@@ -127,7 +136,7 @@ fn inert(mask: &LayerMask, ctl: &Controls, l: Layer) -> bool {
     match l {
         Layer::RealSun => ctl.real_light,
         Layer::RealLight => ctl.real_sun,
-        Layer::Linear | Layer::FollowHeading | Layer::LockToFix | Layer::Pen | Layer::Select | Layer::PenColour | Layer::ClearInk | Layer::ClearSel | Layer::Areas => false,
+        Layer::Linear | Layer::FollowHeading | Layer::LockToFix | Layer::Pen | Layer::Select | Layer::PenColour | Layer::ClearInk | Layer::ClearSel | Layer::Areas | Layer::Drive | Layer::Ride | Layer::Walk => false,
         _ => get(&mask.inert(), &Controls::default(), l),
     }
 }
@@ -156,6 +165,9 @@ fn get(mask: &LayerMask, ctl: &Controls, l: Layer) -> bool {
         Layer::Debug => mask.debug,
         Layer::Pen => ctl.tool == 1,
         Layer::Select => ctl.tool == 2,
+        Layer::Drive => ctl.travel == 1,
+        Layer::Ride => ctl.travel == 2,
+        Layer::Walk => ctl.travel == 3,
         Layer::PenColour | Layer::ClearInk | Layer::ClearSel | Layer::Areas => false,
     }
 }
@@ -184,6 +196,9 @@ fn set(mask: &mut LayerMask, ctl: &mut Controls, l: Layer, v: bool) {
         Layer::Debug => mask.debug = v,
         Layer::Pen => ctl.tool = if v { 1 } else { 0 },
         Layer::Select => ctl.tool = if v { 2 } else { 0 },
+        Layer::Drive => ctl.travel = if v { 1 } else { 0 },
+        Layer::Ride => ctl.travel = if v { 2 } else { 0 },
+        Layer::Walk => ctl.travel = if v { 3 } else { 0 },
         Layer::PenColour | Layer::Areas => {}
         Layer::ClearInk => ctl.clear_ink = true,
         Layer::ClearSel => ctl.clear_sel = true,
@@ -600,11 +615,12 @@ impl Panel {
         let top = theme_y + row * 0.8;
         let mut last = top;
         for (i, (l, cb)) in self.checks.iter_mut().enumerate() {
-            // The modes sit a little apart from the layers, and the tools a little apart from the modes.
+            // The modes sit a little apart from the layers, navigation a little apart from the modes, the tools from navigation.
             let gap = match l {
                 Layer::RealSun | Layer::RealLight | Layer::Linear | Layer::FollowHeading | Layer::LockToFix => row * 0.5,
-                Layer::Pen | Layer::PenColour | Layer::Select | Layer::ClearInk | Layer::ClearSel => row,
-                Layer::Areas => row * 1.5,
+                Layer::Drive | Layer::Ride | Layer::Walk => row,
+                Layer::Pen | Layer::PenColour | Layer::Select | Layer::ClearInk | Layer::ClearSel => row * 1.5,
+                Layer::Areas => row * 2.0,
                 _ => 0.0,
             };
             let cy = top + row * (i as f32 + 0.5) + gap;

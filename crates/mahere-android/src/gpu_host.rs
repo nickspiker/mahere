@@ -210,7 +210,7 @@ impl GpuHost {
             hs.finish()
         });
         // Labels: lettered again once the view rests with its cells in, on the still frame; until then the last lettering rides along with the map, and hides when the zoom has changed it by more than half or double.
-        if mask.labels {
+        if mahere_panel::labels::Labeller::wanted(map) {
             if !in_motion && map.converged() && self.labeller.stale(map, w as usize, h as usize) {
                 self.labeller.update(map, w as usize, h as usize, panel.font_px());
                 self.map.set_labels_rgba(&self.device, &self.queue, w, h, &self.labeller.rgba());

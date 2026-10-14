@@ -317,6 +317,11 @@ pub struct MapCore {
     tap_info: Vec<String>,
     /// Cells' names as labels last read them; None for a resident cell with none.
     names_cache: rustc_hash::FxHashMap<mahere_tiles::CellKey, Option<std::sync::Arc<mahere_tiles::NameCell>>>,
+    /// Navigation (Nick 2026-10-13): how a tap routes there, if it does; the route found and its version; the search running.
+    pub travel: Option<route::Travel>,
+    route: Option<Arc<route::Route>>,
+    pub route_version: u64,
+    route_rx: Option<std::sync::mpsc::Receiver<Result<route::Route, String>>>,
 }
 
 type PlanKey = (u64, u64, u64, u64, usize, usize, u64, u8, u8);
@@ -391,6 +396,10 @@ impl MapCore {
             user_store: None,
             tap_info: Vec::new(),
             names_cache: Default::default(),
+            travel: None,
+            route: None,
+            route_version: 0,
+            route_rx: None,
         }
     }
 
@@ -927,7 +936,81 @@ impl MapCore {
 
     /// Integrate async-loaded cells. True if a redraw is due: cells arrived or the camera/sun/GPS changed since the last render.
     pub fn tick(&mut self, _w: usize, _h: usize) -> bool {
-        self.res.drain() > 0 || self.dirty
+        let routed = self.poll_route();
+        self.res.drain() > 0 || self.dirty || routed
+    }
+
+    // ==================== NAVIGATION ====================
+
+    /// How a tap routes there: by car, bike or foot, or not at all (which clears the route).
+    pub fn set_travel(&mut self, travel: Option<route::Travel>) {
+        if travel != self.travel {
+            self.travel = travel;
+            if travel.is_none() {
+                self.clear_route();
+            }
+            self.dirty = true;
+        }
+    }
+
+    fn clear_route(&mut self) {
+        if self.route.take().is_some() {
+            self.route_version += 1;
+        }
+        self.route_rx = None;
+    }
+
+    /// The route on the map, as latitude and longitude.
+    pub fn route_points(&self) -> Option<&[(f64, f64)]> {
+        self.route.as_ref().map(|r| r.pts.as_slice())
+    }
+
+    pub fn route(&self) -> Option<&route::Route> {
+        self.route.as_deref()
+    }
+
+    /// Search for a route from the fix (the screen centre without one) to a point, on a thread of its own; the result comes in through [`MapCore::tick`].
+    fn start_route(&mut self, to: (f64, f64), travel: route::Travel) {
+        let from = self.gps.map_or((self.cam.lat(), self.cam.lon()), |g| (g.lat, g.lon));
+        let store = self.res.store();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(route::find(store, from, to, travel));
+        });
+        self.route_rx = Some(rx);
+        self.tap_info.insert(0, format!("Finding a route by {}\u{2026}", travel.word().to_lowercase()));
+    }
+
+    /// A finished search: the route kept and told at the top of the strip (its length, time and climb, then the turns), or why there is none.
+    fn poll_route(&mut self) -> bool {
+        let Some(rx) = &self.route_rx else { return false };
+        let Ok(found) = rx.try_recv() else { return false };
+        self.route_rx = None;
+        self.tap_info.retain(|l| !l.starts_with("Finding a route"));
+        match found {
+            Ok(r) => {
+                let mut lines = Vec::new();
+                let mins = (r.seconds / 60.0).round() as i64;
+                let time = if mins >= 60 { format!("{} h {:02} min", mins / 60, mins % 60) } else { format!("{mins} min") };
+                let climb = if r.climb_m >= 1.0 { format!(" \u{b7} {} m up", r.climb_m.round() as i64) } else { String::new() };
+                lines.push(format!("{} \u{b7} {:.1} km \u{b7} {time}{climb}", r.travel.word(), r.metres / 1000.0));
+                for s in r.steps.iter().skip(1).take(4) {
+                    let name = if s.name.is_empty() { "the way" } else { &s.name };
+                    lines.push(format!("{:.1} km  {} {name}", s.at_m / 1000.0, s.turn));
+                }
+                for (k, l) in lines.into_iter().enumerate() {
+                    self.tap_info.insert(k, l);
+                }
+                self.route = Some(Arc::new(r));
+            }
+            Err(e) => {
+                self.route = None;
+                self.tap_info.insert(0, format!("No route: {e}"));
+            }
+        }
+        self.route_version += 1;
+        self.dirty = true;
+        true
     }
 
     pub fn converged(&self) -> bool {
@@ -1641,6 +1724,10 @@ impl MapCore {
         let target = self.cam.screen_to_geo(x, y, w, h);
         self.measure = Some(Measure { target, from_fix: self.lock_to_fix && self.gps.is_some() });
         self.tap_info = self.point_info(x, y, w, h);
+        // Navigating: a tap is where to go.
+        if let Some(t) = self.travel {
+            self.start_route(target, t);
+        }
         self.dirty = true;
     }
 
@@ -1657,6 +1744,7 @@ impl MapCore {
     pub fn clear_measure(&mut self) {
         self.measure = None;
         self.tap_info.clear();
+        self.clear_route();
         self.dirty = true;
     }
 

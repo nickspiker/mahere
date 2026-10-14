@@ -23,6 +23,9 @@ const TRAIL: u32 = ink(0x74_2A_18, 255);
 const BOUNDARY: u32 = ink(0x2A_5C_2C, 255);
 const GREEN: u32 = ink(0x2E_5E_30, 255);
 const MARK: u32 = ink(0x46_46_4C, 255);
+/// A route: a strong blue line on a white casing, under the labels.
+const ROUTE: u32 = ink(0x1E_6E_F0, 255);
+const ROUTE_CASING: u32 = ink(0xFF_FF_FF, 255);
 
 /// Water's names lean, as maps letter them: a shear of tan 12°.
 const ITALIC: f32 = 0.2126;
@@ -127,7 +130,7 @@ pub struct Labeller {
     /// Two screen points of the drawn view and where on the globe they were, so the buffer can follow the map until the next rest.
     anchor: Option<([f64; 2], [f64; 2], (f64, f64), (f64, f64))>,
     /// The view the buffer was drawn for, to tell when it is out of date.
-    drawn_for: Option<(i64, i64, i64, i64, u8, usize)>,
+    drawn_for: Option<(i64, i64, i64, i64, u8, usize, u64, bool)>,
     advance: HashMap<(char, u16, u32), f32>,
 }
 
@@ -197,6 +200,69 @@ fn glyph_box(g: &Glyph, size: f32, pad: f32) -> [f32; 4] {
 fn unturn(p: [f32; 2], angle: f32) -> [f32; 2] {
     let (s, c) = angle.sin_cos();
     [p[0] * c + p[1] * s, -p[0] * s + p[1] * c]
+}
+
+/// A thick polyline under what a buffer already holds (fluor's α + darkness, front to back): each pixel's coverage by distance to the nearest segment, feathered over a pixel, added beneath.
+fn under_polyline(px: &mut [u32], w: usize, h: usize, pts: &[[f32; 2]], width: f32, colour: u32) {
+    if pts.len() < 2 {
+        return;
+    }
+    let half = width / 2.0;
+    let dark = colour & 0x00FF_FFFF;
+    let mut cover = vec![0u8; 0];
+    let (mut x0, mut y0, mut x1, mut y1) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
+    for p in pts {
+        x0 = x0.min(p[0]);
+        y0 = y0.min(p[1]);
+        x1 = x1.max(p[0]);
+        y1 = y1.max(p[1]);
+    }
+    let (bx0, by0) = ((x0 - half - 1.0).floor().max(0.0) as usize, (y0 - half - 1.0).floor().max(0.0) as usize);
+    let (bx1, by1) = (((x1 + half + 1.0).ceil() as i64).clamp(0, w as i64) as usize, ((y1 + half + 1.0).ceil() as i64).clamp(0, h as i64) as usize);
+    if bx0 >= bx1 || by0 >= by1 {
+        return;
+    }
+    let bw = bx1 - bx0;
+    cover.resize(bw * (by1 - by0), 0);
+    for seg in pts.windows(2) {
+        let (a, b) = (seg[0], seg[1]);
+        let sx0 = ((a[0].min(b[0]) - half - 1.0).floor().max(bx0 as f32)) as usize;
+        let sx1 = ((a[0].max(b[0]) + half + 1.0).ceil().min(bx1 as f32 - 1.0)).max(0.0) as usize;
+        let sy0 = ((a[1].min(b[1]) - half - 1.0).floor().max(by0 as f32)) as usize;
+        let sy1 = ((a[1].max(b[1]) + half + 1.0).ceil().min(by1 as f32 - 1.0)).max(0.0) as usize;
+        let (dx, dy) = (b[0] - a[0], b[1] - a[1]);
+        let len2 = (dx * dx + dy * dy).max(1e-6);
+        for y in sy0..=sy1 {
+            for x in sx0..=sx1 {
+                let (px_, py_) = (x as f32 + 0.5, y as f32 + 0.5);
+                let t = (((px_ - a[0]) * dx + (py_ - a[1]) * dy) / len2).clamp(0.0, 1.0);
+                let d = (px_ - (a[0] + dx * t)).hypot(py_ - (a[1] + dy * t));
+                let c = ((half - d + 0.5).clamp(0.0, 1.0) * 255.0) as u8;
+                let i = (y - by0) * bw + (x - bx0);
+                cover[i] = cover[i].max(c);
+            }
+        }
+    }
+    for y in by0..by1 {
+        for x in bx0..bx1 {
+            let a = cover[(y - by0) * bw + (x - bx0)] as u32;
+            if a == 0 {
+                continue;
+            }
+            let i = y * w + x;
+            let old = px[i];
+            let keep = 255 - (old >> 24);
+            // The new pixel premultiplied by its coverage, added under what is there by what that lets through.
+            let mut out = old;
+            for shift in [0u32, 8, 16] {
+                let n = ((dark >> shift) & 255) * a / 255;
+                let o = (old >> shift) & 255;
+                out = (out & !(255 << shift)) | ((o + n * keep / 255).min(255) << shift);
+            }
+            let alpha = ((old >> 24) + a * keep / 255).min(255);
+            px[i] = (out & 0x00FF_FFFF) | (alpha << 24);
+        }
+    }
 }
 
 /// A polyline's cumulative lengths.
@@ -322,9 +388,14 @@ impl Labeller {
         self.drawn_for != Some(Self::view_key(map, w, h))
     }
 
-    fn view_key(map: &mahere_engine::MapCore, w: usize, h: usize) -> (i64, i64, i64, i64, u8, usize) {
+    fn view_key(map: &mahere_engine::MapCore, w: usize, h: usize) -> (i64, i64, i64, i64, u8, usize, u64, bool) {
         let c = &map.cam;
-        ((c.lat() * 1e7) as i64, (c.lon() * 1e7) as i64, (c.ppd * 100.0) as i64, (c.bearing() * 1e5) as i64, map.vec_depth(), map.pool_version() as usize ^ (w << 20) ^ (h << 40))
+        ((c.lat() * 1e7) as i64, (c.lon() * 1e7) as i64, (c.ppd * 100.0) as i64, (c.bearing() * 1e5) as i64, map.vec_depth(), map.pool_version() as usize ^ (w << 20) ^ (h << 40), map.route_version, map.layers().labels)
+    }
+
+    /// Whether there is anything to draw: labels shown, or a route.
+    pub fn wanted(map: &mahere_engine::MapCore) -> bool {
+        map.layers().labels || map.route_points().is_some()
     }
 
     fn advance(&mut self, ch: char, size: f32, weight: u16) -> f32 {
@@ -346,11 +417,20 @@ impl Labeller {
         let t = std::time::Instant::now();
         self.w = w;
         self.h = h;
-        let texels = map.gather_names(w, h);
+        let texels = if map.layers().labels { map.gather_names(w, h) } else { NamedTexels::default() };
         let gathered = t.elapsed();
         let previous: HashSet<(u8, String, String)> = self.placed.iter().map(|p| (p.name.kind, p.name.name.clone(), p.name.reference.clone())).collect();
         let laid = self.layout(&texels, w, h, font, &previous);
-        self.draw(&laid, w, h);
+        // The route on the screen, a point every few pixels at most.
+        let route: Vec<[f32; 2]> = map.route_points().map_or(Vec::new(), |pts| {
+            pts.iter()
+                .map(|&(lat, lon)| {
+                    let (x, y) = map.cam.geo_to_screen(lat, lon, w, h);
+                    [x as f32, y as f32]
+                })
+                .collect()
+        });
+        self.draw(&laid, &route, font, w, h);
         self.placed = laid.iter().map(|l| Placed { name: l.name.clone(), boxes: l.glyphs.iter().map(|g| glyph_box(g, l.size, 0.0)).collect() }).collect();
         // Two points of this view, by where they are on the globe, so the buffer can be carried with the map.
         let (a, b) = ([w as f64 * 0.25, h as f64 * 0.5], [w as f64 * 0.75, h as f64 * 0.5]);
@@ -664,7 +744,7 @@ impl Labeller {
         out
     }
 
-    fn draw(&mut self, laid: &[Laid], w: usize, h: usize) {
+    fn draw(&mut self, laid: &[Laid], route: &[[f32; 2]], font: f32, w: usize, h: usize) {
         self.w = w;
         self.h = h;
         self.buf.clear();
@@ -686,7 +766,7 @@ impl Labeller {
                 self.text.draw_text_center(&mut canvas, glyph, p[0], p[1], &TextStyle::new(l.size * scale, fill), None, None);
             }
         }
-        // The halos: each letter again in the paper's colour, a little around it.
+        // The halos: each letter again in the paper's colour, a little around it (the route goes under them, after).
         for l in laid {
             let r = (l.size * 0.11).max(1.0);
             for g in &l.glyphs {
@@ -698,6 +778,10 @@ impl Labeller {
                 }
             }
         }
+        // The route under everything lettered: its line, then its casing under that.
+        let width = (font * 0.32).max(3.0);
+        under_polyline(canvas.pixels, w, h, route, width, ROUTE);
+        under_polyline(canvas.pixels, w, h, route, width + (font * 0.14).max(1.5), ROUTE_CASING);
     }
 
     /// The lettering as premultiplied RGBA bytes for a GPU host.
