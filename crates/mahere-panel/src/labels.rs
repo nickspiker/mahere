@@ -507,6 +507,18 @@ impl Labeller {
         Some([re as f32, -im as f32, c as f32, im as f32, re as f32, f as f32])
     }
 
+    /// Whether lettering drawn for another view may still be shown carried along with the map: while the map has turned less than about ten degrees and zoomed less than half again either way since it was drawn. Past that the letters would stand crooked or swollen, so they hide until the map rests and is lettered again.
+    pub fn carried(m: &[f32; 6]) -> bool {
+        let scale = m[0].hypot(m[3]);
+        let turn = m[3].atan2(m[0]).abs();
+        (0.67..=1.5).contains(&scale) && turn < 10f32.to_radians()
+    }
+
+    /// Whether to letter the view now: it is stale and the camera is at rest, and either every cell is in or a second has passed since the last lettering (so a cell that keeps failing or arriving never holds the labels back). `last` is when this host last lettered.
+    pub fn due(&self, map: &mahere_engine::MapCore, w: usize, h: usize, at_rest: bool, last: std::time::Instant) -> bool {
+        at_rest && self.stale(map, w, h) && (map.converged() || last.elapsed() >= std::time::Duration::from_secs(1))
+    }
+
     /// The label under a screen point, as the screen is now.
     pub fn hit(&self, cam: &mahere_engine::Camera, w: usize, h: usize, x: f32, y: f32) -> Option<&Named> {
         let m = self.transform(cam, w, h)?;

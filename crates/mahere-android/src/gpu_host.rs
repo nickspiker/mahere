@@ -18,6 +18,8 @@ pub struct GpuHost {
     pub map: GpuMap,
     /// The map's lettering, laid out when the view rests.
     pub labeller: mahere_panel::labels::Labeller,
+    /// When the view was last lettered.
+    lettered: std::time::Instant,
     configured: (u32, u32),
     overlay_stamp: Option<OverlayStamp>,
     overlay_at: std::time::Instant,
@@ -80,6 +82,7 @@ impl GpuHost {
             alpha,
             map,
             labeller: mahere_panel::labels::Labeller::new(),
+            lettered: std::time::Instant::now(),
             configured: (0, 0),
             overlay_stamp: None,
             overlay_at: std::time::Instant::now(),
@@ -211,11 +214,12 @@ impl GpuHost {
         });
         // Labels: lettered again once the view rests with its cells in, on the still frame; until then the last lettering rides along with the map, and hides when the zoom has changed it by more than half or double.
         if mahere_panel::labels::Labeller::wanted(map) {
-            if !in_motion && map.converged() && self.labeller.stale(map, w as usize, h as usize) {
+            if self.labeller.due(map, w as usize, h as usize, !in_motion, self.lettered) {
                 self.labeller.update(map, w as usize, h as usize, panel.font_px());
                 self.map.set_labels_rgba(&self.device, &self.queue, w, h, &self.labeller.rgba());
+                self.lettered = std::time::Instant::now();
             }
-            self.map.labels_xf = self.labeller.transform(&map.cam, w as usize, h as usize).filter(|m| (0.5..=2.0).contains(&m[0].hypot(m[3])));
+            self.map.labels_xf = self.labeller.transform(&map.cam, w as usize, h as usize).filter(mahere_panel::labels::Labeller::carried);
         } else {
             self.map.labels_xf = None;
         }
@@ -271,7 +275,8 @@ impl GpuHost {
             self.sync_ms = 0.0;
             self.report = std::time::Instant::now();
         }
-        !map.converged()
+        // Lettering held back by cells still arriving needs another frame once its second is up.
+        !map.converged() || (mahere_panel::labels::Labeller::wanted(map) && self.labeller.stale(map, w as usize, h as usize))
     }
 }
 
