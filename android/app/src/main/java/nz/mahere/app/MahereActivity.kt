@@ -57,6 +57,8 @@ class MahereActivity : Activity(), SurfaceHolder.Callback, Choreographer.FrameCa
     private external fun nativeGoTo(ptr: Long, lat: Double, lon: Double, ppd: Double)
     private external fun nativeOpenArea(ptr: Long, bytes: ByteArray)
     private external fun nativeBack(ptr: Long): Boolean
+    private external fun nativeTakeInstall(ptr: Long): String?
+    private external fun nativeSetUnmetered(ptr: Long, unmetered: Boolean)
     private external fun nativeOnDeclination(ptr: Long, declinationDeg: Float)
     private external fun nativeOnOrientation(ptr: Long, r0: Float, r1: Float, r2: Float, r3: Float, r4: Float, r5: Float, r6: Float, r7: Float, r8: Float)
     private external fun nativeOnPause(ptr: Long)
@@ -141,6 +143,7 @@ class MahereActivity : Activity(), SurfaceHolder.Callback, Choreographer.FrameCa
             @Suppress("DEPRECATION")
             registerReceiver(penReceiver, IntentFilter("com.samsung.pen.INSERT"))
         }
+        runCatching { getSystemService(android.net.ConnectivityManager::class.java).registerDefaultNetworkCallback(networkCallback) }
         // The map tags its buffers BT.2020 (gpu_host::tag_bt2020); wide-gamut mode lets the panel show them without an sRGB clamp, and minimal post-processing asks the compositor to skip vendor saturation passes.
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             window.colorMode = ActivityInfo.COLOR_MODE_WIDE_COLOR_GAMUT
@@ -242,7 +245,52 @@ class MahereActivity : Activity(), SurfaceHolder.Callback, Choreographer.FrameCa
         if (nativePtr != 0L && surfaceReady) {
             nativeDraw(nativePtr, surfaceView.holder.surface)
             syncProbe()
+            nativeTakeInstall(nativePtr)?.let { installApk(it) }
             Choreographer.getInstance().postFrameCallback(this)
+        }
+    }
+
+    // ---- Updates (after Photon's): a downloaded, verified build installed through a package installer session ----
+
+    /// Install an update the engine downloaded and checked against the signed manifest: a PackageInstaller session, off the main thread (it copies the whole APK). Once Mahere is its own installer of record, Android 12 and later install without asking; the first time, the system's confirm comes up through MahereInstallReceiver.
+    private fun installApk(path: String) {
+        Thread({
+            try {
+                val installer = packageManager.packageInstaller
+                val params = android.content.pm.PackageInstaller.SessionParams(android.content.pm.PackageInstaller.SessionParams.MODE_FULL_INSTALL).apply {
+                    setAppPackageName(packageName)
+                    if (android.os.Build.VERSION.SDK_INT >= 31) {
+                        setRequireUserAction(android.content.pm.PackageInstaller.SessionParams.USER_ACTION_NOT_REQUIRED)
+                    }
+                }
+                val id = installer.createSession(params)
+                installer.openSession(id).use { session ->
+                    java.io.File(path).inputStream().use { input ->
+                        session.openWrite("mahere-update.apk", 0, -1).use { out ->
+                            input.copyTo(out)
+                            session.fsync(out)
+                        }
+                    }
+                    // Mutable: the installer writes its status into it.
+                    val intent = android.content.Intent(this, MahereInstallReceiver::class.java).apply { action = "nz.mahere.app.INSTALL_RESULT" }
+                    val flags = if (android.os.Build.VERSION.SDK_INT >= 31) android.app.PendingIntent.FLAG_UPDATE_CURRENT or android.app.PendingIntent.FLAG_MUTABLE else android.app.PendingIntent.FLAG_UPDATE_CURRENT
+                    session.commit(android.app.PendingIntent.getBroadcast(this, id, intent, flags).intentSender)
+                }
+            } catch (e: Exception) {
+                android.util.Log.e("mahere", "update install failed: ${e.message}")
+            }
+        }, "mahere-install").start()
+    }
+
+    /// Whether the network is unmetered, told to the engine as it changes: automatic updates download only then.
+    private val networkCallback = object : android.net.ConnectivityManager.NetworkCallback() {
+        override fun onCapabilitiesChanged(network: android.net.Network, caps: android.net.NetworkCapabilities) {
+            val ptr = nativePtr
+            if (ptr != 0L) nativeSetUnmetered(ptr, caps.hasCapability(android.net.NetworkCapabilities.NET_CAPABILITY_NOT_METERED))
+        }
+        override fun onLost(network: android.net.Network) {
+            val ptr = nativePtr
+            if (ptr != 0L) nativeSetUnmetered(ptr, false)
         }
     }
 
@@ -297,6 +345,7 @@ class MahereActivity : Activity(), SurfaceHolder.Callback, Choreographer.FrameCa
 
     override fun onDestroy() {
         runCatching { unregisterReceiver(penReceiver) }
+        runCatching { getSystemService(android.net.ConnectivityManager::class.java).unregisterNetworkCallback(networkCallback) }
         super.onDestroy()
     }
 

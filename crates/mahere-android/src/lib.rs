@@ -79,6 +79,9 @@ pub struct AndroidApp {
     share_file: Option<String>,
     /// When the panel last repainted for a download's progress: a few times a second, not every frame.
     areas_shown: Instant,
+    /// Updates (after Photon's): the channels' builds, a download, and a verified APK waiting for the activity to install.
+    updater: mahere_update::Updater,
+    install: Option<String>,
 }
 
 /// Vault writes, off the UI thread. The vault serialises every write through one queue, and the loader fills it with cells while the map streams: a settings save on the UI thread waited behind hundreds of them and the system killed the app as unresponsive. Touch, location and pause now hand their writes here and return at once.
@@ -231,6 +234,58 @@ impl AndroidApp {
     }
 
     /// What the areas pages asked: save the selection, change an area's detail, download, share, show, delete.
+    /// What the Updates page asked: check, get a channel's build, automatic on or off.
+    fn apply_update_acts(&mut self) {
+        use mahere_panel::UpdateAct;
+        use mahere_update::Channel;
+        for act in self.panel.take_update_acts() {
+            match act {
+                UpdateAct::Check => self.updater.check(),
+                UpdateAct::Get(i) => self.updater.get(if i == 0 { Channel::Release } else { Channel::Dev }),
+                UpdateAct::Auto(on) => {
+                    self.updater.auto = on;
+                    self.save_settings();
+                }
+            }
+        }
+        let view = self.updates_view();
+        self.panel.set_updates(view);
+    }
+
+    /// The Updates page's view of the updater.
+    fn updates_view(&self) -> mahere_panel::UpdatesView {
+        use mahere_update::{Channel, Known};
+        let u = &self.updater;
+        let line = |c: Channel| -> (String, String, bool) {
+            let what = c.label();
+            // A build's name is "0.<count>+<hash>": the number big, the hash small.
+            let split = |name: &str| -> (String, String) {
+                let mut parts = name.splitn(2, '+');
+                (parts.next().unwrap_or("").to_string(), parts.next().unwrap_or("").to_string())
+            };
+            match u.known(c) {
+                Known::Unchecked | Known::Checking => (capital(what), "checking\u{2026}".into(), false),
+                Known::Failed(_) => (capital(what), "unavailable".into(), false),
+                Known::Has(None) => (capital(what), "none for this device yet".into(), false),
+                Known::Has(Some(r)) if u.offer(c).is_none() => {
+                    let (n, h) = split(&r.name);
+                    (format!("{} {n}", capital(what)), format!("{h} \u{b7} this build"), false)
+                }
+                Known::Has(Some(r)) => {
+                    let (n, h) = split(&r.name);
+                    (format!("Get {what} {n}"), format!("{h} \u{b7} tap to install"), !u.busy())
+                }
+            }
+        };
+        mahere_panel::UpdatesView {
+            this: mahere_update::our_name().to_string(),
+            channels: [line(Channel::Release), line(Channel::Dev)],
+            status: u.status.clone(),
+            progress: u.progress.map(|(d, t)| if t > 0 { d as f32 / t as f32 } else { 0.0 }),
+            auto: u.auto,
+        }
+    }
+
     fn apply_area_acts(&mut self) {
         use mahere_panel::AreaAct;
         for act in self.panel.take_area_acts() {
@@ -280,7 +335,7 @@ impl AndroidApp {
 
     fn save_settings(&self) {
         if let Some(store) = &self.store {
-            let s = mahere_store::Settings { cache_budget: self.cache_budget, layer_bits: self.map.layers().bits() as u64, real_sun: self.map.real_sun, real_light: self.map.real_light, follow_heading: self.map.follow_heading, lock_to_fix: self.map.lock_to_fix, theme: self.map.theme as u64, compressed: self.map.compressed(), ui_ru: self.ui_ru, tool: self.map.tool as u8, pen_rgba: Some(self.map.pen_colour), travel: travel_code(self.map.travel) };
+            let s = mahere_store::Settings { cache_budget: self.cache_budget, layer_bits: self.map.layers().bits() as u64, real_sun: self.map.real_sun, real_light: self.map.real_light, follow_heading: self.map.follow_heading, lock_to_fix: self.map.lock_to_fix, theme: self.map.theme as u64, compressed: self.map.compressed(), ui_ru: self.ui_ru, tool: self.map.tool as u8, pen_rgba: Some(self.map.pen_colour), travel: travel_code(self.map.travel), auto_update: self.updater.auto };
             self.persist.settings(store.clone(), s);
         }
     }
@@ -392,6 +447,8 @@ impl FluorApp for AndroidApp {
                     self.apply_controls(ctl, mask);
                     self.apply_theme_edits();
                     self.apply_area_acts();
+                self.apply_update_acts();
+                    self.apply_update_acts();
                     if self.panel.take_clear_measure() {
                         self.map.clear_measure();
                     }
@@ -436,6 +493,7 @@ impl FluorApp for AndroidApp {
                     self.apply_controls(ctl, mask);
                 }
                 self.apply_area_acts();
+                self.apply_update_acts();
                 if self.drawing {
                     self.map.end_stroke(self.w, self.h);
                     self.drawing = false;
@@ -460,6 +518,8 @@ impl FluorApp for AndroidApp {
                     self.apply_controls(ctl, mask);
                     self.apply_theme_edits();
                     self.apply_area_acts();
+                self.apply_update_acts();
+                    self.apply_update_acts();
                     self.last_cursor = (x, y);
                     return EventResponse::Handled;
                 }
@@ -665,6 +725,12 @@ pub extern "system" fn Java_nz_mahere_app_MahereActivity_nativeInit(
         areas,
         share_file: None,
         areas_shown: Instant::now(),
+        updater: {
+            let mut u = mahere_update::Updater::new(std::path::PathBuf::from(&dir));
+            u.auto = settings.is_none_or(|s| s.auto_update);
+            u
+        },
+        install: None,
     };
     app.panel.set_ru(ui_ru);
     Box::into_raw(Box::new(AndroidShell::new(app, width as u32, height as u32))) as jlong
@@ -721,6 +787,14 @@ pub extern "system" fn Java_nz_mahere_app_MahereActivity_nativeDraw(
         if app.panel.is_open() && (finished || (app.areas.downloading() && app.areas_shown.elapsed().as_millis() >= 250)) {
             app.panel.invalidate();
             app.areas_shown = Instant::now();
+        }
+        // Updates: what the threads found, onto the page; a verified build waits for the activity to install it.
+        if app.updater.poll() {
+            let view = app.updates_view();
+            app.panel.set_updates(view);
+        }
+        if let Some(p) = app.updater.take_ready() {
+            app.install = Some(p.to_string_lossy().into_owned());
         }
         let areas = app.areas.view(app.map.user.has_selection());
         let AndroidApp { gpu: Some(g), map, panel, w, h, .. } = app else {
@@ -1071,5 +1145,30 @@ fn travel_code(t: Option<mahere_engine::route::Travel>) -> u8 {
         Some(Travel::Bike) => 2,
         Some(Travel::Foot) => 3,
         None => 0,
+    }
+}
+
+fn capital(s: &str) -> String {
+    let mut c = s.chars();
+    c.next().map_or(String::new(), |f| f.to_uppercase().collect::<String>() + c.as_str())
+}
+
+/// A verified update the activity should install now, once; null when there is none.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_nz_mahere_app_MahereActivity_nativeTakeInstall<'a>(env: JNIEnv<'a>, _class: JClass, ptr: jlong) -> jni::sys::jstring {
+    if ptr == 0 {
+        return std::ptr::null_mut();
+    }
+    match shell(ptr).app().install.take() {
+        Some(path) => env.new_string(path).map_or(std::ptr::null_mut(), |s| s.into_raw()),
+        None => std::ptr::null_mut(),
+    }
+}
+
+/// Whether the network is unmetered, from the activity's network callback: automatic updates download only then.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_nz_mahere_app_MahereActivity_nativeSetUnmetered(_env: JNIEnv, _class: JClass, ptr: jlong, unmetered: jboolean) {
+    if ptr != 0 {
+        shell(ptr).app().updater.unmetered = unmetered != 0;
     }
 }

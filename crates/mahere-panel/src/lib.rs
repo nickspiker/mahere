@@ -93,13 +93,15 @@ enum Layer {
     ClearSel,
     /// The areas page: saved selections, downloaded and shared.
     Areas,
+    /// The updates page.
+    Updates,
     /// Navigation: a tap routes there by car, by bike or on foot (one at a time).
     Drive,
     Ride,
     Walk,
 }
 
-const LAYERS: [(Layer, &str); 29] = [
+const LAYERS: [(Layer, &str); 30] = [
     (Layer::Dem, "Terrain"),
     (Layer::Hypso, "Elevation tint"),
     (Layer::Raw, "Raw elevation"),
@@ -129,6 +131,7 @@ const LAYERS: [(Layer, &str); 29] = [
     (Layer::ClearInk, "Clear ink"),
     (Layer::ClearSel, "Clear selection"),
     (Layer::Areas, "Areas  \u{203a}"),
+    (Layer::Updates, "Updates  \u{203a}"),
 ];
 
 /// A row that takes a tap but changes nothing: a layer another layer has greyed, or the one of real sun and real light the other has taken (the sun is either the almanac's or the camera's).
@@ -136,7 +139,7 @@ fn inert(mask: &LayerMask, ctl: &Controls, l: Layer) -> bool {
     match l {
         Layer::RealSun => ctl.real_light,
         Layer::RealLight => ctl.real_sun,
-        Layer::Linear | Layer::FollowHeading | Layer::LockToFix | Layer::Pen | Layer::Select | Layer::PenColour | Layer::ClearInk | Layer::ClearSel | Layer::Areas | Layer::Drive | Layer::Ride | Layer::Walk => false,
+        Layer::Linear | Layer::FollowHeading | Layer::LockToFix | Layer::Pen | Layer::Select | Layer::PenColour | Layer::ClearInk | Layer::ClearSel | Layer::Areas | Layer::Updates | Layer::Drive | Layer::Ride | Layer::Walk => false,
         _ => get(&mask.inert(), &Controls::default(), l),
     }
 }
@@ -168,7 +171,7 @@ fn get(mask: &LayerMask, ctl: &Controls, l: Layer) -> bool {
         Layer::Drive => ctl.travel == 1,
         Layer::Ride => ctl.travel == 2,
         Layer::Walk => ctl.travel == 3,
-        Layer::PenColour | Layer::ClearInk | Layer::ClearSel | Layer::Areas => false,
+        Layer::PenColour | Layer::ClearInk | Layer::ClearSel | Layer::Areas | Layer::Updates => false,
     }
 }
 
@@ -199,7 +202,7 @@ fn set(mask: &mut LayerMask, ctl: &mut Controls, l: Layer, v: bool) {
         Layer::Drive => ctl.travel = if v { 1 } else { 0 },
         Layer::Ride => ctl.travel = if v { 2 } else { 0 },
         Layer::Walk => ctl.travel = if v { 3 } else { 0 },
-        Layer::PenColour | Layer::Areas => {}
+        Layer::PenColour | Layer::Areas | Layer::Updates => {}
         Layer::ClearInk => ctl.clear_ink = true,
         Layer::ClearSel => ctl.clear_sel = true,
     }
@@ -253,6 +256,35 @@ enum Page {
     /// The saved areas, and one of them.
     Areas,
     Area(usize),
+    /// Updates: this build, the release and dev channels' builds, automatic updates.
+    Updates,
+}
+
+/// What the Updates page shows (the host's updater, as text): this build, each channel's row (a short title, a small line under it, and whether a tap gets it), the line of what is happening, a download's progress, and whether updates are automatic.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct UpdatesView {
+    pub this: String,
+    pub channels: [(String, String, bool); 2],
+    pub status: String,
+    pub progress: Option<f32>,
+    pub auto: bool,
+}
+
+/// What a tap on the Updates page asks of the host.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UpdateAct {
+    /// The page opened: check both channels.
+    Check,
+    /// Get a channel's build: 0 release, 1 dev.
+    Get(usize),
+    Auto(bool),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum UpdateRow {
+    Back,
+    Get(usize),
+    Auto,
 }
 
 /// A row of the areas pages.
@@ -354,6 +386,9 @@ pub struct Panel {
     area_rows: Vec<(f32, f32, AreaRow)>,
     area_acts: Vec<AreaAct>,
     areas: AreasView,
+    update_rows: Vec<(f32, f32, UpdateRow)>,
+    update_acts: Vec<UpdateAct>,
+    updates: UpdatesView,
     /// Where the host draws the orb itself (a desktop's chrome, with the title beside it): the panel then lays out under it, takes a tap there as the toggle, and paints no orb of its own.
     host_orb: Option<(f32, f32, f32)>,
     /// The Layers page scrolls between the orb and the footer (Nick 2026-10-11): how far, how far it can, a press on it (where it started, whether it has moved), and the band it scrolls in (top, bottom, where the footer starts).
@@ -376,7 +411,7 @@ impl Panel {
     pub fn new() -> Panel {
         let mut hits: HitId = HIT_NONE;
         let checks = LAYERS.iter().map(|&(l, label)| (l, Checkbox::new(&mut hits, label, 0.0, 0.0, 10.0, 10.0, 10.0, false))).collect();
-        Panel { open: false, dirty: true, ru: 1.0, stack: vec![Page::Layers], theme_rows: Vec::new(), edit_rows: Vec::new(), edit_scroll: 0.0, edit_extent: 0.0, press: None, sliders: Vec::new(), field_vals: [0.0; 4], held: None, edits: Vec::new(), hits, checks, text: TextRenderer::new(), buf: Vec::new(), w: 0, h: 0, font: 16.0, gear: (0.0, 0.0, 0.0), panel_w: 0.0, theme_row: (0.0, 0.0, 0.0), slider: (0.0, 0.0, 0.0), slider_held: false, cache_max: CACHE_MIN + 1, strip_close: None, clear_measure: false, area_rows: Vec::new(), area_acts: Vec::new(), areas: AreasView::default(), host_orb: None, layers_scroll: 0.0, layers_extent: 0.0, layers_press: None, layers_band: (0.0, 0.0), orb_icon: fluor::host::icon::Icon::from_vsf_bytes(APP_ORB_VSF).ok(), orb_scaled: (0, Vec::new()) }
+        Panel { open: false, dirty: true, ru: 1.0, stack: vec![Page::Layers], theme_rows: Vec::new(), edit_rows: Vec::new(), edit_scroll: 0.0, edit_extent: 0.0, press: None, sliders: Vec::new(), field_vals: [0.0; 4], held: None, edits: Vec::new(), hits, checks, text: TextRenderer::new(), buf: Vec::new(), w: 0, h: 0, font: 16.0, gear: (0.0, 0.0, 0.0), panel_w: 0.0, theme_row: (0.0, 0.0, 0.0), slider: (0.0, 0.0, 0.0), slider_held: false, cache_max: CACHE_MIN + 1, strip_close: None, clear_measure: false, area_rows: Vec::new(), area_acts: Vec::new(), areas: AreasView::default(), update_rows: Vec::new(), update_acts: Vec::new(), updates: UpdatesView::default(), host_orb: None, layers_scroll: 0.0, layers_extent: 0.0, layers_press: None, layers_band: (0.0, 0.0), orb_icon: fluor::host::icon::Icon::from_vsf_bytes(APP_ORB_VSF).ok(), orb_scaled: (0, Vec::new()) }
     }
 
     pub fn is_open(&self) -> bool {
@@ -499,6 +534,26 @@ impl Panel {
     /// What the areas pages asked since last polled.
     pub fn take_area_acts(&mut self) -> Vec<AreaAct> {
         std::mem::take(&mut self.area_acts)
+    }
+
+    /// What the Updates page shows, from the host's updater; repaints when it changed while the page is open.
+    pub fn set_updates(&mut self, v: UpdatesView) {
+        if v != self.updates {
+            self.updates = v;
+            if self.stack.last() == Some(&Page::Updates) {
+                self.dirty = true;
+            }
+        }
+    }
+
+    /// Open the Updates page (gpu_check's preview).
+    pub fn show_updates(&mut self) {
+        self.stack = vec![Page::Layers, Page::Updates];
+        self.dirty = true;
+    }
+
+    pub fn take_update_acts(&mut self) -> Vec<UpdateAct> {
+        std::mem::take(&mut self.update_acts)
     }
 
     /// What the editor changed since last asked.
@@ -625,7 +680,7 @@ impl Panel {
                 Layer::RealSun | Layer::RealLight | Layer::Linear | Layer::FollowHeading | Layer::LockToFix => row * 0.5,
                 Layer::Drive | Layer::Ride | Layer::Walk => row,
                 Layer::Pen | Layer::PenColour | Layer::Select | Layer::ClearInk | Layer::ClearSel => row * 1.5,
-                Layer::Areas => row * 2.0,
+                Layer::Areas | Layer::Updates => row * 2.0,
                 _ => 0.0,
             };
             let cy = top + row * (i as f32 + 0.5) + gap;
@@ -667,6 +722,12 @@ impl Panel {
                 }
                 if *l == Layer::Areas {
                     self.stack.push(Page::Areas);
+                    self.dirty = true;
+                    return false;
+                }
+                if *l == Layer::Updates {
+                    self.stack.push(Page::Updates);
+                    self.update_acts.push(UpdateAct::Check);
                     self.dirty = true;
                     return false;
                 }
@@ -739,6 +800,28 @@ impl Panel {
                         self.held = Some(i);
                         self.field_vals[i] = Self::slider_val(f, i, sl.value());
                         self.edits.push(ThemeEdit::Set(f, self.field_vals));
+                        self.dirty = true;
+                        return true;
+                    }
+                }
+                return true;
+            }
+            Page::Updates => {
+                let rows = self.update_rows.clone();
+                for (cy, hh, row) in rows {
+                    if (y - cy).abs() <= hh {
+                        match row {
+                            UpdateRow::Back => self.pop(),
+                            UpdateRow::Get(i) => {
+                                if self.updates.channels[i].2 {
+                                    self.update_acts.push(UpdateAct::Get(i));
+                                }
+                            }
+                            UpdateRow::Auto => {
+                                self.updates.auto = !self.updates.auto;
+                                self.update_acts.push(UpdateAct::Auto(self.updates.auto));
+                            }
+                        }
                         self.dirty = true;
                         return true;
                     }
@@ -921,6 +1004,7 @@ impl Panel {
                 Page::Field(f) => Self::paint_field(&mut canvas, &mut self.text, font, rail, cw, self.gear, f, &mut self.sliders, self.field_vals, current),
                 Page::Pen => Self::paint_pen(&mut canvas, &mut self.text, font, rail, cw, self.gear, &mut self.sliders, self.field_vals),
                 Page::Areas => self.area_rows = Self::paint_areas(&mut canvas, &mut self.text, font, rail, cw, self.gear, &self.areas),
+                Page::Updates => self.update_rows = Self::paint_updates(&mut canvas, &mut self.text, font, rail, cw, self.gear, &self.updates),
                 Page::Area(i) => self.area_rows = Self::paint_area(&mut canvas, &mut self.text, font, rail, cw, self.gear, &self.areas, i, &mut self.sliders, self.field_vals[0] as u8),
                 Page::Layers => {}
             }
@@ -1431,6 +1515,43 @@ impl Panel {
 
 impl Panel {
     /// The areas list: the back row, a row to save the selection (dim without one), then every area with what is on the device.
+    /// The Updates page: this build, then each channel's row (a tap gets its build, when it is not this one), the line of what is happening and a download's bar, and the automatic switch.
+    fn paint_updates(canvas: &mut Canvas, text: &mut TextRenderer, font: f32, ox: f32, cw: f32, gear: (f32, f32, f32), u: &UpdatesView) -> Vec<(f32, f32, UpdateRow)> {
+        let x0 = ox + font * 0.9;
+        let row = font * 1.6;
+        let mut y = gear.1 + gear.2 + font * 0.9 + row * 0.5;
+        let title = TextStyle::new(font, theme::TEXTBOX_TEXT);
+        let dim = TextStyle::new(font, READOUT_DIM);
+        let small = TextStyle::new(font * 0.75, READOUT_DIM);
+        let mut rows = Vec::new();
+        text.draw_text_left(canvas, "\u{2039}  Updates", x0, y, &title, None, None);
+        rows.push((y, row * 0.5, UpdateRow::Back));
+        y += row * 1.1;
+        text.draw_text_left(canvas, &format!("This build  {}", u.this), x0, y, &small, None, None);
+        y += row * 1.1;
+        for (i, (label, detail, live)) in u.channels.iter().enumerate() {
+            text.draw_text_left(canvas, label, x0, y, if *live { &title } else { &dim }, None, None);
+            text.draw_text_left(canvas, detail, x0 + font * 0.4, y + font * 0.95, &small, None, None);
+            rows.push((y + font * 0.4, row * 0.75, UpdateRow::Get(i)));
+            y += row * 1.5;
+        }
+        if !u.status.is_empty() {
+            text.draw_text_left(canvas, &u.status, x0, y, &small, None, None);
+            y += row * 0.8;
+        }
+        if let Some(p) = u.progress {
+            let w = cw - font * 1.8;
+            paint::fill_rect(canvas, x0 as isize, y as isize, (w * p.clamp(0.0, 1.0)) as isize, (font * 0.35) as isize, SLIDER_USED, None, None);
+            paint::fill_rect(canvas, x0 as isize, y as isize, w as isize, (font * 0.35) as isize, SLIDER_TRACK, None, None);
+            y += row * 0.8;
+        }
+        y += row * 0.4;
+        text.draw_text_left(canvas, &format!("{}  Automatic updates", if u.auto { "\u{2611}" } else { "\u{2610}" }), x0, y, &title, None, None);
+        text.draw_text_left(canvas, "release builds, on Wi-Fi", x0 + font * 0.4, y + font * 0.95, &small, None, None);
+        rows.push((y, row * 0.5, UpdateRow::Auto));
+        rows
+    }
+
     fn paint_areas(canvas: &mut Canvas, text: &mut TextRenderer, font: f32, ox: f32, cw: f32, gear: (f32, f32, f32), areas: &AreasView) -> Vec<(f32, f32, AreaRow)> {
         let x0 = ox + font * 0.9;
         let right = ox + cw - font * 0.9;

@@ -36,6 +36,8 @@ struct MahereApp {
     label_cam: ((u64, u64, u64, u64), Instant),
     cache_budget: u64,
     areas: mahere_engine::areas::Areas,
+    /// Updates (after Photon's): a verified build is swapped in for this one, which then starts again as it.
+    updater: mahere_update::Updater,
 }
 
 impl MahereApp {
@@ -104,6 +106,7 @@ impl MahereApp {
             label_cam: ((0, 0, 0, 0), Instant::now()),
             cache_budget: 2 << 30,
             areas,
+            updater: mahere_update::Updater::new(std::path::PathBuf::from("data/user")),
         }
     }
 
@@ -112,6 +115,7 @@ impl MahereApp {
         self.cache_budget = ctl.cache_budget;
         self.apply_theme_edits();
         self.apply_area_acts();
+        self.apply_update_acts();
         if ctl.theme != self.map.theme {
             self.map.set_theme(ctl.theme);
         }
@@ -147,6 +151,21 @@ impl MahereApp {
         if ctl.clear_sel {
             self.map.clear_selection();
         }
+    }
+
+    /// What the Updates page asked, and what it shows now.
+    fn apply_update_acts(&mut self) {
+        use mahere_panel::UpdateAct;
+        use mahere_update::Channel;
+        for act in self.panel.take_update_acts() {
+            match act {
+                UpdateAct::Check => self.updater.check(),
+                UpdateAct::Get(i) => self.updater.get(if i == 0 { Channel::Release } else { Channel::Dev }),
+                UpdateAct::Auto(on) => self.updater.auto = on,
+            }
+        }
+        let view = updates_view(&self.updater);
+        self.panel.set_updates(view);
     }
 
     /// What the areas pages asked. A share is a file under data/user/share, its path printed.
@@ -353,6 +372,7 @@ impl FluorApp for MahereApp {
                     self.map.set_pen_colour(ctl.pen_rgba);
                     self.apply_theme_edits();
                     self.apply_area_acts();
+                    self.apply_update_acts();
                     ctx.window.request_redraw();
                     self.last_cursor = (x, y);
                     return EventResponse::Handled;
@@ -528,8 +548,36 @@ impl FluorApp for MahereApp {
                 );
             }
         }
+        // Updates: what the threads found, onto the page; a verified build swapped in and started in this one's place.
+        let updates_changed = self.updater.poll();
+        if updates_changed {
+            let view = updates_view(&self.updater);
+            self.panel.set_updates(view);
+            self.chrome.invalidate_bg();
+        }
+        if let Some(staged) = self.updater.take_ready() {
+            match mahere_update::install_desktop(&staged) {
+                Ok(exe) => {
+                    eprintln!("update: starting {}", exe.display());
+                    let args: Vec<String> = std::env::args().skip(1).collect();
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::process::CommandExt;
+                        let e = std::process::Command::new(&exe).args(&args).exec();
+                        eprintln!("update: restart failed: {e}");
+                    }
+                    #[cfg(not(unix))]
+                    {
+                        if std::process::Command::new(&exe).args(&args).spawn().is_ok() {
+                            std::process::exit(0);
+                        }
+                    }
+                }
+                Err(e) => self.updater.status = format!("Update failed, nothing changed: {e}"),
+            }
+        }
         // A download's progress repaints the panel as it goes.
-        let areas_changed = self.areas.poll() || self.areas.downloading();
+        let areas_changed = self.areas.poll() || self.areas.downloading() || updates_changed || self.updater.busy();
         if areas_changed {
             self.chrome.invalidate_bg();
         }
@@ -738,4 +786,42 @@ fn travel_code(t: Option<mahere_engine::route::Travel>) -> u8 {
         Some(Travel::Foot) => 3,
         None => 0,
     }
+}
+
+/// The Updates page's view of an updater.
+fn updates_view(u: &mahere_update::Updater) -> mahere_panel::UpdatesView {
+    use mahere_update::{Channel, Known};
+    let line = |c: Channel| -> (String, String, bool) {
+        let what = c.label();
+        // A build's name is "0.<count>+<hash>": the number big, the hash small.
+        let split = |name: &str| -> (String, String) {
+            let mut parts = name.splitn(2, '+');
+            (parts.next().unwrap_or("").to_string(), parts.next().unwrap_or("").to_string())
+        };
+        match u.known(c) {
+            Known::Unchecked | Known::Checking => (capital(what), "checking\u{2026}".into(), false),
+            Known::Failed(_) => (capital(what), "unavailable".into(), false),
+            Known::Has(None) => (capital(what), "none for this computer yet".into(), false),
+            Known::Has(Some(r)) if u.offer(c).is_none() => {
+                let (n, h) = split(&r.name);
+                (format!("{} {n}", capital(what)), format!("{h} \u{b7} this build"), false)
+            }
+            Known::Has(Some(r)) => {
+                let (n, h) = split(&r.name);
+                (format!("Get {what} {n}"), format!("{h} \u{b7} tap to install"), !u.busy())
+            }
+        }
+    };
+    mahere_panel::UpdatesView {
+        this: mahere_update::our_name().to_string(),
+        channels: [line(Channel::Release), line(Channel::Dev)],
+        status: u.status.clone(),
+        progress: u.progress.map(|(d, t)| if t > 0 { d as f32 / t as f32 } else { 0.0 }),
+        auto: u.auto,
+    }
+}
+
+fn capital(s: &str) -> String {
+    let mut c = s.chars();
+    c.next().map_or(String::new(), |f| f.to_uppercase().collect::<String>() + c.as_str())
 }

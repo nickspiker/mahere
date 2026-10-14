@@ -118,7 +118,7 @@ fn main() {
     let overlay = map.overlay(w, h, true).to_vec();
     // MAHERE_PANEL=1 lays the open control panel over the GPU frame (the CPU frame has none, so the diff below is then meaningless).
     let panel_mode = std::env::var("MAHERE_PANEL").unwrap_or_default();
-    if panel_mode == "1" || panel_mode == "closed" || panel_mode == "themes" || panel_mode == "pen" || panel_mode == "areas" || panel_mode == "area" {
+    if panel_mode == "1" || panel_mode == "closed" || panel_mode == "themes" || panel_mode == "pen" || panel_mode == "areas" || panel_mode == "area" || panel_mode == "updates" {
         let mut panel = mahere_panel::Panel::new();
         panel.set_open(panel_mode != "closed");
         if panel_mode == "themes" {
@@ -144,6 +144,11 @@ fn main() {
                 panel.show_area(1, 12);
                 panel.pop_page();
             }
+        }
+        // MAHERE_PANEL=updates opens the Updates page with a made-up state: a release to get, dev current, a download part way.
+        if panel_mode == "updates" {
+            panel.show_updates();
+            panel.set_updates(mahere_panel::UpdatesView { this: "0.178+457980b".into(), channels: [("Get release 0.176".into(), "e677c45 \u{b7} tap to install".into(), true), ("Dev 0.178".into(), "457980b \u{b7} this build".into(), false)], status: "Downloading release 0.176+e677c45".into(), progress: Some(0.42), auto: true });
         }
         let c = map.cam;
         let readouts = mahere_panel::Readouts { lat: c.lat(), lon: c.lon(), elev: map.elevation_at(c.lat(), c.lon()), heading_deg: c.bearing().to_degrees(), m_per_px: 111_320.0 / c.ppd, frame_ms: cpu_ms, resident: map.pool().map.len(), phone_heading: None, cache_used: 0, cache_max: 1 << 30 };
