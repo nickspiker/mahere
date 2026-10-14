@@ -210,6 +210,9 @@ const fn ink(rgb: u32, alpha: u8) -> u32 {
     (theme::dark(theme::fmt(theme::vsf(rgb))) & 0x00FF_FFFF) | ((alpha as u32) << 24)
 }
 
+/// The label look's sliders, low and high: size, glow, smoothing, spacing (`Theme::label_look`).
+const LOOK_RANGE: [(f32, f32); 4] = [(0.5, 2.0), (0.0, 0.4), (0.0, 2.0), (0.0, 1.0)];
+
 /// Fluor's production zoom bounds, 12.5% to 300%.
 pub const RU_MIN: f32 = 0.125;
 pub const RU_MAX: f32 = 3.0;
@@ -552,6 +555,7 @@ impl Panel {
         match (f, i) {
             (Field::Hypso(_), 3) => v / 4000.0,
             (Field::Sun | Field::Sky, _) => v / 3.0,
+            (Field::LabelLook, _) => (v - LOOK_RANGE[i].0) / (LOOK_RANGE[i].1 - LOOK_RANGE[i].0),
             _ => v / 255.0,
         }
     }
@@ -560,6 +564,7 @@ impl Panel {
         match (f, i) {
             (Field::Hypso(_), 3) => pos * 4000.0,
             (Field::Sun | Field::Sky, _) => pos * 3.0,
+            (Field::LabelLook, _) => LOOK_RANGE[i].0 + pos * (LOOK_RANGE[i].1 - LOOK_RANGE[i].0),
             _ => (pos * 255.0).round(),
         }
     }
@@ -1318,6 +1323,7 @@ impl Panel {
                 Field::Mvum(_) => "motor vehicle use",
                 Field::Water | Field::Contour | Field::ContourIndex => "inks",
                 Field::Sun | Field::Sky => "light",
+                Field::Label(_) | Field::LabelLook => "labels",
             };
             if sec != section {
                 section = sec;
@@ -1390,7 +1396,9 @@ impl Panel {
         y += font * 1.6;
         // The swatch: a colour as the map shows it unlit; a light as the colour it would make white ground.
         let sw = cw - font * 1.8;
-        if f.is_colour() {
+        if f == Field::LabelLook {
+            // No swatch: the look is numbers, shown beside their sliders.
+        } else if f.is_colour() {
             paint::fill_rect(canvas, x0 as isize, y as isize, sw as isize, (font * 1.6) as isize, swatch([vals[0] as u8, vals[1] as u8, vals[2] as u8]), None, None);
         } else {
             let c = mahere_engine::colour::Display::default().encode([vals[0] * 0.5, vals[1] * 0.5, vals[2] * 0.5], true);
@@ -1399,6 +1407,7 @@ impl Panel {
         y += font * 2.4;
         let labels: [&str; 4] = match f {
             Field::Hypso(_) => ["R", "G", "B", "metres"],
+            Field::LabelLook => ["Size", "Glow", "Smoothing", "Spacing"],
             _ => ["R", "G", "B", "A"],
         };
         for (i, sl) in sliders.iter_mut().enumerate() {
@@ -1406,6 +1415,9 @@ impl Panel {
             let val = match (f, i) {
                 (Field::Hypso(_), 3) => format!("{} m", vals[3].round() as i64),
                 (Field::Sun | Field::Sky, _) => format!("{:.2}", vals[i]),
+                (Field::LabelLook, 0) => format!("{:.2}\u{d7}", vals[i]),
+                (Field::LabelLook, 2) => format!("{:.2} letters", vals[i]),
+                (Field::LabelLook, _) => format!("{:.2} of a letter", vals[i]),
                 _ => format!("{}", vals[i] as u8),
             };
             text.draw_text_left(canvas, &val, x0 + font * 4.5, y, &small, None, None);

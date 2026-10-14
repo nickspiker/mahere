@@ -722,6 +722,7 @@ pub mod themes {
                 }
                 f
             })
+            .add_section("labels", vec![("colours".to_string(), table_t(&t.label)), ("look".to_string(), VsfType::t_f5(Tensor::new(vec![4], t.label_look.to_vec())))])
             .build()
             .ok()
     }
@@ -836,6 +837,15 @@ pub mod themes {
             sky: [sky[0], sky[1], sky[2]],
             probe: get("light", "probe").and_then(floats_of).filter(|v| v.len() == 27).map(|v| mahere_engine::sh::Sh9 { l: std::array::from_fn(|c| std::array::from_fn(|k| v[c * 9 + k])) }),
             layers,
+            // Saved before labels had a look of their own: the palette for its ground (set below) and the shipped look.
+            label: get("labels", "colours").and_then(|v| table(v, 255)).unwrap_or([[0; 4]; 11]),
+            label_look: get("labels", "look").and_then(floats_of).filter(|v| v.len() == 4).map_or(mahere_engine::theme::LABEL_LOOK, |v| [v[0], v[1], v[2], v[3]]),
+        })
+        .map(|mut t| {
+            if get("labels", "colours").is_none() {
+                t.label = t.default_labels();
+            }
+            t
         })
     }
 

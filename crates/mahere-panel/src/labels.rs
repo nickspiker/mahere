@@ -9,23 +9,25 @@ use fluor::theme;
 use mahere_engine::labels::NamedTexels;
 use mahere_tiles::Named;
 
-const fn ink(rgb: u32, alpha: u8) -> u32 {
-    (theme::dark(theme::fmt(theme::vsf(rgb))) & 0x00FF_FFFF) | ((alpha as u32) << 24)
-}
 
-/// The halo every label sits on, the map's paper.
-const HALO: u32 = ink(0xF2_F0_E8, 210);
-const PLACE: u32 = ink(0x1E_1E_22, 255);
-const SUMMIT: u32 = ink(0x5A_36_1A, 255);
-const WATER: u32 = ink(0x1A_52_86, 255);
-const ROAD: u32 = ink(0x2C_2C_30, 255);
-const TRAIL: u32 = ink(0x74_2A_18, 255);
-const BOUNDARY: u32 = ink(0x2A_5C_2C, 255);
-const GREEN: u32 = ink(0x2E_5E_30, 255);
-const MARK: u32 = ink(0x46_46_4C, 255);
-/// A route: a strong blue line on a white casing, under the labels.
-const ROUTE: u32 = ink(0x1E_6E_F0, 255);
-const ROUTE_CASING: u32 = ink(0xFF_FF_FF, 255);
+// The theme's label colours by index (`mahere_engine::theme::LABEL_NAMES`).
+const PLACE: usize = 0;
+const SUMMIT: usize = 1;
+const WATER: usize = 2;
+const ROAD: usize = 3;
+const TRAIL: usize = 4;
+const BOUNDARY: usize = 5;
+const GREEN: usize = 6;
+const MARK: usize = 7;
+const HALO: usize = 8;
+const ROUTE: usize = 9;
+const ROUTE_CASING: usize = 10;
+
+/// A theme colour (VSF RGB at gamma 2 with opacity) in fluor's stored form on this platform.
+fn stored(c: [u8; 4]) -> u32 {
+    let rgb = ((c[0] as u32) << 16) | ((c[1] as u32) << 8) | c[2] as u32;
+    (theme::dark(theme::fmt(theme::vsf(rgb))) & 0x00FF_FFFF) | ((c[3] as u32) << 24)
+}
 
 /// Water's names lean, as maps letter them: a shear of tan 12°.
 const ITALIC: f32 = 0.2126;
@@ -76,8 +78,8 @@ fn tier(n: &Named) -> Option<u8> {
     })
 }
 
-/// How a kind is lettered: its size against the base font, its colour, its weight, its lean.
-fn style_of(n: &Named) -> (f32, u32, u16, f32) {
+/// How a kind is lettered: its size against the base font, its colour (an index into the theme's), its weight, its lean.
+fn style_of(n: &Named) -> (f32, usize, u16, f32) {
     match n.kind {
         CITY => (1.25, PLACE, 700, 0.0),
         TOWN => (1.1, PLACE, 700, 0.0),
@@ -130,8 +132,11 @@ pub struct Labeller {
     /// Two screen points of the drawn view and where on the globe they were, so the buffer can follow the map until the next rest.
     anchor: Option<([f64; 2], [f64; 2], (f64, f64), (f64, f64))>,
     /// The view the buffer was drawn for, to tell when it is out of date.
-    drawn_for: Option<(i64, i64, i64, i64, u8, usize, u64, bool)>,
+    drawn_for: Option<(i64, i64, i64, i64, u8, usize, u64, bool, u64)>,
     advance: HashMap<(char, u16, u32), f32>,
+    /// The theme's label colours in fluor's form, and its look (size, glow, smoothing, spacing), as of the last lettering.
+    colours: [u32; 11],
+    look: [f32; 4],
 }
 
 impl Default for Labeller {
@@ -416,7 +421,7 @@ fn centrelines(pts: &[[f32; 2]], bin: f32) -> Vec<Vec<[f32; 2]>> {
 
 impl Labeller {
     pub fn new() -> Labeller {
-        Labeller { text: TextRenderer::new(), buf: Vec::new(), w: 0, h: 0, placed: Vec::new(), anchor: None, drawn_for: None, advance: HashMap::new() }
+        Labeller { text: TextRenderer::new(), buf: Vec::new(), w: 0, h: 0, placed: Vec::new(), anchor: None, drawn_for: None, advance: HashMap::new(), colours: [0; 11], look: mahere_engine::theme::LABEL_LOOK }
     }
 
     /// Whether the lettering is out of date for this view: the camera, the depth or the cells resident changed since it was drawn (a cell arriving, leaving or replaced by a newer copy).
@@ -424,9 +429,9 @@ impl Labeller {
         self.drawn_for != Some(Self::view_key(map, w, h))
     }
 
-    fn view_key(map: &mahere_engine::MapCore, w: usize, h: usize) -> (i64, i64, i64, i64, u8, usize, u64, bool) {
+    fn view_key(map: &mahere_engine::MapCore, w: usize, h: usize) -> (i64, i64, i64, i64, u8, usize, u64, bool, u64) {
         let c = &map.cam;
-        ((c.lat() * 1e7) as i64, (c.lon() * 1e7) as i64, (c.ppd * 100.0) as i64, (c.bearing() * 1e5) as i64, map.vec_depth(), map.pool_version() as usize ^ (w << 20) ^ (h << 40), map.route_version, map.layers().labels)
+        ((c.lat() * 1e7) as i64, (c.lon() * 1e7) as i64, (c.ppd * 100.0) as i64, (c.bearing() * 1e5) as i64, map.vec_depth(), map.pool_version() as usize ^ (w << 20) ^ (h << 40), map.route_version, map.layers().labels, map.style_version())
     }
 
     /// Whether there is anything to draw: labels shown, or a route.
@@ -439,7 +444,7 @@ impl Labeller {
         if let Some(&a) = self.advance.get(&key) {
             return a;
         }
-        let a = self.text.measure_text(&ch.to_string(), &TextStyle::new(size, PLACE).weight(weight));
+        let a = self.text.measure_text(&ch.to_string(), &TextStyle::new(size, 0xFF00_0000).weight(weight));
         self.advance.insert(key, a);
         a
     }
@@ -453,6 +458,12 @@ impl Labeller {
         let t = std::time::Instant::now();
         self.w = w;
         self.h = h;
+        // The theme's colours and look; the size scales the base font.
+        if let Some(th) = map.themes.get(map.theme) {
+            self.colours = th.label.map(stored);
+            self.look = th.label_look;
+        }
+        let font = font * self.look[0];
         let texels = if map.layers().labels { map.gather_names(w, h) } else { NamedTexels::default() };
         let gathered = t.elapsed();
         let previous: HashSet<(u8, String, String)> = self.placed.iter().map(|p| (p.name.kind, p.name.name.clone(), p.name.reference.clone())).collect();
@@ -528,13 +539,14 @@ impl Labeller {
         todo.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)).then(b.2.cmp(&a.2)).then(b.3.cmp(&a.3)));
         let mut room = Room::new(w, h);
         let mut out = Vec::new();
-        let pad = font * 0.12;
+        let pad = font * self.look[3];
         for (_, _, _, _, n, shape) in todo {
             let label = n.label();
             if label.is_empty() {
                 continue;
             }
             let (rel, colour, weight, shear) = style_of(n);
+            let colour = self.colours[colour];
             let size = font * rel;
             let laid: Vec<Laid> = match shape {
                 Shape::Point(p) => self.point(n, &label, p, size, colour, weight, &room, pad).into_iter().collect(),
@@ -719,7 +731,7 @@ impl Labeller {
         let repeat = (self.w.max(self.h) as f32 / 3.0).max(width * 2.0);
         for path in centrelines(pts, bin).into_iter().take(4) {
             // The curve fit at the label's own scale: wiggles under half a letter cannot twist the name.
-            let path = smooth(&path, 2.0, size * 0.5);
+            let path = smooth(&path, 2.0, (size * self.look[2]).max(0.5));
             let len = lengths(&path);
             let total = *len.last().unwrap_or(&0.0);
             if total < width * 1.15 + size {
@@ -799,15 +811,18 @@ impl Labeller {
         for l in laid {
             if let Some((p, summit)) = l.mark {
                 // A summit's triangle, point up; a dot for the small marks.
-                let (glyph, fill, scale) = if summit { ("\u{25B2}", SUMMIT, 0.7) } else { ("\u{2022}", MARK, 1.0) };
+                let (glyph, fill, scale) = if summit { ("\u{25B2}", self.colours[SUMMIT], 0.7) } else { ("\u{2022}", self.colours[MARK], 1.0) };
                 self.text.draw_text_center(&mut canvas, glyph, p[0], p[1], &TextStyle::new(l.size * scale, fill), None, None);
             }
         }
         // The halos: each letter again in the paper's colour, a little around it (the route goes under them, after).
         for l in laid {
-            let r = (l.size * 0.11).max(1.0);
+            let r = l.size * self.look[1];
+            if r < 0.25 {
+                continue;
+            }
             for g in &l.glyphs {
-                let style = TextStyle::new(l.size, HALO).weight(l.weight).shear(l.shear).rotation(g.angle);
+                let style = TextStyle::new(l.size, self.colours[HALO]).weight(l.weight).shear(l.shear).rotation(g.angle);
                 for k in 0..8 {
                     let a = k as f32 * std::f32::consts::FRAC_PI_4;
                     let at = unturn([g.at[0] + r * a.cos(), g.at[1] + r * a.sin()], g.angle);
@@ -817,8 +832,8 @@ impl Labeller {
         }
         // The route under everything lettered: its line, then its casing under that.
         let width = (font * 0.32).max(3.0);
-        under_polyline(canvas.pixels, w, h, route, width, ROUTE);
-        under_polyline(canvas.pixels, w, h, route, width + (font * 0.14).max(1.5), ROUTE_CASING);
+        under_polyline(canvas.pixels, w, h, route, width, self.colours[ROUTE]);
+        under_polyline(canvas.pixels, w, h, route, width + (font * 0.14).max(1.5), self.colours[ROUTE_CASING]);
     }
 
     /// The lettering as premultiplied RGBA bytes for a GPU host.

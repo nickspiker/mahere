@@ -5,7 +5,7 @@
 use crate::raster::{LayerMask, Style};
 
 /// Bumped whenever the built-ins change, so a vault holding an older copy of one is refreshed.
-pub const BUILTIN_REVISION: u32 = 8;
+pub const BUILTIN_REVISION: u32 = 9;
 
 #[derive(Clone, Debug)]
 pub struct Theme {
@@ -41,7 +41,23 @@ pub struct Theme {
     pub sun: [f32; 3],
     pub sky: [f32; 3],
     pub layers: LayerMask,
+    /// The labels' colours, in [`LABEL_NAMES`] order, VSF RGB at gamma 2 with opacity, as every theme colour (Nick 2026-10-13: labels and their look in the theme).
+    pub label: [[u8; 4]; 11],
+    /// How labels are lettered: size (times the base), glow (the halo's width, a fraction of the letter), smoothing (the curve fit's radius, in letters), spacing (room kept around each label, a fraction of the letter).
+    pub label_look: [f32; 4],
 }
+
+/// What each label colour is for, by index.
+pub const LABEL_NAMES: [&str; 11] = ["Places", "Summits", "Water names", "Roads", "Trails", "Boundaries", "Area names", "Small marks", "Halo", "Route", "Route casing"];
+
+/// Labels on a light ground: dark letters on a paper halo.
+pub const LABELS_LIGHT: [[u8; 4]; 11] = [[30, 30, 34, 255], [90, 54, 26, 255], [26, 82, 134, 255], [44, 44, 48, 255], [116, 42, 24, 255], [42, 92, 44, 255], [46, 94, 48, 255], [70, 70, 76, 255], [242, 240, 232, 210], [30, 110, 240, 255], [255, 255, 255, 255]];
+
+/// Labels on a dark ground: light letters on a dark halo.
+pub const LABELS_DARK: [[u8; 4]; 11] = [[238, 238, 234, 255], [232, 200, 160, 255], [142, 196, 240, 255], [230, 230, 230, 255], [240, 160, 128, 255], [158, 214, 154, 255], [168, 216, 160, 255], [208, 208, 216, 255], [16, 20, 24, 200], [74, 154, 255, 255], [10, 14, 20, 255]];
+
+/// The look labels start from: their base size, a glow of a ninth of a letter, a curve fit half a letter wide, an eighth of a letter of room.
+pub const LABEL_LOOK: [f32; 4] = [1.0, 0.11, 0.5, 0.12];
 
 /// Land cover classes in table order (1-based ids; 0 is empty).
 pub const LAND_NAMES: [&str; 14] = ["", "Grass", "Farmland", "Orchard", "Scrub", "Forest", "Wetland", "Sand", "Rock", "Glacier", "Quarry", "Industrial", "Urban", "Water"];
@@ -85,6 +101,8 @@ pub fn trail() -> Theme {
         wild: WILD,
         mvum: MVUM,
         layers: ALL,
+        label: LABELS_LIGHT,
+        label_look: LABEL_LOOK,
     }
 }
 
@@ -111,6 +129,8 @@ pub fn topo() -> Theme {
         wild: WILD,
         mvum: MVUM,
         layers: LayerMask { hypso: false, ..ALL },
+        label: LABELS_LIGHT,
+        label_look: LABEL_LOOK,
     }
 }
 
@@ -137,6 +157,8 @@ pub fn night() -> Theme {
         wild: WILD,
         mvum: MVUM,
         layers: ALL,
+        label: LABELS_LIGHT,
+        label_look: LABEL_LOOK,
     }
 }
 
@@ -163,6 +185,8 @@ pub fn alpine() -> Theme {
         wild: WILD,
         mvum: MVUM,
         layers: ALL,
+        label: LABELS_LIGHT,
+        label_look: LABEL_LOOK,
     }
 }
 
@@ -189,6 +213,8 @@ pub fn desert() -> Theme {
         wild: WILD,
         mvum: MVUM,
         layers: ALL,
+        label: LABELS_LIGHT,
+        label_look: LABEL_LOOK,
     }
 }
 
@@ -215,6 +241,8 @@ pub fn ink() -> Theme {
         wild: WILD,
         mvum: MVUM,
         layers: LayerMask { hypso: false, ..ALL },
+        label: LABELS_LIGHT,
+        label_look: LABEL_LOOK,
     }
 }
 
@@ -236,6 +264,10 @@ pub enum Field {
     Mvum(u8),
     Sun,
     Sky,
+    /// A label colour, by [`LABEL_NAMES`] index.
+    Label(u8),
+    /// The labels' look: size, glow, smoothing, spacing.
+    LabelLook,
 }
 
 impl Field {
@@ -249,6 +281,8 @@ impl Field {
         v.push(Field::Wild);
         v.extend((1..15).map(Field::Mvum));
         v.extend([Field::Water, Field::Contour, Field::ContourIndex, Field::Sun, Field::Sky]);
+        v.push(Field::LabelLook);
+        v.extend((0..11).map(Field::Label));
         v
     }
 
@@ -269,12 +303,14 @@ impl Field {
             Field::Mvum(i) => mahere_tiles::landuse::mvum::NAMES[i as usize].to_string(),
             Field::Sun => "Sun".into(),
             Field::Sky => "Sky".into(),
+            Field::Label(i) => LABEL_NAMES[i as usize].to_string(),
+            Field::LabelLook => "Label look".into(),
         }
     }
 
     /// Whether the field is a colour (three VSF RGB bytes) as opposed to a light (three channels, 0 to 3) or a single number.
     pub fn is_colour(self) -> bool {
-        !matches!(self, Field::Sun | Field::Sky)
+        !matches!(self, Field::Sun | Field::Sky | Field::LabelLook)
     }
 }
 
@@ -301,6 +337,8 @@ impl Theme {
             Field::Mvum(i) => c(self.mvum[i as usize]),
             Field::Sun => [self.sun[0], self.sun[1], self.sun[2], 0.0],
             Field::Sky => [self.sky[0], self.sky[1], self.sky[2], 0.0],
+            Field::Label(i) => c(self.label[i as usize]),
+            Field::LabelLook => self.label_look,
         }
     }
 
@@ -323,6 +361,8 @@ impl Theme {
             Field::Mvum(i) => self.mvum[i as usize] = c,
             Field::Sun => self.sun = [v[0].max(0.0), v[1].max(0.0), v[2].max(0.0)],
             Field::Sky => self.sky = [v[0].max(0.0), v[1].max(0.0), v[2].max(0.0)],
+            Field::Label(i) => self.label[i as usize] = c,
+            Field::LabelLook => self.label_look = [v[0].clamp(0.5, 2.0), v[1].clamp(0.0, 0.4), v[2].clamp(0.0, 2.0), v[3].clamp(0.0, 1.0)],
         }
     }
 
@@ -360,6 +400,8 @@ pub fn blueprint() -> Theme {
         wild: WILD,
         mvum: MVUM,
         layers: ALL,
+        label: LABELS_LIGHT,
+        label_look: LABEL_LOOK,
     }
 }
 
@@ -386,6 +428,8 @@ pub fn atlas() -> Theme {
         wild: WILD,
         mvum: MVUM,
         layers: ALL,
+        label: LABELS_LIGHT,
+        label_look: LABEL_LOOK,
     }
 }
 
@@ -412,6 +456,8 @@ pub fn ember() -> Theme {
         wild: WILD,
         mvum: MVUM,
         layers: ALL,
+        label: LABELS_LIGHT,
+        label_look: LABEL_LOOK,
     }
 }
 
@@ -438,6 +484,8 @@ pub fn monsoon() -> Theme {
         wild: WILD,
         mvum: MVUM,
         layers: ALL,
+        label: LABELS_LIGHT,
+        label_look: LABEL_LOOK,
     }
 }
 
@@ -464,6 +512,8 @@ pub fn chart() -> Theme {
         wild: WILD,
         mvum: MVUM,
         layers: LayerMask { hypso: false, ..ALL },
+        label: LABELS_LIGHT,
+        label_look: LABEL_LOOK,
     }
 }
 
@@ -490,6 +540,8 @@ pub fn neon() -> Theme {
         wild: WILD,
         mvum: MVUM,
         layers: ALL,
+        label: LABELS_LIGHT,
+        label_look: LABEL_LOOK,
     }
 }
 
@@ -516,6 +568,8 @@ pub fn dawn() -> Theme {
         wild: WILD,
         mvum: MVUM,
         layers: ALL,
+        label: LABELS_LIGHT,
+        label_look: LABEL_LOOK,
     }
 }
 
@@ -545,6 +599,8 @@ pub fn terra() -> Theme {
         wild: WILD,
         mvum: MVUM,
         layers: ALL,
+        label: LABELS_LIGHT,
+        label_look: LABEL_LOOK,
     }
 }
 
@@ -571,6 +627,8 @@ pub fn tundra() -> Theme {
         wild: WILD,
         mvum: MVUM,
         layers: ALL,
+        label: LABELS_LIGHT,
+        label_look: LABEL_LOOK,
     }
 }
 
@@ -597,6 +655,8 @@ pub fn savanna() -> Theme {
         wild: WILD,
         mvum: MVUM,
         layers: ALL,
+        label: LABELS_LIGHT,
+        label_look: LABEL_LOOK,
     }
 }
 
@@ -623,6 +683,8 @@ pub fn candy() -> Theme {
         wild: WILD,
         mvum: MVUM,
         layers: ALL,
+        label: LABELS_LIGHT,
+        label_look: LABEL_LOOK,
     }
 }
 
@@ -649,6 +711,8 @@ pub fn survey() -> Theme {
         wild: WILD,
         mvum: MVUM,
         layers: ALL,
+        label: LABELS_LIGHT,
+        label_look: LABEL_LOOK,
     }
 }
 
@@ -675,6 +739,8 @@ pub fn woodcut() -> Theme {
         wild: WILD,
         mvum: MVUM,
         layers: ALL,
+        label: LABELS_LIGHT,
+        label_look: LABEL_LOOK,
     }
 }
 
@@ -701,6 +767,8 @@ pub fn gazetteer() -> Theme {
         wild: WILD,
         mvum: MVUM,
         layers: ALL,
+        label: LABELS_LIGHT,
+        label_look: LABEL_LOOK,
     }
 }
 
@@ -708,7 +776,20 @@ pub const BUILTIN_NAMES: [&str; 20] = ["Trail", "Topo", "Night", "Alpine", "Dese
 
 /// The built-in themes, as authored: VSF RGB, gamma 2. The renderers convert to the display at their one encode.
 pub fn builtin() -> Vec<Theme> {
-    vec![trail(), topo(), night(), alpine(), desert(), ink(), blueprint(), atlas(), ember(), monsoon(), chart(), neon(), dawn(), terra(), tundra(), savanna(), candy(), survey(), woodcut(), gazetteer()]
+    let mut v = vec![trail(), topo(), night(), alpine(), desert(), ink(), blueprint(), atlas(), ember(), monsoon(), chart(), neon(), dawn(), terra(), tundra(), savanna(), candy(), survey(), woodcut(), gazetteer()];
+    for t in &mut v {
+        t.label = t.default_labels();
+    }
+    v
+}
+
+impl Theme {
+    /// The label palette that reads on this theme's ground: light letters on a dark halo where the lowland tint is dark, dark on a paper halo otherwise.
+    pub fn default_labels(&self) -> [[u8; 4]; 11] {
+        let c = self.hypso[1].1;
+        let lum = 0.3 * c[0] as f32 + 0.59 * c[1] as f32 + 0.11 * c[2] as f32;
+        if lum < 110.0 { LABELS_DARK } else { LABELS_LIGHT }
+    }
 }
 
 impl Theme {
