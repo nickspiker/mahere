@@ -1188,27 +1188,40 @@ pub extern "system" fn Java_nz_mahere_app_MahereActivity_nativeWantsRecording(_e
     shell(ptr).app().recording as jboolean
 }
 
-/// The track service's fixes, one or a batch (a batch arrives a minute or more after it was measured): each into the track at the time it was taken, the newest onto the map.
+/// The track service's fixes, one or a batch (a batch arrives a minute or more after it was measured): each into the track as the receiver measured it, at the time it was taken (NaN where it gave nothing), the newest onto the map.
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_nz_mahere_app_MahereTrackService_nativeOnTrackFixes<'a>(env: JNIEnv<'a>, _class: JClass, ptr: jlong, lats: jni::objects::JDoubleArray<'a>, lons: jni::objects::JDoubleArray<'a>, accs: jni::objects::JFloatArray<'a>, times: jni::objects::JLongArray<'a>) {
+#[allow(clippy::too_many_arguments)]
+pub extern "system" fn Java_nz_mahere_app_MahereTrackService_nativeOnTrackFixes<'a>(env: JNIEnv<'a>, _class: JClass, ptr: jlong, lats: jni::objects::JDoubleArray<'a>, lons: jni::objects::JDoubleArray<'a>, accs: jni::objects::JFloatArray<'a>, times: jni::objects::JLongArray<'a>, heights: jni::objects::JDoubleArray<'a>, vaccs: jni::objects::JFloatArray<'a>, speeds: jni::objects::JFloatArray<'a>, bearings: jni::objects::JFloatArray<'a>) {
     if ptr == 0 {
         return;
     }
     let n = env.get_array_length(&lats).unwrap_or(0).max(0) as usize;
-    let (mut la, mut lo, mut ac, mut tm) = (vec![0.0f64; n], vec![0.0f64; n], vec![0.0f32; n], vec![0i64; n]);
-    if env.get_double_array_region(&lats, 0, &mut la).is_err() || env.get_double_array_region(&lons, 0, &mut lo).is_err() || env.get_float_array_region(&accs, 0, &mut ac).is_err() || env.get_long_array_region(&times, 0, &mut tm).is_err() {
+    let (mut la, mut lo, mut ht) = (vec![0.0f64; n], vec![0.0f64; n], vec![0.0f64; n]);
+    let (mut ac, mut va, mut sp, mut be) = (vec![0.0f32; n], vec![0.0f32; n], vec![0.0f32; n], vec![0.0f32; n]);
+    let mut tm = vec![0i64; n];
+    let ok = env.get_double_array_region(&lats, 0, &mut la).is_ok()
+        && env.get_double_array_region(&lons, 0, &mut lo).is_ok()
+        && env.get_double_array_region(&heights, 0, &mut ht).is_ok()
+        && env.get_float_array_region(&accs, 0, &mut ac).is_ok()
+        && env.get_float_array_region(&vaccs, 0, &mut va).is_ok()
+        && env.get_float_array_region(&speeds, 0, &mut sp).is_ok()
+        && env.get_float_array_region(&bearings, 0, &mut be).is_ok()
+        && env.get_long_array_region(&times, 0, &mut tm).is_ok();
+    if !ok {
         return;
     }
     let app = shell(ptr).app();
     if app.recording {
         if let Some(rec) = &app.recorder {
             let rec = rec.clone();
-            let elev: Vec<f64> = (0..n).map(|i| app.map.elevation_at(la[i], lo[i]).map_or(f64::NAN, |e| e as f64)).collect();
-            let fixes: Vec<(f64, f64, f64, f64)> = (0..n).map(|i| (la[i], lo[i], elev[i], tm[i] as f64 / 1000.0)).collect();
+            let some = |v: f32| v.is_finite().then_some(v);
+            let fixes: Vec<mahere_store::Fix> = (0..n)
+                .map(|i| mahere_store::Fix { coord: mahere_coord::Coord::from_lat_lon(la[i], lo[i]).raw(), unix_ms: tm[i], height_m: ht[i].is_finite().then_some(ht[i] as f32), accuracy_m: ac[i], v_accuracy_m: some(va[i]), speed_ms: some(sp[i]), bearing_deg: some(be[i]) })
+                .collect();
             app.persist.run(move || {
                 let mut r = rec.lock().unwrap();
-                for (lat, lon, e, t) in fixes {
-                    r.on_fix_at(lat, lon, e, t);
+                for f in fixes {
+                    r.on_gps(f);
                 }
             });
         }

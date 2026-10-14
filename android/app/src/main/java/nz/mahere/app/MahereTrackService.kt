@@ -50,7 +50,7 @@ class MahereTrackService : Service(), SensorEventListener {
         private const val STOPPED = 0.7f
     }
 
-    private external fun nativeOnTrackFixes(ptr: Long, lats: DoubleArray, lons: DoubleArray, accs: FloatArray, times: LongArray)
+    private external fun nativeOnTrackFixes(ptr: Long, lats: DoubleArray, lons: DoubleArray, accs: FloatArray, times: LongArray, heights: DoubleArray, vaccs: FloatArray, speeds: FloatArray, bearings: FloatArray)
 
     private val handler = Handler(Looper.getMainLooper())
     private var live = true
@@ -123,7 +123,18 @@ class MahereTrackService : Service(), SensorEventListener {
         locs.last().let { if (it.hasSpeed()) lastSpeed = it.speed }
         val ptr = MahereActivity.sharedPtr
         if (ptr == 0L) return
-        nativeOnTrackFixes(ptr, DoubleArray(locs.size) { locs[it].latitude }, DoubleArray(locs.size) { locs[it].longitude }, FloatArray(locs.size) { locs[it].accuracy }, LongArray(locs.size) { locs[it].time })
+        // Everything the receiver measured, NaN where it gave nothing; the height is above the WGS84 ellipsoid, as GPS gives it.
+        nativeOnTrackFixes(
+            ptr,
+            DoubleArray(locs.size) { locs[it].latitude },
+            DoubleArray(locs.size) { locs[it].longitude },
+            FloatArray(locs.size) { locs[it].accuracy },
+            LongArray(locs.size) { locs[it].time },
+            DoubleArray(locs.size) { if (locs[it].hasAltitude()) locs[it].altitude else Double.NaN },
+            FloatArray(locs.size) { if (locs[it].hasVerticalAccuracy()) locs[it].verticalAccuracyMeters else Float.NaN },
+            FloatArray(locs.size) { if (locs[it].hasSpeed()) locs[it].speed else Float.NaN },
+            FloatArray(locs.size) { if (locs[it].hasBearing()) locs[it].bearing else Float.NaN },
+        )
     }
 
     /// The GPS as the moment wants it: off while still, else one fix a second, live or batched.

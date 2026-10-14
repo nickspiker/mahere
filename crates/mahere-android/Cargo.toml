@@ -25,3 +25,4 @@ raw-window-handle = "0.6"
 pollster = "0.4"
 mahere-panel = { path = "../mahere-panel" }
 mahere-update = { path = "../mahere-update" }
+mahere-coord = { path = "../mahere-coord" }

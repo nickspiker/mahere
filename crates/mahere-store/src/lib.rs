@@ -185,34 +185,40 @@ fn tensor_f64(v: VsfType) -> Option<Vec<f64>> {
 
 // ==================== TRACKS ====================
 
-/// Chunked GPS track recorder: (lat, lon, elevation m, unix seconds) per fix, flushed every CHUNK fixes so a crash costs at most one chunk and a day's hike never rewrites more than a small object per flush.
+/// One GPS fix as the receiver measured it, nothing derived (Nick 2026-10-13: never store the map's height, never throw away the GPS's): the place as a dymaxion coordinate, when (unix milliseconds), the height above the WGS84 ellipsoid, the horizontal and vertical accuracy, the speed and the bearing; None where the receiver gave none. Elevation above sea level is worked out when the track is shown: the map's terrain where the fix is on the ground, else the height less the geoid.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Fix {
+    pub coord: u64,
+    pub unix_ms: i64,
+    pub height_m: Option<f32>,
+    pub accuracy_m: f32,
+    pub v_accuracy_m: Option<f32>,
+    pub speed_ms: Option<f32>,
+    pub bearing_deg: Option<f32>,
+}
+
+/// Chunked track recorder: fixes flushed every CHUNK fixes as one VSF document of columns (coordinates, times, heights in centimetres, accuracies, speeds, bearings), zstd-compressed, so a crash costs at most one chunk and a day's hike never rewrites more than a small object per flush.
 pub struct TrackRecorder {
     store: Arc<FlatStorage>,
-    /// Eagle Time of the first fix's session — the track's identity.
+    /// Eagle Time of the recording's start: the track's identity.
     start: i64,
-    buf: Vec<f64>,
+    buf: Vec<Fix>,
     chunk: u32,
 }
 
 const CHUNK_FIXES: usize = 64;
+
+/// An absent column value in its 16-bit field.
+const NONE16: u16 = u16::MAX;
 
 impl TrackRecorder {
     pub fn new(store: Arc<FlatStorage>) -> TrackRecorder {
         TrackRecorder { store, start: et_now(), buf: Vec::new(), chunk: 0 }
     }
 
-    pub fn on_fix(&mut self, lat: f64, lon: f64, elevation_m: f64) {
-        let ts = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs_f64())
-            .unwrap_or(0.0);
-        self.on_fix_at(lat, lon, elevation_m, ts);
-    }
-
-    /// A fix at the time it was taken (unix seconds): batched fixes arrive a minute or more after they were measured.
-    pub fn on_fix_at(&mut self, lat: f64, lon: f64, elevation_m: f64, unix_s: f64) {
-        self.buf.extend_from_slice(&[lat, lon, elevation_m, unix_s]);
-        if self.buf.len() >= CHUNK_FIXES * 4 {
+    pub fn on_gps(&mut self, fix: Fix) {
+        self.buf.push(fix);
+        if self.buf.len() >= CHUNK_FIXES {
             self.flush();
         }
     }
@@ -221,15 +227,29 @@ impl TrackRecorder {
         if self.buf.is_empty() {
             return;
         }
-        let key = track_chunk_key(self.start, self.chunk);
-        let t = VsfType::t_f6(Tensor::new(vec![self.buf.len()], std::mem::take(&mut self.buf)));
-        if self.store.write_device(&key, &t.flatten()).is_ok() {
+        let fixes = std::mem::take(&mut self.buf);
+        let n = fixes.len();
+        let cm16 = |v: Option<f32>| v.map_or(NONE16, |m| (m * 100.0).round().clamp(0.0, 65534.0) as u16);
+        let doc = VsfBuilder::new()
+            .add_section(
+                "fixes",
+                vec![
+                    ("coord".to_string(), VsfType::t_u6(Tensor::new(vec![n], fixes.iter().map(|f| f.coord).collect()))),
+                    ("ms".to_string(), VsfType::t_i6(Tensor::new(vec![n], fixes.iter().map(|f| f.unix_ms).collect()))),
+                    ("height".to_string(), VsfType::t_i5(Tensor::new(vec![n], fixes.iter().map(|f| f.height_m.map_or(i32::MIN, |h| (h * 100.0).round() as i32)).collect()))),
+                    ("accuracy".to_string(), VsfType::t_u4(Tensor::new(vec![n], fixes.iter().map(|f| cm16(Some(f.accuracy_m))).collect()))),
+                    ("vaccuracy".to_string(), VsfType::t_u4(Tensor::new(vec![n], fixes.iter().map(|f| cm16(f.v_accuracy_m)).collect()))),
+                    ("speed".to_string(), VsfType::t_u4(Tensor::new(vec![n], fixes.iter().map(|f| cm16(f.speed_ms)).collect()))),
+                    ("bearing".to_string(), VsfType::t_u4(Tensor::new(vec![n], fixes.iter().map(|f| f.bearing_deg.map_or(NONE16, |b| (b.rem_euclid(360.0) * 100.0).round() as u16 % 36000)).collect()))),
+                ],
+            )
+            .build();
+        let Ok(doc) = doc else { return };
+        let Ok(z) = zstd::encode_all(&doc[..], 3) else { return };
+        if self.store.write_device(&track_chunk_key(self.start, self.chunk), &z).is_ok() {
             self.chunk += 1;
             // VSF all the way down: the counter is a u, not naked LE bytes.
-            let _ = self.store.write_device(
-                &track_count_key(self.start),
-                &VsfType::u(self.chunk as usize, false).flatten(),
-            );
+            let _ = self.store.write_device(&track_count_key(self.start), &VsfType::u(self.chunk as usize, false).flatten());
         }
     }
 
@@ -251,13 +271,47 @@ impl TrackRecorder {
     }
 }
 
-/// One recorded chunk's fixes (lat, lon, elevation m, unix s) × n.
-pub fn track_chunk(store: &FlatStorage, start: i64, chunk: u32) -> Option<Vec<f64>> {
+/// One recorded chunk's fixes. A chunk from before (latitude, longitude, the map's elevation, unix seconds, as f64s) reads with the place and time only: its height was the map's, not the receiver's.
+pub fn track_chunk(store: &FlatStorage, start: i64, chunk: u32) -> Option<Vec<Fix>> {
     let bytes = store.read_device(&track_chunk_key(start, chunk)).ok()??;
+    if bytes.starts_with(&[0x28, 0xB5, 0x2F, 0xFD]) {
+        let plain = zstd::decode_all(&bytes[..]).ok()?;
+        let (header, end) = vsf::VsfHeader::decode(&plain).ok()?;
+        let s = header.sections(&plain, end).ok()?.into_iter().find(|s| s.name == "fixes")?;
+        // Columns read whatever way VSF hands them back (a one-dimensional tensor parses as a vector).
+        let col = |name: &str| s.fields.iter().find(|f| f.name == name).and_then(|f| f.values.first().cloned());
+        let u64s = |v: Option<VsfType>| match v {
+            Some(VsfType::t_u6(t)) => Some(t.data),
+            Some(VsfType::v_u6(t)) => Some(t.data),
+            _ => None,
+        };
+        let i64s = |v: Option<VsfType>| match v {
+            Some(VsfType::t_i6(t)) => Some(t.data),
+            Some(VsfType::v_i6(t)) => Some(t.data),
+            _ => None,
+        };
+        let i32s = |v: Option<VsfType>| match v {
+            Some(VsfType::t_i5(t)) => Some(t.data),
+            Some(VsfType::v_i5(t)) => Some(t.data),
+            _ => None,
+        };
+        let u16s = |v: Option<VsfType>| match v {
+            Some(VsfType::t_u4(t)) => Some(t.data),
+            Some(VsfType::v_u4(t)) => Some(t.data),
+            _ => None,
+        };
+        let (c, t, hh, a, va, sp, b) = (u64s(col("coord"))?, i64s(col("ms"))?, i32s(col("height"))?, u16s(col("accuracy"))?, u16s(col("vaccuracy"))?, u16s(col("speed"))?, u16s(col("bearing"))?);
+        let n = c.len();
+        if [t.len(), hh.len(), a.len(), va.len(), sp.len(), b.len()].iter().any(|&l| l != n) {
+            return None;
+        }
+        let m16 = |v: u16| (v != NONE16).then_some(v as f32 / 100.0);
+        return Some((0..n).map(|i| Fix { coord: c[i], unix_ms: t[i], height_m: (hh[i] != i32::MIN).then_some(hh[i] as f32 / 100.0), accuracy_m: a[i] as f32 / 100.0, v_accuracy_m: m16(va[i]), speed_ms: m16(sp[i]), bearing_deg: m16(b[i]) }).collect());
+    }
     let mut ptr = 0usize;
-    tensor_f64(vsf::parse(&bytes, &mut ptr).ok()?)
+    let old = tensor_f64(vsf::parse(&bytes, &mut ptr).ok()?)?;
+    Some(old.chunks_exact(4).map(|f| Fix { coord: mahere_coord::Coord::from_lat_lon(f[0], f[1]).raw(), unix_ms: (f[3] * 1000.0) as i64, height_m: None, accuracy_m: 0.0, v_accuracy_m: None, speed_ms: None, bearing_deg: None }).collect())
 }
-
 
 /// Chunk count for a recorded track session (width-agnostic VSF read).
 pub fn track_chunks(store: &FlatStorage, start: i64) -> Option<u32> {
@@ -305,7 +359,7 @@ mod tests {
         let mut rec = TrackRecorder::new(store.clone());
         let key = rec.start();
         for i in 0..200 {
-            rec.on_fix(46.2 + i as f64 * 1e-5, -121.49, 2000.0 + i as f64);
+            rec.on_gps(Fix { coord: mahere_coord::Coord::from_lat_lon(46.2 + i as f64 * 1e-5, -121.49).raw(), unix_ms: 1_791_900_000_000 + i * 1000, height_m: (i % 2 == 0).then_some(2000.0 + i as f32), accuracy_m: 3.5, v_accuracy_m: Some(6.0), speed_ms: None, bearing_deg: Some(359.99) });
         }
         rec.flush();
         assert_eq!(rec.chunks(), 4);
@@ -313,6 +367,12 @@ mod tests {
         for c in 0..4u32 {
             assert!(track_chunk(&store, key, c).is_some(), "chunk {c} missing");
         }
+        // A fix reads back as it was measured: heights where given and absent where not, to the centimetre.
+        let first = track_chunk(&store, key, 0).unwrap();
+        assert_eq!(first.len(), 64);
+        assert_eq!(first[2].height_m, Some(2002.0));
+        assert_eq!(first[3].height_m, None);
+        assert_eq!((first[1].unix_ms, first[1].accuracy_m, first[1].v_accuracy_m, first[1].speed_ms, first[1].bearing_deg), (1_791_900_001_000, 3.5, Some(6.0), None, Some(359.99)));
 
         // Persistence across a real reopen: drop every handle, open again, read everything back.
         drop(rec);
