@@ -226,6 +226,7 @@ struct LabelJob {
     font: f32,
     palette: [[u8; 4]; 11],
     look: [f32; 4],
+    amount: [f32; 2],
     route: Vec<(f64, f64)>,
     key: ViewKey,
 }
@@ -241,6 +242,7 @@ struct Letterer {
     shared: std::sync::Arc<Atlas>,
     advance: HashMap<(char, u16, u32), f32>,
     look: [f32; 4],
+    amount: [f32; 2],
     previous: HashSet<(u8, String, String)>,
     names: mahere_engine::labels::NamesCache,
 }
@@ -473,7 +475,7 @@ impl Labeller {
         std::thread::Builder::new()
             .name("labels".into())
             .spawn(move || {
-                let mut l = Letterer { text: TextRenderer::new(), w: 0, h: 0, atlas: Atlas::new(), sent: 0, shared: std::sync::Arc::new(Atlas::new()), advance: HashMap::new(), look: mahere_engine::theme::LABEL_LOOK, previous: HashSet::new(), names: Default::default() };
+                let mut l = Letterer { text: TextRenderer::new(), w: 0, h: 0, atlas: Atlas::new(), sent: 0, shared: std::sync::Arc::new(Atlas::new()), advance: HashMap::new(), look: mahere_engine::theme::LABEL_LOOK, amount: mahere_engine::theme::LABEL_AMOUNT, previous: HashSet::new(), names: Default::default() };
                 while let Ok(mut job) = jobs.recv() {
                     // Only the newest job matters: a camera that moved on has made the others stale.
                     while let Ok(newer) = jobs.try_recv() {
@@ -499,10 +501,10 @@ impl Labeller {
     }
 
     fn job(map: &mut mahere_engine::MapCore, w: usize, h: usize, font: f32) -> LabelJob {
-        let (palette, look) = map.themes.get(map.theme).map_or((mahere_engine::theme::LABELS_LIGHT, mahere_engine::theme::LABEL_LOOK), |t| (t.label, t.label_look));
+        let (palette, look, amount) = map.themes.get(map.theme).map_or((mahere_engine::theme::LABELS_LIGHT, mahere_engine::theme::LABEL_LOOK, mahere_engine::theme::LABEL_AMOUNT), |t| (t.label, t.label_look, t.label_amount));
         let key = Self::view_key(map, w, h);
         let names = map.layers().labels.then(|| map.name_job(w, h));
-        LabelJob { names, cam: map.cam, w, h, font, palette, look, route: map.route_points().map_or(Vec::new(), |p| p.to_vec()), key }
+        LabelJob { names, cam: map.cam, w, h, font, palette, look, amount, route: map.route_points().map_or(Vec::new(), |p| p.to_vec()), key }
     }
 
     /// Ask the worker for a layout when one is due: the view rests, the lettering is stale, none is running, and every cell is in or a second has passed since the last ask (so cells still arriving never hold the labels back). Never waits.
@@ -610,6 +612,7 @@ impl Letterer {
         self.w = w;
         self.h = h;
         self.look = job.look;
+        self.amount = job.amount;
         let font = job.font * self.look[0];
         let texels = match &job.names {
             Some(n) => mahere_engine::labels::gather(n, &mut self.names),
@@ -764,19 +767,21 @@ impl Letterer {
             Area(&'a [[f32; 2]]),
             Line(&'a [[f32; 2]]),
         }
+        // The density's cut in the order of kinds: below it nothing is lettered.
+        let limit = mahere_engine::theme::label_tier_limit(self.amount[0]);
         let mut todo: Vec<(u8, bool, u32, usize, &Named, Shape)> = Vec::new();
         for (n, p) in &texels.points {
-            if let Some(t) = tier(n) {
+            if let Some(t) = tier(n).filter(|&t| t <= limit) {
                 todo.push((t, !previous.contains(&(n.kind, n.name.clone(), n.reference.clone())), n.rank, 1, n, Shape::Point(*p)));
             }
         }
         for (n, pts) in &texels.areas {
-            if let Some(t) = tier(n) {
+            if let Some(t) = tier(n).filter(|&t| t <= limit) {
                 todo.push((t, !previous.contains(&(n.kind, n.name.clone(), n.reference.clone())), n.rank, pts.len(), n, Shape::Area(pts)));
             }
         }
         for (n, pts) in &texels.lines {
-            if let Some(t) = tier(n) {
+            if let Some(t) = tier(n).filter(|&t| t <= limit) {
                 todo.push((t, !previous.contains(&(n.kind, n.name.clone(), n.reference.clone())), n.rank, pts.len(), n, Shape::Line(pts)));
             }
         }
@@ -971,7 +976,7 @@ impl Letterer {
         let width: f32 = advances.iter().map(|a| a.1).sum();
         let bin = (texel_px * 3.0).max(6.0);
         let mut out = Vec::new();
-        let repeat = (self.w.max(self.h) as f32 / 3.0).max(width * 2.0);
+        let repeat = (self.w.max(self.h) as f32 * self.amount[1]).max(width * 1.5);
         for path in centrelines(pts, bin).into_iter().take(4) {
             // The curve fit at the label's own scale: wiggles under half a letter cannot twist the name.
             let path = smooth(&path, 2.0, (size * self.look[2]).max(0.5));

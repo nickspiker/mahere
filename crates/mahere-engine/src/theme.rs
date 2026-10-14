@@ -5,7 +5,7 @@
 use crate::raster::{LayerMask, Style};
 
 /// Bumped whenever the built-ins change, so a vault holding an older copy of one is refreshed.
-pub const BUILTIN_REVISION: u32 = 9;
+pub const BUILTIN_REVISION: u32 = 10;
 
 #[derive(Clone, Debug)]
 pub struct Theme {
@@ -45,6 +45,8 @@ pub struct Theme {
     pub label: [[u8; 4]; 11],
     /// How labels are lettered: size (times the base), glow (the halo's width, a fraction of the letter), smoothing (the curve fit's radius, in letters), spacing (room kept around each label, a fraction of the letter).
     pub label_look: [f32; 4],
+    /// How many labels (Nick 2026-10-14: sparse and big): density (how far down the order of kinds labels go, 0 towns only to 1 every kind) and repeat (how far apart a road's or river's name repeats, a fraction of the screen's long side).
+    pub label_amount: [f32; 2],
 }
 
 /// What each label colour is for, by index.
@@ -56,8 +58,19 @@ pub const LABELS_LIGHT: [[u8; 4]; 11] = [[30, 30, 34, 255], [90, 54, 26, 255], [
 /// Labels on a dark ground: light letters on a dark halo.
 pub const LABELS_DARK: [[u8; 4]; 11] = [[238, 238, 234, 255], [232, 200, 160, 255], [142, 196, 240, 255], [230, 230, 230, 255], [240, 160, 128, 255], [158, 214, 154, 255], [168, 216, 160, 255], [208, 208, 216, 255], [16, 20, 24, 200], [74, 154, 255, 255], [10, 14, 20, 255]];
 
-/// The look labels start from: their base size, a glow of a ninth of a letter, a curve fit half a letter wide, an eighth of a letter of room.
-pub const LABEL_LOOK: [f32; 4] = [1.0, 0.11, 0.5, 0.12];
+/// The look labels start from: seven tenths of the panel's font (the panel's own size read big on the map, 2026-10-14), a glow of a ninth of a letter, a curve fit half a letter wide, an eighth of a letter of room.
+pub const LABEL_LOOK: [f32; 4] = [0.7, 0.11, 0.5, 0.12];
+
+/// The amount labels start from: every kind, a road's name every quarter of the screen.
+pub const LABEL_AMOUNT: [f32; 2] = [1.0, 0.25];
+
+/// What each step of the density slider letters, by the order labels are placed in: towns first, every kind last.
+pub const LABEL_TIERS: [&str; 10] = ["towns", "summits", "lakes", "highways", "rivers", "villages", "roads, trails and parks", "streets and rail", "named areas", "every mark"];
+
+/// The deepest tier a density lets through.
+pub fn label_tier_limit(density: f32) -> u8 {
+    (density.clamp(0.0, 1.0) * (LABEL_TIERS.len() - 1) as f32).round() as u8
+}
 
 /// Land cover classes in table order (1-based ids; 0 is empty).
 pub const LAND_NAMES: [&str; 14] = ["", "Grass", "Farmland", "Orchard", "Scrub", "Forest", "Wetland", "Sand", "Rock", "Glacier", "Quarry", "Industrial", "Urban", "Water"];
@@ -103,6 +116,7 @@ pub fn trail() -> Theme {
         layers: ALL,
         label: LABELS_LIGHT,
         label_look: LABEL_LOOK,
+        label_amount: LABEL_AMOUNT,
     }
 }
 
@@ -131,6 +145,7 @@ pub fn topo() -> Theme {
         layers: LayerMask { hypso: false, ..ALL },
         label: LABELS_LIGHT,
         label_look: LABEL_LOOK,
+        label_amount: LABEL_AMOUNT,
     }
 }
 
@@ -159,6 +174,7 @@ pub fn night() -> Theme {
         layers: ALL,
         label: LABELS_LIGHT,
         label_look: LABEL_LOOK,
+        label_amount: LABEL_AMOUNT,
     }
 }
 
@@ -187,6 +203,7 @@ pub fn alpine() -> Theme {
         layers: ALL,
         label: LABELS_LIGHT,
         label_look: LABEL_LOOK,
+        label_amount: LABEL_AMOUNT,
     }
 }
 
@@ -215,6 +232,7 @@ pub fn desert() -> Theme {
         layers: ALL,
         label: LABELS_LIGHT,
         label_look: LABEL_LOOK,
+        label_amount: LABEL_AMOUNT,
     }
 }
 
@@ -243,6 +261,7 @@ pub fn ink() -> Theme {
         layers: LayerMask { hypso: false, ..ALL },
         label: LABELS_LIGHT,
         label_look: LABEL_LOOK,
+        label_amount: LABEL_AMOUNT,
     }
 }
 
@@ -268,6 +287,8 @@ pub enum Field {
     Label(u8),
     /// The labels' look: size, glow, smoothing, spacing.
     LabelLook,
+    /// How many labels: density and repeat.
+    LabelAmount,
 }
 
 impl Field {
@@ -281,7 +302,7 @@ impl Field {
         v.push(Field::Wild);
         v.extend((1..15).map(Field::Mvum));
         v.extend([Field::Water, Field::Contour, Field::ContourIndex, Field::Sun, Field::Sky]);
-        v.push(Field::LabelLook);
+        v.extend([Field::LabelLook, Field::LabelAmount]);
         v.extend((0..11).map(Field::Label));
         v
     }
@@ -305,12 +326,13 @@ impl Field {
             Field::Sky => "Sky".into(),
             Field::Label(i) => LABEL_NAMES[i as usize].to_string(),
             Field::LabelLook => "Label look".into(),
+            Field::LabelAmount => "Label amount".into(),
         }
     }
 
     /// Whether the field is a colour (three VSF RGB bytes) as opposed to a light (three channels, 0 to 3) or a single number.
     pub fn is_colour(self) -> bool {
-        !matches!(self, Field::Sun | Field::Sky | Field::LabelLook)
+        !matches!(self, Field::Sun | Field::Sky | Field::LabelLook | Field::LabelAmount)
     }
 }
 
@@ -339,6 +361,7 @@ impl Theme {
             Field::Sky => [self.sky[0], self.sky[1], self.sky[2], 0.0],
             Field::Label(i) => c(self.label[i as usize]),
             Field::LabelLook => self.label_look,
+            Field::LabelAmount => [self.label_amount[0], self.label_amount[1], 0.0, 0.0],
         }
     }
 
@@ -362,7 +385,8 @@ impl Theme {
             Field::Sun => self.sun = [v[0].max(0.0), v[1].max(0.0), v[2].max(0.0)],
             Field::Sky => self.sky = [v[0].max(0.0), v[1].max(0.0), v[2].max(0.0)],
             Field::Label(i) => self.label[i as usize] = c,
-            Field::LabelLook => self.label_look = [v[0].clamp(0.5, 2.0), v[1].clamp(0.0, 0.4), v[2].clamp(0.0, 2.0), v[3].clamp(0.0, 1.0)],
+            Field::LabelLook => self.label_look = [v[0].clamp(0.3, 2.0), v[1].clamp(0.0, 0.4), v[2].clamp(0.0, 2.0), v[3].clamp(0.0, 1.0)],
+            Field::LabelAmount => self.label_amount = [v[0].clamp(0.0, 1.0), v[1].clamp(0.1, 1.0)],
         }
     }
 
@@ -402,6 +426,7 @@ pub fn blueprint() -> Theme {
         layers: ALL,
         label: LABELS_LIGHT,
         label_look: LABEL_LOOK,
+        label_amount: LABEL_AMOUNT,
     }
 }
 
@@ -430,6 +455,7 @@ pub fn atlas() -> Theme {
         layers: ALL,
         label: LABELS_LIGHT,
         label_look: LABEL_LOOK,
+        label_amount: LABEL_AMOUNT,
     }
 }
 
@@ -458,6 +484,7 @@ pub fn ember() -> Theme {
         layers: ALL,
         label: LABELS_LIGHT,
         label_look: LABEL_LOOK,
+        label_amount: LABEL_AMOUNT,
     }
 }
 
@@ -486,6 +513,7 @@ pub fn monsoon() -> Theme {
         layers: ALL,
         label: LABELS_LIGHT,
         label_look: LABEL_LOOK,
+        label_amount: LABEL_AMOUNT,
     }
 }
 
@@ -514,6 +542,7 @@ pub fn chart() -> Theme {
         layers: LayerMask { hypso: false, ..ALL },
         label: LABELS_LIGHT,
         label_look: LABEL_LOOK,
+        label_amount: LABEL_AMOUNT,
     }
 }
 
@@ -542,6 +571,7 @@ pub fn neon() -> Theme {
         layers: ALL,
         label: LABELS_LIGHT,
         label_look: LABEL_LOOK,
+        label_amount: LABEL_AMOUNT,
     }
 }
 
@@ -570,6 +600,7 @@ pub fn dawn() -> Theme {
         layers: ALL,
         label: LABELS_LIGHT,
         label_look: LABEL_LOOK,
+        label_amount: LABEL_AMOUNT,
     }
 }
 
@@ -601,6 +632,7 @@ pub fn terra() -> Theme {
         layers: ALL,
         label: LABELS_LIGHT,
         label_look: LABEL_LOOK,
+        label_amount: LABEL_AMOUNT,
     }
 }
 
@@ -629,6 +661,7 @@ pub fn tundra() -> Theme {
         layers: ALL,
         label: LABELS_LIGHT,
         label_look: LABEL_LOOK,
+        label_amount: LABEL_AMOUNT,
     }
 }
 
@@ -657,6 +690,7 @@ pub fn savanna() -> Theme {
         layers: ALL,
         label: LABELS_LIGHT,
         label_look: LABEL_LOOK,
+        label_amount: LABEL_AMOUNT,
     }
 }
 
@@ -685,6 +719,7 @@ pub fn candy() -> Theme {
         layers: ALL,
         label: LABELS_LIGHT,
         label_look: LABEL_LOOK,
+        label_amount: LABEL_AMOUNT,
     }
 }
 
@@ -713,6 +748,7 @@ pub fn survey() -> Theme {
         layers: ALL,
         label: LABELS_LIGHT,
         label_look: LABEL_LOOK,
+        label_amount: LABEL_AMOUNT,
     }
 }
 
@@ -741,6 +777,7 @@ pub fn woodcut() -> Theme {
         layers: ALL,
         label: LABELS_LIGHT,
         label_look: LABEL_LOOK,
+        label_amount: LABEL_AMOUNT,
     }
 }
 
@@ -769,6 +806,7 @@ pub fn gazetteer() -> Theme {
         layers: ALL,
         label: LABELS_LIGHT,
         label_look: LABEL_LOOK,
+        label_amount: LABEL_AMOUNT,
     }
 }
 

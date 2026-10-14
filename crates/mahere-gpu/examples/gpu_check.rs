@@ -204,6 +204,14 @@ fn main() {
     }
     if std::env::var_os("MAHERE_LABELS").is_some() {
         let font = std::env::var("MAHERE_LABEL_FONT").ok().and_then(|s| s.parse().ok()).unwrap_or(15.0);
+        // MAHERE_LABEL_AMOUNT=density,repeat and MAHERE_LABEL_SIZE=times set the theme's label amount and size for the check.
+        let t = map.theme;
+        if let Some(v) = std::env::var("MAHERE_LABEL_AMOUNT").ok().map(|s| s.split(',').map(|x| x.parse::<f32>().unwrap()).collect::<Vec<f32>>()) {
+            map.themes[t].label_amount = [v[0], v[1]];
+        }
+        if let Some(v) = std::env::var("MAHERE_LABEL_SIZE").ok().and_then(|s| s.parse::<f32>().ok()) {
+            map.themes[t].label_look[0] = v;
+        }
         labeller.update(&mut map, w, h, font);
         if let Ok(p) = std::env::var("MAHERE_LABEL_PAN") {
             let v: Vec<f64> = p.split(',').map(|x| x.parse().unwrap()).collect();

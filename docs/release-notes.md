@@ -7,6 +7,7 @@
 - Labels follow the map smoothly as you pan and turn it. Names along roads and rivers bend with them and always read the right way up.
 - Tap anything to hear what it is: the road or trail and its number, the nearest peak or town, the lake or park you're in.
 - Label colours, size, glow and how smoothly they follow curves are part of each map style, and dark styles get light lettering.
+- Label amount in each style: Density sets how far down the list labels go, from towns only to every street and mark, and Repeat how often a road's name comes back along it. Labels start smaller than before, so more of them fit.
 
 ### Directions
 - Navigate by car, by bike or on foot: turn one on in the panel, then tap where you want to go.
