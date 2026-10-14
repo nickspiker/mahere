@@ -431,15 +431,40 @@ enum WayRec {
     Member(i64, Vec<i64>),
 }
 
+/// What a load keeps: the line classes `line` passes and the areas `area` passes (by class, and whether it has a name); the rest are dropped as they are read, never held.
+/// The planet's names pass keeps the major roads and the named lakes, and holding every street and building outline of central Europe first took it past 28 GB (region 0-8-1, 2026-10-13).
+pub struct Keep {
+    pub line: fn(RoadClass) -> bool,
+    pub area: fn(AreaClass, bool) -> bool,
+}
+
+impl Keep {
+    pub const ALL: Keep = Keep { line: keep_any_line, area: keep_any_area };
+}
+
+fn keep_any_line(_: RoadClass) -> bool {
+    true
+}
+
+fn keep_any_area(_: AreaClass, _: bool) -> bool {
+    true
+}
+
 /// Load every drawable line and area from a .osm.pbf extract.
 pub fn load_features(path: &str) -> Result<Features, osmpbf::Error> {
+    load_features_keeping(path, &Keep::ALL)
+}
+
+/// Load the lines and areas `keep` passes from a .osm.pbf extract.
+pub fn load_features_keeping(path: &str, keep: &Keep) -> Result<Features, osmpbf::Error> {
     // Pass 1: relations — multipolygons with a drawable area class, and boundaries, which become rings of line.
     let rels: Vec<(Option<AreaClass>, Option<RoadClass>, Vec<i64>, (String, String))> = ElementReader::from_path(path)?.par_map_reduce(
         |element| match element {
             Element::Relation(r) => {
                 let is_mp = r.tags().any(|(k, v)| k == "type" && v == "multipolygon");
-                let area = if is_mp { AreaClass::from_tags(r.tags()) } else { None };
-                let bound = RoadClass::from_boundary(r.tags());
+                let names = name_tags(r.tags());
+                let area = if is_mp { AreaClass::from_tags(r.tags()).filter(|&a| (keep.area)(a, !names.0.is_empty())) } else { None };
+                let bound = RoadClass::from_boundary(r.tags()).filter(|&b| (keep.line)(b));
                 if area.is_none() && bound.is_none() {
                     return Vec::new();
                 }
@@ -448,7 +473,7 @@ pub fn load_features(path: &str) -> Result<Features, osmpbf::Error> {
                     .filter(|m| m.member_type == osmpbf::RelMemberType::Way)
                     .map(|m| m.member_id)
                     .collect();
-                vec![(area, bound, members, name_tags(r.tags()))]
+                vec![(area, bound, members, names)]
             }
             _ => Vec::new(),
         },
@@ -494,7 +519,7 @@ pub fn load_features(path: &str) -> Result<Features, osmpbf::Error> {
                     "railway" => RoadClass::from_railway(v),
                     "power" => RoadClass::from_power(v),
                     _ => None,
-                }).or(border.then_some(RoadClass::Admin));
+                }).or(border.then_some(RoadClass::Admin)).filter(|&c| (keep.line)(c));
                 // Sidewalks, crossings and traffic islands are footways that only shadow a street: a trail map leaves them out, or every downtown street grows a trail-coloured fringe.
                 let street_furniture = w.tags().any(|(k, v)| k == "footway" && matches!(v, "sidewalk" | "crossing" | "traffic_island" | "access_aisle"));
                 if let Some(class) = line.filter(|_| !street_furniture) {
@@ -504,7 +529,10 @@ pub fn load_features(path: &str) -> Result<Features, osmpbf::Error> {
                 let closed = refs.len() >= 4 && refs.first() == refs.last();
                 if closed && !is_member {
                     if let Some(class) = AreaClass::from_tags(w.tags()) {
-                        out.push(WayRec::Area(class, refs, name_tags(w.tags())));
+                        let names = name_tags(w.tags());
+                        if (keep.area)(class, !names.0.is_empty()) {
+                            out.push(WayRec::Area(class, refs, names));
+                        }
                     }
                 }
                 out

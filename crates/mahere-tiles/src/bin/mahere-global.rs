@@ -691,12 +691,13 @@ fn osm_lines(out: &Path, dir: &str, depth: u8, region_depth: u8, bbox: Option<Ve
             continue;
         }
         let t = std::time::Instant::now();
-        let feats = mahere_osm::load_features(path.to_str().unwrap()).expect("osm extract");
         // At a hundred metres a texel the fine classes (streets, service roads, tracks, paths) are noise, and the waterways are HydroRIVERS': the roads that carry a map at this scale, rail, power and the boundaries.
-        use mahere_osm::RoadClass as C;
-        let roads: Vec<mahere_osm::Road> = feats.roads.into_iter().filter(|r| !matches!(r.class, C::Residential | C::Service | C::Track | C::Path | C::Waterway)).collect();
+        // Dropped as the extract is read, so a region as dense as central Europe fits in memory; the areas kept are the named lakes, for their names.
+        let keep = mahere_osm::Keep { line: major_line, area: if named { named_lake } else { no_area } };
+        let feats = mahere_osm::load_features_keeping(path.to_str().unwrap(), &keep).expect("osm extract");
+        let roads = feats.roads;
         let n = if named {
-            let lakes: Vec<mahere_osm::Area> = feats.areas.into_iter().filter(|a| a.name != 0 && a.class == mahere_osm::AreaClass::Water).collect();
+            let lakes: Vec<mahere_osm::Area> = feats.areas.into_iter().filter(|a| a.name != 0).collect();
             write_named(out, &roads, &feats.points, &lakes, &feats.names, depth, region_depth)
         } else if roads.is_empty() {
             0
@@ -708,6 +709,19 @@ fn osm_lines(out: &Path, dir: &str, depth: u8, region_depth: u8, bbox: Option<Ve
         writeln!(done_file, "{} {}", region.depth, region.prefix).unwrap();
     }
     eprintln!("osm: {baked} regions baked, {missing} extracts missing");
+}
+
+fn major_line(c: mahere_osm::RoadClass) -> bool {
+    use mahere_osm::RoadClass as C;
+    !matches!(c, C::Residential | C::Service | C::Track | C::Path | C::Waterway)
+}
+
+fn named_lake(c: mahere_osm::AreaClass, named: bool) -> bool {
+    named && c == mahere_osm::AreaClass::Water
+}
+
+fn no_area(_: mahere_osm::AreaClass, _: bool) -> bool {
+    false
 }
 
 /// The line, land and water layers above the regions, from the region cells on disk.
