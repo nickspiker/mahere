@@ -14,6 +14,7 @@
 //!
 //! Files are zstd'd VSF at `{name}.vsf.zst` where the name is the cell's flattened VSF value (`u` depth, `wm` cell) in base64url: no delimiters, no numerals — a directory layout that is byte-for-byte the bucket.
 
+pub mod ac;
 pub mod area;
 /// The ownership and motor vehicle use classes, for the renderers and the themes.
 pub use mahere_osm::landuse;
