@@ -899,6 +899,17 @@ impl Letterer {
             }
         }
         let (best, depth) = d.iter().enumerate().fold((0usize, 0.0f32), |b, (i, &v)| if v > b.1 { (i, v) } else { b });
+        let at = |x: f32, y: f32| -> bool {
+            let (cx, cy) = ((x / step).round() as i32 - x0 + 1, (y / step).round() as i32 - y0 + 1);
+            cx >= 0 && cy >= 0 && (cx as usize) < gw && (cy as usize) < gh && inside[cy as usize * gw + cx as usize]
+        };
+        // Along the shape's spine first (Nick 2026-10-14: fill in from the shore until a line is left, the spine of the lake, and letter along it); straight through the deepest point when the shape has no spine long enough.
+        let room_px = depth * step;
+        let max = (size * (1.0 + (room_px / (size * 6.0)).min(1.0))).max(size);
+        let min = size * 0.8;
+        if let Some(l) = self.on_spine(n, label, &d, gw, gh, (x0, y0), step, depth, (max, min, size), colour, weight, shear, room, pad, &at) {
+            return Some(l);
+        }
         let centre = [((best % gw) as i32 + x0 - 1) as f32 * step, ((best / gw) as i32 + y0 - 1) as f32 * step];
         // The long axis from the second moments of the cells inside.
         let (mut mx, mut my, mut cnt) = (0.0f64, 0.0f64, 0.0f64);
@@ -929,14 +940,7 @@ impl Letterer {
         } else if angle < -std::f32::consts::FRAC_PI_2 {
             angle += std::f32::consts::PI;
         }
-        let at = |x: f32, y: f32| -> bool {
-            let (cx, cy) = ((x / step).round() as i32 - x0 + 1, (y / step).round() as i32 - y0 + 1);
-            cx >= 0 && cy >= 0 && (cx as usize) < gw && (cy as usize) < gh && inside[cy as usize * gw + cx as usize]
-        };
         // Largest first, from the kind's size scaled by how much room there is, down to the smallest readable.
-        let room_px = depth * step;
-        let max = (size * (1.0 + (room_px / (size * 6.0)).min(1.0))).max(size);
-        let min = size * 0.8;
         let (ca, sa) = (angle.cos(), angle.sin());
         let mut sz = max;
         while sz >= min {
@@ -963,6 +967,89 @@ impl Letterer {
                     return Some(Laid { name: n.clone(), glyphs, size: sz, colour, weight, shear, mark: None });
                 }
                 return None;
+            }
+            sz -= (size * 0.08).max(0.5);
+        }
+        None
+    }
+
+    /// An area's name along its spine: the ridge of the distance to the shore (what is left after filling in from the outside until a line remains), its longest path, smoothed at the letters' own scale, the name centred on it (or a little either side), every letter inside the shape and the bends gentle; None when the shape has no spine long enough, so the name goes straight instead.
+    #[allow(clippy::too_many_arguments)]
+    fn on_spine(&mut self, n: &Named, label: &str, d: &[f32], gw: usize, gh: usize, origin: (i32, i32), step: f32, depth: f32, sizes: (f32, f32, f32), colour: usize, weight: u16, shear: f32, room: &Room, pad: f32, inside: &dyn Fn(f32, f32) -> bool) -> Option<Laid> {
+        let (max, min, size) = sizes;
+        if depth < 2.0 {
+            return None;
+        }
+        // The ridge: cells no nearer the shore than their neighbours on either side in some direction, well inside (the shallow ridges of a shoreline's bumps left out).
+        let mut ridge = Vec::new();
+        for y in 1..gh - 1 {
+            for x in 1..gw - 1 {
+                let i = y * gw + x;
+                let v = d[i];
+                if v < depth * 0.4 {
+                    continue;
+                }
+                let crest = (v >= d[i - 1] && v >= d[i + 1]) || (v >= d[i - gw] && v >= d[i + gw]) || (v >= d[i - gw - 1] && v >= d[i + gw + 1]) || (v >= d[i - gw + 1] && v >= d[i + gw - 1]);
+                if crest {
+                    ridge.push([(x as i32 + origin.0 - 1) as f32 * step, (y as i32 + origin.1 - 1) as f32 * step]);
+                }
+            }
+        }
+        let spine = centrelines(&ridge, step * 1.6).into_iter().next()?;
+        let mut sz = max;
+        while sz >= min {
+            // A broad curve: bends under a few letters' size are the shoreline's, not the lake's.
+            let path = smooth(&spine, 2.0, sz * 2.0);
+            let len = lengths(&path);
+            let total = *len.last().unwrap_or(&0.0);
+            let advances: Vec<(char, f32)> = label.chars().map(|c| (c, self.advance(c, sz, weight))).collect();
+            let width: f32 = advances.iter().map(|a| a.1).sum();
+            if total >= width * 1.05 {
+                for shift in [0.0f32, -0.12, 0.12, -0.25, 0.25] {
+                    let s = (total / 2.0 - width / 2.0 + shift * total).clamp(0.0, total - width);
+                    let mut glyphs: Vec<Glyph> = Vec::new();
+                    let (mut at, mut bends, mut worst) = (s, 0.0f32, 0.0f32);
+                    for &(ch, a) in &advances {
+                        let g = letter(&path, &len, ch, at, at + a);
+                        if let Some(last) = glyphs.last() {
+                            let t = turn(last.angle, g.angle);
+                            bends += t;
+                            worst = worst.max(t);
+                        }
+                        glyphs.push(g);
+                        at += a;
+                    }
+                    if worst > 0.35 || bends > 0.9 {
+                        continue;
+                    }
+                    // Top up, as a line's name.
+                    let (first, last) = (glyphs.first().unwrap().at, glyphs.last().unwrap().at);
+                    let (dx, dy) = (last[0] - first[0], last[1] - first[1]);
+                    let steep = dx.abs() <= dx.hypot(dy) * 0.05;
+                    if (!steep && dx < 0.0) || (steep && dy > 0.0) {
+                        let mut at = s + width;
+                        glyphs.clear();
+                        for &(ch, a) in &advances {
+                            glyphs.push(letter(&path, &len, ch, at, at - a));
+                            at -= a;
+                        }
+                    }
+                    // Every letter inside the shape, its top and foot too.
+                    let within = glyphs.iter().zip(&advances).all(|(g, &(_, a))| {
+                        let (c, s_) = (g.angle.cos(), g.angle.sin());
+                        [(-0.5f32, -0.4f32), (0.5, -0.4), (-0.5, 0.4), (0.5, 0.4), (0.0, 0.0)].iter().all(|&(u, v)| {
+                            let (ux, vy) = (u * a, v * sz);
+                            inside(g.at[0] + ux * c - vy * s_, g.at[1] + ux * s_ + vy * c)
+                        })
+                    });
+                    if !within {
+                        continue;
+                    }
+                    let boxes: Vec<[f32; 4]> = glyphs.iter().map(|g| glyph_box(g, sz, pad)).collect();
+                    if room.free(&boxes) {
+                        return Some(Laid { name: n.clone(), glyphs, size: sz, colour, weight, shear, mark: None });
+                    }
+                }
             }
             sz -= (size * 0.08).max(0.5);
         }
