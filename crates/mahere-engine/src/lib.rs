@@ -335,9 +335,14 @@ type PlanKey = (u64, u64, u64, u64, usize, usize, u64, u8, u8);
 
 impl MapCore {
     pub fn new(store: Arc<dyn CellStore>, home: Camera) -> MapCore {
+        MapCore::layered(store, None, home)
+    }
+
+    /// The map over published cells: the base from `store`, imagery and infrared from their own stores, fetched while a view shows them.
+    pub fn layered(store: Arc<dyn CellStore>, layers: Option<residency::LayerStores>, home: Camera) -> MapCore {
         MapCore {
             cam: home,
-            res: Residency::new(store),
+            res: Residency::layered(store, layers),
             luts: FrameLuts {
                 hypso: build_hypso_lut(),
                 style: raster::Style::default(),
@@ -786,6 +791,13 @@ impl MapCore {
     pub fn set_layers(&mut self, mask: LayerMask) {
         self.layer_mask = mask;
         self.luts.mask = mask.effective();
+        // The image layers come with each cell only while a view shows them: true colour, or the infrared alone.
+        let want = match (mask.imagery, mask.infrared) {
+            (true, false) => residency::WANT_IMG,
+            (true, true) => residency::WANT_NIR,
+            _ => 0,
+        };
+        self.res.set_imagery(want);
         self.dirty = true;
     }
 

@@ -1190,5 +1190,5 @@ fn img_texel(pool: &Pool, diamond: u8, uq: i64, vq: i64) -> Option<[u8; 4]> {
     let (e, d, _) = probe(pool, VEC_BASE_DEPTH, raw >> (60 - 2 * VEC_BASE_DEPTH as u32), |e| e.img.is_some())?;
     let im = e.img.as_ref()?;
     let i = tri_index(uq, vq, 16 + (22 - d as u32));
-    (im.red[i] != 0 || im.green[i] != 0 || im.blue[i] != 0).then(|| [im.red[i], im.green[i], im.blue[i], im.nir[i]])
+    (im.red[i] != 0 || im.green[i] != 0 || im.blue[i] != 0 || im.nir[i] != 0).then(|| [im.red[i], im.green[i], im.blue[i], im.nir[i]])
 }

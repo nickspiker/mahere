@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, channel};
 
-use mahere_tiles::{CellKey, ClassCell, CovCell, ImgCell, decode_cell};
+use mahere_tiles::{CellKey, ClassCell, CovCell, ImgCell};
 use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
 
@@ -41,6 +41,19 @@ pub struct DirStore(pub PathBuf);
 impl CellStore for DirStore {
     fn get(&self, key: CellKey) -> Fetch {
         match std::fs::read(self.0.join(key.path())) {
+            Ok(b) => Fetch::Bytes(b),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Fetch::Absent,
+            Err(e) => Fetch::Failed(e.to_string()),
+        }
+    }
+}
+
+/// One layer of a published cells directory (`<root>/<layer>/<cell>.vsf`), as the bucket has it: an empty file is a cell with nothing in that layer.
+pub struct LayerDir(pub PathBuf, pub mahere_tiles::publish::Layer);
+
+impl CellStore for LayerDir {
+    fn get(&self, key: CellKey) -> Fetch {
+        match std::fs::read(self.0.join(self.1.path(key))) {
             Ok(b) => Fetch::Bytes(b),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Fetch::Absent,
             Err(e) => Fetch::Failed(e.to_string()),
@@ -170,9 +183,26 @@ pub struct Pool {
     pub map: FxHashMap<CellKey, Entry>,
 }
 
+/// The image layers a published cell comes in besides its base (Nick 2026-10-14: imagery and infrared only when a view shows them): each from a store of its own.
+#[derive(Clone)]
+pub struct LayerStores {
+    pub img: Arc<dyn CellStore>,
+    pub nir: Arc<dyn CellStore>,
+}
+
+/// Which image layers the view wants loaded with each cell.
+pub const WANT_IMG: u8 = 1;
+pub const WANT_NIR: u8 = 2;
+
 pub struct Residency {
     /// The store the loader reads, for reading one cell's planes back on demand (a tap's details on a host whose GPU took the CPU copies).
     store: Arc<dyn CellStore>,
+    /// The image layers' stores, when cells come published in layers.
+    layers: Option<LayerStores>,
+    /// The image layers wanted ([`WANT_IMG`], [`WANT_NIR`]), read by the loader.
+    imagery: Arc<std::sync::atomic::AtomicU8>,
+    /// Resident cells loaded without an image layer the view now wants: asked for again, kept on show until the new copy lands.
+    stale: FxHashSet<CellKey>,
     /// Whether the loader packs the CPU raster's u64 texels (normals included) for each dem; a GPU-only host turns it off and saves a megabyte and a few milliseconds per cell.
     pack_cpu: Arc<std::sync::atomic::AtomicBool>,
     want_tx: Sender<WantList>,
@@ -199,14 +229,24 @@ pub const PIN_DEPTH: u8 = 4;
 
 impl Residency {
     pub fn new(store: Arc<dyn CellStore>) -> Residency {
+        Residency::layered(store, None)
+    }
+
+    /// Cells from a base store, with the image layers from their own stores when they come published in layers.
+    pub fn layered(store: Arc<dyn CellStore>, layers: Option<LayerStores>) -> Residency {
         let (want_tx, want_rx) = channel::<WantList>();
         let (done_tx, done_rx) = channel::<Loaded>();
         let pack_cpu = Arc::new(std::sync::atomic::AtomicBool::new(true));
         let pack = pack_cpu.clone();
         let read_store = store.clone();
-        std::thread::spawn(move || loader_thread(store, want_rx, done_tx, pack));
+        let imagery = Arc::new(std::sync::atomic::AtomicU8::new(0));
+        let (l, want) = (layers.clone(), imagery.clone());
+        std::thread::spawn(move || loader_thread(store, l, want, want_rx, done_tx, pack));
         Residency {
             store: read_store,
+            layers,
+            imagery,
+            stale: FxHashSet::default(),
             pack_cpu,
             want_tx,
             done_rx,
@@ -220,6 +260,20 @@ impl Residency {
             last_send_at: std::time::Instant::now(),
             reloaded: Vec::new(),
         }
+    }
+
+    /// The image layers the view shows ([`WANT_IMG`], [`WANT_NIR`]): one newly wanted reloads every resident cell with something in it, each kept on show until its new copy lands.
+    pub fn set_imagery(&mut self, want: u8) {
+        let old = self.imagery.swap(want, std::sync::atomic::Ordering::Relaxed);
+        if self.layers.is_some() && want & !old != 0 {
+            self.stale = self.pool.map.iter().filter(|(_, e)| e.present != 0).map(|(k, _)| *k).collect();
+            self.last_sent.clear();
+        }
+    }
+
+    /// The image layers' stores, when cells come in layers.
+    pub fn layer_stores(&self) -> Option<LayerStores> {
+        self.layers.clone()
     }
 
     pub fn set_pack_cpu(&self, pack: bool) {
@@ -238,6 +292,7 @@ impl Residency {
         }
         while let Ok(l) = self.done_rx.try_recv() {
             self.pending.remove(&l.key);
+            self.stale.remove(&l.key);
             self.last_sent.retain(|k| *k != l.key);
             match l.entry {
                 Some(e) => {
@@ -267,7 +322,8 @@ impl Residency {
         let now = std::time::Instant::now();
         self.failed.retain(|k, t| desired.contains(k) && now.duration_since(*t) < RETRY_AFTER);
         // Everything still missing goes every time, pending or not: the loader keeps only the newest list, so a cell dropped from an older one would otherwise stay pending forever and never arrive (the holes Nick saw once the orientation sensor made every frame a new list). Nothing is sent while the missing set is unchanged.
-        list.retain(|k| !self.pool.map.contains_key(k) && !self.failed.contains_key(k));
+        self.stale.retain(|k| desired.contains(k));
+        list.retain(|k| (!self.pool.map.contains_key(k) || self.stale.contains(k)) && !self.failed.contains_key(k));
         // Below a cell the loader confirmed absent nothing exists: its descendants are marked absent here and never asked for, so zooming past the finest data does not ask the bucket for a screen of cells that cannot be there (Nick 2026-10-10).
         let mut under_absent = Vec::new();
         list.retain(|k| {
@@ -350,7 +406,7 @@ impl Residency {
 
 /// The newest want-list is the only one that matters: an older list's leftovers are cells the view no longer needs (the main side forgets them as pending too, so they're re-requested if they come back).
 /// Cells decode in parallel a small chunk at a time so the nearest-first order still holds and a newer list preempts within a few cells.
-fn loader_thread(store: Arc<dyn CellStore>, want_rx: Receiver<WantList>, done_tx: Sender<Loaded>, pack_cpu: Arc<std::sync::atomic::AtomicBool>) {
+fn loader_thread(store: Arc<dyn CellStore>, layers: Option<LayerStores>, imagery: Arc<std::sync::atomic::AtomicU8>, want_rx: Receiver<WantList>, done_tx: Sender<Loaded>, pack_cpu: Arc<std::sync::atomic::AtomicBool>) {
     // Decoding runs in its own pool: on the global one a frame's lattice waited behind cells mid-decode, and a plan took fifty milliseconds while the view streamed.
     let threads = (rayon::current_num_threads() / 2).clamp(2, 4);
     let pool = rayon::ThreadPoolBuilder::new().num_threads(threads).thread_name(|i| format!("mahere-load-{i}")).build().expect("loader pool");
@@ -377,7 +433,8 @@ fn loader_thread(store: Arc<dyn CellStore>, want_rx: Receiver<WantList>, done_tx
             let n = list.len().min(chunk);
             let batch: Vec<CellKey> = list.drain(..n).collect();
             let pack = pack_cpu.load(std::sync::atomic::Ordering::Relaxed);
-            let loaded: Vec<Loaded> = pool.install(|| batch.par_iter().map(|&k| load_cell(&*store, k, pack)).collect());
+            let want = imagery.load(std::sync::atomic::Ordering::Relaxed);
+            let loaded: Vec<Loaded> = pool.install(|| batch.par_iter().map(|&k| load_cell(&*store, layers.as_ref(), want, k, pack)).collect());
             let t = std::time::Instant::now();
             for l in loaded {
                 done.insert(l.key, t);
@@ -393,20 +450,44 @@ fn loader_thread(store: Arc<dyn CellStore>, want_rx: Receiver<WantList>, done_tx
     }
 }
 
-fn load_cell(store: &dyn CellStore, key: CellKey, pack_cpu: bool) -> Loaded {
-    let bytes = match store.get(key) {
-        Fetch::Bytes(b) => b,
-        Fetch::Absent => return Loaded { key, entry: Some(Entry::default()) },
+/// One layer's bytes: Some(empty) for none (absent, or a published cell with no base), None for a failure to try again.
+fn layer_bytes(store: &dyn CellStore, key: CellKey, what: &str) -> Option<Vec<u8>> {
+    match store.get(key) {
+        Fetch::Bytes(b) => Some(b),
+        Fetch::Absent => Some(Vec::new()),
         Fetch::Failed(e) => {
-            eprintln!("cell {} fetch failed: {e}", key.path());
-            return Loaded { key, entry: None };
+            eprintln!("cell {} {what} fetch failed: {e}", key.name());
+            None
         }
-    };
-    let planes = match decode_cell(&bytes) {
+    }
+}
+
+fn non_empty(b: &[u8]) -> Option<&[u8]> {
+    (!b.is_empty()).then_some(b)
+}
+
+fn load_cell(store: &dyn CellStore, layers: Option<&LayerStores>, want: u8, key: CellKey, pack_cpu: bool) -> Loaded {
+    let Some(bytes) = layer_bytes(store, key, "base") else { return Loaded { key, entry: None } };
+    // The image layers the view shows, beside the base.
+    let mut img_bytes: (Vec<u8>, Vec<u8>) = Default::default();
+    if let Some(l) = layers {
+        if want & WANT_IMG != 0 {
+            let Some(b) = layer_bytes(&*l.img, key, "img") else { return Loaded { key, entry: None } };
+            img_bytes.0 = b;
+        }
+        if want & WANT_NIR != 0 {
+            let Some(b) = layer_bytes(&*l.nir, key, "nir") else { return Loaded { key, entry: None } };
+            img_bytes.1 = b;
+        }
+    }
+    if bytes.is_empty() && img_bytes.0.is_empty() && img_bytes.1.is_empty() {
+        return Loaded { key, entry: Some(Entry::default()) };
+    }
+    let planes = match mahere_tiles::publish::decode_layers(non_empty(&bytes), non_empty(&img_bytes.0), non_empty(&img_bytes.1)) {
         Ok(p) => p,
         Err(e) => {
             // A corrupt object: treat as a failure so it's retried (the vault may have a bad copy) rather than remembered as absent.
-            eprintln!("cell {} decode failed ({} bytes): {e}", key.path(), bytes.len());
+            eprintln!("cell {} decode failed ({} bytes): {e}", key.name(), bytes.len());
             return Loaded { key, entry: None };
         }
     };
@@ -451,7 +532,7 @@ fn load_cell(store: &dyn CellStore, key: CellKey, pack_cpu: bool) -> Loaded {
 pub const DEFAULT_CELLS_URL: &str = "https://brobdingnagian.holdmyoscilloscope.com/mahere/cells";
 
 /// Cell format epoch: bumped whenever the encoding changes incompatibly. It rides on the fetch URL as a query (so the CDN edge, which caches a key for hours, sees a new key) and in the vault key (so a cached cell of an older format is never read back as this one). Old clients keep fetching the old objects they understand.
-pub const CELL_EPOCH: u32 = 7;
+pub const CELL_EPOCH: u32 = 8;
 
 /// A store that can also keep what it's given (the vault), and the source's tag for each copy (its ETag), so a copy can be checked without fetching it again.
 pub trait CellCache: CellStore {
@@ -620,6 +701,8 @@ impl CellStore for TieredStore {
 pub struct HttpStore {
     base: String,
     agent: ureq::Agent,
+    /// The published layer this store fetches (`<base>/<layer>/<cell>.vsf`); None for a baked directory served as it is (`<base>/<cell>.vsf.zst`).
+    layer: Option<mahere_tiles::publish::Layer>,
 }
 
 impl HttpStore {
@@ -628,13 +711,25 @@ impl HttpStore {
             .timeout_connect(std::time::Duration::from_secs(10))
             .timeout_read(std::time::Duration::from_secs(30))
             .build();
-        HttpStore { base: base.trim_end_matches('/').to_string(), agent }
+        HttpStore { base: base.trim_end_matches('/').to_string(), agent, layer: None }
+    }
+
+    /// One published layer of the cells under `base`.
+    pub fn layer(base: &str, layer: mahere_tiles::publish::Layer) -> HttpStore {
+        HttpStore { layer: Some(layer), ..HttpStore::new(base) }
+    }
+
+    fn url(&self, key: CellKey) -> String {
+        match self.layer {
+            Some(l) => format!("{}/{}?e={}", self.base, l.path(key), CELL_EPOCH),
+            None => format!("{}/{}?e={}", self.base, key.path(), CELL_EPOCH),
+        }
     }
 }
 
 impl RemoteStore for HttpStore {
     fn check(&self, key: CellKey, tag: Option<&str>) -> Checked {
-        let url = format!("{}/{}?e={}", self.base, key.path(), CELL_EPOCH);
+        let url = self.url(key);
         let mut req = self.agent.get(&url);
         if let Some(t) = tag {
             req = req.set("If-None-Match", t);

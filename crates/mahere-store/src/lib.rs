@@ -417,9 +417,14 @@ impl VaultCells {
         VaultCells { store, index: std::sync::Mutex::new(index), pinned: std::sync::Mutex::new(Default::default()) }
     }
 
-    fn touch(&self, key: mahere_tiles::CellKey, bytes: usize) {
+    /// The index's key for a cell's layer: the layer rides in the depth byte's top bits (depths stop at 30), so the index document keeps its form.
+    fn ix(key: mahere_tiles::CellKey, layer: u8) -> (u8, u64) {
+        (key.depth | layer << 6, key.raw())
+    }
+
+    fn touch(&self, key: mahere_tiles::CellKey, layer: u8, bytes: usize) {
         let mut ix = self.index.lock().unwrap();
-        let fresh = ix.entries.insert((key.depth, key.raw()), (et_now(), bytes as u32)).is_none();
+        let fresh = ix.entries.insert(Self::ix(key, layer), (et_now(), bytes as u32)).is_none();
         if fresh {
             ix.unsaved += 1;
         }
@@ -450,7 +455,7 @@ impl VaultCells {
     /// Bytes of pinned cells on the device.
     pub fn pinned_bytes(&self) -> u64 {
         let pinned = self.pinned.lock().unwrap();
-        self.index.lock().unwrap().entries.iter().filter(|(k, _)| pinned.contains(k)).map(|(_, &(_, b))| b as u64).sum()
+        self.index.lock().unwrap().entries.iter().filter(|(k, _)| pinned.contains(&(k.0 & 63, k.1))).map(|(_, &(_, b))| b as u64).sum()
     }
 
     /// The cells the areas keep: the whole set, replacing the last.
@@ -463,9 +468,11 @@ impl VaultCells {
         let victims: Vec<(u8, u64)> = {
             let ix = self.index.lock().unwrap();
             let pinned = self.pinned.lock().unwrap();
-            let mut total: u64 = ix.entries.iter().filter(|(k, _)| !pinned.contains(k)).map(|(_, &(_, b))| b as u64).sum();
-            let mut by_age: Vec<(&(u8, u64), &(i64, u32))> = ix.entries.iter().filter(|(k, _)| !pinned.contains(k)).collect();
-            by_age.sort_by_key(|(_, v)| v.0);
+            let unpinned = |k: &(u8, u64)| !pinned.contains(&(k.0 & 63, k.1));
+            let mut total: u64 = ix.entries.iter().filter(|(k, _)| unpinned(k)).map(|(_, &(_, b))| b as u64).sum();
+            let mut by_age: Vec<(&(u8, u64), &(i64, u32))> = ix.entries.iter().filter(|(k, _)| unpinned(k)).collect();
+            // The image layers go before any base (a map without its photo still reads), oldest first within each.
+            by_age.sort_by_key(|(k, v)| (k.0 >> 6 == 0, v.0));
             let mut out = Vec::new();
             for (k, &(_, b)) in by_age {
                 if total <= budget {
@@ -476,11 +483,12 @@ impl VaultCells {
             }
             out
         };
-        for &(depth, raw) in &victims {
+        for &(packed, raw) in &victims {
+            let (depth, layer) = (packed & 63, packed >> 6);
             let key = mahere_tiles::CellKey { depth, prefix: raw >> (60 - 2 * depth as u32) };
-            let _ = self.store.delete_device(&cell_key(key));
-            let _ = self.store.delete_device(&tag_key(key));
-            self.index.lock().unwrap().entries.remove(&(depth, raw));
+            let _ = self.store.delete_device(&cell_key(key, layer));
+            let _ = self.store.delete_device(&tag_key(key, layer));
+            self.index.lock().unwrap().entries.remove(&(packed, raw));
         }
         if !victims.is_empty() {
             self.flush();
@@ -550,22 +558,56 @@ fn decode_cell_index(data: &[u8]) -> std::collections::HashMap<(u8, u64), (i64, 
 }
 
 /// Where a kept cell's source tag (the bucket's ETag) lives, beside the cell.
-fn tag_key(key: mahere_tiles::CellKey) -> String {
+/// What a cell's layer is called in its vault key: the base as cells always were, the image layers by name.
+fn layer_name(word: &str, layer: u8) -> VsfType {
+    match layer {
+        0 => name(word),
+        1 => name(&format!("{word}img")),
+        _ => name(&format!("{word}nir")),
+    }
+}
+
+fn tag_key(key: mahere_tiles::CellKey, layer: u8) -> String {
     vault_key(&[
-        name("celltag"),
+        layer_name("celltag", layer),
         VsfType::u(mahere_engine::residency::CELL_EPOCH as usize, false),
         VsfType::u(key.depth as usize, false),
         VsfType::wm(vsf::types::WorldCell::from_raw(key.raw())),
     ])
 }
 
-fn cell_key(key: mahere_tiles::CellKey) -> String {
+fn cell_key(key: mahere_tiles::CellKey, layer: u8) -> String {
     vault_key(&[
-        name("cell"),
+        layer_name("cell", layer),
         VsfType::u(mahere_engine::residency::CELL_EPOCH as usize, false),
         VsfType::u(key.depth as usize, false),
         VsfType::wm(vsf::types::WorldCell::from_raw(key.raw())),
     ])
+}
+
+/// Where a host's cells come from (the flag day's published layers): a local directory as it is, a published one by layer, or the bucket through the vault, each image layer through a cache of its own. Returns the base store, the image layers' stores when cells come in layers, and the vault's cell cache for the budget and the areas' pins.
+pub fn cell_stores(local: Option<&std::path::Path>, vault: Option<&Arc<FlatStorage>>) -> (Arc<dyn mahere_engine::residency::CellStore>, Option<mahere_engine::residency::LayerStores>, Option<Arc<VaultCells>>) {
+    use mahere_engine::residency::{DEFAULT_CELLS_URL, DirStore, HttpStore, LayerDir, LayerStores, TieredStore};
+    use mahere_tiles::publish::Layer;
+    if let Some(dir) = local {
+        if dir.join("base").is_dir() {
+            let layers = LayerStores { img: Arc::new(LayerDir(dir.to_path_buf(), Layer::Img)), nir: Arc::new(LayerDir(dir.to_path_buf(), Layer::Nir)) };
+            return (Arc::new(LayerDir(dir.to_path_buf(), Layer::Base)), Some(layers), None);
+        }
+        return (Arc::new(DirStore(dir.to_path_buf())), None, None);
+    }
+    let remote = |l: Layer| Arc::new(HttpStore::layer(DEFAULT_CELLS_URL, l));
+    match vault {
+        Some(v) => {
+            let cache = Arc::new(VaultCells::new(v.clone()));
+            let layers = LayerStores {
+                img: Arc::new(TieredStore::new(cache.layer(Layer::Img), remote(Layer::Img))),
+                nir: Arc::new(TieredStore::new(cache.layer(Layer::Nir), remote(Layer::Nir))),
+            };
+            (Arc::new(TieredStore::new(cache.clone(), remote(Layer::Base))), Some(layers), Some(cache))
+        }
+        None => (remote(Layer::Base), Some(LayerStores { img: remote(Layer::Img), nir: remote(Layer::Nir) }), None),
+    }
 }
 
 // ==================== USER CELLS ====================
@@ -699,33 +741,79 @@ impl mahere_engine::areas::AreaStore for VaultAreas {
     }
 }
 
-impl mahere_engine::residency::CellStore for VaultCells {
-    fn get(&self, key: mahere_tiles::CellKey) -> mahere_engine::residency::Fetch {
+impl VaultCells {
+    fn get_layer(&self, key: mahere_tiles::CellKey, layer: u8) -> mahere_engine::residency::Fetch {
         use mahere_engine::residency::Fetch;
-        match self.store.read_device(&cell_key(key)) {
+        match self.store.read_device(&cell_key(key, layer)) {
             Ok(Some(b)) => {
-                self.touch(key, b.len());
+                self.touch(key, layer, b.len());
                 Fetch::Bytes(b)
             }
             Ok(None) => Fetch::Absent,
             Err(e) => Fetch::Failed(format!("{e:?}")),
         }
     }
+
+    fn put_layer(&self, key: mahere_tiles::CellKey, layer: u8, bytes: &[u8]) {
+        if self.store.write_device(&cell_key(key, layer), bytes).is_ok() {
+            self.touch(key, layer, bytes.len());
+        }
+    }
+
+    /// One of a published cell's image layers, as a cache of its own over the same vault, index and pins (1 the image, 2 the infrared).
+    pub fn layer(self: &Arc<Self>, layer: mahere_tiles::publish::Layer) -> Arc<VaultLayer> {
+        let code = match layer {
+            mahere_tiles::publish::Layer::Base => 0,
+            mahere_tiles::publish::Layer::Img => 1,
+            mahere_tiles::publish::Layer::Nir => 2,
+        };
+        Arc::new(VaultLayer { cells: self.clone(), layer: code })
+    }
+}
+
+/// A published cell's image layer in the vault.
+pub struct VaultLayer {
+    cells: Arc<VaultCells>,
+    layer: u8,
+}
+
+impl mahere_engine::residency::CellStore for VaultCells {
+    fn get(&self, key: mahere_tiles::CellKey) -> mahere_engine::residency::Fetch {
+        self.get_layer(key, 0)
+    }
 }
 
 impl mahere_engine::residency::CellCache for VaultCells {
     fn put(&self, key: mahere_tiles::CellKey, bytes: &[u8]) {
-        if self.store.write_device(&cell_key(key), bytes).is_ok() {
-            self.touch(key, bytes.len());
-        }
+        self.put_layer(key, 0, bytes);
     }
 
     fn tag(&self, key: mahere_tiles::CellKey) -> Option<String> {
-        self.store.read_device(&tag_key(key)).ok().flatten().and_then(|b| String::from_utf8(b).ok())
+        self.store.read_device(&tag_key(key, 0)).ok().flatten().and_then(|b| String::from_utf8(b).ok())
     }
 
     fn set_tag(&self, key: mahere_tiles::CellKey, tag: &str) {
-        let _ = self.store.write_device(&tag_key(key), tag.as_bytes());
+        let _ = self.store.write_device(&tag_key(key, 0), tag.as_bytes());
+    }
+}
+
+impl mahere_engine::residency::CellStore for VaultLayer {
+    fn get(&self, key: mahere_tiles::CellKey) -> mahere_engine::residency::Fetch {
+        self.cells.get_layer(key, self.layer)
+    }
+}
+
+impl mahere_engine::residency::CellCache for VaultLayer {
+    fn put(&self, key: mahere_tiles::CellKey, bytes: &[u8]) {
+        self.cells.put_layer(key, self.layer, bytes);
+    }
+
+    fn tag(&self, key: mahere_tiles::CellKey) -> Option<String> {
+        self.cells.store.read_device(&tag_key(key, self.layer)).ok().flatten().and_then(|b| String::from_utf8(b).ok())
+    }
+
+    fn set_tag(&self, key: mahere_tiles::CellKey, tag: &str) {
+        let _ = self.cells.store.write_device(&tag_key(key, self.layer), tag.as_bytes());
     }
 }
 

@@ -696,7 +696,7 @@ fn compose(d: u32, u: u32, v: u32, pos: vec2<f32>) -> Composed {
             im = textureLoad(img_tex, vec2<i32>(i32(2u * ti.x + ti.z), i32(ti.y)), i32(ri.b.w), 0);
         }
     }
-    if (vi == NONE && (mask & M_IMAGERY) != 0u && (im.x != 0u || im.y != 0u || im.z != 0u)) {
+    if (vi == NONE && (mask & M_IMAGERY) != 0u && (im.x != 0u || im.y != 0u || im.z != 0u || im.w != 0u)) {
         out.ground = false;
         out.base = select(vec3<f32>(img_light(im.x), img_light(im.y), img_light(im.z)), vec3<f32>(img_light(im.w)), (mask & M_INFRARED) != 0u);
         if (contour_cov > 0.0) {
@@ -708,7 +708,7 @@ fn compose(d: u32, u: u32, v: u32, pos: vec2<f32>) -> Composed {
     if (vi != NONE) {
         let flags = vflags;
         let draw_line = (mask & M_LINE) != 0u && line.y != 0u && (line.x < BOUNDARY_FIRST || (mask & M_BOUND) != 0u) && U.depths.x >= line_min_depth(line.x, line.z);
-        if ((mask & M_IMAGERY) != 0u && (im.x != 0u || im.y != 0u || im.z != 0u)) {
+        if ((mask & M_IMAGERY) != 0u && (im.x != 0u || im.y != 0u || im.z != 0u || im.w != 0u)) {
             // Imagery stands in for the ground: nothing lights it. True colour, or the near-infrared band as grey, unrolled to scene light.
             out.ground = false;
             if ((mask & M_INFRARED) != 0u) {

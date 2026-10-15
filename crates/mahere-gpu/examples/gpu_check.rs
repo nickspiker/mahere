@@ -26,8 +26,16 @@ fn main() {
     let (w, h) = (1024usize, 768usize);
 
     let cells = std::env::var("MAHERE_CELLS").unwrap_or_else(|_| "data/cells".into());
-    let store = Arc::new(DirStore(cells.into()));
-    let mut map = MapCore::new(store, Camera::new(lat, lon, ppd, bearing));
+    // A published directory (base/, img/, nir/) is read by layer, as the bucket serves it; a baked one as it is.
+    let root = std::path::PathBuf::from(&cells);
+    let mut map = if root.join("base").is_dir() {
+        use mahere_engine::residency::{LayerDir, LayerStores};
+        use mahere_tiles::publish::Layer;
+        let layers = LayerStores { img: Arc::new(LayerDir(root.clone(), Layer::Img)), nir: Arc::new(LayerDir(root.clone(), Layer::Nir)) };
+        MapCore::layered(Arc::new(LayerDir(root, Layer::Base)), Some(layers), Camera::new(lat, lon, ppd, bearing))
+    } else {
+        MapCore::new(Arc::new(DirStore(root)), Camera::new(lat, lon, ppd, bearing))
+    };
     // MAHERE_THEME=n picks a built-in theme (its layers first, MAHERE_LAYERS over them).
     if let Some(t) = std::env::var("MAHERE_THEME").ok().and_then(|s| s.parse::<usize>().ok()) {
         map.set_theme(t);

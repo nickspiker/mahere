@@ -14,7 +14,7 @@ use fluor::paint::pack_argb;
 use jni::JNIEnv;
 use jni::objects::{JByteBuffer, JClass, JFloatArray, JObject, JString};
 use jni::sys::{jboolean, jdouble, jfloat, jint, jlong};
-use mahere_engine::residency::{CellStore, DirStore, HttpStore, TieredStore, DEFAULT_CELLS_URL};
+use mahere_engine::residency::DEFAULT_CELLS_URL;
 use mahere_engine::{Camera, GpsFix, MapCore};
 use mahere_panel::{Controls, Panel};
 use ndk::native_window::NativeWindow;
@@ -641,20 +641,7 @@ pub extern "system" fn Java_nz_mahere_app_MahereActivity_nativeInit(
     let store = mahere_store::open(Some(&dir)).ok();
     // Cells stream from the bucket through the vault; `cells-local` (pushed by hand) overrides for offline development.
     let local = std::path::PathBuf::from(format!("{dir}/cells-local"));
-    let mut cells_cache: Option<std::sync::Arc<mahere_store::VaultCells>> = None;
-    let cell_store: std::sync::Arc<dyn CellStore> = if local.is_dir() {
-        std::sync::Arc::new(DirStore(local))
-    } else {
-        let remote = std::sync::Arc::new(HttpStore::new(DEFAULT_CELLS_URL));
-        match &store {
-            Some(v) => {
-                let cache = std::sync::Arc::new(mahere_store::VaultCells::new(v.clone()));
-                cells_cache = Some(cache.clone());
-                std::sync::Arc::new(TieredStore::new(cache, remote))
-            }
-            None => remote,
-        }
-    };
+    let (cell_store, layer_stores, cells_cache) = mahere_store::cell_stores(local.is_dir().then_some(local.as_path()), store.as_ref());
     let session = store.as_ref().and_then(|s| mahere_store::load_session(s));
     let settings = store.as_ref().and_then(|s| mahere_store::load_settings(s));
     // Mt St Helens until the first GPS fix recenters us; a saved view only if it is a view (finite, on the globe, at a zoom the map has).
@@ -667,7 +654,10 @@ pub extern "system" fn Java_nz_mahere_app_MahereActivity_nativeInit(
     };
     eprintln!("camera: {:.5} {:.5} ppd {:.1} bearing {:.3}", cam.lat(), cam.lon(), cam.ppd, cam.bearing());
     let mut areas = mahere_engine::areas::Areas::new(cell_store.clone());
-    let mut map = MapCore::new(cell_store, cam);
+    if let Some(l) = &layer_stores {
+        areas.set_imagery_store(l.img.clone());
+    }
+    let mut map = MapCore::layered(cell_store, layer_stores, cam);
     if let Some(v) = &store {
         map.set_user_store(std::sync::Arc::new(mahere_store::VaultUser::new(v.clone())));
         areas.set_store(std::sync::Arc::new(mahere_store::VaultAreas::new(v.clone())));

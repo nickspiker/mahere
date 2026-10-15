@@ -8,7 +8,7 @@ use fluor::host::app::{Context, EventResponse, FluorApp, run_app};
 use fluor::host::chrome::{self, HIT_NONE, ResizeEdge};
 use fluor::host::chrome_widget::DefaultChrome;
 use fluor::paint::{Clip, HitId, pack_argb};
-use mahere_engine::residency::{CellStore, DirStore, HttpStore, TieredStore, DEFAULT_CELLS_URL};
+use mahere_engine::residency::DEFAULT_CELLS_URL;
 use mahere_engine::{Camera, MapCore};
 use mahere_panel::{Controls, Panel, Readouts};
 use std::time::Instant;
@@ -682,29 +682,22 @@ fn main() {
     let vault = mahere_store::open(None).ok();
     // A local bake (argv[1], or data/cells) serves directly; otherwise cells come from the bucket through the vault, like the phone.
     let local = std::env::args().nth(1).map(std::path::PathBuf::from).unwrap_or_else(|| "data/cells".into());
-    let mut cells: Option<std::sync::Arc<mahere_store::VaultCells>> = None;
-    let store: std::sync::Arc<dyn CellStore> = if local.is_dir() {
+    if local.is_dir() {
         eprintln!("cells: {}", local.display());
-        std::sync::Arc::new(DirStore(local))
     } else {
         eprintln!("cells: {} (vault-cached: {})", DEFAULT_CELLS_URL, vault.is_some());
-        let remote = std::sync::Arc::new(HttpStore::new(DEFAULT_CELLS_URL));
-        match &vault {
-            Some(v) => {
-                let cache = std::sync::Arc::new(mahere_store::VaultCells::new(v.clone()));
-                cells = Some(cache.clone());
-                std::sync::Arc::new(TieredStore::new(cache, remote))
-            }
-            None => remote,
-        }
-    };
+    }
+    let (store, layer_stores, cells) = mahere_store::cell_stores(local.is_dir().then_some(local.as_path()), vault.as_ref());
     let session = vault.as_ref().and_then(|s| mahere_store::load_session(s));
     let cam = match session {
         Some(s) => Camera::new(s.lat, s.lon, s.ppd, s.bearing),
         None => Camera::new(46.2000, -122.1900, 12_000.0, 0.0),
     };
     let mut areas = mahere_engine::areas::Areas::new(store.clone());
-    let mut map = MapCore::new(store, cam);
+    if let Some(l) = &layer_stores {
+        areas.set_imagery_store(l.img.clone());
+    }
+    let mut map = MapCore::layered(store, layer_stores, cam);
     // The user's own cells, as files beside the data; the areas as files under them.
     let user_dir = std::path::PathBuf::from("data/user");
     let _ = std::fs::create_dir_all(user_dir.join("areas"));
