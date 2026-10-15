@@ -5,7 +5,7 @@
 use crate::raster::{LayerMask, Style};
 
 /// Bumped whenever the built-ins change, so a vault holding an older copy of one is refreshed.
-pub const BUILTIN_REVISION: u32 = 10;
+pub const BUILTIN_REVISION: u32 = 11;
 
 #[derive(Clone, Debug)]
 pub struct Theme {
@@ -47,6 +47,8 @@ pub struct Theme {
     pub label_look: [f32; 4],
     /// How many labels (Nick 2026-10-14: sparse and big): density (how far down the order of kinds labels go, 0 towns only to 1 every kind) and repeat (how far apart a road's or river's name repeats, a fraction of the screen's long side).
     pub label_amount: [f32; 2],
+    /// The lettering's typeface, one of [`LABEL_FONTS`] (Nick 2026-10-14: theme the map's type too, Oxanium for Neon and the like).
+    pub label_font: String,
 }
 
 /// What each label colour is for, by index.
@@ -66,6 +68,9 @@ pub const LABEL_AMOUNT: [f32; 2] = [1.0, 0.25];
 
 /// What each step of the density slider letters, by the order labels are placed in: towns first, every kind last.
 pub const LABEL_TIERS: [&str; 10] = ["towns", "summits", "lakes", "highways", "rivers", "villages", "roads, trails and parks", "streets and rail", "named areas", "every mark"];
+
+/// The typefaces a theme can letter its map in: the panel's Open Sans, and static cuts of open fonts in five weights each (crates/mahere-panel/assets/fonts).
+pub const LABEL_FONTS: [&str; 7] = ["Open Sans", "Oxanium", "EB Garamond", "Roboto Condensed", "Fredoka", "Cinzel", "Mahere Mono"];
 
 /// The deepest tier a density lets through.
 pub fn label_tier_limit(density: f32) -> u8 {
@@ -117,6 +122,7 @@ pub fn trail() -> Theme {
         label: LABELS_LIGHT,
         label_look: LABEL_LOOK,
         label_amount: LABEL_AMOUNT,
+        label_font: LABEL_FONTS[0].to_string(),
     }
 }
 
@@ -146,6 +152,7 @@ pub fn topo() -> Theme {
         label: LABELS_LIGHT,
         label_look: LABEL_LOOK,
         label_amount: LABEL_AMOUNT,
+        label_font: LABEL_FONTS[0].to_string(),
     }
 }
 
@@ -175,6 +182,7 @@ pub fn night() -> Theme {
         label: LABELS_LIGHT,
         label_look: LABEL_LOOK,
         label_amount: LABEL_AMOUNT,
+        label_font: LABEL_FONTS[0].to_string(),
     }
 }
 
@@ -204,6 +212,7 @@ pub fn alpine() -> Theme {
         label: LABELS_LIGHT,
         label_look: LABEL_LOOK,
         label_amount: LABEL_AMOUNT,
+        label_font: LABEL_FONTS[0].to_string(),
     }
 }
 
@@ -233,6 +242,7 @@ pub fn desert() -> Theme {
         label: LABELS_LIGHT,
         label_look: LABEL_LOOK,
         label_amount: LABEL_AMOUNT,
+        label_font: LABEL_FONTS[0].to_string(),
     }
 }
 
@@ -262,6 +272,7 @@ pub fn ink() -> Theme {
         label: LABELS_LIGHT,
         label_look: LABEL_LOOK,
         label_amount: LABEL_AMOUNT,
+        label_font: LABEL_FONTS[0].to_string(),
     }
 }
 
@@ -289,6 +300,8 @@ pub enum Field {
     LabelLook,
     /// How many labels: density and repeat.
     LabelAmount,
+    /// The lettering's typeface, an index into [`LABEL_FONTS`].
+    LabelFont,
 }
 
 impl Field {
@@ -302,7 +315,7 @@ impl Field {
         v.push(Field::Wild);
         v.extend((1..15).map(Field::Mvum));
         v.extend([Field::Water, Field::Contour, Field::ContourIndex, Field::Sun, Field::Sky]);
-        v.extend([Field::LabelLook, Field::LabelAmount]);
+        v.extend([Field::LabelLook, Field::LabelAmount, Field::LabelFont]);
         v.extend((0..11).map(Field::Label));
         v
     }
@@ -327,12 +340,13 @@ impl Field {
             Field::Label(i) => LABEL_NAMES[i as usize].to_string(),
             Field::LabelLook => "Label look".into(),
             Field::LabelAmount => "Label amount".into(),
+            Field::LabelFont => "Label typeface".into(),
         }
     }
 
     /// Whether the field is a colour (three VSF RGB bytes) as opposed to a light (three channels, 0 to 3) or a single number.
     pub fn is_colour(self) -> bool {
-        !matches!(self, Field::Sun | Field::Sky | Field::LabelLook | Field::LabelAmount)
+        !matches!(self, Field::Sun | Field::Sky | Field::LabelLook | Field::LabelAmount | Field::LabelFont)
     }
 }
 
@@ -362,6 +376,7 @@ impl Theme {
             Field::Label(i) => c(self.label[i as usize]),
             Field::LabelLook => self.label_look,
             Field::LabelAmount => [self.label_amount[0], self.label_amount[1], 0.0, 0.0],
+            Field::LabelFont => [LABEL_FONTS.iter().position(|f| *f == self.label_font).unwrap_or(0) as f32, 0.0, 0.0, 0.0],
         }
     }
 
@@ -387,6 +402,7 @@ impl Theme {
             Field::Label(i) => self.label[i as usize] = c,
             Field::LabelLook => self.label_look = [v[0].clamp(0.3, 2.0), v[1].clamp(0.0, 0.4), v[2].clamp(0.0, 2.0), v[3].clamp(0.0, 1.0)],
             Field::LabelAmount => self.label_amount = [v[0].clamp(0.0, 1.0), v[1].clamp(0.1, 1.0)],
+            Field::LabelFont => self.label_font = LABEL_FONTS[(v[0].round().max(0.0) as usize).min(LABEL_FONTS.len() - 1)].to_string(),
         }
     }
 
@@ -427,6 +443,7 @@ pub fn blueprint() -> Theme {
         label: LABELS_LIGHT,
         label_look: LABEL_LOOK,
         label_amount: LABEL_AMOUNT,
+        label_font: LABEL_FONTS[0].to_string(),
     }
 }
 
@@ -456,6 +473,7 @@ pub fn atlas() -> Theme {
         label: LABELS_LIGHT,
         label_look: LABEL_LOOK,
         label_amount: LABEL_AMOUNT,
+        label_font: LABEL_FONTS[0].to_string(),
     }
 }
 
@@ -485,6 +503,7 @@ pub fn ember() -> Theme {
         label: LABELS_LIGHT,
         label_look: LABEL_LOOK,
         label_amount: LABEL_AMOUNT,
+        label_font: LABEL_FONTS[0].to_string(),
     }
 }
 
@@ -514,6 +533,7 @@ pub fn monsoon() -> Theme {
         label: LABELS_LIGHT,
         label_look: LABEL_LOOK,
         label_amount: LABEL_AMOUNT,
+        label_font: LABEL_FONTS[0].to_string(),
     }
 }
 
@@ -543,6 +563,7 @@ pub fn chart() -> Theme {
         label: LABELS_LIGHT,
         label_look: LABEL_LOOK,
         label_amount: LABEL_AMOUNT,
+        label_font: LABEL_FONTS[0].to_string(),
     }
 }
 
@@ -572,6 +593,7 @@ pub fn neon() -> Theme {
         label: LABELS_LIGHT,
         label_look: LABEL_LOOK,
         label_amount: LABEL_AMOUNT,
+        label_font: LABEL_FONTS[0].to_string(),
     }
 }
 
@@ -601,6 +623,7 @@ pub fn dawn() -> Theme {
         label: LABELS_LIGHT,
         label_look: LABEL_LOOK,
         label_amount: LABEL_AMOUNT,
+        label_font: LABEL_FONTS[0].to_string(),
     }
 }
 
@@ -633,6 +656,7 @@ pub fn terra() -> Theme {
         label: LABELS_LIGHT,
         label_look: LABEL_LOOK,
         label_amount: LABEL_AMOUNT,
+        label_font: LABEL_FONTS[0].to_string(),
     }
 }
 
@@ -662,6 +686,7 @@ pub fn tundra() -> Theme {
         label: LABELS_LIGHT,
         label_look: LABEL_LOOK,
         label_amount: LABEL_AMOUNT,
+        label_font: LABEL_FONTS[0].to_string(),
     }
 }
 
@@ -691,6 +716,7 @@ pub fn savanna() -> Theme {
         label: LABELS_LIGHT,
         label_look: LABEL_LOOK,
         label_amount: LABEL_AMOUNT,
+        label_font: LABEL_FONTS[0].to_string(),
     }
 }
 
@@ -720,6 +746,7 @@ pub fn candy() -> Theme {
         label: LABELS_LIGHT,
         label_look: LABEL_LOOK,
         label_amount: LABEL_AMOUNT,
+        label_font: LABEL_FONTS[0].to_string(),
     }
 }
 
@@ -749,6 +776,7 @@ pub fn survey() -> Theme {
         label: LABELS_LIGHT,
         label_look: LABEL_LOOK,
         label_amount: LABEL_AMOUNT,
+        label_font: LABEL_FONTS[0].to_string(),
     }
 }
 
@@ -778,6 +806,7 @@ pub fn woodcut() -> Theme {
         label: LABELS_LIGHT,
         label_look: LABEL_LOOK,
         label_amount: LABEL_AMOUNT,
+        label_font: LABEL_FONTS[0].to_string(),
     }
 }
 
@@ -807,6 +836,7 @@ pub fn gazetteer() -> Theme {
         label: LABELS_LIGHT,
         label_look: LABEL_LOOK,
         label_amount: LABEL_AMOUNT,
+        label_font: LABEL_FONTS[0].to_string(),
     }
 }
 
@@ -817,8 +847,47 @@ pub fn builtin() -> Vec<Theme> {
     let mut v = vec![trail(), topo(), night(), alpine(), desert(), ink(), blueprint(), atlas(), ember(), monsoon(), chart(), neon(), dawn(), terra(), tundra(), savanna(), candy(), survey(), woodcut(), gazetteer()];
     for t in &mut v {
         t.label = t.default_labels();
+        lettering(t);
     }
     v
+}
+
+/// Each built-in style's own lettering (Nick 2026-10-14: theme the map's type and its colours too, Oxanium for Neon and the like): a typeface for every style, and for the strongest characters their own palette (in [`LABEL_NAMES`] order: places, summits, water, roads, trails, boundaries, areas, small marks, halo, route, route casing) and glow.
+fn lettering(t: &mut Theme) {
+    let (font, palette, glow): (&str, Option<[[u8; 4]; 11]>, Option<f32>) = match t.name.as_str() {
+        // Glowing tubes on black: cyan water, magenta summits, amber roads, a violet bloom behind every letter.
+        "Neon" => ("Oxanium", Some([[255, 236, 255, 255], [255, 96, 224, 255], [86, 236, 255, 255], [255, 214, 92, 255], [150, 255, 150, 255], [200, 146, 255, 255], [124, 255, 206, 255], [206, 206, 255, 255], [34, 0, 60, 210], [255, 64, 204, 255], [24, 0, 44, 255]]), Some(0.24)),
+        // Drafting white on the blue sheet, lettered in a draughtsman's mono.
+        "Blueprint" => ("Mahere Mono", Some([[236, 246, 255, 255], [196, 224, 255, 255], [156, 212, 255, 255], [222, 236, 255, 255], [186, 230, 255, 255], [166, 204, 244, 255], [176, 218, 255, 255], [206, 228, 255, 255], [8, 30, 72, 220], [255, 255, 255, 255], [8, 30, 72, 255]]), Some(0.16)),
+        // Embers: warm amber and coals on the dark.
+        "Ember" => ("Roboto Condensed", Some([[255, 214, 168, 255], [255, 156, 92, 255], [255, 196, 140, 255], [255, 186, 120, 255], [238, 140, 96, 255], [210, 120, 90, 255], [232, 170, 120, 255], [220, 180, 150, 255], [18, 6, 4, 210], [255, 120, 40, 255], [24, 8, 4, 255]]), Some(0.14)),
+        // Pen on paper: every name in the same black ink, greys for what matters less.
+        "Ink" => ("EB Garamond", Some([[16, 16, 16, 255], [36, 36, 36, 255], [52, 52, 52, 255], [24, 24, 24, 255], [46, 46, 46, 255], [70, 70, 70, 255], [58, 58, 58, 255], [80, 80, 80, 255], [250, 248, 242, 225], [0, 0, 0, 255], [255, 255, 255, 255]]), None),
+        // An old atlas: ink-black towns, sepia mountains, blue water, red roads on cream.
+        "Atlas" => ("EB Garamond", Some([[34, 26, 20, 255], [104, 62, 28, 255], [32, 78, 126, 255], [128, 36, 28, 255], [112, 56, 30, 255], [64, 90, 52, 255], [70, 96, 58, 255], [86, 74, 60, 255], [246, 236, 214, 215], [150, 30, 30, 255], [250, 242, 222, 255]]), None),
+        // A carved block: deep brown capitals on the grain.
+        "Woodcut" => ("Cinzel", Some([[38, 26, 18, 255], [70, 44, 24, 255], [40, 58, 72, 255], [52, 34, 22, 255], [76, 50, 30, 255], [86, 66, 46, 255], [74, 56, 38, 255], [90, 72, 54, 255], [236, 226, 206, 220], [120, 30, 20, 255], [240, 232, 214, 255]]), None),
+        // Sugar: berry and bubblegum on mint.
+        "Candy" => ("Fredoka", Some([[128, 24, 96, 255], [176, 40, 120, 255], [24, 96, 176, 255], [200, 50, 110, 255], [120, 60, 170, 255], [90, 120, 60, 255], [60, 130, 90, 255], [150, 80, 140, 255], [255, 246, 252, 220], [236, 60, 150, 255], [255, 255, 255, 255]]), Some(0.14)),
+        // Ice: pale blue-white letters, cold blue water, on the dark.
+        "Tundra" => ("Roboto Condensed", Some([[236, 244, 250, 255], [206, 226, 240, 255], [150, 206, 244, 255], [222, 232, 240, 255], [196, 216, 230, 255], [170, 196, 214, 255], [180, 216, 206, 255], [200, 214, 224, 255], [12, 20, 30, 210], [140, 210, 255, 255], [10, 18, 28, 255]]), None),
+        // Sandstone: warm browns, desert-sky water.
+        "Desert" => ("EB Garamond", Some([[52, 30, 16, 255], [120, 60, 24, 255], [30, 90, 130, 255], [110, 44, 24, 255], [126, 70, 34, 255], [96, 74, 44, 255], [100, 80, 46, 255], [104, 84, 60, 255], [248, 236, 214, 215], [170, 50, 20, 255], [250, 240, 222, 255]]), None),
+        // A nautical chart: navy names and italic blue water on the pale sheet.
+        "Chart" => ("EB Garamond", Some([[20, 34, 64, 255], [60, 50, 40, 255], [24, 70, 130, 255], [40, 40, 60, 255], [70, 60, 50, 255], [120, 40, 90, 255], [50, 90, 70, 255], [70, 76, 96, 255], [244, 246, 248, 220], [200, 40, 80, 255], [255, 255, 255, 255]]), None),
+        "Topo" | "Alpine" | "Terra" => ("Roboto Condensed", None, None),
+        "Survey" => ("Mahere Mono", None, None),
+        "Gazetteer" | "Dawn" => ("EB Garamond", None, None),
+        "Savanna" => ("Cinzel", None, None),
+        _ => ("Open Sans", None, None),
+    };
+    t.label_font = font.to_string();
+    if let Some(p) = palette {
+        t.label = p;
+    }
+    if let Some(g) = glow {
+        t.label_look[1] = g;
+    }
 }
 
 impl Theme {

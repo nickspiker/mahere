@@ -885,7 +885,7 @@ pub mod themes {
                 }
                 f
             })
-            .add_section("labels", vec![("colours".to_string(), table_t(&t.label)), ("look".to_string(), VsfType::t_f5(Tensor::new(vec![4], t.label_look.to_vec()))), ("amount".to_string(), VsfType::t_f5(Tensor::new(vec![2], t.label_amount.to_vec())))])
+            .add_section("labels", vec![("colours".to_string(), table_t(&t.label)), ("look".to_string(), VsfType::t_f5(Tensor::new(vec![4], t.label_look.to_vec()))), ("amount".to_string(), VsfType::t_f5(Tensor::new(vec![2], t.label_amount.to_vec()))), ("font".to_string(), VsfType::x(t.label_font.clone()))])
             .build()
             .ok()
     }
@@ -1001,6 +1001,10 @@ pub mod themes {
             label: get("labels", "colours").and_then(|v| table(v, 255)).unwrap_or([[0; 4]; 11]),
             label_look: get("labels", "look").and_then(floats_of).filter(|v| v.len() == 4).map_or(mahere_engine::theme::LABEL_LOOK, |v| [v[0], v[1], v[2], v[3]]),
             label_amount: get("labels", "amount").and_then(floats_of).filter(|v| v.len() == 2).map_or(mahere_engine::theme::LABEL_AMOUNT, |v| [v[0], v[1]]),
+            label_font: match get("labels", "font") {
+                Some(VsfType::x(f)) | Some(VsfType::a(f)) if mahere_engine::theme::LABEL_FONTS.contains(&f.as_str()) => f.clone(),
+                _ => mahere_engine::theme::LABEL_FONTS[0].to_string(),
+            },
         })
         .map(|mut t| {
             if get("labels", "colours").is_none() {

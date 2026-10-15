@@ -33,12 +33,51 @@ fn display(c: [u8; 4]) -> [f32; 4] {
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 struct GlyphKey {
     ch: char,
+    /// The typeface, an index into [`mahere_engine::theme::LABEL_FONTS`].
+    family: u8,
     size: u32,
     weight: u16,
     shear: u32,
     halo: u32,
     bin: i32,
 }
+
+/// The typefaces a theme letters its map in, five weights each, ASCII only (assets/fonts/README.md): loaded into the letterer's text renderer beside the panel's Open Sans, which every letter outside them falls back to.
+const LABEL_FONT_FILES: [&[u8]; 33] = [
+    include_bytes!("../assets/fonts/Cinzel-300.ttf"),
+    include_bytes!("../assets/fonts/Cinzel-400.ttf"),
+    include_bytes!("../assets/fonts/Cinzel-500.ttf"),
+    include_bytes!("../assets/fonts/Cinzel-600.ttf"),
+    include_bytes!("../assets/fonts/Cinzel-700.ttf"),
+    include_bytes!("../assets/fonts/EBGaramond-300.ttf"),
+    include_bytes!("../assets/fonts/EBGaramond-400.ttf"),
+    include_bytes!("../assets/fonts/EBGaramond-500.ttf"),
+    include_bytes!("../assets/fonts/EBGaramond-600.ttf"),
+    include_bytes!("../assets/fonts/EBGaramond-700.ttf"),
+    include_bytes!("../assets/fonts/Fredoka-300.ttf"),
+    include_bytes!("../assets/fonts/Fredoka-400.ttf"),
+    include_bytes!("../assets/fonts/Fredoka-500.ttf"),
+    include_bytes!("../assets/fonts/Fredoka-600.ttf"),
+    include_bytes!("../assets/fonts/Fredoka-700.ttf"),
+    include_bytes!("../assets/fonts/MahereMono-300.ttf"),
+    include_bytes!("../assets/fonts/MahereMono-400.ttf"),
+    include_bytes!("../assets/fonts/MahereMono-500.ttf"),
+    include_bytes!("../assets/fonts/MahereMono-600.ttf"),
+    include_bytes!("../assets/fonts/MahereMono-700.ttf"),
+    include_bytes!("../assets/fonts/OpenSans-300.ttf"),
+    include_bytes!("../assets/fonts/OpenSans-500.ttf"),
+    include_bytes!("../assets/fonts/OpenSans-600.ttf"),
+    include_bytes!("../assets/fonts/Oxanium-300.ttf"),
+    include_bytes!("../assets/fonts/Oxanium-400.ttf"),
+    include_bytes!("../assets/fonts/Oxanium-500.ttf"),
+    include_bytes!("../assets/fonts/Oxanium-600.ttf"),
+    include_bytes!("../assets/fonts/Oxanium-700.ttf"),
+    include_bytes!("../assets/fonts/RobotoCondensed-300.ttf"),
+    include_bytes!("../assets/fonts/RobotoCondensed-400.ttf"),
+    include_bytes!("../assets/fonts/RobotoCondensed-500.ttf"),
+    include_bytes!("../assets/fonts/RobotoCondensed-600.ttf"),
+    include_bytes!("../assets/fonts/RobotoCondensed-700.ttf"),
+];
 
 /// A glyph's rotation bins, radians apart: one pixel of arc at half its size.
 fn bin_step(size: f32) -> f32 {
@@ -155,6 +194,31 @@ fn tier(n: &Named) -> Option<u8> {
     })
 }
 
+/// The kinds lettered by rank among their own in view: places by population, summits by height, rivers by catchment, lakes by area.
+fn rank_group(n: &Named) -> Option<u8> {
+    match n.kind {
+        CITY..=HAMLET => Some(0),
+        PEAK | VOLCANO => Some(1),
+        WATERWAY => Some(2),
+        WATER_AREA => Some(3),
+        _ => None,
+    }
+}
+
+/// A ranked kind's size before its step.
+fn ranked_base(n: &Named) -> f32 {
+    match n.kind {
+        CITY..=HAMLET => 1.0,
+        PEAK | VOLCANO => 0.85,
+        WATERWAY => 0.8,
+        _ => 0.95,
+    }
+}
+
+/// The five steps, smallest rank in view to largest: size against the kind's base, and weight.
+const RANK_SIZE: [f32; 5] = [0.85, 0.95, 1.05, 1.2, 1.4];
+const RANK_WEIGHT: [u16; 5] = [300, 400, 500, 600, 700];
+
 /// How a kind is lettered: its size against the base font, its colour (an index into the theme's), its weight, its lean.
 fn style_of(n: &Named) -> (f32, usize, u16, f32) {
     match n.kind {
@@ -227,6 +291,7 @@ struct LabelJob {
     palette: [[u8; 4]; 11],
     look: [f32; 4],
     amount: [f32; 2],
+    family: u8,
     route: Vec<(f64, f64)>,
     key: ViewKey,
 }
@@ -240,7 +305,9 @@ struct Letterer {
     /// The atlas version last handed to the drawing thread.
     sent: u64,
     shared: std::sync::Arc<Atlas>,
-    advance: HashMap<(char, u16, u32), f32>,
+    advance: HashMap<(char, u8, u16, u32), f32>,
+    /// The typeface of the layout being made.
+    family: u8,
     look: [f32; 4],
     amount: [f32; 2],
     previous: HashSet<(u8, String, String)>,
@@ -475,7 +542,11 @@ impl Labeller {
         std::thread::Builder::new()
             .name("labels".into())
             .spawn(move || {
-                let mut l = Letterer { text: TextRenderer::new(), w: 0, h: 0, atlas: Atlas::new(), sent: 0, shared: std::sync::Arc::new(Atlas::new()), advance: HashMap::new(), look: mahere_engine::theme::LABEL_LOOK, amount: mahere_engine::theme::LABEL_AMOUNT, previous: HashSet::new(), names: Default::default() };
+                let mut text = TextRenderer::new();
+                for data in LABEL_FONT_FILES {
+                    text.load_font_data_named(data.to_vec());
+                }
+                let mut l = Letterer { text, family: 0, w: 0, h: 0, atlas: Atlas::new(), sent: 0, shared: std::sync::Arc::new(Atlas::new()), advance: HashMap::new(), look: mahere_engine::theme::LABEL_LOOK, amount: mahere_engine::theme::LABEL_AMOUNT, previous: HashSet::new(), names: Default::default() };
                 while let Ok(mut job) = jobs.recv() {
                     // Only the newest job matters: a camera that moved on has made the others stale.
                     while let Ok(newer) = jobs.try_recv() {
@@ -502,9 +573,10 @@ impl Labeller {
 
     fn job(map: &mut mahere_engine::MapCore, w: usize, h: usize, font: f32) -> LabelJob {
         let (palette, look, amount) = map.themes.get(map.theme).map_or((mahere_engine::theme::LABELS_LIGHT, mahere_engine::theme::LABEL_LOOK, mahere_engine::theme::LABEL_AMOUNT), |t| (t.label, t.label_look, t.label_amount));
+        let family = map.themes.get(map.theme).and_then(|t| mahere_engine::theme::LABEL_FONTS.iter().position(|f| *f == t.label_font)).unwrap_or(0) as u8;
         let key = Self::view_key(map, w, h);
         let names = map.layers().labels.then(|| map.name_job(w, h));
-        LabelJob { names, cam: map.cam, w, h, font, palette, look, amount, route: map.route_points().map_or(Vec::new(), |p| p.to_vec()), key }
+        LabelJob { names, cam: map.cam, w, h, font, palette, look, amount, family, route: map.route_points().map_or(Vec::new(), |p| p.to_vec()), key }
     }
 
     /// Ask the worker for a layout when one is due: the view rests, the lettering is stale, none is running, and every cell is in or a second has passed since the last ask (so cells still arriving never hold the labels back). Never waits.
@@ -591,12 +663,17 @@ impl Labeller {
 }
 
 impl Letterer {
+    /// The typeface's family name.
+    fn face(&self) -> &'static str {
+        mahere_engine::theme::LABEL_FONTS[(self.family as usize).min(mahere_engine::theme::LABEL_FONTS.len() - 1)]
+    }
+
     fn advance(&mut self, ch: char, size: f32, weight: u16) -> f32 {
-        let key = (ch, weight, (size * 16.0) as u32);
+        let key = (ch, self.family, weight, (size * 16.0) as u32);
         if let Some(&a) = self.advance.get(&key) {
             return a;
         }
-        let a = self.text.measure_text(&ch.to_string(), &TextStyle::new(size, 0xFF00_0000).weight(weight));
+        let a = self.text.measure_text(&ch.to_string(), &TextStyle::new(size, 0xFF00_0000).weight(weight).font(self.face()));
         self.advance.insert(key, a);
         a
     }
@@ -613,6 +690,7 @@ impl Letterer {
         self.h = h;
         self.look = job.look;
         self.amount = job.amount;
+        self.family = job.family;
         let font = job.font * self.look[0];
         let texels = match &job.names {
             Some(n) => mahere_engine::labels::gather(n, &mut self.names),
@@ -669,7 +747,7 @@ impl Letterer {
     /// A glyph's place in the atlas, rasterised by fluor the first time it is asked for, its outline turned to the angle's bin: the letter's coverage, and around it the halo, a distance out from the letter's edge.
     fn glyph(&mut self, ch: char, size: f32, weight: u16, shear: f32, halo: u32, angle: f32) -> GlyphKey {
         let bin = (angle / bin_step(size)).round() as i32;
-        let key = GlyphKey { ch, size: (size * 16.0) as u32, weight, shear: shear.to_bits(), halo, bin };
+        let key = GlyphKey { ch, family: self.family, size: (size * 16.0) as u32, weight, shear: shear.to_bits(), halo, bin };
         if self.atlas.slots.contains_key(&key) {
             return key;
         }
@@ -685,7 +763,7 @@ impl Letterer {
         {
             let mut damage = Damage::new();
             let mut canvas = Canvas::new(&mut px, cw, chh, &mut damage);
-            let style = TextStyle::new(size, 0xFF00_0000).weight(weight).shear(shear).rotation(turn);
+            let style = TextStyle::new(size, 0xFF00_0000).weight(weight).shear(shear).rotation(turn).font(self.face());
             let at = unturn([cw as f32 / 2.0, chh as f32 / 2.0], turn);
             self.text.draw_text_center(&mut canvas, &ch.to_string(), at[0], at[1], &style, None, None);
         }
@@ -786,6 +864,15 @@ impl Letterer {
             }
         }
         todo.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)).then(b.2.cmp(&a.2)).then(b.3.cmp(&a.3)));
+        // Each ranked kind's span in view, log of rank.
+        let mut ranks = [(f32::MAX, f32::MIN); 4];
+        for (_, _, _, _, n, _) in &todo {
+            if let Some(g) = rank_group(n) {
+                let r = (n.rank as f32 + 1.0).ln();
+                let e = &mut ranks[g as usize];
+                *e = (e.0.min(r), e.1.max(r));
+            }
+        }
         let mut room = Room::new(w, h);
         let mut out = Vec::new();
         let pad = font * self.look[3];
@@ -795,6 +882,15 @@ impl Letterer {
                 continue;
             }
             let (rel, colour, weight, shear) = style_of(n);
+            // A ranked kind's size and weight by where it stands among its kind in view (Nick 2026-10-14: the biggest town on screen the boldest, the smallest the lightest, on a log scale): five steps.
+            let (rel, weight) = match rank_group(n).map(|g| (g, ranks[g as usize])) {
+                Some((_, (lo, hi))) => {
+                    let t = if hi > lo { ((n.rank as f32 + 1.0).ln() - lo) / (hi - lo) } else { 1.0 };
+                    let step = (t.clamp(0.0, 1.0) * 4.0).round() as usize;
+                    (ranked_base(n) * RANK_SIZE[step], RANK_WEIGHT[step])
+                }
+                None => (rel, weight),
+            };
             let size = font * rel;
             let laid: Vec<Laid> = match shape {
                 Shape::Point(p) => self.point(n, &label, p, size, colour, weight, &room, pad).into_iter().collect(),

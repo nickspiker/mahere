@@ -686,6 +686,7 @@ impl Panel {
         let n = match f {
             Field::Sun | Field::Sky => 3,
             Field::LabelAmount => 2,
+            Field::LabelFont => 1,
             _ => 4,
         };
         self.sliders = (0..n).map(|i| Slider::new(&mut self.hits, 0.0, 0.0, 10.0, 10.0, Self::slider_pos(f, i, self.field_vals[i]))).collect();
@@ -701,6 +702,7 @@ impl Panel {
             (Field::Sun | Field::Sky, _) => v / 3.0,
             (Field::LabelLook, _) => (v - LOOK_RANGE[i].0) / (LOOK_RANGE[i].1 - LOOK_RANGE[i].0),
             (Field::LabelAmount, _) => (v - AMOUNT_RANGE[i].0) / (AMOUNT_RANGE[i].1 - AMOUNT_RANGE[i].0),
+            (Field::LabelFont, _) => v / (mahere_engine::theme::LABEL_FONTS.len() - 1) as f32,
             _ => v / 255.0,
         }
     }
@@ -711,6 +713,7 @@ impl Panel {
             (Field::Sun | Field::Sky, _) => pos * 3.0,
             (Field::LabelLook, _) => LOOK_RANGE[i].0 + pos * (LOOK_RANGE[i].1 - LOOK_RANGE[i].0),
             (Field::LabelAmount, _) => AMOUNT_RANGE[i].0 + pos * (AMOUNT_RANGE[i].1 - AMOUNT_RANGE[i].0),
+            (Field::LabelFont, _) => (pos * (mahere_engine::theme::LABEL_FONTS.len() - 1) as f32).round(),
             _ => (pos * 255.0).round(),
         }
     }
@@ -1623,7 +1626,7 @@ impl Panel {
                 Field::Mvum(_) => "motor vehicle use",
                 Field::Water | Field::Contour | Field::ContourIndex => "inks",
                 Field::Sun | Field::Sky => "light",
-                Field::Label(_) | Field::LabelLook | Field::LabelAmount => "labels",
+                Field::Label(_) | Field::LabelLook | Field::LabelAmount | Field::LabelFont => "labels",
             };
             if sec != section {
                 section = sec;
@@ -1696,7 +1699,7 @@ impl Panel {
         y += font * 1.6;
         // The swatch: a colour as the map shows it unlit; a light as the colour it would make white ground.
         let sw = cw - font * 1.8;
-        if matches!(f, Field::LabelLook | Field::LabelAmount) {
+        if matches!(f, Field::LabelLook | Field::LabelAmount | Field::LabelFont) {
             // No swatch: the look is numbers, shown beside their sliders.
         } else if f.is_colour() {
             paint::fill_rect(canvas, x0 as isize, y as isize, sw as isize, (font * 1.6) as isize, swatch([vals[0] as u8, vals[1] as u8, vals[2] as u8]), None, None);
@@ -1709,6 +1712,7 @@ impl Panel {
             Field::Hypso(_) => ["R", "G", "B", "metres"],
             Field::LabelLook => ["Size", "Glow", "Smoothing", "Spacing"],
             Field::LabelAmount => ["Density", "Repeat", "", ""],
+            Field::LabelFont => ["Typeface", "", "", ""],
             _ => ["R", "G", "B", "A"],
         };
         for (i, sl) in sliders.iter_mut().enumerate() {
@@ -1721,6 +1725,7 @@ impl Panel {
                 (Field::LabelLook, _) => format!("{:.2} of a letter", vals[i]),
                 (Field::LabelAmount, 0) => format!("to {}", mahere_engine::theme::LABEL_TIERS[mahere_engine::theme::label_tier_limit(vals[0]) as usize]),
                 (Field::LabelAmount, _) => format!("every {:.2} screen", vals[i]),
+                (Field::LabelFont, _) => mahere_engine::theme::LABEL_FONTS[(vals[0].round().max(0.0) as usize).min(mahere_engine::theme::LABEL_FONTS.len() - 1)].to_string(),
                 _ => format!("{}", vals[i] as u8),
             };
             text.draw_text_left(canvas, &val, x0 + font * 4.5, y, &small, None, None);
