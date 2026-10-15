@@ -1,5 +1,18 @@
 # Mahere release notes
 
+## 0.21x · October 2026
+
+### Faster maps
+- The map's cells are now held at Cloudflare's servers near you, so a cell anyone has viewed before arrives about three times sooner.
+- A new view fills in about twice as fast: lines in under two seconds, then terrain.
+- Once the map is still, the cells just around it and one zoom level closer download quietly, so panning and zooming in show from the phone at once.
+- Connections to the map server are kept open between cells rather than made again each time.
+
+### Fixes
+- Large-screen phones (1440 by 3040, like the Note 10+) no longer flash black.
+- River names no longer show inside lakes.
+- Automatic updates install only a newer release, never an older one or a test build.
+
 ## 0.20x · October 2026
 
 ### A new map format
