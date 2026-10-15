@@ -19,6 +19,11 @@ pub struct NamedTexels {
     pub area_step_px: f32,
 }
 
+/// A river's kind (a line's kind is its class plus one) and a named lake's (an area's is its class above AREA).
+const RIVER: u8 = mahere_tiles::osm::RoadClass::Waterway as u8 + 1;
+const LAKE: u8 = mahere_tiles::names::AREA + mahere_tiles::osm::AreaClass::Water as u8;
+const _: () = assert!(RIVER == 12 && LAKE == mahere_tiles::names::AREA + 12, "the panel letters waterways as 12 and lakes as AREA + 12");
+
 /// The most cells' names kept between gathers; past it the cache starts again.
 const NAMES_KEPT: usize = 4096;
 
@@ -152,6 +157,10 @@ pub fn gather(job: &NameJob, cache: &mut NamesCache) -> NamedTexels {
                     continue;
                 }
                 let n = &names.entries[e as usize - 1];
+                // A river's centreline runs on through the lakes it feeds; inside a named lake it is the lake's water, not the river's, so its name is not lettered there (Nick 2026-10-15: river labels showed in the lake).
+                if n.kind == RIVER && names.area_at(i).is_some_and(|a| a.kind == LAKE) {
+                    continue;
+                }
                 let p = centroid(i);
                 if !on_screen(p) {
                     continue;
