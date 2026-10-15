@@ -120,6 +120,15 @@ pub fn linked(base: &[u8], layer: Layer, doc: &[u8]) -> bool {
     }
 }
 
+/// The name a base gives one of its layers, for an address no cache has seen an older copy under: the first half of the layer's provenance hash, in hex.
+pub fn link_name(base: &[u8], layer: Layer) -> Option<String> {
+    let fields = crate::section_fields(base, "layers")?;
+    match fields.get(layer.dir())?.first()? {
+        VsfType::hp(h) => Some(h.iter().take(16).map(|b| format!("{b:02x}")).collect()),
+        _ => None,
+    }
+}
+
 /// A cell's planes from whichever of its published layers are at hand (the base, the terrain, the image, the infrared), merged.
 pub fn decode_layers(base: Option<&[u8]>, dem: Option<&[u8]>, img: Option<&[u8]>, nir: Option<&[u8]>) -> Result<CellPlanes, String> {
     let mut out = match base {
@@ -141,4 +150,19 @@ pub fn decode_layers(base: Option<&[u8]>, dem: Option<&[u8]>, img: Option<&[u8]>
         }
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A base's link names its layer by the first half of the layer's provenance hash; a layer it does not name has no name.
+    #[test]
+    fn a_link_names_its_layer() {
+        let mut links = VsfSection::new("layers");
+        links.add_field("dem", VsfType::hp((0u8..32).collect()));
+        let base = VsfBuilder::new().add_section_direct(links).build().unwrap();
+        assert_eq!(link_name(&base, Layer::Dem).as_deref(), Some("000102030405060708090a0b0c0d0e0f"));
+        assert_eq!(link_name(&base, Layer::Img), None);
+    }
 }

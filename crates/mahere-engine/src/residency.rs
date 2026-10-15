@@ -26,6 +26,11 @@ pub trait CellStore: Send + Sync + 'static {
     fn refresh(&self, key: CellKey) -> Fetch {
         self.get(key)
     }
+    /// The cell as the source has it, asked for by the name its base gives it (its provenance hash), so no copy kept on the way (the vault, the bucket's edge cache) can answer with an older one.
+    fn refresh_named(&self, key: CellKey, name: &str) -> Fetch {
+        let _ = name;
+        self.refresh(key)
+    }
     /// Cells whose kept copy was found out of date and replaced since the last call, for residency to load again.
     fn take_changed(&self) -> Vec<CellKey> {
         Vec::new()
@@ -507,13 +512,17 @@ fn load_cell(store: &dyn CellStore, layers: Option<&LayerStores>, want: u8, key:
     let mut dem_bytes: Vec<u8> = Vec::new();
     if let Some(l) = layers {
         use mahere_tiles::publish::Layer;
-        // A layer the base does not name (a copy kept from an older publish) is fetched again past the copy; still not the one named, the cell shows without it rather than mixing publishes.
+        // A layer the base does not name (a copy kept from an older publish, in the vault or the bucket's edge cache) is fetched again by the name the base gives it, past every copy; still not the one named, the cell shows without it rather than mixing publishes.
         let get = |store: &dyn CellStore, layer: Layer| -> Option<Vec<u8>> {
             let b = layer_bytes(store, key, layer.dir())?;
             if b.is_empty() || bytes.is_empty() || mahere_tiles::publish::linked(&bytes, layer, &b) {
                 return Some(b);
             }
-            match store.refresh(key) {
+            let fresh = match mahere_tiles::publish::link_name(&bytes, layer) {
+                Some(name) => store.refresh_named(key, &name),
+                None => store.refresh(key),
+            };
+            match fresh {
                 Fetch::Bytes(fresh) if mahere_tiles::publish::linked(&bytes, layer, &fresh) => Some(fresh),
                 Fetch::Failed(_) => None,
                 _ => {
@@ -612,6 +621,11 @@ pub enum Checked {
 /// The far tier: the same outcomes as a store, over the network.
 pub trait RemoteStore: Send + Sync + 'static {
     fn fetch(&self, key: CellKey) -> Fetch;
+    /// The cell at an address its name makes, which no cache between has seen under an older copy.
+    fn fetch_named(&self, key: CellKey, name: &str) -> Fetch {
+        let _ = name;
+        self.fetch(key)
+    }
     /// The cell unless the source still has the copy with this tag; with no tag, the cell and its tag.
     fn check(&self, key: CellKey, tag: Option<&str>) -> Checked {
         let _ = tag;
@@ -743,6 +757,18 @@ impl CellStore for TieredStore {
         self.cache.get(key)
     }
 
+    fn refresh_named(&self, key: CellKey, name: &str) -> Fetch {
+        match self.remote.fetch_named(key, name) {
+            Fetch::Bytes(b) => {
+                self.cache.put(key, &b);
+                self.checks.seen.lock().unwrap().insert(key);
+                self.missing.lock().unwrap().remove(&key);
+                Fetch::Bytes(b)
+            }
+            other => other,
+        }
+    }
+
     fn take_changed(&self) -> Vec<CellKey> {
         std::mem::take(&mut *self.checks.changed.lock().unwrap())
     }
@@ -809,8 +835,17 @@ impl RemoteStore for HttpStore {
     }
 
     fn fetch(&self, key: CellKey) -> Fetch {
-        let url = format!("{}/{}?e={}", self.base, key.path(), CELL_EPOCH);
-        match self.agent.get(&url).call() {
+        self.fetch_url(&self.url(key))
+    }
+
+    fn fetch_named(&self, key: CellKey, name: &str) -> Fetch {
+        self.fetch_url(&format!("{}&h={name}", self.url(key)))
+    }
+}
+
+impl HttpStore {
+    fn fetch_url(&self, url: &str) -> Fetch {
+        match self.agent.get(url).call() {
             Ok(resp) => {
                 let expect: Option<usize> = resp.header("Content-Length").and_then(|v| v.parse().ok());
                 let mut buf = Vec::new();
@@ -834,6 +869,10 @@ impl RemoteStore for HttpStore {
 impl CellStore for HttpStore {
     fn get(&self, key: CellKey) -> Fetch {
         self.fetch(key)
+    }
+
+    fn refresh_named(&self, key: CellKey, name: &str) -> Fetch {
+        self.fetch_named(key, name)
     }
 }
 
@@ -916,6 +955,40 @@ mod tests {
         assert_eq!(changed, vec![old], "only the changed cell is reported");
         assert!(matches!(store.get(old), Fetch::Bytes(b) if b == b"new"));
         assert_eq!(kept.tag(old).as_deref(), Some("v2"));
+    }
+
+    /// A layer asked for by its name passes every copy on the way: the bucket's edge still serving the old bytes at the plain address, the named address has the new, and the vault keeps them.
+    #[test]
+    fn a_named_refresh_passes_a_stale_edge() {
+        use std::sync::Mutex;
+        #[derive(Default)]
+        struct Kept(Mutex<FxHashMap<CellKey, Vec<u8>>>);
+        impl CellStore for Kept {
+            fn get(&self, key: CellKey) -> Fetch {
+                self.0.lock().unwrap().get(&key).map_or(Fetch::Absent, |b| Fetch::Bytes(b.clone()))
+            }
+        }
+        impl CellCache for Kept {
+            fn put(&self, key: CellKey, bytes: &[u8]) {
+                self.0.lock().unwrap().insert(key, bytes.to_vec());
+            }
+        }
+        struct Edge;
+        impl RemoteStore for Edge {
+            fn fetch(&self, _key: CellKey) -> Fetch {
+                Fetch::Bytes(b"stale".to_vec())
+            }
+            fn fetch_named(&self, _key: CellKey, name: &str) -> Fetch {
+                Fetch::Bytes(if name == "abc" { b"fresh".to_vec() } else { b"stale".to_vec() })
+            }
+        }
+        let key = CellKey { depth: 9, prefix: 1 };
+        let kept = Arc::new(Kept::default());
+        kept.put(key, b"stale");
+        let store = TieredStore::new(kept.clone(), Arc::new(Edge));
+        assert!(matches!(store.refresh(key), Fetch::Bytes(b) if b == b"stale"), "the plain address is what the edge kept");
+        assert!(matches!(store.refresh_named(key, "abc"), Fetch::Bytes(b) if b == b"fresh"));
+        assert!(matches!(store.get(key), Fetch::Bytes(b) if b == b"fresh"), "the vault keeps what the name fetched");
     }
 
     #[test]
