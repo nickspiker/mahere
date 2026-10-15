@@ -1137,7 +1137,7 @@ dependencies = [
  "softbuffer",
  "swash",
  "unicode-script",
- "vsf",
+ "vsf 0.9.3",
  "wgpu",
  "wide",
  "windows 0.58.0",
@@ -1734,7 +1734,7 @@ dependencies = [
  "manifestus",
  "rand",
  "tohu",
- "vsf",
+ "vsf 0.9.3",
 ]
 
 [[package]]
@@ -1894,7 +1894,7 @@ dependencies = [
  "las",
  "rayon",
  "tiff",
- "vsf",
+ "vsf 0.10.0",
 ]
 
 [[package]]
@@ -1906,7 +1906,7 @@ dependencies = [
  "rayon",
  "rustc-hash 2.1.3",
  "ureq",
- "vsf",
+ "vsf 0.10.0",
 ]
 
 [[package]]
@@ -1930,7 +1930,7 @@ dependencies = [
  "mahere-coord",
  "osmpbf",
  "shapefile",
- "vsf",
+ "vsf 0.10.0",
 ]
 
 [[package]]
@@ -1940,7 +1940,7 @@ dependencies = [
  "fluor",
  "mahere-engine",
  "mahere-tiles",
- "vsf",
+ "vsf 0.10.0",
 ]
 
 [[package]]
@@ -1953,7 +1953,7 @@ dependencies = [
  "mahere-engine",
  "mahere-tiles",
  "rand",
- "vsf",
+ "vsf 0.10.0",
  "zstd",
 ]
 
@@ -1967,7 +1967,7 @@ dependencies = [
  "png",
  "rayon",
  "ureq",
- "vsf",
+ "vsf 0.10.0",
  "zstd",
 ]
 
@@ -1978,7 +1978,7 @@ dependencies = [
  "blake3",
  "ed25519-dalek",
  "ureq",
- "vsf",
+ "vsf 0.10.0",
 ]
 
 [[package]]
@@ -1998,7 +1998,7 @@ dependencies = [
  "blake3",
  "hashbrown 0.15.5",
  "libc",
- "vsf",
+ "vsf 0.9.3",
 ]
 
 [[package]]
@@ -3770,7 +3770,7 @@ dependencies = [
  "ihi",
  "jni 0.21.1",
  "rand",
- "vsf",
+ "vsf 0.9.3",
 ]
 
 [[package]]
@@ -4001,6 +4001,23 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 name = "vsf"
 version = "0.9.3"
 source = "git+https://github.com/nickspiker/vsf?rev=5f2bb06c8d96ee417a2571944882ef36d6c9ca8f#5f2bb06c8d96ee417a2571944882ef36d6c9ca8f"
+dependencies = [
+ "bitvec",
+ "blake3",
+ "chrono",
+ "colored",
+ "hex",
+ "i256",
+ "libm",
+ "num-complex",
+ "num-traits",
+ "spin",
+ "unicode-normalization",
+]
+
+[[package]]
+name = "vsf"
+version = "0.10.0"
 dependencies = [
  "aes-gcm",
  "bitvec",

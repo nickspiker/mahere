@@ -2029,6 +2029,11 @@ fn section_alone(data: &[u8], name: &str) -> Option<HashMap<String, Vec<VsfType>
     Some(uncoded(s.fields.into_iter().map(|f| (f.name, f.values)).collect()))
 }
 
+/// One section's fields from raw cell bytes, as stored (nothing decoded): for a reader that wants a small section alone, as the published layers' links.
+pub fn section_fields(data: &[u8], name: &str) -> Option<HashMap<String, Vec<VsfType>>> {
+    section_alone(data, name)
+}
+
 /// A section's fields with every range-coded plane and table put back as the tensor it was written from; pyramids stay coded for their decoders.
 fn uncoded(mut fields: HashMap<String, Vec<VsfType>>) -> HashMap<String, Vec<VsfType>> {
     for values in fields.values_mut() {
@@ -2047,7 +2052,6 @@ pub fn decode_names(data: &[u8]) -> Option<NameCell> {
 fn decode_geoid(fields: &HashMap<String, Vec<VsfType>>) -> Option<Vec<i16>> {
     let disk = match fields.get("cm")?.first()? {
         VsfType::t_i4(t) => t.data.clone(),
-        VsfType::v_i4(t) => t.data.clone(),
         _ => return None,
     };
     (disk.len() == TRI).then(|| disk_to_mem(&disk))
@@ -2074,7 +2078,6 @@ fn scalar_f32(v: &VsfType) -> Option<f32> {
 fn raw_i16(v: &VsfType) -> Option<Vec<i16>> {
     match v {
         VsfType::t_i4(t) => Some(t.data.clone()),
-        VsfType::v_i4(t) => Some(t.data.clone()),
         _ => None,
     }
 }
@@ -2082,9 +2085,7 @@ fn raw_i16(v: &VsfType) -> Option<Vec<i16>> {
 fn raw_u16(v: &VsfType) -> Option<Vec<u16>> {
     match v {
         VsfType::t_u4(t) => Some(t.data.clone()),
-        VsfType::v_u4(t) => Some(t.data.clone()),
         VsfType::t_u3(t) => Some(t.data.iter().map(|&x| x as u16).collect()),
-        VsfType::v_u3(t) => Some(t.data.iter().map(|&x| x as u16).collect()),
         _ => None,
     }
 }
@@ -2093,7 +2094,6 @@ fn raw_u16(v: &VsfType) -> Option<Vec<u16>> {
 pub fn plane_u8_mem(v: &VsfType) -> Option<Vec<u8>> {
     let disk: Vec<u8> = match v {
         VsfType::t_u3(t) => t.data.clone(),
-        VsfType::v_u3(t) => t.data.clone(),
         VsfType::t_u0(t) => t.data.iter().map(|&b| b as u8).collect(),
         _ => return None,
     };

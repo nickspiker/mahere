@@ -192,12 +192,10 @@ impl NameCell {
         let first = |name: &str| fields.get(name).and_then(|v| v.first());
         let kinds: Vec<u8> = match first("kind")? {
             VsfType::t_u3(t) => t.data.clone(),
-            VsfType::v_u3(t) => t.data.clone(),
             _ => return None,
         };
         let ranks: Vec<u32> = match first("rank")? {
             VsfType::t_u5(t) => t.data.clone(),
-            VsfType::v_u5(t) => t.data.clone(),
             VsfType::t_u4(t) => t.data.iter().map(|&r| r as u32).collect(),
             VsfType::t_u3(t) => t.data.iter().map(|&r| r as u32).collect(),
             _ => return None,

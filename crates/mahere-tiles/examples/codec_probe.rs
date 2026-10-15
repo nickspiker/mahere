@@ -20,23 +20,17 @@ fn main() {
             let mut reference: Option<Vec<i32>> = None;
             for field in s.fields {
                 let v = field.values;
+                let r = reference.as_deref().filter(|_| std::env::var_os("PROBE_NOREF").is_none());
                 let new: Vec<VsfType> = if let Some(coef) = mahere_tiles::pyr::from_vsf(&v, mahere_tiles::pyr::NCOEF) {
-                    let r = reference.as_deref().filter(|_| std::env::var_os("PROBE_NOREF").is_none());
-                    let e = mahere_tiles::ac::encode_coefs_with(&coef, r);
-                    assert_eq!(mahere_tiles::ac::decode_coefs_with(&e, r).unwrap(), coef);
+                    let e = mahere_tiles::ac::code_field(&v, r).expect("codes");
+                    assert_eq!(mahere_tiles::ac::coefs(&e, r).unwrap(), coef);
                     if reference.is_none() {
                         reference = Some(coef);
                     }
-                    vec![VsfType::t_u3(vsf::types::Tensor::new(vec![e.len()], e))]
-                } else if let Some(p) = plane(&v) {
-                    let e = mahere_tiles::ac::encode_plane(&p);
-                    assert_eq!(mahere_tiles::ac::decode_plane(&e).unwrap(), p);
-                    vec![VsfType::t_u3(vsf::types::Tensor::new(vec![e.len()], e))]
-                } else if let Some(t) = series(&v) {
-                    let e = mahere_tiles::ac::encode_series(&t);
-                    assert_eq!(mahere_tiles::ac::decode_series(&e, t.len()).unwrap(), t);
-                    vec![VsfType::t_u3(vsf::types::Tensor::new(vec![e.len()], e))]
-                } else {
+                    e
+                } else if let Some(e) = mahere_tiles::ac::code_field(&v, None) {
+                    assert_eq!(mahere_tiles::ac::uncode_field(&e).map(|u| format!("{u:?}")), Some(format!("{:?}", v[0])));
+                    e                } else {
                     v
                 };
                 if std::env::var_os("PROBE_FIELDS").is_some() {
@@ -63,29 +57,5 @@ fn main() {
     println!("{n} cells: stored (zstd) {:.1} KB, plain VSF {:.1} KB, recoded without zstd {:.1} KB ({:+.0}%)", kb(stored), kb(plain), kb(recoded), (recoded as f64 / stored as f64 - 1.0) * 100.0);
     for (name, (new, old)) in &per {
         println!("  {name:6} {:7.1} KB recoded   (raw {:7.1} KB)", kb(*new), kb(*old));
-    }
-}
-
-/// A one-value field holding one number per trixel, or one bit per trixel (a mask).
-fn plane(v: &[VsfType]) -> Option<Vec<u32>> {
-    if v.len() != 1 {
-        return None;
-    }
-    let tri = mahere_tiles::TRI;
-    match &v[0] {
-        VsfType::t_u3(t) if t.data.len() == tri => Some(t.data.iter().map(|&x| x as u32).collect()),
-        VsfType::t_u4(t) if t.data.len() == tri => Some(t.data.iter().map(|&x| x as u32).collect()),
-        VsfType::p(t) if t.bit_depth == 1 && t.shape.iter().product::<usize>() == tri => {
-            Some((0..tri).map(|i| ((t.data[i >> 3] >> (7 - (i & 7))) & 1) as u32).collect())
-        }
-        _ => None,
-    }
-}
-
-/// A one-value field of 16-bit numbers longer than a few: a table worth coding (the terrain's apron).
-fn series(v: &[VsfType]) -> Option<Vec<u32>> {
-    match v {
-        [VsfType::t_u4(t)] if t.data.len() >= 64 => Some(t.data.iter().map(|&x| x as u32).collect()),
-        _ => None,
     }
 }

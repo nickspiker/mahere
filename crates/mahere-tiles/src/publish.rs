@@ -5,7 +5,7 @@
 //! - **img**: the image's red, green and blue (green and blue coded against red), fetched when the imagery shows.
 //! - **nir**: the near infrared alone, coded on its own, so an infrared view needs nothing else.
 //!
-//! A cell missing a layer has no document for it. Recoding is exact: terrain and imagery were quantised when they were baked, and their coefficients are stored as they are.
+//! A cell missing a layer has no document for it; the base names each layer the cell has by its document's provenance hash (a `layers` section, `hp` values), so a reader never puts one publish's terrain or imagery under another's base. Recoding is exact: terrain and imagery were quantised when they were baked, and their coefficients are stored as they are.
 
 use std::collections::HashMap;
 
@@ -91,7 +91,33 @@ pub fn split(bytes: &[u8]) -> Result<HashMap<Layer, Vec<u8>>, String> {
             put(layer, out);
         }
     }
-    docs.into_iter().map(|(layer, b)| b.build().map(|d| (layer, d)).map_err(|e| format!("{e:?}"))).collect()
+    // The other layers first, then the base naming each by its provenance hash.
+    let mut out: HashMap<Layer, Vec<u8>> = HashMap::new();
+    let mut links = VsfSection::new("layers");
+    for layer in [Layer::Dem, Layer::Img, Layer::Nir] {
+        if let Some(b) = docs.remove(&layer) {
+            let d = b.build().map_err(|e| format!("{e:?}"))?;
+            links.add_field(layer.dir(), provenance(&d).ok_or("a layer without its provenance hash")?);
+            out.insert(layer, d);
+        }
+    }
+    let base = docs.remove(&Layer::Base).unwrap_or_default().add_section_direct(links);
+    out.insert(Layer::Base, base.build().map_err(|e| format!("{e:?}"))?);
+    Ok(out)
+}
+
+/// A document's provenance hash (`hp`), from its header.
+pub fn provenance(doc: &[u8]) -> Option<VsfType> {
+    vsf::VsfHeader::decode(doc).ok().map(|(h, _)| h.provenance_hash)
+}
+
+/// Whether a layer's document is the one its base names (a base from before links, or a base naming none for that layer, takes any).
+pub fn linked(base: &[u8], layer: Layer, doc: &[u8]) -> bool {
+    let Some(fields) = crate::section_fields(base, "layers") else { return true };
+    match fields.get(layer.dir()).and_then(|v| v.first()) {
+        Some(want) => provenance(doc).as_ref() == Some(want),
+        None => true,
+    }
 }
 
 /// A cell's planes from whichever of its published layers are at hand (the base, the terrain, the image, the infrared), merged.

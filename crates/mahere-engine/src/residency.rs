@@ -499,16 +499,32 @@ fn load_cell(store: &dyn CellStore, layers: Option<&LayerStores>, want: u8, key:
     let mut img_bytes: (Vec<u8>, Vec<u8>) = Default::default();
     let mut dem_bytes: Vec<u8> = Vec::new();
     if let Some(l) = layers {
+        use mahere_tiles::publish::Layer;
+        // A layer the base does not name (a copy kept from an older publish) is fetched again past the copy; still not the one named, the cell shows without it rather than mixing publishes.
+        let get = |store: &dyn CellStore, layer: Layer| -> Option<Vec<u8>> {
+            let b = layer_bytes(store, key, layer.dir())?;
+            if b.is_empty() || bytes.is_empty() || mahere_tiles::publish::linked(&bytes, layer, &b) {
+                return Some(b);
+            }
+            match store.refresh(key) {
+                Fetch::Bytes(fresh) if mahere_tiles::publish::linked(&bytes, layer, &fresh) => Some(fresh),
+                Fetch::Failed(_) => None,
+                _ => {
+                    eprintln!("cell {} {}: not the layer its base names", key.name(), layer.dir());
+                    Some(Vec::new())
+                }
+            }
+        };
         if want & WANT_DEM != 0 {
-            let Some(b) = layer_bytes(&*l.dem, key, "dem") else { return Loaded { key, entry: None } };
+            let Some(b) = get(&*l.dem, Layer::Dem) else { return Loaded { key, entry: None } };
             dem_bytes = b;
         }
         if want & WANT_IMG != 0 {
-            let Some(b) = layer_bytes(&*l.img, key, "img") else { return Loaded { key, entry: None } };
+            let Some(b) = get(&*l.img, Layer::Img) else { return Loaded { key, entry: None } };
             img_bytes.0 = b;
         }
         if want & WANT_NIR != 0 {
-            let Some(b) = layer_bytes(&*l.nir, key, "nir") else { return Loaded { key, entry: None } };
+            let Some(b) = get(&*l.nir, Layer::Nir) else { return Loaded { key, entry: None } };
             img_bytes.1 = b;
         }
     }

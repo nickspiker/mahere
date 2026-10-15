@@ -252,19 +252,13 @@ impl Area {
                 match (s.name.as_str(), f.name.as_str(), v) {
                     ("area", "name", Some(VsfType::x(t) | VsfType::a(t))) => name = t,
                     ("area", "created", Some(VsfType::t_i6(t))) => created = t.data.first().copied().unwrap_or(0),
-                    ("area", "created", Some(VsfType::v_i6(t))) => created = t.data.first().copied().unwrap_or(0),
                     ("area", "depth", Some(VsfType::u(d, _))) => depth = d as u8,
                     ("area", "depth", Some(VsfType::u3(d))) => depth = d,
                     ("shape", "depth", Some(VsfType::t_u3(t))) => depths = t.data,
-                    ("shape", "depth", Some(VsfType::v_u3(t))) => depths = t.data,
                     ("shape", "cell", Some(VsfType::t_u6(t))) => cells = t.data,
-                    ("shape", "cell", Some(VsfType::v_u6(t))) => cells = t.data,
                     ("shape", "cov", Some(VsfType::t_u3(t))) => cov = t.data,
-                    ("shape", "cov", Some(VsfType::v_u3(t))) => cov = t.data,
                     ("device", "fetched", Some(VsfType::t_i6(t))) => fetched_at = t.data.first().copied(),
-                    ("device", "fetched", Some(VsfType::v_i6(t))) => fetched_at = t.data.first().copied(),
                     ("device", "bytes", Some(VsfType::t_u6(t))) => fetched_bytes = t.data.first().copied(),
-                    ("device", "bytes", Some(VsfType::v_u6(t))) => fetched_bytes = t.data.first().copied(),
                     _ => {}
                 }
             }

@@ -165,7 +165,6 @@ pub fn load_settings(store: &FlatStorage) -> Option<Settings> {
     let mut ptr = 0usize;
     let d = match vsf::parse(&bytes, &mut ptr).ok()? {
         VsfType::t_u6(t) => t.data,
-        VsfType::v_u6(t) => t.data,
         _ => return None,
     };
     if d.len() < 3 {
@@ -179,8 +178,6 @@ fn tensor_f64(v: VsfType) -> Option<Vec<f64>> {
     Some(match v {
         VsfType::t_f5(t) => t.data.into_iter().map(|x| x as f64).collect(),
         VsfType::t_f6(t) => t.data,
-        VsfType::v_f5(t) => t.data.into_iter().map(|x| x as f64).collect(),
-        VsfType::v_f6(t) => t.data,
         _ => return None,
     })
 }
@@ -284,22 +281,18 @@ pub fn track_chunk(store: &FlatStorage, start: i64, chunk: u32) -> Option<Vec<Fi
         let col = |name: &str| s.fields.iter().find(|f| f.name == name).and_then(|f| f.values.first().cloned());
         let u64s = |v: Option<VsfType>| match v {
             Some(VsfType::t_u6(t)) => Some(t.data),
-            Some(VsfType::v_u6(t)) => Some(t.data),
             _ => None,
         };
         let i64s = |v: Option<VsfType>| match v {
             Some(VsfType::t_i6(t)) => Some(t.data),
-            Some(VsfType::v_i6(t)) => Some(t.data),
             _ => None,
         };
         let i32s = |v: Option<VsfType>| match v {
             Some(VsfType::t_i5(t)) => Some(t.data),
-            Some(VsfType::v_i5(t)) => Some(t.data),
             _ => None,
         };
         let u16s = |v: Option<VsfType>| match v {
             Some(VsfType::t_u4(t)) => Some(t.data),
-            Some(VsfType::v_u4(t)) => Some(t.data),
             _ => None,
         };
         let (c, t, hh, a, va, sp, b) = (u64s(col("coord"))?, i64s(col("ms"))?, i32s(col("height"))?, u16s(col("accuracy"))?, u16s(col("vaccuracy"))?, u16s(col("speed"))?, u16s(col("bearing"))?);
@@ -546,13 +539,9 @@ fn decode_cell_index(data: &[u8]) -> std::collections::HashMap<(u8, u64), (i64, 
             // A one-dimensional tensor comes back as a vector; both spellings are the same data.
             match (f.name.as_str(), f.values.into_iter().next()) {
                 ("depth", Some(VsfType::t_u3(t))) => depth = t.data,
-                ("depth", Some(VsfType::v_u3(t))) => depth = t.data,
                 ("cell", Some(VsfType::t_u6(t))) => cell = t.data,
-                ("cell", Some(VsfType::v_u6(t))) => cell = t.data,
                 ("seen", Some(VsfType::t_i6(t))) => seen = t.data,
-                ("seen", Some(VsfType::v_i6(t))) => seen = t.data,
                 ("bytes", Some(VsfType::t_u5(t))) => bytes = t.data,
-                ("bytes", Some(VsfType::v_u5(t))) => bytes = t.data,
                 _ => {}
             }
         }
@@ -904,7 +893,6 @@ pub mod themes {
     fn bytes_of(v: &VsfType) -> Option<Vec<u8>> {
         match v {
             VsfType::t_u3(t) => Some(t.data.clone()),
-            VsfType::v_u3(t) => Some(t.data.clone()),
             _ => None,
         }
     }
@@ -912,9 +900,7 @@ pub mod themes {
     fn floats_of(v: &VsfType) -> Option<Vec<f32>> {
         match v {
             VsfType::t_f5(t) => Some(t.data.clone()),
-            VsfType::v_f5(t) => Some(t.data.clone()),
             VsfType::t_f6(t) => Some(t.data.iter().map(|&x| x as f32).collect()),
-            VsfType::v_f6(t) => Some(t.data.iter().map(|&x| x as f32).collect()),
             _ => None,
         }
     }

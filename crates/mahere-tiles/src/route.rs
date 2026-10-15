@@ -108,7 +108,6 @@ impl RouteCell {
         let u8s = |name: &str| -> Vec<u8> {
             match first(name) {
                 Some(VsfType::t_u3(t)) => t.data.clone(),
-                Some(VsfType::v_u3(t)) => t.data.clone(),
                 _ => Vec::new(),
             }
         };
@@ -116,13 +115,11 @@ impl RouteCell {
         let u32s = |name: &str| -> Vec<u32> {
             match first(name) {
                 Some(VsfType::t_u5(t)) => t.data.clone(),
-                Some(VsfType::v_u5(t)) => t.data.clone(),
                 _ => Vec::new(),
             }
         };
         let osm: Vec<i64> = match first("osm")? {
             VsfType::t_u6(t) => t.data.iter().map(|&v| v as i64).collect(),
-            VsfType::v_u6(t) => t.data.iter().map(|&v| v as i64).collect(),
             _ => return None,
         };
         let n = osm.len();

@@ -52,6 +52,11 @@ fn main() {
         if check > 0 && i % check == 0 {
             let get = |l: Layer| layers.get(&l).map(|v| v.as_slice());
             let new = decode_layers(get(Layer::Base), get(Layer::Dem), get(Layer::Img), get(Layer::Nir)).expect("published cell decodes");
+            for l in [Layer::Dem, Layer::Img, Layer::Nir] {
+                if let (Some(b), Some(d)) = (get(Layer::Base), get(l)) {
+                    assert!(mahere_tiles::publish::linked(b, l, d), "{}: the base does not name its {}", key.name(), l.dir());
+                }
+            }
             let old = mahere_tiles::decode_cell(&bytes).expect("baked cell decodes");
             let diff = differs(&old, &new);
             assert!(diff.is_empty(), "{}: published cell differs from its bake in {}", key.name(), diff.join(", "));
@@ -70,10 +75,6 @@ fn main() {
                     let _ = std::fs::remove_file(&p);
                 }
             }
-        }
-        // A cell with no base (imagery alone) still marks itself done.
-        if !layers.contains_key(&Layer::Base) {
-            std::fs::write(&base_path, []).unwrap();
         }
         let n = done.fetch_add(1, Ordering::Relaxed) + 1;
         if n % 20000 == 0 {
