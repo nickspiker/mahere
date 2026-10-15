@@ -304,6 +304,8 @@ pub struct MapCore {
     light_version: u64,
     /// Measure from the fix rather than the screen centre, until the camera moves.
     pub lock_to_fix: bool,
+    /// A tap measures (the ruler: a line from the origin, its distance and profile); off, a tap only tells what is there (Nick 2026-10-14: a plain tap shows info, not the distance line).
+    pub ruler: bool,
     /// The user's own layer: ink and selection (see `ink`), what a touch does, the pen and its width in pixels.
     pub user: ink::UserLayer,
     pub tool: ink::Tool,
@@ -397,6 +399,7 @@ impl MapCore {
             style_version: 0,
             light_version: 0,
             lock_to_fix: false,
+            ruler: false,
             user: ink::UserLayer::default(),
             tool: ink::Tool::None,
             pen: 0,
@@ -1773,6 +1776,10 @@ pub struct MeasureView {
     pub profile: Vec<f32>,
     /// What is at the target, a line each: the road, trail or boundary under the finger, motor vehicle use, who manages the land, the ground, and the elevation with its slope and the way it faces.
     pub info: Vec<String>,
+    /// A ruler's measurement (line, distance, profile) or only a tap's card.
+    pub ruler: bool,
+    /// The target, latitude and longitude.
+    pub target: (f64, f64),
 }
 
 impl MapCore {
@@ -2007,8 +2014,9 @@ impl MapCore {
         let m = self.measure?;
         let (olat, olon) = self.measure_origin(w, h)?;
         let (tlat, tlon) = m.target;
-        let (ox, oy) = self.cam.geo_to_screen(olat, olon, w, h);
         let (tx, ty) = self.cam.geo_to_screen(tlat, tlon, w, h);
+        // Without the ruler the line folds onto the target: only its mark shows.
+        let (ox, oy) = if self.ruler { self.cam.geo_to_screen(olat, olon, w, h) } else { (tx, ty) };
         // Flat-earth over the span a screen can show: metres east and north.
         let m_lat = 111_320.0;
         let m_lon = 111_320.0 * ((olat + tlat) * 0.5).to_radians().cos();
@@ -2031,6 +2039,8 @@ impl MapCore {
             elev_target: self.elevation_at(tlat, tlon),
             profile,
             info: self.tap_info.clone(),
+            ruler: self.ruler,
+            target: m.target,
         })
     }
 

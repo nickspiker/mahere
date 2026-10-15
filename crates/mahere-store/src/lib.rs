@@ -144,6 +144,8 @@ pub struct Settings {
     pub auto_update: bool,
     /// A track is being recorded, the screen on or off.
     pub record: bool,
+    /// A tap measures (the ruler) rather than only telling what is there.
+    pub ruler: bool,
 }
 
 fn settings_key() -> String {
@@ -151,7 +153,7 @@ fn settings_key() -> String {
 }
 
 pub fn save_settings(store: &FlatStorage, s: &Settings) -> Result<(), StorageError> {
-    let flags = (s.real_sun as u64) | (s.follow_heading as u64) << 1 | (s.lock_to_fix as u64) << 2 | (!s.compressed as u64) << 3 | (s.real_light as u64) << 4;
+    let flags = (s.real_sun as u64) | (s.follow_heading as u64) << 1 | (s.lock_to_fix as u64) << 2 | (!s.compressed as u64) << 3 | (s.real_light as u64) << 4 | (s.ruler as u64) << 5;
     // The pen's colour is stored one more than its packed RGBA, so 0 says there is none.
     let pen = s.pen_rgba.map_or(0, |c| u32::from_be_bytes(c) as u64 + 1);
     let t = VsfType::t_u6(Tensor::new(vec![10], vec![s.cache_budget, s.layer_bits, flags, s.theme, (s.ui_ru * 1000.0).round() as u64, s.tool as u64, pen, s.travel as u64, !s.auto_update as u64, s.record as u64]));
@@ -169,7 +171,7 @@ pub fn load_settings(store: &FlatStorage) -> Option<Settings> {
     if d.len() < 3 {
         return None;
     }
-    Some(Settings { cache_budget: d[0], layer_bits: d[1], real_sun: d[2] & 1 != 0, follow_heading: d[2] & 2 != 0, lock_to_fix: d[2] & 4 != 0, theme: d.get(3).copied().unwrap_or(0), compressed: d[2] & 8 == 0, real_light: d[2] & 16 != 0, ui_ru: d.get(4).map_or(1.0, |&v| v as f32 / 1000.0), tool: d.get(5).map_or(0, |&v| v.min(2) as u8), pen_rgba: d.get(6).filter(|&&v| v != 0).map(|&v| ((v - 1) as u32).to_be_bytes()), travel: d.get(7).map_or(0, |&v| v.min(3) as u8), auto_update: d.get(8).is_none_or(|&v| v == 0), record: d.get(9).is_some_and(|&v| v != 0) })
+    Some(Settings { cache_budget: d[0], layer_bits: d[1], real_sun: d[2] & 1 != 0, follow_heading: d[2] & 2 != 0, lock_to_fix: d[2] & 4 != 0, theme: d.get(3).copied().unwrap_or(0), compressed: d[2] & 8 == 0, real_light: d[2] & 16 != 0, ui_ru: d.get(4).map_or(1.0, |&v| v as f32 / 1000.0), tool: d.get(5).map_or(0, |&v| v.min(2) as u8), pen_rgba: d.get(6).filter(|&&v| v != 0).map(|&v| ((v - 1) as u32).to_be_bytes()), travel: d.get(7).map_or(0, |&v| v.min(3) as u8), auto_update: d.get(8).is_none_or(|&v| v == 0), record: d.get(9).is_some_and(|&v| v != 0), ruler: d[2] & 32 != 0 })
 }
 
 /// Width-agnostic float-array read, per VSF doctrine.

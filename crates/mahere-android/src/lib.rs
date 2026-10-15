@@ -140,7 +140,7 @@ fn free_bytes(dir: &str) -> Option<u64> {
 
 impl AndroidApp {
     fn controls(&self) -> Controls {
-        Controls { real_sun: self.map.real_sun, real_light: self.map.real_light, follow_heading: self.map.follow_heading, lock_to_fix: self.map.lock_to_fix, cache_budget: self.cache_budget, theme: self.map.theme, compressed: self.map.compressed(), tool: self.map.tool as u8, pen_rgba: self.map.pen_colour, travel: travel_code(self.map.travel), record: self.recording, clear_ink: false, clear_sel: false, locate: false }
+        Controls { real_sun: self.map.real_sun, real_light: self.map.real_light, follow_heading: self.map.follow_heading, lock_to_fix: self.map.lock_to_fix, cache_budget: self.cache_budget, theme: self.map.theme, compressed: self.map.compressed(), tool: self.map.tool as u8, pen_rgba: self.map.pen_colour, travel: travel_code(self.map.travel), record: self.recording, clear_ink: false, clear_sel: false, locate: false, ruler: self.map.ruler }
     }
 
     /// A pinch with the panel open: the finger distance's ratio to the last event's scales the UI.
@@ -240,6 +240,7 @@ impl AndroidApp {
         if ctl.clear_sel {
             self.map.clear_selection();
         }
+        self.map.ruler = ctl.ruler;
         if ctl.locate {
             self.map.locate(self.w, self.h);
         }
@@ -348,7 +349,7 @@ impl AndroidApp {
 
     fn save_settings(&self) {
         if let Some(store) = &self.store {
-            let s = mahere_store::Settings { cache_budget: self.cache_budget, layer_bits: self.map.layers().bits() as u64, real_sun: self.map.real_sun, real_light: self.map.real_light, follow_heading: self.map.follow_heading, lock_to_fix: self.map.lock_to_fix, theme: self.map.theme as u64, compressed: self.map.compressed(), ui_ru: self.ui_ru, tool: self.map.tool as u8, pen_rgba: Some(self.map.pen_colour), travel: travel_code(self.map.travel), auto_update: self.updater.auto, record: self.recording };
+            let s = mahere_store::Settings { cache_budget: self.cache_budget, layer_bits: self.map.layers().bits() as u64, real_sun: self.map.real_sun, real_light: self.map.real_light, follow_heading: self.map.follow_heading, lock_to_fix: self.map.lock_to_fix, theme: self.map.theme as u64, compressed: self.map.compressed(), ui_ru: self.ui_ru, tool: self.map.tool as u8, pen_rgba: Some(self.map.pen_colour), travel: travel_code(self.map.travel), auto_update: self.updater.auto, record: self.recording, ruler: self.map.ruler };
             self.persist.settings(store.clone(), s);
         }
     }
@@ -678,6 +679,7 @@ pub extern "system" fn Java_nz_mahere_app_MahereActivity_nativeInit(
         map.set_compressed(s.compressed);
         map.set_follow_heading(s.follow_heading);
         map.set_lock_to_fix(s.lock_to_fix);
+        map.ruler = s.ruler;
         map.set_tool(match s.tool {
             1 => mahere_engine::ink::Tool::Pen,
             2 => mahere_engine::ink::Tool::Select,

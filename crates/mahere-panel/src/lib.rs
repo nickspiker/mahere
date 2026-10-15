@@ -47,6 +47,64 @@ pub struct Controls {
     pub clear_sel: bool,
     /// One-shot: the locate button was tapped, centre on the fix.
     pub locate: bool,
+    /// A tap measures (the ruler) rather than only telling what is there.
+    pub ruler: bool,
+}
+
+/// What the toolbox offers (Nick 2026-10-14: a popup toolbox for ruler, nav, info and the rest, so a plain tap just shows info): the tool a tap or a touch is for, and the pen's and the clears' one-shots.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Pick {
+    Info,
+    Ruler,
+    Drive,
+    Ride,
+    Walk,
+    Pen,
+    Select,
+    PenColour,
+    ClearInk,
+    ClearSel,
+}
+
+impl Pick {
+    fn word(self) -> &'static str {
+        match self {
+            Pick::Info => "Info",
+            Pick::Ruler => "Ruler",
+            Pick::Drive => "Drive",
+            Pick::Ride => "Ride",
+            Pick::Walk => "Walk",
+            Pick::Pen => "Pen",
+            Pick::Select => "Select",
+            Pick::PenColour => "Pen colour",
+            Pick::ClearInk => "Clear ink",
+            Pick::ClearSel => "Clear selection",
+        }
+    }
+
+    /// The tool the controls have on.
+    fn current(ctl: &Controls) -> Pick {
+        match (ctl.tool, ctl.travel, ctl.ruler) {
+            (1, _, _) => Pick::Pen,
+            (2, _, _) => Pick::Select,
+            (_, 1, _) => Pick::Drive,
+            (_, 2, _) => Pick::Ride,
+            (_, 3, _) => Pick::Walk,
+            (_, _, true) => Pick::Ruler,
+            _ => Pick::Info,
+        }
+    }
+
+    /// The toolbox's list for these controls: the tools, then the pen's colour and the clears beside the tool they belong to.
+    fn list(ctl: &Controls) -> Vec<Pick> {
+        let mut v = vec![Pick::Info, Pick::Ruler, Pick::Drive, Pick::Ride, Pick::Walk, Pick::Pen, Pick::Select];
+        match Pick::current(ctl) {
+            Pick::Pen => v.extend([Pick::PenColour, Pick::ClearInk]),
+            Pick::Select => v.push(Pick::ClearSel),
+            _ => {}
+        }
+        v
+    }
 }
 
 /// What the readouts show.
@@ -93,25 +151,15 @@ enum Layer {
     Infrared,
     Imagery,
     Debug,
-    /// The tools: the pen and the selection as a touch's job, the pen's next colour, and the two clears.
-    Pen,
-    Select,
-    PenColour,
-    ClearInk,
-    ClearSel,
     /// The areas page: saved selections, downloaded and shared.
     Areas,
     /// The updates page.
     Updates,
     /// Recording a track, the screen on or off.
     Record,
-    /// Navigation: a tap routes there by car, by bike or on foot (one at a time).
-    Drive,
-    Ride,
-    Walk,
 }
 
-const LAYERS: [(Layer, &str); 31] = [
+const LAYERS: [(Layer, &str); 23] = [
     (Layer::Dem, "Terrain"),
     (Layer::Hypso, "Elevation tint"),
     (Layer::Raw, "Raw elevation"),
@@ -133,14 +181,6 @@ const LAYERS: [(Layer, &str); 31] = [
     (Layer::FollowHeading, "Follow heading"),
     (Layer::LockToFix, "Measure from me"),
     (Layer::Record, "Record track"),
-    (Layer::Drive, "Navigate by car"),
-    (Layer::Ride, "Navigate by bike"),
-    (Layer::Walk, "Navigate on foot"),
-    (Layer::Pen, "Pen"),
-    (Layer::PenColour, "Pen colour"),
-    (Layer::Select, "Select area"),
-    (Layer::ClearInk, "Clear ink"),
-    (Layer::ClearSel, "Clear selection"),
     (Layer::Areas, "Areas  \u{203a}"),
     (Layer::Updates, "Updates  \u{203a}"),
 ];
@@ -150,7 +190,7 @@ fn inert(mask: &LayerMask, ctl: &Controls, l: Layer) -> bool {
     match l {
         Layer::RealSun => ctl.real_light,
         Layer::RealLight => ctl.real_sun,
-        Layer::Linear | Layer::FollowHeading | Layer::LockToFix | Layer::Record | Layer::Pen | Layer::Select | Layer::PenColour | Layer::ClearInk | Layer::ClearSel | Layer::Areas | Layer::Updates | Layer::Drive | Layer::Ride | Layer::Walk => false,
+        Layer::Linear | Layer::FollowHeading | Layer::LockToFix | Layer::Record | Layer::Areas | Layer::Updates => false,
         _ => get(&mask.inert(), &Controls::default(), l),
     }
 }
@@ -177,13 +217,8 @@ fn get(mask: &LayerMask, ctl: &Controls, l: Layer) -> bool {
         Layer::Infrared => mask.infrared,
         Layer::Imagery => mask.imagery,
         Layer::Debug => mask.debug,
-        Layer::Pen => ctl.tool == 1,
-        Layer::Select => ctl.tool == 2,
         Layer::Record => ctl.record,
-        Layer::Drive => ctl.travel == 1,
-        Layer::Ride => ctl.travel == 2,
-        Layer::Walk => ctl.travel == 3,
-        Layer::PenColour | Layer::ClearInk | Layer::ClearSel | Layer::Areas | Layer::Updates => false,
+        Layer::Areas | Layer::Updates => false,
     }
 }
 
@@ -209,15 +244,8 @@ fn set(mask: &mut LayerMask, ctl: &mut Controls, l: Layer, v: bool) {
         Layer::Infrared => mask.infrared = v,
         Layer::Imagery => mask.imagery = v,
         Layer::Debug => mask.debug = v,
-        Layer::Pen => ctl.tool = if v { 1 } else { 0 },
-        Layer::Select => ctl.tool = if v { 2 } else { 0 },
         Layer::Record => ctl.record = v,
-        Layer::Drive => ctl.travel = if v { 1 } else { 0 },
-        Layer::Ride => ctl.travel = if v { 2 } else { 0 },
-        Layer::Walk => ctl.travel = if v { 3 } else { 0 },
-        Layer::PenColour | Layer::Areas | Layer::Updates => {}
-        Layer::ClearInk => ctl.clear_ink = true,
-        Layer::ClearSel => ctl.clear_sel = true,
+        Layer::Areas | Layer::Updates => {}
     }
 }
 
@@ -417,6 +445,10 @@ pub struct Panel {
     orb_scaled: (usize, Vec<u32>),
     /// The locate button as last painted (centre, radius), for its tap.
     locate_btn: Option<(f32, f32, f32)>,
+    /// The toolbox: its button as last painted (left, top, width, height), whether its list is up, and the list's rows.
+    tool_btn: Option<(f32, f32, f32, f32)>,
+    toolbox_open: bool,
+    tool_rows: Vec<((f32, f32, f32, f32), Pick)>,
 }
 
 impl Default for Panel {
@@ -429,7 +461,7 @@ impl Panel {
     pub fn new() -> Panel {
         let mut hits: HitId = HIT_NONE;
         let checks = LAYERS.iter().map(|&(l, label)| (l, Checkbox::new(&mut hits, label, 0.0, 0.0, 10.0, 10.0, 10.0, false))).collect();
-        Panel { open: false, dirty: true, ru: 1.0, stack: vec![Page::Layers], theme_rows: Vec::new(), edit_rows: Vec::new(), edit_scroll: 0.0, edit_extent: 0.0, press: None, sliders: Vec::new(), field_vals: [0.0; 4], held: None, edits: Vec::new(), hits, checks, text: TextRenderer::new(), buf: Vec::new(), w: 0, h: 0, font: 16.0, gear: (0.0, 0.0, 0.0), panel_w: 0.0, theme_row: (0.0, 0.0, 0.0), slider: (0.0, 0.0, 0.0), slider_held: false, cache_max: CACHE_MIN + 1, strip_close: None, clear_measure: false, area_rows: Vec::new(), area_acts: Vec::new(), areas: AreasView::default(), update_rows: Vec::new(), update_acts: Vec::new(), updates: UpdatesView::default(), host_orb: None, layers_scroll: 0.0, layers_extent: 0.0, layers_press: None, layers_band: (0.0, 0.0), orb_icon: fluor::host::icon::Icon::from_vsf_bytes(APP_ORB_VSF).ok(), orb_scaled: (0, Vec::new()), locate_btn: None }
+        Panel { open: false, dirty: true, ru: 1.0, stack: vec![Page::Layers], theme_rows: Vec::new(), edit_rows: Vec::new(), edit_scroll: 0.0, edit_extent: 0.0, press: None, sliders: Vec::new(), field_vals: [0.0; 4], held: None, edits: Vec::new(), hits, checks, text: TextRenderer::new(), buf: Vec::new(), w: 0, h: 0, font: 16.0, gear: (0.0, 0.0, 0.0), panel_w: 0.0, theme_row: (0.0, 0.0, 0.0), slider: (0.0, 0.0, 0.0), slider_held: false, cache_max: CACHE_MIN + 1, strip_close: None, clear_measure: false, area_rows: Vec::new(), area_acts: Vec::new(), areas: AreasView::default(), update_rows: Vec::new(), update_acts: Vec::new(), updates: UpdatesView::default(), host_orb: None, layers_scroll: 0.0, layers_extent: 0.0, layers_press: None, layers_band: (0.0, 0.0), orb_icon: fluor::host::icon::Icon::from_vsf_bytes(APP_ORB_VSF).ok(), orb_scaled: (0, Vec::new()), locate_btn: None, tool_btn: None, toolbox_open: false, tool_rows: Vec::new() }
     }
 
     pub fn is_open(&self) -> bool {
@@ -602,6 +634,37 @@ impl Panel {
         0.0
     }
 
+    /// Open the toolbox's list, as a tap on its button does (for a check that renders it).
+    pub fn show_toolbox(&mut self) {
+        self.toolbox_open = true;
+        self.dirty = true;
+    }
+
+    /// A toolbox pick into the controls: one tool at a time (a tap's info, the ruler, a way to travel, the pen, the selection), or a one-shot.
+    fn pick(&mut self, p: Pick, ctl: &mut Controls) {
+        let tool = |ctl: &mut Controls, tool: u8, travel: u8, ruler: bool| {
+            ctl.tool = tool;
+            ctl.travel = travel;
+            ctl.ruler = ruler;
+        };
+        match p {
+            Pick::Info => tool(ctl, 0, 0, false),
+            Pick::Ruler => tool(ctl, 0, 0, true),
+            Pick::Drive => tool(ctl, 0, 1, false),
+            Pick::Ride => tool(ctl, 0, 2, false),
+            Pick::Walk => tool(ctl, 0, 3, false),
+            Pick::Pen => tool(ctl, 1, 0, false),
+            Pick::Select => tool(ctl, 2, 0, false),
+            Pick::PenColour => {
+                self.open = true;
+                let rgba = ctl.pen_rgba;
+                self.open_pen(rgba);
+            }
+            Pick::ClearInk => ctl.clear_ink = true,
+            Pick::ClearSel => ctl.clear_sel = true,
+        }
+    }
+
     /// Whether a tap's height is on a page's title row ("‹  Title" goes back, Nick 2026-10-14: the pen and field pages had no way back but the phone's own).
     fn on_title(&self, y: f32) -> bool {
         let ty = self.gear.1 + self.gear.2 + self.font * 0.9 + self.font * 0.8;
@@ -703,12 +766,10 @@ impl Panel {
         let top = theme_y + row * 0.8;
         let mut last = top;
         for (i, (l, cb)) in self.checks.iter_mut().enumerate() {
-            // The modes sit a little apart from the layers, navigation a little apart from the modes, the tools from navigation.
+            // The modes sit a little apart from the layers, the pages from the modes.
             let gap = match l {
                 Layer::RealSun | Layer::RealLight | Layer::Linear | Layer::FollowHeading | Layer::LockToFix | Layer::Record => row * 0.5,
-                Layer::Drive | Layer::Ride | Layer::Walk => row,
-                Layer::Pen | Layer::PenColour | Layer::Select | Layer::ClearInk | Layer::ClearSel => row * 1.5,
-                Layer::Areas | Layer::Updates => row * 2.0,
+                Layer::Areas | Layer::Updates => row,
                 _ => 0.0,
             };
             let cy = top + row * (i as f32 + 0.5) + gap;
@@ -743,11 +804,6 @@ impl Panel {
         }
         for (l, cb) in &mut self.checks {
             if cb.bbox().contains(x, y) {
-                if *l == Layer::PenColour {
-                    let rgba = ctl.pen_rgba;
-                    self.open_pen(rgba);
-                    return false;
-                }
                 if *l == Layer::Areas {
                     self.stack.push(Page::Areas);
                     self.dirty = true;
@@ -776,6 +832,21 @@ impl Panel {
     /// A tap at screen (x, y): true if the panel took it. The orb toggles the panel; a row flips its layer in `mask`.
     pub fn tap(&mut self, x: f32, y: f32, w: usize, h: usize, mask: &mut LayerMask, ctl: &mut Controls, _themes: &[Theme]) -> bool {
         self.layout(w, h);
+        let inside = |r: (f32, f32, f32, f32)| x >= r.0 && x <= r.0 + r.2 && y >= r.1 && y <= r.1 + r.3;
+        // The toolbox's list takes the next tap: a row picks, anywhere else only closes it.
+        if self.toolbox_open {
+            self.toolbox_open = false;
+            self.dirty = true;
+            if let Some(&(_, pick)) = self.tool_rows.iter().find(|(r, _)| inside(*r)) {
+                self.pick(pick, ctl);
+            }
+            return true;
+        }
+        if self.tool_btn.is_some_and(inside) {
+            self.toolbox_open = true;
+            self.dirty = true;
+            return true;
+        }
         if let Some((cx, cy, cr)) = self.strip_close {
             if (x - cx).powi(2) + (y - cy).powi(2) <= (cr * 1.4).powi(2) {
                 self.clear_measure = true;
@@ -1034,6 +1105,25 @@ impl Panel {
         let (bx, by) = (w as f32 - br - font * 0.6, bottom - br - font * 0.6);
         Self::paint_locate(&mut canvas, bx, by, br, r.has_fix);
         self.locate_btn = Some((bx, by, br));
+        // The toolbox, left of the locate button: the tool on, and its list above when open.
+        let (tw, th) = (font * 5.2, font * 1.5);
+        let btn = (bx - br - font * 0.5 - tw, by - th * 0.5, tw, th);
+        self.tool_btn = Some(btn);
+        self.tool_rows.clear();
+        let current = Pick::current(&ctl);
+        if self.toolbox_open {
+            let rows = Pick::list(&ctl);
+            let (rw, rh, gap) = (font * 7.0, font * 1.45, font * 0.2);
+            let rx = btn.0 + btn.2 - rw;
+            let mut ry = btn.1 - gap - rh;
+            for p in rows.into_iter().rev() {
+                let rect = (rx, ry, rw, rh);
+                Self::paint_pill(&mut canvas, &mut self.text, rect, p.word(), p == current, font);
+                self.tool_rows.push((rect, p));
+                ry -= rh + gap;
+            }
+        }
+        Self::paint_pill(&mut canvas, &mut self.text, btn, current.word(), current != Pick::Info, font);
         if !self.open {
             // The scale bar, bottom left; the open panel shows the scale itself.
             Self::paint_scale(&mut canvas, &mut self.text, font, font * 0.8, bottom - font * 0.8, r.m_per_px, (w as f32 * 0.3).min(font * 10.0));
@@ -1140,11 +1230,6 @@ impl Panel {
                 paint::fill_rect(&mut canvas, b.x as isize, b.y as isize, b.w as isize, b.h as isize, PANEL_DIM, clip, None);
             }
             cb.render_content_into(&mut canvas, &mut self.text, clip, None);
-            // The pen colour row shows the colour it opens, at its opacity, at the row's right end.
-            if *l == Layer::PenColour {
-                let side = b.h * 0.7;
-                paint::fill_rect(&mut canvas, (b.x + b.w - side - font * 0.6) as isize, (b.y + (b.h - side) * 0.5) as isize, side as isize, side as isize, pen_swatch(ctl.pen_rgba), clip, None);
-            }
         }
         paint::fill_rect(&mut canvas, 0, 0, self.panel_w as isize, h as isize, PANEL_BG, None, None);
         &self.buf
@@ -1225,6 +1310,10 @@ impl Panel {
     /// Returns the close button's centre and radius.
     /// The measurement strip's height: what is at the point, a line each, above the distance and the profile.
     fn strip_band(font: f32, m: &MeasureView) -> f32 {
+        if !m.ruler {
+            // The card: what is there, a line each, and where.
+            return font * 2.2 + (m.info.len() + 1) as f32 * font * 1.05;
+        }
         font * 6.5 + m.info.len() as f32 * font * 1.05
     }
 
@@ -1261,6 +1350,18 @@ impl Panel {
         paint::fill_rect(canvas, xi - 2, yi - tick - 2, pi + 4, tick + ti / 2 + 4, GEAR_BG, None, None);
     }
 
+    /// A rounded button with its word centred, lit when it is the one on; text first, then the body under it.
+    fn paint_pill(canvas: &mut Canvas, text: &mut TextRenderer, r: (f32, f32, f32, f32), word: &str, lit: bool, font: f32) {
+        let (x, y, w, h) = r;
+        let ink = if lit { theme::TEXTBOX_TEXT } else { READOUT };
+        text.draw_text_center(canvas, word, x + w * 0.5, y + h * 0.5, &TextStyle::new(font * 0.8, ink), None, None);
+        let rad = (h * 0.5) as isize;
+        let bg = if lit { SLIDER_USED } else { GEAR_BG };
+        paint::fill_rect(canvas, (x + h * 0.5) as isize, y as isize, (w - h) as isize, h as isize, bg, None, None);
+        paint::circle_filled(canvas, (x + h * 0.5) as isize, (y + h * 0.5) as isize, rad, bg, None, None);
+        paint::circle_filled(canvas, (x + w - h * 0.5) as isize, (y + h * 0.5) as isize, rad, bg, None, None);
+    }
+
     /// The locate button: a crosshair (four arms and a dot) on the gear's dark disc, dim without a fix.
     fn paint_locate(canvas: &mut Canvas, x: f32, y: f32, r: f32, live: bool) {
         let ink = if live { theme::TEXTBOX_TEXT } else { READOUT_DIM };
@@ -1288,6 +1389,14 @@ impl Panel {
         let point = TextStyle::new(font * 0.9, theme::TEXTBOX_TEXT);
         for (k, line) in m.info.iter().enumerate() {
             text.draw_text_left(canvas, line, margin, strip_top + font * 0.9 + k as f32 * font * 1.05, &point, None, None);
+        }
+        if !m.ruler {
+            // A tap's card (Nick 2026-10-14: a little info at the bottom per tap): the lines, then the place in degrees.
+            let (lat, lon) = m.target;
+            let at = format!("{:.5}\u{b0} {}  {:.5}\u{b0} {}", lat.abs(), if lat >= 0.0 { "N" } else { "S" }, lon.abs(), if lon >= 0.0 { "E" } else { "W" });
+            text.draw_text_left(canvas, &at, margin, strip_top + font * 0.9 + m.info.len() as f32 * font * 1.05, &TextStyle::new(font * 0.8, READOUT), None, None);
+            paint::fill_rect(canvas, 0, strip_top as isize, w as isize, band as isize, PANEL_BG, None, None);
+            return (cx, cy, cr);
         }
         let top = strip_top + info_h;
         let (lo, hi) = m.profile.iter().filter(|e| !e.is_nan()).fold((f32::MAX, f32::MIN), |(a, b), &e| (a.min(e), b.max(e)));

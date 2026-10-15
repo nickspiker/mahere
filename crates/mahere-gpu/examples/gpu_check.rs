@@ -128,6 +128,10 @@ fn main() {
     let panel_mode = std::env::var("MAHERE_PANEL").unwrap_or_default();
     if panel_mode == "1" || panel_mode == "closed" || panel_mode == "themes" || panel_mode == "pen" || panel_mode == "areas" || panel_mode == "area" || panel_mode == "updates" {
         let mut panel = mahere_panel::Panel::new();
+        // MAHERE_TOOLBOX=1 shows the toolbox's list open.
+        if std::env::var_os("MAHERE_TOOLBOX").is_some() {
+            panel.show_toolbox();
+        }
         panel.set_open(panel_mode != "closed");
         if panel_mode == "themes" {
             panel.show_themes();
