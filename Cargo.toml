@@ -20,19 +20,19 @@ edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/nickspiker/mahere"
 
-# fluor's dev tree declares vsf as a sibling path dep (../vsf), which a git checkout of fluor doesn't contain — point it at the pushed vsf repo. fluor is on vsf 0.10 with mahere's own crates; kete, manifestus and tohu stay on vsf 0.9 (format v9) until they move, the two built side by side and never handing a VSF value to each other (bytes and strings only cross).
+# fluor's dev tree declares vsf as a sibling path dep (../vsf), which a git checkout of fluor doesn't contain — point it at the pushed vsf repo. Every one of them and mahere's own crates on the one vsf 0.10.
 [patch."https://github.com/nickspiker/fluor"]
 vsf = { git = "https://github.com/nickspiker/vsf", rev = "a73e319fb96d8298cbb2fab4d0df1c391dee5637" }
 
 # kete (and its manifestus/tohu deps) declare sibling path deps like fluor does — redirect each git source's path deps to the pushed repos, all vsf references unified on one rev.
 [patch."https://github.com/nickspiker/kete"]
-manifestus = { git = "https://github.com/nickspiker/manifestus", rev = "d4aed47f415e7b56dbd6c1a2ff4efcb4cf8e1239" }
-tohu = { git = "https://github.com/nickspiker/tohu", rev = "a0b6b0af38b8967cc436f618e5cf0edbac968bda" }
-vsf = { git = "https://github.com/nickspiker/vsf", rev = "5f2bb06c8d96ee417a2571944882ef36d6c9ca8f" }
+manifestus = { git = "https://github.com/nickspiker/manifestus", rev = "97432dd007bbf425c599af419443bd82c26740d7" }
+tohu = { git = "https://github.com/nickspiker/tohu", rev = "65d55b990cc2957fe9cf5595211319a3c629692a" }
+vsf = { git = "https://github.com/nickspiker/vsf", rev = "a73e319fb96d8298cbb2fab4d0df1c391dee5637" }
 
 [patch."https://github.com/nickspiker/manifestus"]
-vsf = { git = "https://github.com/nickspiker/vsf", rev = "5f2bb06c8d96ee417a2571944882ef36d6c9ca8f" }
+vsf = { git = "https://github.com/nickspiker/vsf", rev = "a73e319fb96d8298cbb2fab4d0df1c391dee5637" }
 
 [patch."https://github.com/nickspiker/tohu"]
 ihi = { git = "https://github.com/nickspiker/ihi", rev = "ac72c54f60662406a7c1de19d49354566d48beac" }
-vsf = { git = "https://github.com/nickspiker/vsf", rev = "5f2bb06c8d96ee417a2571944882ef36d6c9ca8f" }
+vsf = { git = "https://github.com/nickspiker/vsf", rev = "a73e319fb96d8298cbb2fab4d0df1c391dee5637" }

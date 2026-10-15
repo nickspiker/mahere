@@ -1147,7 +1147,7 @@ dependencies = [
  "softbuffer",
  "swash",
  "unicode-script",
- "vsf 0.10.0",
+ "vsf",
  "wgpu",
  "wide",
  "windows 0.58.0",
@@ -1757,7 +1757,7 @@ dependencies = [
 [[package]]
 name = "kete"
 version = "0.0.2"
-source = "git+https://github.com/nickspiker/kete?rev=47b43716cc9342d7b00dd03dd9edf011185b532e#47b43716cc9342d7b00dd03dd9edf011185b532e"
+source = "git+https://github.com/nickspiker/kete?rev=b9e78e963b038fc9b53baeccff0ecaf9a14be719#b9e78e963b038fc9b53baeccff0ecaf9a14be719"
 dependencies = [
  "blake3",
  "chacha20poly1305 0.11.0",
@@ -1766,7 +1766,7 @@ dependencies = [
  "manifestus",
  "rand",
  "tohu",
- "vsf 0.9.3",
+ "vsf",
 ]
 
 [[package]]
@@ -1932,7 +1932,7 @@ dependencies = [
  "las",
  "rayon",
  "tiff",
- "vsf 0.10.0",
+ "vsf",
 ]
 
 [[package]]
@@ -1944,7 +1944,7 @@ dependencies = [
  "rayon",
  "rustc-hash 2.1.3",
  "ureq",
- "vsf 0.10.0",
+ "vsf",
 ]
 
 [[package]]
@@ -1968,7 +1968,7 @@ dependencies = [
  "mahere-coord",
  "osmpbf",
  "shapefile",
- "vsf 0.10.0",
+ "vsf",
 ]
 
 [[package]]
@@ -1978,7 +1978,7 @@ dependencies = [
  "fluor",
  "mahere-engine",
  "mahere-tiles",
- "vsf 0.10.0",
+ "vsf",
 ]
 
 [[package]]
@@ -1991,7 +1991,7 @@ dependencies = [
  "mahere-engine",
  "mahere-tiles",
  "rand",
- "vsf 0.10.0",
+ "vsf",
  "zstd",
 ]
 
@@ -2005,7 +2005,7 @@ dependencies = [
  "png",
  "rayon",
  "ureq",
- "vsf 0.10.0",
+ "vsf",
  "zstd",
 ]
 
@@ -2016,7 +2016,7 @@ dependencies = [
  "blake3",
  "ed25519-dalek",
  "ureq",
- "vsf 0.10.0",
+ "vsf",
 ]
 
 [[package]]
@@ -2031,12 +2031,12 @@ dependencies = [
 [[package]]
 name = "manifestus"
 version = "0.0.2"
-source = "git+https://github.com/nickspiker/manifestus?rev=d4aed47f415e7b56dbd6c1a2ff4efcb4cf8e1239#d4aed47f415e7b56dbd6c1a2ff4efcb4cf8e1239"
+source = "git+https://github.com/nickspiker/manifestus?rev=97432dd007bbf425c599af419443bd82c26740d7#97432dd007bbf425c599af419443bd82c26740d7"
 dependencies = [
  "blake3",
  "hashbrown 0.15.5",
  "libc",
- "vsf 0.9.3",
+ "vsf",
 ]
 
 [[package]]
@@ -3810,7 +3810,7 @@ checksum = "c7c4ceeeca15c8384bbc3e011dbd8fccb7f068a440b752b7d9b32ceb0ca0e2e8"
 [[package]]
 name = "tohu"
 version = "0.0.2"
-source = "git+https://github.com/nickspiker/tohu?rev=a0b6b0af38b8967cc436f618e5cf0edbac968bda#a0b6b0af38b8967cc436f618e5cf0edbac968bda"
+source = "git+https://github.com/nickspiker/tohu?rev=65d55b990cc2957fe9cf5595211319a3c629692a#65d55b990cc2957fe9cf5595211319a3c629692a"
 dependencies = [
  "base64",
  "blake3",
@@ -3818,7 +3818,7 @@ dependencies = [
  "ihi",
  "jni 0.21.1",
  "rand",
- "vsf 0.9.3",
+ "vsf",
 ]
 
 [[package]]
@@ -4017,24 +4017,6 @@ name = "version_check"
 version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
-
-[[package]]
-name = "vsf"
-version = "0.9.3"
-source = "git+https://github.com/nickspiker/vsf?rev=5f2bb06c8d96ee417a2571944882ef36d6c9ca8f#5f2bb06c8d96ee417a2571944882ef36d6c9ca8f"
-dependencies = [
- "bitvec",
- "blake3",
- "chrono",
- "colored",
- "hex",
- "i256",
- "libm",
- "num-complex",
- "num-traits",
- "spin",
- "unicode-normalization",
-]
 
 [[package]]
 name = "vsf"
