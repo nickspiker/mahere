@@ -788,9 +788,11 @@ pub struct HttpStore {
 
 impl HttpStore {
     pub fn new(base: &str) -> HttpStore {
+        // A connection kept for every loader (ureq keeps one a host by default, so eleven of twelve loaders paid a TCP and TLS handshake on every cell, about 160 ms each).
         let agent = ureq::AgentBuilder::new()
             .timeout_connect(std::time::Duration::from_secs(10))
             .timeout_read(std::time::Duration::from_secs(30))
+            .max_idle_connections_per_host(32)
             .build();
         HttpStore { base: base.trim_end_matches('/').to_string(), agent, layer: None }
     }
