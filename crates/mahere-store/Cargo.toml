@@ -13,5 +13,5 @@ mahere-tiles = { path = "../mahere-tiles" }
 mahere-coord = { path = "../mahere-coord" }
 zstd = "0.13"
 blake3 = "1"
-vsf = { path = "../../../vsf-v10" }
+vsf = { git = "https://github.com/nickspiker/vsf", rev = "a73e319fb96d8298cbb2fab4d0df1c391dee5637" }
 rand = "0.8"

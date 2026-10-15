@@ -13,7 +13,7 @@ mahere-osm = { path = "../mahere-osm" }
 rayon = "1"
 ureq = "2"
 zstd = "0.13"
-vsf = { path = "../../../vsf-v10", features = ["text"] }
+vsf = { git = "https://github.com/nickspiker/vsf", rev = "a73e319fb96d8298cbb2fab4d0df1c391dee5637", features = ["text"] }
 
 [dev-dependencies]
 png = "0.17"

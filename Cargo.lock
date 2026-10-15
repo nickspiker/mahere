@@ -4018,6 +4018,7 @@ dependencies = [
 [[package]]
 name = "vsf"
 version = "0.10.0"
+source = "git+https://github.com/nickspiker/vsf?rev=a73e319fb96d8298cbb2fab4d0df1c391dee5637#a73e319fb96d8298cbb2fab4d0df1c391dee5637"
 dependencies = [
  "aes-gcm",
  "bitvec",

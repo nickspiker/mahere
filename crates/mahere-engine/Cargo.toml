@@ -12,4 +12,4 @@ ureq = "2"
 mahere-tiles = { path = "../mahere-tiles" }
 rayon = "1"
 rustc-hash = "2"
-vsf = { path = "../../../vsf-v10" }
+vsf = { git = "https://github.com/nickspiker/vsf", rev = "a73e319fb96d8298cbb2fab4d0df1c391dee5637" }
