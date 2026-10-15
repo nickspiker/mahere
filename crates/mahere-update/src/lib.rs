@@ -51,13 +51,33 @@ impl Channel {
 pub struct Row {
     pub platform: String,
     pub arch: String,
-    /// The build number: the commit count it was built at.
+    /// Android's version code, minor times a thousand plus patch: what builds from before the version numbers compared (they take any release whose build is not theirs).
     pub build: u64,
-    /// What a person reads, "0.178+457980b".
+    /// The version, major, minor and patch (Nick 2026-10-15: Photon's numbering): a release is x.y.0, a dev build carries its patch. [0, 0, 0] for a row from before.
+    pub version: [u64; 3],
+    /// What a person reads, "0.216.0+457980b".
     pub name: String,
     pub url: String,
     pub hash: [u8; 32],
     pub size: u64,
+}
+
+/// A version from its text, "0.216.1" or "0.216.1+457980b".
+pub fn parse_version(s: &str) -> Option<[u64; 3]> {
+    let core = s.split('+').next()?;
+    let mut it = core.split('.').map(|p| p.parse::<u64>().ok());
+    let v = [it.next()??, it.next()??, it.next()??];
+    it.next().is_none().then_some(v)
+}
+
+/// This build's version, the workspace's own: a release x.y.0, a dev build x.y.patch, and the tree between publishes at the next dev patch, so a local build never wears a published version.
+pub fn our_version() -> [u64; 3] {
+    parse_version(env!("CARGO_PKG_VERSION")).unwrap_or([0, 0, 0])
+}
+
+/// Android's version code for a version: minor times a thousand plus patch, rising with every build.
+pub fn version_code(v: [u64; 3]) -> u64 {
+    v[0] * 1_000_000 + v[1] * 1000 + v[2]
 }
 
 /// This build's number, stamped by the publish scripts (MAHERE_VERSION_CODE); 0 for a local build, which no channel ever counts as current.
@@ -105,7 +125,12 @@ pub fn parse(bytes: &[u8], channel: Channel) -> Result<Vec<Row>, String> {
             _ => None,
         };
         let (Some(platform), Some(arch), Some(url), Some(hash), Some(build)) = (text("platform"), text("arch"), text("url"), hash, num("build")) else { continue };
-        rows.push(Row { platform, arch, build, name: text("name").unwrap_or_default(), url, hash, size: num("size").unwrap_or(0) });
+        // Major is left out while 0 and patch when 0 (a release), as Photon writes them; a row with no minor is from before the version numbers, older than any with one.
+        let version = match num("minor") {
+            Some(minor) => [num("major").unwrap_or(0), minor, num("patch").unwrap_or(0)],
+            None => [0, 0, 0],
+        };
+        rows.push(Row { platform, arch, build, version, name: text("name").unwrap_or_default(), url, hash, size: num("size").unwrap_or(0) });
     }
     Ok(rows)
 }
@@ -242,6 +267,13 @@ pub fn write(channel: Channel, rows: &[Row], key: &[u8; 32]) -> Result<Vec<u8>, 
         s.add_field("platform", VsfType::x(r.platform.clone()));
         s.add_field("arch", VsfType::x(r.arch.clone()));
         s.add_field("build", VsfType::z(r.build as usize));
+        if r.version[0] > 0 {
+            s.add_field("major", VsfType::z(r.version[0] as usize));
+        }
+        s.add_field("minor", VsfType::z(r.version[1] as usize));
+        if r.version[2] > 0 {
+            s.add_field("patch", VsfType::z(r.version[2] as usize));
+        }
         s.add_field("name", VsfType::x(r.name.clone()));
         s.add_field("size", VsfType::z(r.size as usize));
         s.add_field("url", VsfType::nu(r.url.clone()));
@@ -262,7 +294,7 @@ mod tests {
 
     #[test]
     fn a_manifest_signed_by_another_key_is_refused() {
-        let row = Row { platform: "Android".into(), arch: "arm64".into(), build: 178, name: "0.178+457980b".into(), url: format!("{BASE}/android/mahere-178.apk"), hash: [7; 32], size: 1234 };
+        let row = Row { platform: "Android".into(), arch: "arm64".into(), build: 216000, version: [0, 216, 0], name: "0.216.0+457980b".into(), url: format!("{BASE}/android/mahere-178.apk"), hash: [7; 32], size: 1234 };
         // Any key but the author's: the manifest is well formed but not his.
         let other = [9u8; 32];
         let bytes = write(Channel::Dev, std::slice::from_ref(&row), &other);
@@ -279,7 +311,7 @@ mod signed_tests {
     fn a_manifest_signed_by_the_author_reads_back() {
         let Ok(k) = std::fs::read("/mnt/Harbor/Code/keys/photon-signing-key") else { return };
         let key: [u8; 32] = k.try_into().unwrap();
-        let rows = vec![Row { platform: "Android".into(), arch: "arm64".into(), build: 178, name: "0.178+457980b".into(), url: format!("{BASE}/android/mahere-178.apk"), hash: [7; 32], size: 1234 }];
+        let rows = vec![Row { platform: "Android".into(), arch: "arm64".into(), build: 216000, version: [0, 216, 0], name: "0.216.0+457980b".into(), url: format!("{BASE}/android/mahere-178.apk"), hash: [7; 32], size: 1234 }];
         let bytes = write(Channel::Release, &rows, &key).unwrap();
         assert_eq!(parse(&bytes, Channel::Release).unwrap(), rows);
         assert!(parse(&bytes, Channel::Dev).unwrap().is_empty(), "a release manifest has no dev rows");
@@ -364,10 +396,18 @@ impl Updater {
         }
     }
 
-    /// The channel's build, when it is not the one running: what "Get" would install.
+    /// The channel's build, when it is not the one running: what "Get" would install (older too: changing channel is a tap).
     pub fn offer(&self, c: Channel) -> Option<&Row> {
         match self.known(c) {
-            Known::Has(Some(r)) if r.build != our_build() => Some(r),
+            Known::Has(Some(r)) if r.version != our_version() => Some(r),
+            _ => None,
+        }
+    }
+
+    /// The release to take on its own: a release (patch 0) strictly newer than the running build, never a dev build and never a step back (Nick 2026-10-15: it tried to put release 211 over dev 215).
+    pub fn newer_release(&self) -> Option<&Row> {
+        match self.known(Channel::Release) {
+            Known::Has(Some(r)) if r.version[2] == 0 && r.version > our_version() => Some(r),
             _ => None,
         }
     }
@@ -414,8 +454,8 @@ impl Updater {
             match e {
                 Event::Checked(c, Ok(row)) => {
                     *self.known_mut(c) = Known::Has(row);
-                    // Automatic: a different release build is taken as soon as it is seen.
-                    if c == Channel::Release && self.auto && self.unmetered && self.last_auto.is_some() && self.offer(c).is_some() {
+                    // Automatic: a newer release is taken as soon as it is seen; nothing else ever is.
+                    if c == Channel::Release && self.auto && self.unmetered && self.last_auto.is_some() && self.newer_release().is_some() {
                         self.get(c);
                     }
                 }

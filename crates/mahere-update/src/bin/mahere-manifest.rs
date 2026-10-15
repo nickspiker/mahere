@@ -2,7 +2,6 @@
 //!   mahere-manifest hash <file>                       its BLAKE3 and size, for a script
 //!   mahere-manifest sign <file>                       a desktop binary signed in place (the author's signature over its BLAKE3, appended)
 //!   mahere-manifest write <channel> <out> [--merge <existing manifest>] --row <platform> <arch> <build> <name> <url> <b3 hex> <size> [--row ...]
-//!   mahere-manifest promote <dev manifest> <build> <out> [--merge <existing release manifest>]   every row of that build from dev into release
 //! A new row replaces the merged manifest's row for the same platform and architecture; the others are kept. Signed with the author's key ($MAHERE_SIGNING_KEY, else the key Photon's builds are signed with), and read back as the app reads it before anything is written.
 use mahere_update::{Channel, Row};
 
@@ -61,7 +60,9 @@ fn main() {
             let mut rows = Vec::new();
             for (i, x) in a.iter().enumerate() {
                 if x == "--row" {
-                    rows.push(Row { platform: arg(i + 1), arch: arg(i + 2), build: arg(i + 3).parse().unwrap_or_else(|_| fail("build is a number")), name: arg(i + 4), url: arg(i + 5), hash: unhex(&arg(i + 6)), size: arg(i + 7).parse().unwrap_or_else(|_| fail("size is a number")) });
+                    let name = arg(i + 4);
+                    let version = mahere_update::parse_version(&name).unwrap_or_else(|| fail("the name starts with its version, 0.216.1+hash"));
+                    rows.push(Row { platform: arg(i + 1), arch: arg(i + 2), build: arg(i + 3).parse().unwrap_or_else(|_| fail("build is a number")), version, name, url: arg(i + 5), hash: unhex(&arg(i + 6)), size: arg(i + 7).parse().unwrap_or_else(|_| fail("size is a number")) });
                 }
             }
             let rows = merge(rows, merged_from.map_or(Vec::new(), |p| rows_of(&p, channel)));
@@ -71,20 +72,6 @@ fn main() {
                 println!("{} {} {} {} build {}", channel.label(), r.platform, r.arch, r.name, r.build);
             }
         }
-        Some("promote") => {
-            let build: u64 = arg(2).parse().unwrap_or_else(|_| fail("build is a number"));
-            let dev = rows_of(&arg(1), Channel::Dev);
-            let chosen: Vec<Row> = dev.into_iter().filter(|r| r.build == build).collect();
-            if chosen.is_empty() {
-                fail(&format!("the dev manifest has no row of build {build}"));
-            }
-            let rows = merge(chosen, merged_from.map_or(Vec::new(), |p| rows_of(&p, Channel::Release)));
-            let bytes = mahere_update::write(Channel::Release, &rows, &key()).unwrap_or_else(|e| fail(&e));
-            std::fs::write(arg(3), bytes).unwrap_or_else(|e| fail(&e.to_string()));
-            for r in &rows {
-                println!("release {} {} {} build {}", r.platform, r.arch, r.name, r.build);
-            }
-        }
-        _ => fail("hash, sign, write or promote"),
+        _ => fail("hash, sign or write (a release is built fresh by scripts/release.sh)"),
     }
 }

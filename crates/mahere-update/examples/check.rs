@@ -4,7 +4,7 @@ fn main() {
         match mahere_update::fetch(c) {
             Ok(rows) => {
                 for r in rows {
-                    println!("{} {} {} build {} {} bytes {}", c.label(), r.platform, r.arch, r.build, r.size, r.name);
+                    println!("{} {} {} {} (code {}) {} bytes {}", c.label(), r.platform, r.arch, r.version.iter().map(|n| n.to_string()).collect::<Vec<_>>().join("."), r.build, r.size, r.name);
                 }
             }
             Err(e) => println!("{}: {e}", c.label()),
