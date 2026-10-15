@@ -444,9 +444,14 @@ pub fn encode(x: &[i32], steps: &Steps) -> Vec<VsfType> {
     to_vsf(&forward(x, steps))
 }
 
-/// Decode a plane (memory order) end to end, all levels.
+/// Decode a plane (memory order) end to end, all levels, from its field coded either way (Rice, or range-coded on its own).
 pub fn decode(values: &[VsfType], steps: &Steps) -> Option<Vec<i32>> {
-    Some(inverse(&from_vsf(values, NCOEF)?, steps, LEVELS))
+    Some(inverse(&crate::ac::coefs(values, None)?, steps, LEVELS))
+}
+
+/// Decode a plane from its coefficients.
+pub fn decode_coefs(coef: &[i32], steps: &Steps) -> Vec<i32> {
+    inverse(coef, steps, LEVELS)
 }
 
 /// The steps as a VSF value: one byte per level, finest last.

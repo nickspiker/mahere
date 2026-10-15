@@ -24,6 +24,7 @@ pub use mahere_osm::names::Named;
 pub use mahere_osm as osm;
 pub use names::{IdCell, NameCell};
 pub mod names;
+pub mod publish;
 pub mod pyr;
 pub mod route;
 pub mod tone;
@@ -1580,9 +1581,15 @@ fn decode_img(fields: &HashMap<String, Vec<VsfType>>) -> Option<ImgCell> {
         _ => 0,
     };
     let mut any = false;
+    // The first band read is the others' reference when they were coded against it (red, for green and blue).
+    let mut first: Option<Vec<i32>> = None;
     for (name, out) in IMG_BANDS.iter().zip(im.bands_mut()) {
         let Some(values) = fields.get(*name) else { continue };
-        let plane = pyr::decode(values, &steps)?;
+        let coef = ac::coefs(values, first.as_deref())?;
+        let plane = pyr::decode_coefs(&coef, &steps);
+        if first.is_none() {
+            first = Some(coef);
+        }
         let mask = match fields.get(&format!("{name}mask")).and_then(|v| v.first()) {
             Some(m) => Some(pyr::mask_from_vsf(m)?),
             None => None,
@@ -1969,7 +1976,7 @@ pub fn decode_cell(data: &[u8]) -> Result<CellPlanes, String> {
     let sections = header.sections(data, end).map_err(|e| e.to_string())?;
     let mut out = CellPlanes::default();
     for s in sections {
-        let fields: HashMap<String, Vec<VsfType>> = s.fields.into_iter().map(|f| (f.name, f.values)).collect();
+        let fields = uncoded(s.fields.into_iter().map(|f| (f.name, f.values)).collect());
         let first = |name: &str| fields.get(name).and_then(|v| v.first());
         match s.name.as_str() {
             "dem" => out.dem = decode_dem(&fields),
@@ -2019,7 +2026,17 @@ fn section_alone(data: &[u8], name: &str) -> Option<HashMap<String, Vec<VsfType>
         return None;
     }
     let s = vsf::VsfSection::parse(data, &mut ptr).ok()?;
-    Some(s.fields.into_iter().map(|f| (f.name, f.values)).collect())
+    Some(uncoded(s.fields.into_iter().map(|f| (f.name, f.values)).collect()))
+}
+
+/// A section's fields with every range-coded plane and table put back as the tensor it was written from; pyramids stay coded for their decoders.
+fn uncoded(mut fields: HashMap<String, Vec<VsfType>>) -> HashMap<String, Vec<VsfType>> {
+    for values in fields.values_mut() {
+        if let Some(v) = ac::uncode_field(values) {
+            *values = vec![v];
+        }
+    }
+    fields
 }
 
 /// Only a cell's names, from raw file bytes: what labels read for every cell in view, its terrain and imagery never parsed.

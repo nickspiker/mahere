@@ -4,6 +4,8 @@
 //! A plane (one value per trixel) is coded in memory order, each trixel against three neighbours already coded: the one before it (the other half of its square, or the square to the left), the square to the left, and the square above. "Same as before", "same as above", "same as left" are adaptive bits under contexts of how those neighbours agree; anything else is a literal.
 //! A pyramid's coefficient stream is coded level by level in quadtree order, each coefficient's "is zero" under its level, its parent's size, its place among its siblings and whether the sibling before was zero; the sign and size follow under their own contexts.
 
+use vsf::VsfType;
+
 use crate::{TEX, TRI, disk_to_mem, mem_to_disk};
 
 const PROB_BITS: u32 = 15;
@@ -355,6 +357,119 @@ fn zigzag(v: i32) -> u32 {
 
 fn unzigzag(u: u32) -> i32 {
     ((u >> 1) as i32) ^ -((u & 1) as i32)
+}
+
+// ==================== FIELDS ====================
+// How a coded field sits in a VSF section (the cell format of the flag day, Nick 2026-10-14): two values, the range-coded bytes and a `t_u5` of what they were, so a reader can put a plane or a table back exactly as it was written and hand a pyramid's coefficients straight to the inverse.
+// A field coded otherwise (Rice multi-values, a bare tensor) is never two values of this shape, so the old and new forms tell themselves apart.
+
+/// A pyramid's coefficients.
+const COEFS: u32 = 1;
+/// A pyramid's coefficients coded against the section's first band (an image's red).
+const COEFS_REF: u32 = 2;
+/// One value per trixel: the meta goes on with the tensor's type and shape.
+const PLANE: u32 = 3;
+/// A short table of 16-bit numbers: type and shape follow.
+const SERIES: u32 = 4;
+
+const T_U8: u32 = 0;
+const T_U16: u32 = 1;
+const BITS: u32 = 2;
+const T_I16: u32 = 3;
+
+fn coded(bytes: Vec<u8>, meta: Vec<u32>) -> Vec<VsfType> {
+    vec![VsfType::t_u3(vsf::types::Tensor::new(vec![bytes.len()], bytes)), VsfType::t_u5(vsf::types::Tensor::new(vec![meta.len()], meta))]
+}
+
+/// The coded bytes and their meta, if the values are a coded field (a one-dimensional tensor reads back as `v_`, so either form).
+fn parts(values: &[VsfType]) -> Option<(&[u8], &[u32])> {
+    let bytes: &[u8] = match values.first()? {
+        VsfType::t_u3(b) => &b.data,
+        VsfType::v_u3(b) => &b.data,
+        _ => return None,
+    };
+    let meta: &[u32] = match values.get(1)? {
+        VsfType::t_u5(m) => &m.data,
+        VsfType::v_u5(m) => &m.data,
+        _ => return None,
+    };
+    (values.len() == 2 && !meta.is_empty() && (COEFS..=SERIES).contains(&meta[0])).then_some((bytes, meta))
+}
+
+/// A field's values coded, when they are a kind the coder knows (a pyramid, a plane, a table); None to keep them as they are.
+pub fn code_field(values: &[VsfType], reference: Option<&[i32]>) -> Option<Vec<VsfType>> {
+    if let Some(c) = crate::pyr::from_vsf(values, crate::pyr::NCOEF) {
+        return Some(match reference {
+            Some(r) => coded(encode_coefs_with(&c, Some(r)), vec![COEFS_REF]),
+            None => coded(encode_coefs(&c), vec![COEFS]),
+        });
+    }
+    let [v] = values else { return None };
+    let (ty, shape, vals): (u32, &[usize], Vec<u32>) = match v {
+        VsfType::t_u3(t) => (T_U8, &t.shape, t.data.iter().map(|&x| x as u32).collect()),
+        VsfType::t_u4(t) => (T_U16, &t.shape, t.data.iter().map(|&x| x as u32).collect()),
+        VsfType::t_i4(t) => (T_I16, &t.shape, t.data.iter().map(|&x| x as u16 as u32).collect()),
+        VsfType::p(t) if t.bit_depth == 1 => {
+            let n: usize = t.shape.iter().product();
+            (BITS, &t.shape, (0..n).map(|i| ((t.data[i >> 3] >> (7 - (i & 7))) & 1) as u32).collect())
+        }
+        _ => return None,
+    };
+    let mut meta: Vec<u32> = vec![0, ty];
+    meta.extend(shape.iter().map(|&s| s as u32));
+    if vals.len() == TRI {
+        meta[0] = PLANE;
+        Some(coded(encode_plane(&vals), meta))
+    } else if vals.len() >= 64 && ty == T_U16 {
+        meta[0] = SERIES;
+        Some(coded(encode_series(&vals), meta))
+    } else {
+        None
+    }
+}
+
+/// A coded plane or table back as the tensor it was written from; None for anything else (a pyramid stays coded for [`coefs`]).
+pub fn uncode_field(values: &[VsfType]) -> Option<VsfType> {
+    let (bytes, meta) = parts(values)?;
+    if meta.len() < 2 || !(meta[0] == PLANE || meta[0] == SERIES) {
+        return None;
+    }
+    let shape: Vec<usize> = meta[2..].iter().map(|&s| s as usize).collect();
+    let n: usize = shape.iter().product();
+    let vals = if meta[0] == PLANE { decode_plane(bytes)? } else { decode_series(bytes, n)? };
+    if vals.len() != n {
+        return None;
+    }
+    Some(match meta[1] {
+        T_U8 => VsfType::t_u3(vsf::types::Tensor::new(shape, vals.iter().map(|&x| x as u8).collect())),
+        T_U16 => VsfType::t_u4(vsf::types::Tensor::new(shape, vals.iter().map(|&x| x as u16).collect())),
+        T_I16 => VsfType::t_i4(vsf::types::Tensor::new(shape, vals.iter().map(|&x| x as u16 as i16).collect())),
+        BITS => {
+            let mut data = vec![0u8; n.div_ceil(8)];
+            for (i, &b) in vals.iter().enumerate() {
+                if b != 0 {
+                    data[i >> 3] |= 0x80 >> (i & 7);
+                }
+            }
+            VsfType::p(vsf::types::BitPackedTensor { bit_depth: 1, shape, data })
+        }
+        _ => return None,
+    })
+}
+
+/// Whether a field's coefficients were coded against the section's first band.
+pub fn needs_reference(values: &[VsfType]) -> bool {
+    parts(values).is_some_and(|(_, m)| m[0] == COEFS_REF)
+}
+
+/// A pyramid's coefficients from its field, coded either way (the reference for one coded against a first band).
+pub fn coefs(values: &[VsfType], reference: Option<&[i32]>) -> Option<Vec<i32>> {
+    match parts(values) {
+        Some((b, m)) if m[0] == COEFS => decode_coefs(b),
+        Some((b, m)) if m[0] == COEFS_REF => decode_coefs_with(b, Some(reference?)),
+        Some(_) => None,
+        None => crate::pyr::from_vsf(values, crate::pyr::NCOEF),
+    }
 }
 
 #[cfg(test)]
