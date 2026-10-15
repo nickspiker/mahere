@@ -8,6 +8,11 @@
 - Downloaded areas keep their imagery for offline use. When the phone's cache is full, imagery is let go before the map itself.
 - Older versions of the app can't read the new map: install this one fresh.
 
+### Lettering
+- Each map style has its own typeface: Oxanium for Neon, a classic serif for Atlas and Gazetteer, carved capitals for Woodcut, a draughtsman's mono for Blueprint, and more, with colours and glow to match. Pick any typeface for any style in the style editor.
+- Names are weighted by importance among what's on screen: the biggest town in view is the boldest and largest, the smallest the lightest; peaks by height, rivers by size, lakes by area.
+- A lake's name follows the lake's own shape, curving along its length.
+
 ### Tools
 - A toolbox next to the locate button: Info, Ruler, Drive, Ride, Walk, Pen and Select, with the pen's colour and the clears beside their tools.
 - A plain tap now shows a small card with what's there and its coordinates, without the distance line and profile; the Ruler measures as before.
