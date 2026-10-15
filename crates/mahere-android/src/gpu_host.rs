@@ -40,6 +40,8 @@ pub struct GpuHost {
 /// Supersampling while the camera moves and once it has stopped.
 const MOVING_SCALE: u32 = 1;
 const STILL_SCALE: u32 = 3;
+/// The most pixels a still frame draws, its scale included: three times a 1080 by 2340 screen. A 1440 by 3040 screen at three times is 39 million, near a second a frame on the Note 10+'s Adreno 640 (Nick 2026-10-15), so it rests at two, the same pixels as the 1080 phones at three.
+const STILL_PIXELS: u64 = 3 * 3 * 1080 * 2340;
 
 type OverlayStamp = (u64, u64, u64, u64, Option<(u64, u64, u32)>, u32, u32, bool, u32, u64, u32, u64);
 
@@ -186,7 +188,8 @@ impl GpuHost {
         let mode = RenderMode::Full;
         // The still frame's scale, at most what the GPU's largest texture holds for this screen: a scale it cannot hold fails to make its target, and the frame is lost.
         let fits = (self.device.limits().max_texture_dimension_2d / w.max(h).max(1)).max(1);
-        self.map.scale = if in_motion { MOVING_SCALE } else { STILL_SCALE.min(fits) };
+        let budget = ((STILL_PIXELS as f64 / (w as f64 * h as f64).max(1.0)).sqrt().floor() as u32).max(1);
+        self.map.scale = if in_motion { MOVING_SCALE } else { STILL_SCALE.min(fits).min(budget) };
         if in_motion {
             self.last_low = now;
         }
