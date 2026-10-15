@@ -57,6 +57,8 @@ impl GpuHost {
         // Texture arrays hold one cell per layer: ask for the adapter.s real layer limit, not WebGPU.s 256.
         let mut limits = wgpu::Limits::default();
         limits.max_texture_array_layers = adapter.limits().max_texture_array_layers.min(2048);
+        // The still frame is drawn at three times the screen, larger than WebGPU's 8192 on a tall screen (a 1440 by 3040 Note 10+ needs 9120): ask for the GPU's own limit (Nick 2026-10-15: the screen flicked to black whenever the map came to rest).
+        limits.max_texture_dimension_2d = adapter.limits().max_texture_dimension_2d.max(limits.max_texture_dimension_2d);
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor { label: Some("mahere"), required_limits: limits, ..Default::default() }))
             .map_err(|e| eprintln!("gpu: no device: {e:?}"))
             .ok()?;
@@ -182,7 +184,9 @@ impl GpuHost {
         }
         let in_motion = changed && (moving || self.last_move.elapsed() < quiet);
         let mode = RenderMode::Full;
-        self.map.scale = if in_motion { MOVING_SCALE } else { STILL_SCALE };
+        // The still frame's scale, at most what the GPU's largest texture holds for this screen: a scale it cannot hold fails to make its target, and the frame is lost.
+        let fits = (self.device.limits().max_texture_dimension_2d / w.max(h).max(1)).max(1);
+        self.map.scale = if in_motion { MOVING_SCALE } else { STILL_SCALE.min(fits) };
         if in_motion {
             self.last_low = now;
         }
