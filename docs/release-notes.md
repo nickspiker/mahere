@@ -1,5 +1,23 @@
 # Mahere release notes
 
+## 0.20x · October 2026
+
+### A new map format
+- Every cell is about a fifth smaller, with nothing lost: the same terrain, imagery and lines, coded more tightly.
+- Imagery and infrared download only when you turn them on, so the map without them is about a quarter of the data in the 1 m areas.
+- Downloaded areas keep their imagery for offline use. When the phone's cache is full, imagery is let go before the map itself.
+- Older versions of the app can't read the new map: install this one fresh.
+
+### Tools
+- A toolbox next to the locate button: Info, Ruler, Drive, Ride, Walk, Pen and Select, with the pen's colour and the clears beside their tools.
+- A plain tap now shows a small card with what's there and its coordinates, without the distance line and profile; the Ruler measures as before.
+- Directions start where the ruler does: the middle of the screen, or you with "Measure from me" on.
+- A scale bar, and a button that takes the map to where you are.
+- Every settings page has a way back.
+
+### New detail
+- Snoqualmie Pass to Leavenworth now has directions too.
+
 ## 0.19x · October 2026
 
 ### Names on the map
