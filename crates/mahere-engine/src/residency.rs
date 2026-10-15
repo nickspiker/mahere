@@ -433,7 +433,8 @@ impl Residency {
 /// Cells decode in parallel a small chunk at a time so the nearest-first order still holds and a newer list preempts within a few cells.
 fn loader_thread(store: Arc<dyn CellStore>, layers: Option<LayerStores>, want_rx: Receiver<WantList>, done_tx: Sender<Loaded>, pack_cpu: Arc<std::sync::atomic::AtomicBool>) {
     // Decoding runs in its own pool: on the global one a frame's lattice waited behind cells mid-decode, and a plan took fifty milliseconds while the view streamed.
-    let threads = (rayon::current_num_threads() / 2).clamp(2, 4);
+    // Fetching is waiting on the network far more than decoding (a cell is a round trip of a few hundred milliseconds to the bucket, Nick 2026-10-15: tiles slow though small), so cells from the bucket load a dozen at a time; from the device, as many as there are cores to decode them.
+    let threads = if layers.is_some() { 12 } else { (rayon::current_num_threads() / 2).clamp(2, 4) };
     let pool = rayon::ThreadPoolBuilder::new().num_threads(threads).thread_name(|i| format!("mahere-load-{i}")).build().expect("loader pool");
     let chunk = threads * 2;
     let mut current: Option<WantList> = None;
