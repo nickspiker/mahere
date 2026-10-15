@@ -207,6 +207,8 @@ pub struct Residency {
     layers: Option<LayerStores>,
     /// The layers the view wants beside each base ([`WANT_DEM`], [`WANT_IMG`], [`WANT_NIR`]).
     want_layers: u8,
+    /// Cells in view, there, still without a layer the view wants, at the last want: the view is not settled while any are (a host that stops drawing once settled would never ask for them).
+    fill_left: usize,
     /// Whether the loader packs the CPU raster's u64 texels (normals included) for each dem; a GPU-only host turns it off and saves a megabyte and a few milliseconds per cell.
     pack_cpu: Arc<std::sync::atomic::AtomicBool>,
     want_tx: Sender<WantList>,
@@ -249,6 +251,7 @@ impl Residency {
             store: read_store,
             layers,
             want_layers: WANT_DEM,
+            fill_left: 0,
             pack_cpu,
             want_tx,
             done_rx,
@@ -269,6 +272,8 @@ impl Residency {
         if want != self.want_layers {
             self.want_layers = want;
             self.last_sent.clear();
+            // Unsettled until the next want has looked for cells without the new layers.
+            self.fill_left = usize::MAX;
         }
     }
 
@@ -361,6 +366,7 @@ impl Residency {
         };
         list.sort_by_key(near);
         fill.sort_by_key(near);
+        self.fill_left = fill.len();
         // Cells baked whole carry everything in one read; cells in layers come base first, the layers after.
         let first = if self.layers.is_some() { 0 } else { want };
         let list: Vec<(CellKey, u8)> = list.into_iter().map(|k| (k, first)).chain(fill.into_iter().map(|k| (k, want))).collect();
@@ -419,7 +425,7 @@ impl Residency {
     }
 
     pub fn converged(&self) -> bool {
-        self.pending.is_empty()
+        self.pending.is_empty() && self.fill_left == 0
     }
 }
 
