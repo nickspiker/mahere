@@ -1009,9 +1009,13 @@ impl MapCore {
         self.route.as_deref()
     }
 
-    /// Search for a route from the fix (the screen centre without one) to a point, on a thread of its own; the result comes in through [`MapCore::tick`].
+    /// Search for a route from where the ruler starts (the screen centre, or the fix with "Measure from me" on: Nick 2026-10-14, the route started at the fix and found nothing from outside the 1 m areas) to a point, on a thread of its own; the result comes in through [`MapCore::tick`].
     fn start_route(&mut self, to: (f64, f64), travel: route::Travel) {
-        let from = self.gps.map_or((self.cam.lat(), self.cam.lon()), |g| (g.lat, g.lon));
+        let centre = (self.cam.lat(), self.cam.lon());
+        let from = match self.gps {
+            Some(g) if self.lock_to_fix => (g.lat, g.lon),
+            _ => centre,
+        };
         let store = self.res.store();
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
