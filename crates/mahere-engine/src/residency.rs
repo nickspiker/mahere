@@ -7,7 +7,6 @@ use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, channel};
 
 use mahere_tiles::{CellKey, ClassCell, CovCell, ImgCell};
-use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 /// What a store found for a cell: bytes, a definite absence (never baked), or a failure to find out (offline, timeout, a bad read) — which must not be remembered as absence.
@@ -184,6 +183,40 @@ pub struct Loaded {
 struct WantList {
     /// Pre-sorted by priority: every missing cell's base first (Nick 2026-10-14: the whole scene in lines, then the terrain filling in), then resident cells' layers, each nearest the view's centre first. Each with the layers to load beside its base.
     list: Vec<(CellKey, u8)>,
+    /// The layers the view shows, fetched into the store beside each base as it is fetched (Nick 2026-10-15), so the terrain's round trip runs with the base's and the fill after the lines reads the device.
+    warm: u8,
+    /// Cells around a settled view, fetched into the store and decoded for nothing (Nick 2026-10-15: make the area being looked at hot), so a pan or a zoom in reads the device instead of waiting on the bucket.
+    prefetch: Vec<CellKey>,
+}
+
+/// What a loader does with a cell.
+#[derive(Clone, Copy)]
+enum Work {
+    /// Load and decode it with these layers beside its base, for the pool.
+    Load(CellKey, u8),
+    /// Fetch it into the store and decode nothing: its base too or not, and these layers.
+    Fetch(CellKey, bool, u8),
+}
+
+/// The loaders' work: the cells to load, the layers to fetch beside their bases, and what is loading or just loaded.
+#[derive(Default)]
+struct Queues {
+    work: std::collections::VecDeque<Work>,
+    warm: std::collections::VecDeque<Work>,
+    busy: FxHashSet<(CellKey, u8)>,
+    /// Cells finished in the last moment: a newer list arrives before the main side has drained them, and would load them twice.
+    done: FxHashMap<(CellKey, u8), std::time::Instant>,
+    closed: bool,
+}
+
+/// The most cells fetched around a settled view: about 3 MB of base and terrain, 5 MB with imagery.
+const PREFETCH_MAX: usize = 48;
+
+/// Chebyshev distance from the view's centre in a cell's own grid (the centre given at depth-30 precision).
+fn near(k: &CellKey, center: (u64, u64)) -> u64 {
+    let (cu, cv) = k.grid();
+    let sh = 30 - k.depth as u32;
+    cu.abs_diff(center.0 >> sh).max(cv.abs_diff(center.1 >> sh))
 }
 
 /// Resident cells: page table over decoded planes. Plain map — a few hundred entries, probed per BLOCK (not per pixel) during render.
@@ -231,6 +264,10 @@ pub struct Residency {
     last_send_at: std::time::Instant,
     /// Cells the store replaced with a newer copy, for whatever keeps something read from them to forget it.
     pub reloaded: Vec<CellKey>,
+    /// Cells already prefetched, so a settled view sends each once.
+    prefetched: FxHashSet<CellKey>,
+    /// The view the ring was last looked for around (a fingerprint of its cells), so a still view does not look every frame.
+    prefetch_view: u64,
 }
 
 const RETRY_AFTER: std::time::Duration = std::time::Duration::from_secs(3);
@@ -269,6 +306,8 @@ impl Residency {
             last_sent: Vec::new(),
             last_send_at: std::time::Instant::now(),
             reloaded: Vec::new(),
+            prefetched: FxHashSet::default(),
+            prefetch_view: 0,
         }
     }
 
@@ -345,14 +384,9 @@ impl Residency {
         // Below a cell the loader confirmed absent nothing exists: its descendants are marked absent here and never asked for, so zooming past the finest data does not ask the bucket for a screen of cells that cannot be there (Nick 2026-10-10).
         let mut under_absent = Vec::new();
         list.retain(|k| {
-            let (mut depth, mut prefix) = (k.depth, k.prefix);
-            while depth > 0 {
-                depth -= 1;
-                prefix >>= 2;
-                if self.pool.map.get(&CellKey { depth, prefix }).is_some_and(|e| e.present == 0 && e.is_absent()) {
-                    under_absent.push(*k);
-                    return false;
-                }
+            if self.under_absent(*k) {
+                under_absent.push(*k);
+                return false;
             }
             true
         });
@@ -362,19 +396,28 @@ impl Residency {
             }
             self.pool_version += 1;
         }
-        let near = |k: &CellKey| {
-            let (cu, cv) = k.grid();
-            // Chebyshev distance in this depth's grid, normalized by shifting the center (given at depth 30-ish precision) down.
-            let sh = 30 - k.depth as u32;
-            let (ku, kv) = (center.0 >> sh, center.1 >> sh);
-            (cu.abs_diff(ku)).max(cv.abs_diff(kv))
-        };
-        list.sort_by_key(near);
-        fill.sort_by_key(near);
+        list.sort_by_key(|k| near(k, center));
+        fill.sort_by_key(|k| near(k, center));
         self.fill_left = fill.len();
         // Cells baked whole carry everything in one read; cells in layers come base first, the layers after.
         let first = if self.layers.is_some() { 0 } else { want };
         let list: Vec<(CellKey, u8)> = list.into_iter().map(|k| (k, first)).chain(fill.into_iter().map(|k| (k, want))).collect();
+        let warm = if self.layers.is_some() { want } else { 0 };
+        // Nothing missing: the cells around the view, into the store.
+        let view = self.desired.iter().fold(self.desired.len() as u64, |h, k| h.wrapping_add((k.prefix ^ ((k.depth as u64) << 58)).wrapping_mul(0x9E37_79B9_7F4A_7C15)));
+        if list.is_empty() && self.layers.is_some() && view != self.prefetch_view {
+            self.prefetch_view = view;
+            let prefetch = self.prefetch_set(center);
+            if !prefetch.is_empty() {
+                if self.prefetched.len() > 20_000 {
+                    self.prefetched.clear();
+                }
+                self.prefetched.extend(prefetch.iter().copied());
+                self.last_sent.clear();
+                let _ = self.want_tx.send(WantList { list: Vec::new(), warm, prefetch });
+                return;
+            }
+        }
         // An unchanged list is still re-sent once a second: a cell the loader skipped as just-done can otherwise be waited on forever after a quick zoom out and back.
         if list == self.last_sent && self.last_send_at.elapsed() < std::time::Duration::from_secs(1) {
             return;
@@ -386,8 +429,37 @@ impl Residency {
         }
         self.last_sent = list.clone();
         if !list.is_empty() {
-            let _ = self.want_tx.send(WantList { list });
+            let _ = self.want_tx.send(WantList { list, warm, prefetch: Vec::new() });
         }
+    }
+
+    /// Whether a cell lies under one the loader confirmed absent, where nothing exists.
+    fn under_absent(&self, k: CellKey) -> bool {
+        (0..k.depth).any(|d| self.pool.map.get(&k.ancestor(d)).is_some_and(|e| e.present == 0 && e.is_absent()))
+    }
+
+    /// The cells to fetch around a settled view: the ring one cell out at each depth it shows, and the children of the cells at its centre (the next zoom in), nearest first, none resident, prefetched already, or under an absent cell.
+    fn prefetch_set(&self, center: (u64, u64)) -> Vec<CellKey> {
+        let Some(finest) = self.desired.iter().map(|k| k.depth).max() else { return Vec::new() };
+        let mut out: FxHashSet<CellKey> = FxHashSet::default();
+        for k in self.desired.iter().filter(|k| k.depth > PIN_DEPTH) {
+            let (cu, cv) = k.grid();
+            let n = 1i64 << k.depth;
+            for (du, dv) in [(-1i64, -1i64), (-1, 0), (-1, 1), (0, -1), (0, 1), (1, -1), (1, 0), (1, 1)] {
+                let (u, v) = (cu as i64 + du, cv as i64 + dv);
+                if (0..n).contains(&u) && (0..n).contains(&v) {
+                    out.insert(CellKey::from_grid(k.diamond(), k.depth, u as u64, v as u64));
+                }
+            }
+            let there = self.pool.map.get(k).is_some_and(|e| e.exists || e.present != 0);
+            if k.depth == finest && there && near(k, center) <= 1 {
+                out.extend((0..4).map(|q| k.child(q)));
+            }
+        }
+        let mut list: Vec<CellKey> = out.into_iter().filter(|k| !self.desired.contains(k) && !self.pool.map.contains_key(k) && !self.prefetched.contains(k) && !self.under_absent(*k)).collect();
+        list.sort_by_key(|k| (near(k, center), k.depth));
+        list.truncate(PREFETCH_MAX);
+        list
     }
 
     /// A resident cell's planes, decoded again from its store (the vault on a phone, so no network): for reading what a GPU host no longer keeps on the CPU.
@@ -435,47 +507,90 @@ impl Residency {
 }
 
 /// The newest want-list is the only one that matters: an older list's leftovers are cells the view no longer needs (the main side forgets them as pending too, so they're re-requested if they come back).
-/// Cells decode in parallel a small chunk at a time so the nearest-first order still holds and a newer list preempts within a few cells.
+/// Each loader takes the next cell as it finishes one and sends it on at once, so a slow cell holds up only itself (in batches, a whole batch waited on its slowest fetch); a newer list replaces what is queued.
 fn loader_thread(store: Arc<dyn CellStore>, layers: Option<LayerStores>, want_rx: Receiver<WantList>, done_tx: Sender<Loaded>, pack_cpu: Arc<std::sync::atomic::AtomicBool>) {
+    // Fetching is waiting on the network far more than decoding (a cell is a round trip of a hundred milliseconds or more to the bucket, Nick 2026-10-15: tiles slow though small), so cells from the bucket load a dozen at a time, with eight more fetching the layers beside the bases; from the device, as many as there are cores to decode them.
+    let (loaders, warmers) = if layers.is_some() { (12, 8) } else { ((rayon::current_num_threads() / 2).clamp(2, 4), 0) };
     // Decoding runs in its own pool: on the global one a frame's lattice waited behind cells mid-decode, and a plan took fifty milliseconds while the view streamed.
-    // Fetching is waiting on the network far more than decoding (a cell is a round trip of a few hundred milliseconds to the bucket, Nick 2026-10-15: tiles slow though small), so cells from the bucket load a dozen at a time; from the device, as many as there are cores to decode them.
-    let threads = if layers.is_some() { 12 } else { (rayon::current_num_threads() / 2).clamp(2, 4) };
-    let pool = rayon::ThreadPoolBuilder::new().num_threads(threads).thread_name(|i| format!("mahere-load-{i}")).build().expect("loader pool");
-    let chunk = threads * 2;
-    let mut current: Option<WantList> = None;
-    // Cells finished in the last moment: a newer list arrives before the main side has drained them, and would load them twice.
-    let mut done: FxHashMap<(CellKey, u8), std::time::Instant> = FxHashMap::default();
-    loop {
-        if current.is_none() {
-            match want_rx.recv() {
-                Ok(w) => current = Some(w),
-                Err(_) => return,
+    let pool = rayon::ThreadPoolBuilder::new().num_threads(loaders + warmers).thread_name(|i| format!("mahere-load-{i}")).build().expect("loader pool");
+    let shared = Arc::new((std::sync::Mutex::new(Queues::default()), std::sync::Condvar::new()));
+    for i in 0..loaders + warmers {
+        let (store, layers, done_tx, pack_cpu, shared) = (store.clone(), layers.clone(), done_tx.clone(), pack_cpu.clone(), shared.clone());
+        pool.spawn(move || loader(i >= loaders, &*store, layers.as_ref(), &done_tx, &pack_cpu, &shared));
+    }
+    let (lock, wake) = &*shared;
+    while let Ok(mut w) = want_rx.recv() {
+        while let Ok(newer) = want_rx.try_recv() {
+            w = newer;
+        }
+        let mut q = lock.lock().unwrap();
+        let now = std::time::Instant::now();
+        q.done.retain(|_, t| now.duration_since(*t) < std::time::Duration::from_millis(800));
+        let Queues { work, warm, busy, done, .. } = &mut *q;
+        work.clear();
+        warm.clear();
+        for &(k, want) in &w.list {
+            if done.contains_key(&(k, want)) || busy.contains(&(k, want)) {
+                continue;
+            }
+            work.push_back(Work::Load(k, want));
+            if want == 0 && w.warm != 0 {
+                warm.push_back(Work::Fetch(k, false, w.warm));
             }
         }
-        while let Ok(w) = want_rx.try_recv() {
-            current = Some(w);
-        }
-        let Some(w) = current.take() else { continue };
-        let mut list = w.list;
-        let now = std::time::Instant::now();
-        done.retain(|_, t| now.duration_since(*t) < std::time::Duration::from_millis(800));
-        list.retain(|k| !done.contains_key(k));
-        while !list.is_empty() {
-            let n = list.len().min(chunk);
-            let batch: Vec<(CellKey, u8)> = list.drain(..n).collect();
-            let pack = pack_cpu.load(std::sync::atomic::Ordering::Relaxed);
-            let loaded: Vec<(u8, Loaded)> = pool.install(|| batch.par_iter().map(|&(k, want)| (want, load_cell(&*store, layers.as_ref(), want, k, pack))).collect());
-            let t = std::time::Instant::now();
-            for (want, l) in loaded {
-                done.insert((l.key, want), t);
+        work.extend(w.prefetch.iter().map(|&k| Work::Fetch(k, true, w.warm)));
+        wake.notify_all();
+    }
+    lock.lock().unwrap().closed = true;
+    wake.notify_all();
+}
+
+/// One loader: the next cell from its queue (the loads, or the layers beside them), until the residency is gone.
+fn loader(warm_side: bool, store: &dyn CellStore, layers: Option<&LayerStores>, done_tx: &Sender<Loaded>, pack_cpu: &std::sync::atomic::AtomicBool, shared: &(std::sync::Mutex<Queues>, std::sync::Condvar)) {
+    let (lock, wake) = shared;
+    loop {
+        let job = {
+            let mut q = lock.lock().unwrap();
+            loop {
+                if q.closed {
+                    return;
+                }
+                let next = if warm_side { q.warm.pop_front() } else { q.work.pop_front() };
+                if let Some(j) = next {
+                    if let Work::Load(k, want) = j {
+                        q.busy.insert((k, want));
+                    }
+                    break j;
+                }
+                q = wake.wait(q).unwrap();
+            }
+        };
+        match job {
+            Work::Load(k, want) => {
+                let l = load_cell(store, layers, want, k, pack_cpu.load(std::sync::atomic::Ordering::Relaxed));
+                {
+                    let mut q = lock.lock().unwrap();
+                    q.busy.remove(&(k, want));
+                    q.done.insert((k, want), std::time::Instant::now());
+                }
                 if done_tx.send(l).is_err() {
                     return;
                 }
             }
-            if let Ok(newer) = want_rx.try_recv() {
-                current = Some(newer);
-                break;
-            }
+            Work::Fetch(k, base, want) => fetch_only(store, layers, k, base, want),
+        }
+    }
+}
+
+/// A cell fetched into its stores and decoded for nothing: its base (when asked, and then nothing more if it has none), and the layers wanted.
+fn fetch_only(store: &dyn CellStore, layers: Option<&LayerStores>, key: CellKey, base: bool, want: u8) {
+    if base && !matches!(store.get(key), Fetch::Bytes(_)) {
+        return;
+    }
+    let Some(l) = layers else { return };
+    for (bit, s) in [(WANT_DEM, &l.dem), (WANT_IMG, &l.img), (WANT_NIR, &l.nir)] {
+        if want & bit != 0 {
+            let _ = s.get(key);
         }
     }
 }
@@ -644,6 +759,9 @@ pub struct TieredStore {
     remote: Arc<dyn RemoteStore>,
     missing: std::sync::Mutex<FxHashSet<CellKey>>,
     checks: Arc<Checks>,
+    /// Cells being fetched now, so a second asker (a layer fetched beside its base, then asked for by the fill) waits on the first fetch instead of making its own.
+    inflight: std::sync::Mutex<FxHashSet<CellKey>>,
+    landed: std::sync::Condvar,
 }
 
 /// The copies waiting to be checked, those checked this session, and those found changed.
@@ -697,11 +815,34 @@ impl TieredStore {
                 }
             });
         }
-        TieredStore { cache, remote, missing: std::sync::Mutex::new(FxHashSet::default()), checks }
+        TieredStore { cache, remote, missing: std::sync::Mutex::new(FxHashSet::default()), checks, inflight: Default::default(), landed: Default::default() }
     }
 
-    /// Fetch from the bucket and keep it with its tag.
+    /// Fetch from the bucket and keep it with its tag; a cell already being fetched is waited for and read from what that fetch kept (fetched again only if it failed).
     fn fetch_and_keep(&self, key: CellKey) -> Fetch {
+        loop {
+            let mut f = self.inflight.lock().unwrap();
+            if f.insert(key) {
+                break;
+            }
+            while f.contains(&key) {
+                f = self.landed.wait(f).unwrap();
+            }
+            drop(f);
+            if let Fetch::Bytes(b) = self.cache.get(key) {
+                return Fetch::Bytes(b);
+            }
+            if self.missing.lock().unwrap().contains(&key) {
+                return Fetch::Absent;
+            }
+        }
+        let got = self.fetch_now(key);
+        self.inflight.lock().unwrap().remove(&key);
+        self.landed.notify_all();
+        got
+    }
+
+    fn fetch_now(&self, key: CellKey) -> Fetch {
         match self.remote.check(key, None) {
             Checked::Changed(b, tag) => {
                 self.cache.put(key, &b);
@@ -991,6 +1132,44 @@ mod tests {
         assert!(matches!(store.refresh(key), Fetch::Bytes(b) if b == b"stale"), "the plain address is what the edge kept");
         assert!(matches!(store.refresh_named(key, "abc"), Fetch::Bytes(b) if b == b"fresh"));
         assert!(matches!(store.get(key), Fetch::Bytes(b) if b == b"fresh"), "the vault keeps what the name fetched");
+    }
+
+    /// A settled view's ring is fetched into the store once, decoded for nothing; nothing is fetched under a cell known absent, nor a layer for a cell with no base.
+    #[test]
+    fn a_settled_view_prefetches_its_ring_once() {
+        use std::sync::Mutex;
+        #[derive(Default)]
+        struct Counting(Mutex<Vec<CellKey>>);
+        impl CellStore for Counting {
+            fn get(&self, key: CellKey) -> Fetch {
+                self.0.lock().unwrap().push(key);
+                Fetch::Absent
+            }
+        }
+        let base = Arc::new(Counting::default());
+        let dem = Arc::new(Counting::default());
+        let layers = LayerStores { dem: dem.clone(), img: Arc::new(Empty), nir: Arc::new(Empty) };
+        let mut r = Residency::layered(base.clone(), Some(layers));
+        let a = CellKey::from_grid(3, 12, 100, 100);
+        r.want(vec![a], (0, 0));
+        settle(&mut r);
+        // Settled: the next want sends the ring.
+        r.want(vec![a], (0, 0));
+        for _ in 0..500 {
+            if base.0.lock().unwrap().len() >= 9 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        r.want(vec![a], (0, 0));
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let got = base.0.lock().unwrap().clone();
+        assert_eq!(got.len(), 9, "the cell, then its eight neighbours once: {got:?}");
+        assert!(got[1..].iter().all(|k| k.depth == 12 && *k != a && near(k, (a.grid().0 << 18, a.grid().1 << 18)) <= 1));
+        assert!(!got.iter().any(|k| k.depth == 13), "no children of an absent cell");
+        // The base fetched as the view loaded had its terrain fetched beside it; the ring's absent bases fetched no terrain.
+        assert_eq!(dem.0.lock().unwrap().as_slice(), &[a]);
     }
 
     #[test]
