@@ -42,41 +42,19 @@ struct GlyphKey {
     bin: i32,
 }
 
-/// The typefaces a theme letters its map in, five weights each, ASCII only (assets/fonts/README.md): loaded into the letterer's text renderer beside the panel's Open Sans, which every letter outside them falls back to.
-const LABEL_FONT_FILES: [&[u8]; 33] = [
-    include_bytes!("../assets/fonts/Cinzel-300.ttf"),
-    include_bytes!("../assets/fonts/Cinzel-400.ttf"),
-    include_bytes!("../assets/fonts/Cinzel-500.ttf"),
-    include_bytes!("../assets/fonts/Cinzel-600.ttf"),
-    include_bytes!("../assets/fonts/Cinzel-700.ttf"),
-    include_bytes!("../assets/fonts/EBGaramond-300.ttf"),
-    include_bytes!("../assets/fonts/EBGaramond-400.ttf"),
-    include_bytes!("../assets/fonts/EBGaramond-500.ttf"),
-    include_bytes!("../assets/fonts/EBGaramond-600.ttf"),
-    include_bytes!("../assets/fonts/EBGaramond-700.ttf"),
-    include_bytes!("../assets/fonts/Fredoka-300.ttf"),
-    include_bytes!("../assets/fonts/Fredoka-400.ttf"),
-    include_bytes!("../assets/fonts/Fredoka-500.ttf"),
-    include_bytes!("../assets/fonts/Fredoka-600.ttf"),
-    include_bytes!("../assets/fonts/Fredoka-700.ttf"),
+/// The typefaces a theme letters its map in, ASCII only (assets/fonts/README.md): variable fonts drawn at any weight on their wght axis (fluor on cosmic-text 0.19), Mahere Mono in five static weights; loaded into the letterer's text renderer beside the panel's Open Sans, which every letter outside them falls back to.
+const LABEL_FONT_FILES: [&[u8]; 11] = [
+    include_bytes!("../assets/fonts/Cinzel.ttf"),
+    include_bytes!("../assets/fonts/EBGaramond.ttf"),
+    include_bytes!("../assets/fonts/Fredoka.ttf"),
     include_bytes!("../assets/fonts/MahereMono-300.ttf"),
     include_bytes!("../assets/fonts/MahereMono-400.ttf"),
     include_bytes!("../assets/fonts/MahereMono-500.ttf"),
     include_bytes!("../assets/fonts/MahereMono-600.ttf"),
     include_bytes!("../assets/fonts/MahereMono-700.ttf"),
-    include_bytes!("../assets/fonts/OpenSans-300.ttf"),
-    include_bytes!("../assets/fonts/OpenSans-500.ttf"),
-    include_bytes!("../assets/fonts/OpenSans-600.ttf"),
-    include_bytes!("../assets/fonts/Oxanium-300.ttf"),
-    include_bytes!("../assets/fonts/Oxanium-400.ttf"),
-    include_bytes!("../assets/fonts/Oxanium-500.ttf"),
-    include_bytes!("../assets/fonts/Oxanium-600.ttf"),
-    include_bytes!("../assets/fonts/Oxanium-700.ttf"),
-    include_bytes!("../assets/fonts/RobotoCondensed-300.ttf"),
-    include_bytes!("../assets/fonts/RobotoCondensed-400.ttf"),
-    include_bytes!("../assets/fonts/RobotoCondensed-500.ttf"),
-    include_bytes!("../assets/fonts/RobotoCondensed-600.ttf"),
-    include_bytes!("../assets/fonts/RobotoCondensed-700.ttf"),
+    include_bytes!("../assets/fonts/OpenSansVariable.ttf"),
+    include_bytes!("../assets/fonts/Oxanium.ttf"),
+    include_bytes!("../assets/fonts/RobotoCondensed.ttf"),
 ];
 
 /// A glyph's rotation bins, radians apart: one pixel of arc at half its size.
@@ -665,7 +643,11 @@ impl Labeller {
 impl Letterer {
     /// The typeface's family name.
     fn face(&self) -> &'static str {
-        mahere_engine::theme::LABEL_FONTS[(self.family as usize).min(mahere_engine::theme::LABEL_FONTS.len() - 1)]
+        match mahere_engine::theme::LABEL_FONTS[(self.family as usize).min(mahere_engine::theme::LABEL_FONTS.len() - 1)] {
+            // The variable Open Sans under a name of its own, so the panel's static Regular and Bold never stand in for the weights between.
+            "Open Sans" => "Open Sans Variable",
+            f => f,
+        }
     }
 
     fn advance(&mut self, ch: char, size: f32, weight: u16) -> f32 {

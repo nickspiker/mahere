@@ -704,22 +704,32 @@ dependencies = [
 ]
 
 [[package]]
-name = "cosmic-text"
-version = "0.14.2"
+name = "core_maths"
+version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "da46a9d5a8905cc538a4a5bceb6a4510de7a51049c5588c0114efce102bcbbe8"
+checksum = "77745e017f5edba1a9c1d854f6f3a52dac8a12dd5af5d2f54aecf61e43d80d30"
+dependencies = [
+ "libm",
+]
+
+[[package]]
+name = "cosmic-text"
+version = "0.19.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "be17b688510d934ce13f48a2beba700e11583e281e0fda99c22bb256a14eda73"
 dependencies = [
  "bitflags 2.13.2",
  "fontdb",
+ "harfrust",
+ "linebender_resource_handle",
  "log",
  "rangemap",
- "rustc-hash 1.1.0",
- "rustybuzz",
+ "rustc-hash 2.1.3",
  "self_cell",
- "smol_str",
+ "skrifa 0.40.0",
+ "smol_str 0.3.6",
  "swash",
  "sys-locale",
- "ttf-parser 0.21.1",
  "unicode-bidi",
  "unicode-linebreak",
  "unicode-script",
@@ -1115,7 +1125,6 @@ dependencies = [
 [[package]]
 name = "fluor"
 version = "0.0.4"
-source = "git+https://github.com/nickspiker/fluor?rev=d538a0a#d538a0a2c8215046bafbae8422d8a6c6ea90e403"
 dependencies = [
  "block2 0.6.2",
  "cosmic-text",
@@ -1137,7 +1146,7 @@ dependencies = [
  "softbuffer",
  "swash",
  "unicode-script",
- "vsf 0.9.3",
+ "vsf 0.10.0",
  "wgpu",
  "wide",
  "windows 0.58.0",
@@ -1159,6 +1168,15 @@ checksum = "77ce24cb58228fbb8aa041425bb1050850ac19177686ea6e0f41a70416f56fdb"
 
 [[package]]
 name = "font-types"
+version = "0.11.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5b38ad915f6dadd993ced50848a8291a543bd41ca62bc10740d5e64e2ab4cfd7"
+dependencies = [
+ "bytemuck",
+]
+
+[[package]]
+name = "font-types"
 version = "0.12.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6c92d9081c7ab3bd83ef1eecdfad090f3d966e3ce74106779664114cfe1a6274"
@@ -1177,16 +1195,16 @@ dependencies = [
 
 [[package]]
 name = "fontdb"
-version = "0.16.2"
+version = "0.23.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b0299020c3ef3f60f526a4f64ab4a3d4ce116b1acbf24cdd22da0068e5d81dc3"
+checksum = "457e789b3d1202543297a350643cf459f836cade38934e7a4cf6a39e7cde2905"
 dependencies = [
  "fontconfig-parser",
  "log",
  "memmap2 0.9.11",
  "slotmap",
  "tinyvec",
- "ttf-parser 0.20.0",
+ "ttf-parser",
 ]
 
 [[package]]
@@ -1363,6 +1381,19 @@ dependencies = [
  "crunchy",
  "num-traits",
  "zerocopy 0.8.59",
+]
+
+[[package]]
+name = "harfrust"
+version = "0.5.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9da2e5ae821f6e96664977bf974d6d6a2d6682f9ccee23e62ec1d134246845f9"
+dependencies = [
+ "bitflags 2.13.2",
+ "bytemuck",
+ "core_maths",
+ "read-fonts 0.37.0",
+ "smallvec",
 ]
 
 [[package]]
@@ -1803,6 +1834,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "linebender_resource_handle"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d4a5ff6bcca6c4867b1c4fd4ef63e4db7436ef363e0ad7531d1558856bae64f4"
+
+[[package]]
 name = "linux-raw-sys"
 version = "0.4.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1894,7 +1931,7 @@ dependencies = [
  "las",
  "rayon",
  "tiff",
- "vsf 0.10.0",
+ "vsf 0.10.0 (git+https://github.com/nickspiker/vsf?rev=a73e319fb96d8298cbb2fab4d0df1c391dee5637)",
 ]
 
 [[package]]
@@ -1906,7 +1943,7 @@ dependencies = [
  "rayon",
  "rustc-hash 2.1.3",
  "ureq",
- "vsf 0.10.0",
+ "vsf 0.10.0 (git+https://github.com/nickspiker/vsf?rev=a73e319fb96d8298cbb2fab4d0df1c391dee5637)",
 ]
 
 [[package]]
@@ -1930,7 +1967,7 @@ dependencies = [
  "mahere-coord",
  "osmpbf",
  "shapefile",
- "vsf 0.10.0",
+ "vsf 0.10.0 (git+https://github.com/nickspiker/vsf?rev=a73e319fb96d8298cbb2fab4d0df1c391dee5637)",
 ]
 
 [[package]]
@@ -1940,7 +1977,7 @@ dependencies = [
  "fluor",
  "mahere-engine",
  "mahere-tiles",
- "vsf 0.10.0",
+ "vsf 0.10.0 (git+https://github.com/nickspiker/vsf?rev=a73e319fb96d8298cbb2fab4d0df1c391dee5637)",
 ]
 
 [[package]]
@@ -1953,7 +1990,7 @@ dependencies = [
  "mahere-engine",
  "mahere-tiles",
  "rand",
- "vsf 0.10.0",
+ "vsf 0.10.0 (git+https://github.com/nickspiker/vsf?rev=a73e319fb96d8298cbb2fab4d0df1c391dee5637)",
  "zstd",
 ]
 
@@ -1967,7 +2004,7 @@ dependencies = [
  "png",
  "rayon",
  "ureq",
- "vsf 0.10.0",
+ "vsf 0.10.0 (git+https://github.com/nickspiker/vsf?rev=a73e319fb96d8298cbb2fab4d0df1c391dee5637)",
  "zstd",
 ]
 
@@ -1978,7 +2015,7 @@ dependencies = [
  "blake3",
  "ed25519-dalek",
  "ureq",
- "vsf 0.10.0",
+ "vsf 0.10.0 (git+https://github.com/nickspiker/vsf?rev=a73e319fb96d8298cbb2fab4d0df1c391dee5637)",
 ]
 
 [[package]]
@@ -2616,7 +2653,7 @@ version = "0.25.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "36820e9051aca1014ddc75770aab4d68bc1e9e632f0f5627c4086bc216fb583b"
 dependencies = [
- "ttf-parser 0.25.1",
+ "ttf-parser",
 ]
 
 [[package]]
@@ -3024,12 +3061,23 @@ dependencies = [
 
 [[package]]
 name = "read-fonts"
+version = "0.37.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7b634fabf032fab15307ffd272149b622260f55974d9fad689292a5d33df02e5"
+dependencies = [
+ "bytemuck",
+ "core_maths",
+ "font-types 0.11.3",
+]
+
+[[package]]
+name = "read-fonts"
 version = "0.41.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "046a7d674daf459825b32f5062056d6882db0d2f5a479fbd76ccfc870ac18709"
 dependencies = [
  "bytemuck",
- "font-types",
+ "font-types 0.12.6",
  "once_cell",
 ]
 
@@ -3214,23 +3262,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
 
 [[package]]
-name = "rustybuzz"
-version = "0.14.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cfb9cf8877777222e4a3bc7eb247e398b56baba500c38c1c46842431adc8b55c"
-dependencies = [
- "bitflags 2.13.2",
- "bytemuck",
- "libm",
- "smallvec",
- "ttf-parser 0.21.1",
- "unicode-bidi-mirroring",
- "unicode-ccc",
- "unicode-properties",
- "unicode-script",
-]
-
-[[package]]
 name = "safe_arch"
 version = "0.7.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3385,12 +3416,22 @@ checksum = "e3a9fe34e3e7a50316060351f37187a3f546bce95496156754b601a5fa71b76e"
 
 [[package]]
 name = "skrifa"
+version = "0.40.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7fbdfe3d2475fbd7ddd1f3e5cf8288a30eb3e5f95832829570cd88115a7434ac"
+dependencies = [
+ "bytemuck",
+ "read-fonts 0.37.0",
+]
+
+[[package]]
+name = "skrifa"
 version = "0.44.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "819ab7d62b1d3e72d9d9dea5650bac30424f9111364bb94928dbf5ecad1baa68"
 dependencies = [
  "bytemuck",
- "read-fonts",
+ "read-fonts 0.41.0",
 ]
 
 [[package]]
@@ -3447,6 +3488,12 @@ checksum = "dd538fb6910ac1099850255cf94a94df6551fbdd602454387d0adb2d1ca6dead"
 dependencies = [
  "serde",
 ]
+
+[[package]]
+name = "smol_str"
+version = "0.3.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4aaa7368fcf4852a4c2dd92df0cace6a71f2091ca0a23391ce7f3a31833f1523"
 
 [[package]]
 name = "softbuffer"
@@ -3563,7 +3610,7 @@ version = "0.2.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6c2499c2d826531388872b2268718aed907a39bd785ab0dcfe57fab26283f92e"
 dependencies = [
- "skrifa",
+ "skrifa 0.44.0",
  "yazi",
  "zeno",
 ]
@@ -3830,21 +3877,12 @@ checksum = "db97caf9d906fbde555dd62fa95ddba9eecfd14cb388e4f491a66d74cd5fb79a"
 
 [[package]]
 name = "ttf-parser"
-version = "0.20.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "17f77d76d837a7830fe1d4f12b7b4ba4192c1888001c7164257e4bc6d21d96b4"
-
-[[package]]
-name = "ttf-parser"
-version = "0.21.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2c591d83f69777866b9126b24c6dd9a18351f177e49d625920d19f989fd31cf8"
-
-[[package]]
-name = "ttf-parser"
 version = "0.25.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d2df906b07856748fa3f6e0ad0cbaa047052d4a7dd609e231c4f72cee8c36f31"
+dependencies = [
+ "core_maths",
+]
 
 [[package]]
 name = "typenum"
@@ -3857,18 +3895,6 @@ name = "unicode-bidi"
 version = "0.3.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5c1cb5db39152898a79168971543b1cb5020dff7fe43c8dc468b0885f5e29df5"
-
-[[package]]
-name = "unicode-bidi-mirroring"
-version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "23cb788ffebc92c5948d0e997106233eeb1d8b9512f93f41651f52b6c5f5af86"
-
-[[package]]
-name = "unicode-ccc"
-version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1df77b101bcc4ea3d78dafc5ad7e4f58ceffe0b2b16bf446aeb50b6cb4157656"
 
 [[package]]
 name = "unicode-ident"
@@ -3890,12 +3916,6 @@ checksum = "5fd4f6878c9cb28d874b009da9e8d183b5abc80117c40bbd187a1fde336be6e8"
 dependencies = [
  "tinyvec",
 ]
-
-[[package]]
-name = "unicode-properties"
-version = "0.1.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7df058c713841ad818f1dc5d3fd88063241cc61f49f5fbea4b951e8cf5a8d71d"
 
 [[package]]
 name = "unicode-script"
@@ -4013,6 +4033,21 @@ dependencies = [
  "num-traits",
  "spin",
  "unicode-normalization",
+]
+
+[[package]]
+name = "vsf"
+version = "0.10.0"
+dependencies = [
+ "bitvec",
+ "blake3",
+ "chrono",
+ "hex",
+ "i256",
+ "libm",
+ "num-complex",
+ "num-traits",
+ "spin",
 ]
 
 [[package]]
@@ -4791,7 +4826,7 @@ dependencies = [
  "rustix 0.38.44",
  "sctk-adwaita",
  "smithay-client-toolkit",
- "smol_str",
+ "smol_str 0.2.2",
  "tracing",
  "unicode-segmentation",
  "wasm-bindgen",

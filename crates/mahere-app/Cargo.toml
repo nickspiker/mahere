@@ -12,7 +12,7 @@ mahere-engine = { path = "../mahere-engine" }
 mahere-store = { path = "../mahere-store" }
 mahere-panel = { path = "../mahere-panel" }
 mahere-update = { path = "../mahere-update" }
-fluor = { git = "https://github.com/nickspiker/fluor", rev = "d538a0a", features = ["host-winit"] }
+fluor = { path = "../../../fluor-var", features = ["host-winit"] }
 
 [dev-dependencies]
 mahere-coord = { path = "../mahere-coord" }

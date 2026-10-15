@@ -9,5 +9,5 @@ description = "mahere's on-map controls: a gear that shows and hides the layer t
 [dependencies]
 mahere-engine = { path = "../mahere-engine" }
 mahere-tiles = { path = "../mahere-tiles" }
-fluor = { git = "https://github.com/nickspiker/fluor", rev = "d538a0a", default-features = false, features = ["std", "text", "icon"] }
+fluor = { path = "../../../fluor-var", default-features = false, features = ["std", "text", "icon"] }
 vsf = { git = "https://github.com/nickspiker/vsf", rev = "a73e319fb96d8298cbb2fab4d0df1c391dee5637" }
