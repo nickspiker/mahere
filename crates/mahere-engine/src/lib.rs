@@ -1086,6 +1086,11 @@ impl MapCore {
         self.res.pending_count()
     }
 
+    /// Cells in view still without their base: the lines are all drawn when it is none.
+    pub fn bases_left(&self) -> usize {
+        self.res.bases_left()
+    }
+
     /// The elevations a GPU's map pass drew (quantised, lowest and highest), read back after the frame: the next frame's contour interval and raw elevation range come from them, and a change redraws. None when it drew no terrain, which keeps the last. Until the first arrives a frame draws unscaled.
     pub fn set_drawn_range(&mut self, range: Option<(u16, u16)>) {
         if let Some((lo, hi)) = range {

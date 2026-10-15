@@ -34,18 +34,23 @@ impl RemoteStore for Counting {
     }
 }
 
-/// Render and tick until the view settles; the seconds it took.
-fn settle(map: &mut MapCore, w: usize, h: usize) -> f32 {
+/// Render and tick until the view settles; the seconds until its lines were all there, and until it settled.
+fn settle(map: &mut MapCore, w: usize, h: usize) -> (f32, f32) {
     let t = std::time::Instant::now();
+    let mut lines = None;
     for _ in 0..6000 {
         map.render(w, h);
+        if lines.is_none() && map.bases_left() == 0 {
+            lines = Some(t.elapsed().as_secs_f32());
+        }
         if map.converged() {
             break;
         }
         std::thread::sleep(std::time::Duration::from_millis(5));
         map.tick(w, h);
     }
-    t.elapsed().as_secs_f32()
+    let all = t.elapsed().as_secs_f32();
+    (lines.unwrap_or(all), all)
 }
 
 fn main() {
@@ -59,7 +64,7 @@ fn main() {
     let layers = LayerStores { dem: tiered(cache.layer(Layer::Dem), Layer::Dem), img: tiered(cache.layer(Layer::Img), Layer::Img), nir: tiered(cache.layer(Layer::Nir), Layer::Nir) };
     let mut map = MapCore::layered(tiered(cache.clone(), Layer::Base), Some(layers), Camera::new(lat, lon, 12000.0, 0.0));
     let (w, h) = (1080usize, 2340usize);
-    let report = |what: &str, s: f32, before: usize| eprintln!("{what}: {s:.2} s, {} bucket requests", FETCHES.load(Ordering::Relaxed) - before);
+    let report = |what: &str, (lines, all): (f32, f32), before: usize| eprintln!("{what}: lines {lines:.2} s, settled {all:.2} s, {} bucket requests", FETCHES.load(Ordering::Relaxed) - before);
     let n = FETCHES.load(Ordering::Relaxed);
     report("view from nothing", settle(&mut map, w, h), n);
     std::thread::sleep(std::time::Duration::from_secs(4));
