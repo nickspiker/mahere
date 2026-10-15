@@ -20,9 +20,9 @@ edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/nickspiker/mahere"
 
-# fluor's dev tree declares vsf as a sibling path dep (../vsf), which a git checkout of fluor doesn't contain — point it at the pushed vsf repo. fluor, kete, manifestus and tohu stay on vsf 0.9 (format v9) until they move; mahere's own crates use vsf 0.10 (format v10, which reads v9), the two built side by side and never handing a VSF value to each other (bytes and strings only cross).
+# fluor's dev tree declares vsf as a sibling path dep (../vsf), which a git checkout of fluor doesn't contain — point it at the pushed vsf repo. fluor is on vsf 0.10 with mahere's own crates; kete, manifestus and tohu stay on vsf 0.9 (format v9) until they move, the two built side by side and never handing a VSF value to each other (bytes and strings only cross).
 [patch."https://github.com/nickspiker/fluor"]
-vsf = { git = "https://github.com/nickspiker/vsf", rev = "5f2bb06c8d96ee417a2571944882ef36d6c9ca8f" }
+vsf = { git = "https://github.com/nickspiker/vsf", rev = "a73e319fb96d8298cbb2fab4d0df1c391dee5637" }
 
 # kete (and its manifestus/tohu deps) declare sibling path deps like fluor does — redirect each git source's path deps to the pushed repos, all vsf references unified on one rev.
 [patch."https://github.com/nickspiker/kete"]

@@ -1125,6 +1125,7 @@ dependencies = [
 [[package]]
 name = "fluor"
 version = "0.0.4"
+source = "git+https://github.com/nickspiker/fluor?rev=5855711#5855711fdaace662f5721ce0797e1a6f5c64325e"
 dependencies = [
  "block2 0.6.2",
  "cosmic-text",
@@ -1931,7 +1932,7 @@ dependencies = [
  "las",
  "rayon",
  "tiff",
- "vsf 0.10.0 (git+https://github.com/nickspiker/vsf?rev=a73e319fb96d8298cbb2fab4d0df1c391dee5637)",
+ "vsf 0.10.0",
 ]
 
 [[package]]
@@ -1943,7 +1944,7 @@ dependencies = [
  "rayon",
  "rustc-hash 2.1.3",
  "ureq",
- "vsf 0.10.0 (git+https://github.com/nickspiker/vsf?rev=a73e319fb96d8298cbb2fab4d0df1c391dee5637)",
+ "vsf 0.10.0",
 ]
 
 [[package]]
@@ -1967,7 +1968,7 @@ dependencies = [
  "mahere-coord",
  "osmpbf",
  "shapefile",
- "vsf 0.10.0 (git+https://github.com/nickspiker/vsf?rev=a73e319fb96d8298cbb2fab4d0df1c391dee5637)",
+ "vsf 0.10.0",
 ]
 
 [[package]]
@@ -1977,7 +1978,7 @@ dependencies = [
  "fluor",
  "mahere-engine",
  "mahere-tiles",
- "vsf 0.10.0 (git+https://github.com/nickspiker/vsf?rev=a73e319fb96d8298cbb2fab4d0df1c391dee5637)",
+ "vsf 0.10.0",
 ]
 
 [[package]]
@@ -1990,7 +1991,7 @@ dependencies = [
  "mahere-engine",
  "mahere-tiles",
  "rand",
- "vsf 0.10.0 (git+https://github.com/nickspiker/vsf?rev=a73e319fb96d8298cbb2fab4d0df1c391dee5637)",
+ "vsf 0.10.0",
  "zstd",
 ]
 
@@ -2004,7 +2005,7 @@ dependencies = [
  "png",
  "rayon",
  "ureq",
- "vsf 0.10.0 (git+https://github.com/nickspiker/vsf?rev=a73e319fb96d8298cbb2fab4d0df1c391dee5637)",
+ "vsf 0.10.0",
  "zstd",
 ]
 
@@ -2015,7 +2016,7 @@ dependencies = [
  "blake3",
  "ed25519-dalek",
  "ureq",
- "vsf 0.10.0 (git+https://github.com/nickspiker/vsf?rev=a73e319fb96d8298cbb2fab4d0df1c391dee5637)",
+ "vsf 0.10.0",
 ]
 
 [[package]]
@@ -4033,21 +4034,6 @@ dependencies = [
  "num-traits",
  "spin",
  "unicode-normalization",
-]
-
-[[package]]
-name = "vsf"
-version = "0.10.0"
-dependencies = [
- "bitvec",
- "blake3",
- "chrono",
- "hex",
- "i256",
- "libm",
- "num-complex",
- "num-traits",
- "spin",
 ]
 
 [[package]]
