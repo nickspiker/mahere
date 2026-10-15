@@ -656,7 +656,7 @@ pub extern "system" fn Java_nz_mahere_app_MahereActivity_nativeInit(
     eprintln!("camera: {:.5} {:.5} ppd {:.1} bearing {:.3}", cam.lat(), cam.lon(), cam.ppd, cam.bearing());
     let mut areas = mahere_engine::areas::Areas::new(cell_store.clone());
     if let Some(l) = &layer_stores {
-        areas.set_imagery_store(l.img.clone());
+        areas.set_layer_stores(vec![l.dem.clone(), l.img.clone()]);
     }
     let mut map = MapCore::layered(cell_store, layer_stores, cam);
     if let Some(v) = &store {

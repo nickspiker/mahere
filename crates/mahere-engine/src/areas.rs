@@ -63,8 +63,8 @@ pub struct Areas {
     pub list: Vec<AreaEntry>,
     store: Option<Arc<dyn AreaStore>>,
     cells: Arc<dyn CellStore>,
-    /// The image layer's store, when cells come published in layers: an area's download takes its imagery too, so the photo is there offline.
-    img: Option<Arc<dyn CellStore>>,
+    /// The other layers' stores, when cells come published in layers: an area's download takes its terrain and imagery too, so both are there offline.
+    extra: Vec<Arc<dyn CellStore>>,
 }
 
 /// Eagle Time now.
@@ -75,12 +75,12 @@ fn et_now() -> i64 {
 
 impl Areas {
     pub fn new(cells: Arc<dyn CellStore>) -> Areas {
-        Areas { list: Vec::new(), store: None, cells, img: None }
+        Areas { list: Vec::new(), store: None, cells, extra: Vec::new() }
     }
 
-    /// Downloads take the image layer from this store as well as the base.
-    pub fn set_imagery_store(&mut self, img: Arc<dyn CellStore>) {
-        self.img = Some(img);
+    /// Downloads take these layers (the terrain, the imagery) as well as the base.
+    pub fn set_layer_stores(&mut self, stores: Vec<Arc<dyn CellStore>>) {
+        self.extra = stores;
     }
 
     /// The store, and everything in it loaded.
@@ -185,8 +185,8 @@ impl Areas {
         let cells: Vec<CellKey> = e.area.all_cells_to(e.area.depth);
         progress.total.store(cells.len() as u64, Ordering::Relaxed);
         e.download = Some(progress.clone());
-        let (store, img) = (self.cells.clone(), self.img.clone());
-        std::thread::spawn(move || fetch_all(store, img, cells, progress, refresh));
+        let (store, extra) = (self.cells.clone(), self.extra.clone());
+        std::thread::spawn(move || fetch_all(store, extra, cells, progress, refresh));
     }
 
     pub fn cancel(&mut self, i: usize) {
@@ -243,7 +243,7 @@ impl Areas {
 }
 
 /// The fetch itself: depth by depth so a cell found absent spares its descendants, four cells at a time within a depth.
-fn fetch_all(store: Arc<dyn CellStore>, img: Option<Arc<dyn CellStore>>, cells: Vec<CellKey>, progress: Arc<Progress>, refresh: bool) {
+fn fetch_all(store: Arc<dyn CellStore>, extra: Vec<Arc<dyn CellStore>>, cells: Vec<CellKey>, progress: Arc<Progress>, refresh: bool) {
     let absent = std::sync::Mutex::new(FxHashSet::<CellKey>::default());
     let max_depth = cells.iter().map(|k| k.depth).max().unwrap_or(0);
     'depths: for d in 0..=max_depth {
@@ -274,8 +274,8 @@ fn fetch_all(store: Arc<dyn CellStore>, img: Option<Arc<dyn CellStore>>, cells: 
                             match if refresh { store.refresh(key) } else { store.get(key) } {
                                 Fetch::Bytes(b) => {
                                     progress.bytes.fetch_add(b.len() as u64, Ordering::Relaxed);
-                                    // The cell's imagery beside it, absent or not.
-                                    if let Some(i) = &img {
+                                    // The cell's other layers beside it, absent or not.
+                                    for i in &extra {
                                         match if refresh { i.refresh(key) } else { i.get(key) } {
                                             Fetch::Bytes(b) => {
                                                 progress.bytes.fetch_add(b.len() as u64, Ordering::Relaxed);

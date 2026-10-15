@@ -473,8 +473,13 @@ impl VaultCells {
             let unpinned = |k: &(u8, u64)| !pinned.contains(&(k.0 & 63, k.1));
             let mut total: u64 = ix.entries.iter().filter(|(k, _)| unpinned(k)).map(|(_, &(_, b))| b as u64).sum();
             let mut by_age: Vec<(&(u8, u64), &(i64, u32))> = ix.entries.iter().filter(|(k, _)| unpinned(k)).collect();
-            // The image layers go before any base (a map without its photo still reads), oldest first within each.
-            by_age.sort_by_key(|(k, v)| (k.0 >> 6 == 0, v.0));
+            // The image layers go first (a map without its photo still reads), then the terrain, the base last, oldest first within each.
+            let keep = |layer: u8| match layer {
+                0 => 2,
+                3 => 1,
+                _ => 0,
+            };
+            by_age.sort_by_key(|(k, v)| (keep(k.0 >> 6), v.0));
             let mut out = Vec::new();
             for (k, &(_, b)) in by_age {
                 if total <= budget {
@@ -565,6 +570,7 @@ fn layer_name(word: &str, layer: u8) -> VsfType {
     match layer {
         0 => name(word),
         1 => name(&format!("{word}img")),
+        3 => name(&format!("{word}dem")),
         _ => name(&format!("{word}nir")),
     }
 }
@@ -593,7 +599,7 @@ pub fn cell_stores(local: Option<&std::path::Path>, vault: Option<&Arc<FlatStora
     use mahere_tiles::publish::Layer;
     if let Some(dir) = local {
         if dir.join("base").is_dir() {
-            let layers = LayerStores { img: Arc::new(LayerDir(dir.to_path_buf(), Layer::Img)), nir: Arc::new(LayerDir(dir.to_path_buf(), Layer::Nir)) };
+            let layers = LayerStores { dem: Arc::new(LayerDir(dir.to_path_buf(), Layer::Dem)), img: Arc::new(LayerDir(dir.to_path_buf(), Layer::Img)), nir: Arc::new(LayerDir(dir.to_path_buf(), Layer::Nir)) };
             return (Arc::new(LayerDir(dir.to_path_buf(), Layer::Base)), Some(layers), None);
         }
         return (Arc::new(DirStore(dir.to_path_buf())), None, None);
@@ -603,12 +609,13 @@ pub fn cell_stores(local: Option<&std::path::Path>, vault: Option<&Arc<FlatStora
         Some(v) => {
             let cache = Arc::new(VaultCells::new(v.clone()));
             let layers = LayerStores {
+                dem: Arc::new(TieredStore::new(cache.layer(Layer::Dem), remote(Layer::Dem))),
                 img: Arc::new(TieredStore::new(cache.layer(Layer::Img), remote(Layer::Img))),
                 nir: Arc::new(TieredStore::new(cache.layer(Layer::Nir), remote(Layer::Nir))),
             };
             (Arc::new(TieredStore::new(cache.clone(), remote(Layer::Base))), Some(layers), Some(cache))
         }
-        None => (remote(Layer::Base), Some(LayerStores { img: remote(Layer::Img), nir: remote(Layer::Nir) }), None),
+        None => (remote(Layer::Base), Some(LayerStores { dem: remote(Layer::Dem), img: remote(Layer::Img), nir: remote(Layer::Nir) }), None),
     }
 }
 
@@ -762,18 +769,19 @@ impl VaultCells {
         }
     }
 
-    /// One of a published cell's image layers, as a cache of its own over the same vault, index and pins (1 the image, 2 the infrared).
+    /// One of a published cell's other layers, as a cache of its own over the same vault, index and pins (1 the image, 2 the infrared, 3 the terrain).
     pub fn layer(self: &Arc<Self>, layer: mahere_tiles::publish::Layer) -> Arc<VaultLayer> {
         let code = match layer {
             mahere_tiles::publish::Layer::Base => 0,
             mahere_tiles::publish::Layer::Img => 1,
             mahere_tiles::publish::Layer::Nir => 2,
+            mahere_tiles::publish::Layer::Dem => 3,
         };
         Arc::new(VaultLayer { cells: self.clone(), layer: code })
     }
 }
 
-/// A published cell's image layer in the vault.
+/// A published cell's layer other than its base, in the vault.
 pub struct VaultLayer {
     cells: Arc<VaultCells>,
     layer: u8,

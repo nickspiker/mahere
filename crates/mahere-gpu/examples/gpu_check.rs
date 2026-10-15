@@ -31,7 +31,7 @@ fn main() {
     let mut map = if root.join("base").is_dir() {
         use mahere_engine::residency::{LayerDir, LayerStores};
         use mahere_tiles::publish::Layer;
-        let layers = LayerStores { img: Arc::new(LayerDir(root.clone(), Layer::Img)), nir: Arc::new(LayerDir(root.clone(), Layer::Nir)) };
+        let layers = LayerStores { dem: Arc::new(LayerDir(root.clone(), Layer::Dem)), img: Arc::new(LayerDir(root.clone(), Layer::Img)), nir: Arc::new(LayerDir(root.clone(), Layer::Nir)) };
         MapCore::layered(Arc::new(LayerDir(root, Layer::Base)), Some(layers), Camera::new(lat, lon, ppd, bearing))
     } else {
         MapCore::new(Arc::new(DirStore(root)), Camera::new(lat, lon, ppd, bearing))

@@ -228,7 +228,8 @@ fn snap(cells: &mut Cells, at: T, travel: Travel) -> Vec<(T, i64, f64)> {
 }
 
 /// The best route from one point to another, or why there is none.
-pub fn find(store: Arc<dyn CellStore>, from: (f64, f64), to: (f64, f64), travel: Travel) -> Result<Route, String> {
+/// `dem` is where the terrain comes from for the climb (the base store itself for cells baked whole).
+pub fn find(store: Arc<dyn CellStore>, dem: Arc<dyn CellStore>, from: (f64, f64), to: (f64, f64), travel: Travel) -> Result<Route, String> {
     let mut cells = Cells { store: store.clone(), got: HashMap::new() };
     let (a, b) = (T::of(from.0, from.1), T::of(to.0, to.1));
     if a.d != b.d {
@@ -381,7 +382,7 @@ pub fn find(store: Arc<dyn CellStore>, from: (f64, f64), to: (f64, f64), travel:
     }
     route.steps = kept;
     if travel != Travel::Car {
-        let (time, climb) = ground_time(&store, &chain.iter().map(|s| s.0).collect::<Vec<_>>(), travel);
+        let (time, climb) = ground_time(&dem, &chain.iter().map(|s| s.0).collect::<Vec<_>>(), travel);
         route.climb_m = climb;
         if let Some(t) = time {
             route.seconds = t + grid_m(a.centre(), chain[0].0.centre()) / off_way + grid_m(chain.last().unwrap().0.centre(), b.centre()) / off_way;
@@ -476,11 +477,11 @@ mod tests {
         let north = road(2, vec![(lat, lon), (lat + 0.004, lon)], 0, 0);
         let bridge = road(3, vec![(lat - 0.004, lon + 0.003), (lat + 0.004, lon + 0.003)], 0, 1);
         let store = baked(&[east, north, bridge], &[(lat, lon)]);
-        let to_north = find(store.clone(), (lat as f64, lon as f64 - 0.0035), (lat as f64 + 0.0035, lon as f64), Travel::Car).unwrap();
+        let to_north = find(store.clone(), store.clone(), (lat as f64, lon as f64 - 0.0035), (lat as f64 + 0.0035, lon as f64), Travel::Car).unwrap();
         let said: Vec<String> = to_north.steps.iter().map(|s| format!("{} {}", s.turn, s.name)).collect();
         assert_eq!(said, ["Start East Road", "Turn left onto North Road"], "{:?}", to_north.steps);
         // The bridge's far end is reachable only by the bridge: from the east road there is no way up.
-        let err = find(store, (lat as f64, lon as f64 - 0.0035), (lat as f64 + 0.0035, lon as f64 + 0.003), Travel::Car);
+        let err = find(store.clone(), store, (lat as f64, lon as f64 - 0.0035), (lat as f64 + 0.0035, lon as f64 + 0.003), Travel::Car);
         assert!(err.is_err() || err.unwrap().metres > 2000.0, "a route climbed onto the bridge from the road beneath");
     }
 
@@ -489,8 +490,8 @@ mod tests {
         let (lat, lon) = (47.60f32, -122.33f32);
         let one = road(1, vec![(lat, lon - 0.003), (lat, lon + 0.003)], 1, 0);
         let store = baked(&[one], &[]);
-        assert!(find(store.clone(), (lat as f64, lon as f64 - 0.002), (lat as f64, lon as f64 + 0.002), Travel::Car).is_ok());
-        assert!(find(store.clone(), (lat as f64, lon as f64 + 0.002), (lat as f64, lon as f64 - 0.002), Travel::Car).is_err(), "drove the wrong way down a one-way");
-        assert!(find(store, (lat as f64, lon as f64 + 0.002), (lat as f64, lon as f64 - 0.002), Travel::Foot).is_ok(), "walking ignores one-ways");
+        assert!(find(store.clone(), store.clone(), (lat as f64, lon as f64 - 0.002), (lat as f64, lon as f64 + 0.002), Travel::Car).is_ok());
+        assert!(find(store.clone(), store.clone(), (lat as f64, lon as f64 + 0.002), (lat as f64, lon as f64 - 0.002), Travel::Car).is_err(), "drove the wrong way down a one-way");
+        assert!(find(store.clone(), store, (lat as f64, lon as f64 + 0.002), (lat as f64, lon as f64 - 0.002), Travel::Foot).is_ok(), "walking ignores one-ways");
     }
 }

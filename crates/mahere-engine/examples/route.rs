@@ -11,7 +11,7 @@ fn main() {
     };
     let store = Arc::new(mahere_engine::residency::DirStore(a[1].clone().into()));
     let t = std::time::Instant::now();
-    match mahere_engine::route::find(store, (n(2), n(3)), (n(4), n(5)), travel) {
+    match mahere_engine::route::find(store.clone(), store, (n(2), n(3)), (n(4), n(5)), travel) {
         Ok(r) => {
             println!("{} {:.2} km, {:.0} min, {:.0} m climbed, found in {:.0} ms", r.travel.word(), r.metres / 1000.0, r.seconds / 60.0, r.climb_m, t.elapsed().as_secs_f64() * 1e3);
             for s in &r.steps {

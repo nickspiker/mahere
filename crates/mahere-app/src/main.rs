@@ -696,7 +696,7 @@ fn main() {
     };
     let mut areas = mahere_engine::areas::Areas::new(store.clone());
     if let Some(l) = &layer_stores {
-        areas.set_imagery_store(l.img.clone());
+        areas.set_layer_stores(vec![l.dem.clone(), l.img.clone()]);
     }
     let mut map = MapCore::layered(store, layer_stores, cam);
     // The user's own cells, as files beside the data; the areas as files under them.

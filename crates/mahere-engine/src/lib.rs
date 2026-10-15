@@ -795,11 +795,15 @@ impl MapCore {
         self.layer_mask = mask;
         self.luts.mask = mask.effective();
         // The image layers come with each cell only while a view shows them: true colour, or the infrared alone.
-        let want = match (mask.imagery, mask.infrared) {
+        let mut want = match (mask.imagery, mask.infrared) {
             (true, false) => residency::WANT_IMG,
             (true, true) => residency::WANT_NIR,
             _ => 0,
         };
+        // The terrain whenever anything drawn from it shows: the shading, the tint, contours, slope bands, raw elevation, and the sea under imagery.
+        if mask.dem || mask.hypso || mask.contours || mask.slope || mask.raw || mask.imagery {
+            want |= residency::WANT_DEM;
+        }
         self.res.set_imagery(want);
         self.dirty = true;
     }
@@ -1032,9 +1036,11 @@ impl MapCore {
             _ => centre,
         };
         let store = self.res.store();
+        // The climb comes from the terrain, its own layer when cells come in layers.
+        let dem = self.res.layer_stores().map_or(store.clone(), |l| l.dem);
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            let _ = tx.send(route::find(store, from, to, travel));
+            let _ = tx.send(route::find(store, dem, from, to, travel));
         });
         self.route_rx = Some(rx);
         self.tap_info.insert(0, format!("Finding a route by {}\u{2026}", travel.word().to_lowercase()));

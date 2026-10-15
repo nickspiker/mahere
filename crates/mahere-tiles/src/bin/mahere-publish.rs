@@ -30,7 +30,7 @@ fn main() {
     eprintln!("{} cells in {}", files.len(), src.display());
     let (done, skipped, failed) = (AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0));
     let bytes_in = AtomicU64::new(0);
-    let bytes_out: [AtomicU64; 3] = Default::default();
+    let bytes_out: [AtomicU64; 4] = Default::default();
     let t = std::time::Instant::now();
     files.par_iter().enumerate().for_each(|(i, (key, path))| {
         let base_path = out.join(Layer::Base.path(*key));
@@ -51,7 +51,7 @@ fn main() {
         };
         if check > 0 && i % check == 0 {
             let get = |l: Layer| layers.get(&l).map(|v| v.as_slice());
-            let new = decode_layers(get(Layer::Base), get(Layer::Img), get(Layer::Nir)).expect("published cell decodes");
+            let new = decode_layers(get(Layer::Base), get(Layer::Dem), get(Layer::Img), get(Layer::Nir)).expect("published cell decodes");
             let old = mahere_tiles::decode_cell(&bytes).expect("baked cell decodes");
             let diff = differs(&old, &new);
             assert!(diff.is_empty(), "{}: published cell differs from its bake in {}", key.name(), diff.join(", "));
@@ -83,7 +83,7 @@ fn main() {
     let gb = |b: u64| b as f64 / 1e9;
     let o: Vec<u64> = bytes_out.iter().map(|b| b.load(Ordering::Relaxed)).collect();
     eprintln!(
-        "{} published, {} already, {} failed, {:.0}s: {:.2} GB baked -> base {:.2} + img {:.2} + nir {:.2} = {:.2} GB",
+        "{} published, {} already, {} failed, {:.0}s: {:.2} GB baked -> base {:.2} + dem {:.2} + img {:.2} + nir {:.2} = {:.2} GB",
         done.load(Ordering::Relaxed),
         skipped.load(Ordering::Relaxed),
         failed.load(Ordering::Relaxed),
@@ -92,6 +92,7 @@ fn main() {
         gb(o[0]),
         gb(o[1]),
         gb(o[2]),
+        gb(o[3]),
         gb(o.iter().sum())
     );
     if failed.load(Ordering::Relaxed) > 0 {

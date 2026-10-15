@@ -1142,6 +1142,8 @@ mod tests {
                 img: None,
                 own: None,
                 mvum: None,
+                layers: u8::MAX,
+                exists: true,
             },
         );
 

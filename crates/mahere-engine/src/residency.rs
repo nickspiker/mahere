@@ -142,6 +142,10 @@ pub struct Entry {
     /// Land ownership and motor vehicle use, where an area's overlay pass put them.
     pub own: Option<ClassCell>,
     pub mvum: Option<ClassCell>,
+    /// The layers loaded with the base ([`WANT_DEM`], [`WANT_IMG`], [`WANT_NIR`]; all of them for a cell baked whole).
+    pub layers: u8,
+    /// The cell exists (its base was there, if empty): a cell with only terrain or imagery is not absent.
+    pub exists: bool,
 }
 
 impl Entry {
@@ -159,7 +163,7 @@ impl Entry {
         self.present & PRESENT_DEM != 0
     }
     pub fn is_absent(&self) -> bool {
-        self.dem.is_none() && self.line.is_none() && self.land.is_none() && self.water.is_none() && self.img.is_none() && self.own.is_none() && self.mvum.is_none()
+        !self.exists && self.dem.is_none() && self.line.is_none() && self.land.is_none() && self.water.is_none() && self.img.is_none() && self.own.is_none() && self.mvum.is_none()
     }
     pub fn has_vec(&self) -> bool {
         self.line.is_some() || self.land.is_some() || self.water.is_some() || self.own.is_some() || self.mvum.is_some()
@@ -173,8 +177,8 @@ pub struct Loaded {
 }
 
 struct WantList {
-    /// Pre-sorted by priority (cell distance from view center).
-    list: Vec<CellKey>,
+    /// Pre-sorted by priority: every missing cell's base first (Nick 2026-10-14: the whole scene in lines, then the terrain filling in), then resident cells' layers, each nearest the view's centre first. Each with the layers to load beside its base.
+    list: Vec<(CellKey, u8)>,
 }
 
 /// Resident cells: page table over decoded planes. Plain map — a few hundred entries, probed per BLOCK (not per pixel) during render.
@@ -183,26 +187,26 @@ pub struct Pool {
     pub map: FxHashMap<CellKey, Entry>,
 }
 
-/// The image layers a published cell comes in besides its base (Nick 2026-10-14: imagery and infrared only when a view shows them): each from a store of its own.
+/// The layers a published cell comes in besides its base (Nick 2026-10-14: imagery and infrared only when a view shows them, and the terrain a layer of its own): each from a store of its own.
 #[derive(Clone)]
 pub struct LayerStores {
+    pub dem: Arc<dyn CellStore>,
     pub img: Arc<dyn CellStore>,
     pub nir: Arc<dyn CellStore>,
 }
 
-/// Which image layers the view wants loaded with each cell.
+/// Which layers the view wants loaded with each cell's base.
 pub const WANT_IMG: u8 = 1;
 pub const WANT_NIR: u8 = 2;
+pub const WANT_DEM: u8 = 4;
 
 pub struct Residency {
     /// The store the loader reads, for reading one cell's planes back on demand (a tap's details on a host whose GPU took the CPU copies).
     store: Arc<dyn CellStore>,
-    /// The image layers' stores, when cells come published in layers.
+    /// The other layers' stores, when cells come published in layers.
     layers: Option<LayerStores>,
-    /// The image layers wanted ([`WANT_IMG`], [`WANT_NIR`]), read by the loader.
-    imagery: Arc<std::sync::atomic::AtomicU8>,
-    /// Resident cells loaded without an image layer the view now wants: asked for again, kept on show until the new copy lands.
-    stale: FxHashSet<CellKey>,
+    /// The layers the view wants beside each base ([`WANT_DEM`], [`WANT_IMG`], [`WANT_NIR`]).
+    want_layers: u8,
     /// Whether the loader packs the CPU raster's u64 texels (normals included) for each dem; a GPU-only host turns it off and saves a megabyte and a few milliseconds per cell.
     pack_cpu: Arc<std::sync::atomic::AtomicBool>,
     want_tx: Sender<WantList>,
@@ -216,7 +220,7 @@ pub struct Residency {
     /// Bumped whenever the pool's membership changes, so a planner can reuse its last plan while nothing moved.
     pub pool_version: u64,
     /// The last missing list sent to the loader, so an unchanged one is not sent again.
-    last_sent: Vec<CellKey>,
+    last_sent: Vec<(CellKey, u8)>,
     last_send_at: std::time::Instant,
     /// Cells the store replaced with a newer copy, for whatever keeps something read from them to forget it.
     pub reloaded: Vec<CellKey>,
@@ -239,14 +243,12 @@ impl Residency {
         let pack_cpu = Arc::new(std::sync::atomic::AtomicBool::new(true));
         let pack = pack_cpu.clone();
         let read_store = store.clone();
-        let imagery = Arc::new(std::sync::atomic::AtomicU8::new(0));
-        let (l, want) = (layers.clone(), imagery.clone());
-        std::thread::spawn(move || loader_thread(store, l, want, want_rx, done_tx, pack));
+        let l = layers.clone();
+        std::thread::spawn(move || loader_thread(store, l, want_rx, done_tx, pack));
         Residency {
             store: read_store,
             layers,
-            imagery,
-            stale: FxHashSet::default(),
+            want_layers: WANT_DEM,
             pack_cpu,
             want_tx,
             done_rx,
@@ -262,11 +264,10 @@ impl Residency {
         }
     }
 
-    /// The image layers the view shows ([`WANT_IMG`], [`WANT_NIR`]): one newly wanted reloads every resident cell with something in it, each kept on show until its new copy lands.
+    /// The layers the view shows ([`WANT_DEM`], [`WANT_IMG`], [`WANT_NIR`]): one newly wanted is loaded for every resident cell, each kept on show until its fuller copy lands.
     pub fn set_imagery(&mut self, want: u8) {
-        let old = self.imagery.swap(want, std::sync::atomic::Ordering::Relaxed);
-        if self.layers.is_some() && want & !old != 0 {
-            self.stale = self.pool.map.iter().filter(|(_, e)| e.present != 0).map(|(k, _)| *k).collect();
+        if want != self.want_layers {
+            self.want_layers = want;
             self.last_sent.clear();
         }
     }
@@ -292,9 +293,10 @@ impl Residency {
         }
         while let Ok(l) = self.done_rx.try_recv() {
             self.pending.remove(&l.key);
-            self.stale.remove(&l.key);
-            self.last_sent.retain(|k| *k != l.key);
+            self.last_sent.retain(|(k, _)| *k != l.key);
             match l.entry {
+                // A base arriving after the same cell with its layers (an older request overtaken) leaves the fuller copy on show.
+                Some(e) if self.pool.map.get(&l.key).is_some_and(|old| old.layers & !e.layers != 0 && e.layers & !old.layers == 0) => {}
                 Some(e) => {
                     self.pool.map.insert(l.key, e);
                     self.pool_version += 1;
@@ -322,8 +324,14 @@ impl Residency {
         let now = std::time::Instant::now();
         self.failed.retain(|k, t| desired.contains(k) && now.duration_since(*t) < RETRY_AFTER);
         // Everything still missing goes every time, pending or not: the loader keeps only the newest list, so a cell dropped from an older one would otherwise stay pending forever and never arrive (the holes Nick saw once the orientation sensor made every frame a new list). Nothing is sent while the missing set is unchanged.
-        self.stale.retain(|k| desired.contains(k));
-        list.retain(|k| (!self.pool.map.contains_key(k) || self.stale.contains(k)) && !self.failed.contains_key(k));
+        // Resident cells (there, base and all) without a layer the view now shows: asked for again with it, after every missing base.
+        let want = self.want_layers;
+        let mut fill: Vec<CellKey> = if self.layers.is_some() {
+            list.iter().copied().filter(|k| !self.failed.contains_key(k) && self.pool.map.get(k).is_some_and(|e| e.exists && e.layers & want != want)).collect()
+        } else {
+            Vec::new()
+        };
+        list.retain(|k| !self.pool.map.contains_key(k) && !self.failed.contains_key(k));
         // Below a cell the loader confirmed absent nothing exists: its descendants are marked absent here and never asked for, so zooming past the finest data does not ask the bucket for a screen of cells that cannot be there (Nick 2026-10-10).
         let mut under_absent = Vec::new();
         list.retain(|k| {
@@ -344,20 +352,25 @@ impl Residency {
             }
             self.pool_version += 1;
         }
-        list.sort_by_key(|k| {
+        let near = |k: &CellKey| {
             let (cu, cv) = k.grid();
             // Chebyshev distance in this depth's grid, normalized by shifting the center (given at depth 30-ish precision) down.
             let sh = 30 - k.depth as u32;
             let (ku, kv) = (center.0 >> sh, center.1 >> sh);
             (cu.abs_diff(ku)).max(cv.abs_diff(kv))
-        });
+        };
+        list.sort_by_key(near);
+        fill.sort_by_key(near);
+        // Cells baked whole carry everything in one read; cells in layers come base first, the layers after.
+        let first = if self.layers.is_some() { 0 } else { want };
+        let list: Vec<(CellKey, u8)> = list.into_iter().map(|k| (k, first)).chain(fill.into_iter().map(|k| (k, want))).collect();
         // An unchanged list is still re-sent once a second: a cell the loader skipped as just-done can otherwise be waited on forever after a quick zoom out and back.
         if list == self.last_sent && self.last_send_at.elapsed() < std::time::Duration::from_secs(1) {
             return;
         }
         self.last_send_at = std::time::Instant::now();
         self.pending.clear();
-        for &k in &list {
+        for &(k, _) in &list {
             self.pending.insert(k);
         }
         self.last_sent = list.clone();
@@ -372,10 +385,16 @@ impl Residency {
         if self.pool.map.get(&key).is_none_or(|e| e.present == 0) {
             return None;
         }
-        match self.store.get_local(key) {
-            Fetch::Bytes(b) => mahere_tiles::decode_cell(&b).ok(),
-            _ => None,
-        }
+        let base = match self.store.get_local(key) {
+            Fetch::Bytes(b) => b,
+            _ => Vec::new(),
+        };
+        // The terrain from its own layer when cells come in layers, so a tap's elevation and slope are there.
+        let dem = match self.layers.as_ref().map(|l| l.dem.get_local(key)) {
+            Some(Fetch::Bytes(b)) => b,
+            _ => Vec::new(),
+        };
+        mahere_tiles::publish::decode_layers(non_empty(&base), non_empty(&dem), None, None).ok()
     }
 
     /// The store cells come from, for work that reads cells the view has not asked for (a route search).
@@ -406,14 +425,14 @@ impl Residency {
 
 /// The newest want-list is the only one that matters: an older list's leftovers are cells the view no longer needs (the main side forgets them as pending too, so they're re-requested if they come back).
 /// Cells decode in parallel a small chunk at a time so the nearest-first order still holds and a newer list preempts within a few cells.
-fn loader_thread(store: Arc<dyn CellStore>, layers: Option<LayerStores>, imagery: Arc<std::sync::atomic::AtomicU8>, want_rx: Receiver<WantList>, done_tx: Sender<Loaded>, pack_cpu: Arc<std::sync::atomic::AtomicBool>) {
+fn loader_thread(store: Arc<dyn CellStore>, layers: Option<LayerStores>, want_rx: Receiver<WantList>, done_tx: Sender<Loaded>, pack_cpu: Arc<std::sync::atomic::AtomicBool>) {
     // Decoding runs in its own pool: on the global one a frame's lattice waited behind cells mid-decode, and a plan took fifty milliseconds while the view streamed.
     let threads = (rayon::current_num_threads() / 2).clamp(2, 4);
     let pool = rayon::ThreadPoolBuilder::new().num_threads(threads).thread_name(|i| format!("mahere-load-{i}")).build().expect("loader pool");
     let chunk = threads * 2;
     let mut current: Option<WantList> = None;
     // Cells finished in the last moment: a newer list arrives before the main side has drained them, and would load them twice.
-    let mut done: FxHashMap<CellKey, std::time::Instant> = FxHashMap::default();
+    let mut done: FxHashMap<(CellKey, u8), std::time::Instant> = FxHashMap::default();
     loop {
         if current.is_none() {
             match want_rx.recv() {
@@ -431,13 +450,12 @@ fn loader_thread(store: Arc<dyn CellStore>, layers: Option<LayerStores>, imagery
         list.retain(|k| !done.contains_key(k));
         while !list.is_empty() {
             let n = list.len().min(chunk);
-            let batch: Vec<CellKey> = list.drain(..n).collect();
+            let batch: Vec<(CellKey, u8)> = list.drain(..n).collect();
             let pack = pack_cpu.load(std::sync::atomic::Ordering::Relaxed);
-            let want = imagery.load(std::sync::atomic::Ordering::Relaxed);
-            let loaded: Vec<Loaded> = pool.install(|| batch.par_iter().map(|&k| load_cell(&*store, layers.as_ref(), want, k, pack)).collect());
+            let loaded: Vec<(u8, Loaded)> = pool.install(|| batch.par_iter().map(|&(k, want)| (want, load_cell(&*store, layers.as_ref(), want, k, pack))).collect());
             let t = std::time::Instant::now();
-            for l in loaded {
-                done.insert(l.key, t);
+            for (want, l) in loaded {
+                done.insert((l.key, want), t);
                 if done_tx.send(l).is_err() {
                     return;
                 }
@@ -467,10 +485,24 @@ fn non_empty(b: &[u8]) -> Option<&[u8]> {
 }
 
 fn load_cell(store: &dyn CellStore, layers: Option<&LayerStores>, want: u8, key: CellKey, pack_cpu: bool) -> Loaded {
-    let Some(bytes) = layer_bytes(store, key, "base") else { return Loaded { key, entry: None } };
-    // The image layers the view shows, beside the base.
+    // No base, no cell (a published cell always has one, if empty); a failure is tried again.
+    let bytes = match store.get(key) {
+        Fetch::Bytes(b) => b,
+        Fetch::Absent => return Loaded { key, entry: Some(Entry::default()) },
+        Fetch::Failed(e) => {
+            eprintln!("cell {} fetch failed: {e}", key.name());
+            return Loaded { key, entry: None };
+        }
+    };
+    let layers_loaded = if layers.is_some() { want } else { u8::MAX };
+    // The layers the view shows, beside the base.
     let mut img_bytes: (Vec<u8>, Vec<u8>) = Default::default();
+    let mut dem_bytes: Vec<u8> = Vec::new();
     if let Some(l) = layers {
+        if want & WANT_DEM != 0 {
+            let Some(b) = layer_bytes(&*l.dem, key, "dem") else { return Loaded { key, entry: None } };
+            dem_bytes = b;
+        }
         if want & WANT_IMG != 0 {
             let Some(b) = layer_bytes(&*l.img, key, "img") else { return Loaded { key, entry: None } };
             img_bytes.0 = b;
@@ -480,10 +512,10 @@ fn load_cell(store: &dyn CellStore, layers: Option<&LayerStores>, want: u8, key:
             img_bytes.1 = b;
         }
     }
-    if bytes.is_empty() && img_bytes.0.is_empty() && img_bytes.1.is_empty() {
-        return Loaded { key, entry: Some(Entry::default()) };
+    if bytes.is_empty() && dem_bytes.is_empty() && img_bytes.0.is_empty() && img_bytes.1.is_empty() {
+        return Loaded { key, entry: Some(Entry { layers: layers_loaded, exists: true, ..Entry::default() }) };
     }
-    let planes = match mahere_tiles::publish::decode_layers(non_empty(&bytes), non_empty(&img_bytes.0), non_empty(&img_bytes.1)) {
+    let planes = match mahere_tiles::publish::decode_layers(non_empty(&bytes), non_empty(&dem_bytes), non_empty(&img_bytes.0), non_empty(&img_bytes.1)) {
         Ok(p) => p,
         Err(e) => {
             // A corrupt object: treat as a failure so it's retried (the vault may have a bad copy) rather than remembered as absent.
@@ -523,7 +555,7 @@ fn load_cell(store: &dyn CellStore, layers: Option<&LayerStores>, want: u8, key:
     if let Some(im) = &mut img {
         im.retone(mahere_tiles::tone::IMG_TAG);
     }
-    Loaded { key, entry: Some(Entry { present, line_mag_max, elev_lo, elev_hi, dem, dem_q, line: planes.line, land: planes.land, water: planes.water, img, own: planes.own, mvum: planes.mvum }) }
+    Loaded { key, entry: Some(Entry { present, line_mag_max, elev_lo, elev_hi, dem, dem_q, line: planes.line, land: planes.land, water: planes.water, img, own: planes.own, mvum: planes.mvum, layers: layers_loaded, exists: true }) }
 }
 
 // ==================== TIERED STORE: VAULT CACHE OVER THE BUCKET ====================
