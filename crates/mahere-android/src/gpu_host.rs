@@ -214,8 +214,10 @@ impl GpuHost {
             if panel.is_open() {
                 areas.hash(&mut hs);
             }
-            // The zoom shown under the compass.
+            // The zoom shown under the compass, and whether it is past the data (it turns amber).
             map.view_depth().hash(&mut hs);
+            map.zoom_depth().hash(&mut hs);
+            map.past_data().hash(&mut hs);
             hs.finish()
         });
         // Labels: laid out again when the view rests; every frame each letter is a quad at its label's place on the map now.

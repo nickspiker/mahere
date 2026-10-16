@@ -260,7 +260,7 @@ fn style_of(n: &Named) -> (f32, usize, u16, f32) {
         MOTORWAY..=PRIMARY => (0.82, ROAD, 700, 0.0),
         TRACK | PATH => (0.78, TRAIL, 400, 0.0),
         PARK..=ADMIN => (0.78, BOUNDARY, 400, 0.0),
-        EXIT => (0.72, ROAD, 700, 0.0),
+        EXIT => (0.72, PLACE, 700, 0.0),
         ISLAND => (1.0, PLACE, 600, 0.0),
         ISLET | CAPE => (0.8, PLACE, 400, 0.0),
         NEIGHBOURHOOD => (0.82, PLACE, 500, 0.0),

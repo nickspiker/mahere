@@ -1468,6 +1468,21 @@ impl MapCore {
         }
     }
 
+    /// Whether the view is zoomed past the finest data under the crosshair: the cell there at the view's depth is known to be absent (a 404 from the bucket, or under a cell that was). A cell still loading is not past anything.
+    pub fn past_data(&self) -> bool {
+        if self.zoom_depth() > self.vec_depth {
+            return true;
+        }
+        let key = mahere_tiles::CellKey::containing(Coord::from_lat_lon(self.cam.lat(), self.cam.lon()), self.vec_depth);
+        self.res.pool.map.get(&key).is_some_and(|e| e.present == 0 && e.is_absent())
+    }
+
+    /// The depth the zoom asks for: the view's depth, counting on past the finest any cell is baked to (so z keeps climbing as the map magnifies past its detail).
+    pub fn zoom_depth(&self) -> u8 {
+        let ideal = raster::select_depth(self.cam.ppd, 0, 30);
+        if self.vec_depth == raster::VEC_BASE_DEPTH { ideal.max(self.vec_depth) } else { self.vec_depth }
+    }
+
     /// North arrow, top-right, with the view's heading below it: degrees the screen's up is turned from true north, clockwise positive, -180..180. No letters.
     fn draw_compass(&mut self, w: usize, h: usize) {
         if w < 120 || h < 160 {
@@ -1496,7 +1511,11 @@ impl MapCore {
         let text = format!("{}", deg.round() as i64);
         draw_seven_seg(&mut self.canvas, w, h, &text, cx, cy + len + 30.0, 18.0, INK);
         // The zoom: the depth of the cells the view is drawn from, under the heading (Nick 2026-10-10: to see the level and when it changes).
-        draw_seven_seg(&mut self.canvas, w, h, &format!("z{}", self.vec_depth), cx, cy + len + 58.0, 18.0, INK);
+        // Amber past the data (Nick 2026-10-16): the cell under the crosshair at this depth is known not to exist, on the device or in the bucket; white while it is there or still on its way.
+        const AMBER: [u8; 3] = [255, 168, 0];
+        let zoom_ink = if self.past_data() { AMBER } else { INK };
+        let zoom = format!("z{}", self.zoom_depth());
+        draw_seven_seg(&mut self.canvas, w, h, &zoom, cx, cy + len + 58.0, 18.0, zoom_ink);
         // With Detail on, its legend under the zoom: a bar in each depth's colour, the depth beside it, finest at the top.
         if self.luts.mask.debug {
             let n = raster::DETAIL_COLOURS.len();
@@ -1654,6 +1673,26 @@ mod tests {
         fn get(&self, _key: mahere_tiles::CellKey) -> residency::Fetch {
             residency::Fetch::Absent
         }
+    }
+
+    /// The zoom turns amber past the data: where no cell exists under the crosshair once the view has looked, and past the finest depth any cell is baked to, where it keeps counting.
+    #[test]
+    fn the_zoom_says_when_it_is_past_the_data() {
+        let mut map = MapCore::new(Arc::new(Empty), Camera::new(47.6, -122.3, 20_000.0, 0.0));
+        let (w, h) = (400, 300);
+        for _ in 0..500 {
+            map.render(w, h);
+            if map.converged() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            map.tick(w, h);
+        }
+        assert!(map.past_data(), "nothing anywhere: past the data at z{}", map.zoom_depth());
+        let mut deep = MapCore::new(Arc::new(Empty), Camera::new(47.6, -122.3, 5_000_000.0, 0.0));
+        deep.render(w, h);
+        assert!(deep.zoom_depth() > raster::VEC_BASE_DEPTH, "the zoom counts on past the finest depth: z{}", deep.zoom_depth());
+        assert!(deep.past_data());
     }
 
     /// Shells that draw on demand rely on `tick` to report camera changes (the Android two-finger path has no redraw request of its own).
