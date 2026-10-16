@@ -2,6 +2,12 @@
 
 ## 0.21x · October 2026
 
+### Names in their own scripts
+- Place names everywhere read as the people there write them: 北京市, 東京都, 서울, القاهرة, תל אביב, Москва.
+- The fonts for each script download the first time you look at a place that needs one, then stay on the phone; the app itself stays small.
+- Japanese names get Japanese letterforms and Korean names Korean, not one shared set.
+- Arabic, Hebrew and the Indian scripts show in full on the info card; on the map itself they arrive in a later update.
+
 ### Faster maps
 - The map's cells are now held at Cloudflare's servers near you, so a cell anyone has viewed before arrives about three times sooner.
 - A new view fills in about twice as fast: lines in under two seconds, then terrain.

@@ -19,7 +19,7 @@ set_version() {
     git add Cargo.toml Cargo.lock
     git commit -q -m "$2
 
-Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
+Built with Claude Opus 5.5"
 }
 
 # stamp: the environment a build carries, from the version and the commit: Android's version code (minor times a thousand plus patch) and the name a person reads.
