@@ -86,6 +86,9 @@ fn cell_names(job: &NameJob, cache: &mut NamesCache, key: CellKey) -> Option<Arc
 }
 
 /// Every named texel in view at the depth the lines are drawn, a cell missing there read from its nearest resident ancestor within three levels. Runs on any thread.
+/// How near two copies of one named point must land to be one label, pixels.
+const POINT_MERGE_PX: f32 = 96.0;
+
 pub fn gather(job: &NameJob, cache: &mut NamesCache) -> NamedTexels {
     for k in &job.reloaded {
         cache.remove(k);
@@ -193,6 +196,15 @@ pub fn gather(job: &NameJob, cache: &mut NamesCache) -> NamedTexels {
         }
         out.lines = lines.into_values().collect();
         out.areas = areas.into_values().collect();
+        // One label a point (Nick 2026-10-16: "Madrid Madrid, Paris Paris? yeahnah"): the same place met in a parent cell and its child, or on two texels, lands a few pixels apart; copies of one point within a few label heights merge, and places sharing a name far apart stay apart. A city's limits lettered as an area are another label and stay.
+        let mut points: Vec<(Named, [f32; 2])> = Vec::with_capacity(out.points.len());
+        for (n, p) in out.points.drain(..) {
+            let copy = points.iter().any(|(m, q)| m.kind == n.kind && m.name == n.name && m.reference == n.reference && (q[0] - p[0]).hypot(q[1] - p[1]) < POINT_MERGE_PX);
+            if !copy {
+                points.push((n, p));
+            }
+        }
+        out.points = points;
         out.texel_px = if tpx_n > 0 { tpx_sum / tpx_n as f32 } else { 1.0 };
         out.area_step_px = area_step.max(1.0);
         out
