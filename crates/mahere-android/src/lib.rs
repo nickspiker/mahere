@@ -73,6 +73,8 @@ pub struct AndroidApp {
     ui_ru: f32,
     ui_pinch: Option<f64>,
     panel: Panel,
+    /// Font packs (Nick 2026-10-16), shared by the panel and the GPU host's labels.
+    fonts: std::sync::Arc<mahere_panel::fonts::FontPacks>,
     /// Bytes the cell cache may hold; purged to it at the pause moment.
     cache_budget: u64,
     data_dir: Option<String>,
@@ -691,6 +693,7 @@ pub extern "system" fn Java_nz_mahere_app_MahereActivity_nativeInit(
         map.set_travel(travel_of(s.travel));
     }
     let recorder = store.clone().map(|s| std::sync::Arc::new(std::sync::Mutex::new(mahere_store::TrackRecorder::new(s))));
+    let fonts = mahere_panel::fonts::FontPacks::new(mahere_store::VaultFonts::new(store.clone()), mahere_update::AUTHOR_PUBKEY);
     let mut app = AndroidApp {
         map,
         w: width as usize,
@@ -721,6 +724,7 @@ pub extern "system" fn Java_nz_mahere_app_MahereActivity_nativeInit(
             ui_ru,
             ui_pinch: None,
         panel: Panel::new(),
+        fonts,
         cache_budget: settings.map_or(DEFAULT_CACHE_BUDGET, |s| if s.cache_budget == 0 { DEFAULT_CACHE_BUDGET } else { s.cache_budget }),
         data_dir: Some(dir.clone()),
         areas,
@@ -734,6 +738,7 @@ pub extern "system" fn Java_nz_mahere_app_MahereActivity_nativeInit(
         install: None,
     };
     app.panel.set_ru(ui_ru);
+    app.panel.set_fonts(app.fonts.clone());
     Box::into_raw(Box::new(AndroidShell::new(app, width as u32, height as u32))) as jlong
 }
 
@@ -774,7 +779,10 @@ pub extern "system" fn Java_nz_mahere_app_MahereActivity_nativeDraw(
     if !app.gpu_failed {
         if app.gpu.is_none() {
             match GpuHost::new(&window) {
-                Some(g) => app.gpu = Some(g),
+                Some(mut g) => {
+                    g.labeller.set_fonts(app.fonts.clone());
+                    app.gpu = Some(g);
+                }
                 None => {
                     app.gpu_failed = true;
                     eprintln!("gpu: unavailable, CPU present");
@@ -785,6 +793,10 @@ pub extern "system" fn Java_nz_mahere_app_MahereActivity_nativeDraw(
         let ctl = app.controls();
         // A download's progress repaints the open panel a few times a second; the GPU host otherwise skips frames while the map is still.
         let finished = app.areas.poll();
+        // A font pack on its way or just arrived: the panel paints again, loading it as it does.
+        if app.panel.fonts_due() {
+            app.panel.invalidate();
+        }
         if app.panel.is_open() && (finished || (app.areas.downloading() && app.areas_shown.elapsed().as_millis() >= 250)) {
             app.panel.invalidate();
             app.areas_shown = Instant::now();

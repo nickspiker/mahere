@@ -1105,3 +1105,72 @@ mod theme_tests {
         assert_eq!(super::themes::decode(&super::themes::encode(&t).unwrap()).unwrap().probe, None);
     }
 }
+
+// ==================== FONT PACKS ====================
+
+/// Where font packs are served (Nick 2026-10-16), shared with Photon: `<id>.vsf` under each, the bucket first, the GitHub release its mirror.
+pub const FONT_PACK_URLS: [&str; 2] = ["https://brobdingnagian.holdmyoscilloscope.com/fonts", "https://github.com/nickspiker/fluor/releases/download/fonts-v1"];
+
+fn font_key(id: &str) -> String {
+    vault_key(&[name("font"), VsfType::x(id.to_string())])
+}
+
+/// Font packs from the vault's copy, else fetched and kept in the vault (one download a device per script); without a vault, fetched each time the app starts.
+pub struct VaultFonts {
+    store: Option<Arc<FlatStorage>>,
+    agent: ureq::Agent,
+}
+
+impl VaultFonts {
+    pub fn new(store: Option<Arc<FlatStorage>>) -> Arc<VaultFonts> {
+        let agent = ureq::AgentBuilder::new().timeout_connect(std::time::Duration::from_secs(10)).timeout_read(std::time::Duration::from_secs(120)).build();
+        Arc::new(VaultFonts { store, agent })
+    }
+
+    fn fetch(&self, id: &str) -> Result<Vec<u8>, String> {
+        let mut last = String::new();
+        for base in FONT_PACK_URLS {
+            let url = format!("{base}/{id}.vsf");
+            match self.agent.get(&url).call() {
+                Ok(resp) => {
+                    let expect: Option<usize> = resp.header("Content-Length").and_then(|v| v.parse().ok());
+                    let mut buf = Vec::new();
+                    if let Err(e) = std::io::Read::read_to_end(&mut resp.into_reader(), &mut buf) {
+                        last = format!("{url}: {e}");
+                        continue;
+                    }
+                    if expect.is_some_and(|n| n != buf.len()) {
+                        last = format!("{url}: short body, {} of {expect:?} bytes", buf.len());
+                        continue;
+                    }
+                    return Ok(buf);
+                }
+                Err(e) => last = format!("{url}: {e}"),
+            }
+        }
+        Err(last)
+    }
+}
+
+impl mahere_panel::fonts::PackSource for VaultFonts {
+    fn get(&self, id: &str) -> Result<Vec<u8>, String> {
+        if let Some(s) = &self.store {
+            if let Ok(Some(b)) = s.read_device(&font_key(id)) {
+                if !b.is_empty() {
+                    return Ok(b);
+                }
+            }
+        }
+        let doc = self.fetch(id)?;
+        if let Some(s) = &self.store {
+            let _ = s.write_device(&font_key(id), &doc);
+        }
+        Ok(doc)
+    }
+
+    fn forget(&self, id: &str) {
+        if let Some(s) = &self.store {
+            let _ = s.write_device(&font_key(id), &[]);
+        }
+    }
+}

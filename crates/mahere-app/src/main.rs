@@ -523,7 +523,8 @@ impl FluorApp for MahereApp {
     }
 
     fn wake_at(&self) -> Option<Instant> {
-        if self.areas.downloading() {
+        // A download or a font pack on its way: a frame now and then until it lands.
+        if self.areas.downloading() || self.panel.fonts_due() {
             return Some(Instant::now() + std::time::Duration::from_millis(200));
         }
         if self.map.converged() { None } else { Some(Instant::now()) }
@@ -582,7 +583,7 @@ impl FluorApp for MahereApp {
             }
         }
         // A download's progress repaints the panel as it goes.
-        let areas_changed = self.areas.poll() || self.areas.downloading() || updates_changed || self.updater.busy();
+        let areas_changed = self.areas.poll() || self.areas.downloading() || updates_changed || self.updater.busy() || self.panel.fonts_due();
         if areas_changed {
             self.chrome.invalidate_bg();
         }
@@ -719,6 +720,10 @@ fn main() {
         map.set_themes(mahere_store::themes::load_all(v));
     }
     let mut app = MahereApp::new(map, areas);
+    // Font packs (Nick 2026-10-16): names in scripts the binary lacks draw in their own face once its pack, signed by the author, is fetched.
+    let fonts = mahere_panel::fonts::FontPacks::new(mahere_store::VaultFonts::new(vault.clone()), mahere_update::AUTHOR_PUBKEY);
+    app.panel.set_fonts(fonts.clone());
+    app.labeller.set_fonts(fonts);
     app.store = vault;
     app.cells = cells;
     run_app(app).expect("fluor event loop failed");

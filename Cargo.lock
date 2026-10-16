@@ -1125,7 +1125,7 @@ dependencies = [
 [[package]]
 name = "fluor"
 version = "0.0.4"
-source = "git+https://github.com/nickspiker/fluor?rev=5855711#5855711fdaace662f5721ce0797e1a6f5c64325e"
+source = "git+https://github.com/nickspiker/fluor?rev=e8bbfd43119cc510abfc85b304a583377a5a1e81#e8bbfd43119cc510abfc85b304a583377a5a1e81"
 dependencies = [
  "block2 0.6.2",
  "cosmic-text",
@@ -1602,7 +1602,7 @@ dependencies = [
 [[package]]
 name = "ihi"
 version = "0.0.48"
-source = "git+https://github.com/nickspiker/ihi?rev=ac72c54f60662406a7c1de19d49354566d48beac#ac72c54f60662406a7c1de19d49354566d48beac"
+source = "git+https://github.com/nickspiker/ihi?rev=dea19a3ef9bf8c09a16089a115167f95cde4ea8a#dea19a3ef9bf8c09a16089a115167f95cde4ea8a"
 dependencies = [
  "blake3",
  "i256",
@@ -1757,7 +1757,7 @@ dependencies = [
 [[package]]
 name = "kete"
 version = "0.0.2"
-source = "git+https://github.com/nickspiker/kete?rev=b9e78e963b038fc9b53baeccff0ecaf9a14be719#b9e78e963b038fc9b53baeccff0ecaf9a14be719"
+source = "git+https://github.com/nickspiker/kete?rev=6885551b94ad2dda349fff43dd77f1d45e84bca7#6885551b94ad2dda349fff43dd77f1d45e84bca7"
 dependencies = [
  "blake3",
  "chacha20poly1305 0.11.0",
@@ -1989,8 +1989,10 @@ dependencies = [
  "kete",
  "mahere-coord",
  "mahere-engine",
+ "mahere-panel",
  "mahere-tiles",
  "rand",
+ "ureq",
  "vsf",
  "zstd",
 ]
@@ -2031,7 +2033,7 @@ dependencies = [
 [[package]]
 name = "manifestus"
 version = "0.0.2"
-source = "git+https://github.com/nickspiker/manifestus?rev=97432dd007bbf425c599af419443bd82c26740d7#97432dd007bbf425c599af419443bd82c26740d7"
+source = "git+https://github.com/nickspiker/manifestus?rev=a6b885ed3f691453b87012e734205f10307d6bb2#a6b885ed3f691453b87012e734205f10307d6bb2"
 dependencies = [
  "blake3",
  "hashbrown 0.15.5",
@@ -3810,7 +3812,7 @@ checksum = "c7c4ceeeca15c8384bbc3e011dbd8fccb7f068a440b752b7d9b32ceb0ca0e2e8"
 [[package]]
 name = "tohu"
 version = "0.0.2"
-source = "git+https://github.com/nickspiker/tohu?rev=65d55b990cc2957fe9cf5595211319a3c629692a#65d55b990cc2957fe9cf5595211319a3c629692a"
+source = "git+https://github.com/nickspiker/tohu?rev=5f1f0cc5b50ce0f0d30dee9edf301ca8e80edd06#5f1f0cc5b50ce0f0d30dee9edf301ca8e80edd06"
 dependencies = [
  "base64",
  "blake3",
@@ -4020,8 +4022,8 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "vsf"
-version = "0.10.0"
-source = "git+https://github.com/nickspiker/vsf?rev=a73e319fb96d8298cbb2fab4d0df1c391dee5637#a73e319fb96d8298cbb2fab4d0df1c391dee5637"
+version = "0.11.0"
+source = "git+https://github.com/nickspiker/vsf?rev=7b19bd1508bf20f2bd6f208cb00c0e55c76db6a1#7b19bd1508bf20f2bd6f208cb00c0e55c76db6a1"
 dependencies = [
  "aes-gcm",
  "bitvec",

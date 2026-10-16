@@ -281,7 +281,7 @@ impl GpuHost {
             self.report = std::time::Instant::now();
         }
         // Lettering held back by cells still arriving needs another frame once its second is up.
-        !map.converged() || self.labeller.pending(map, w as usize, h as usize)
+        !map.converged() || self.labeller.pending(map, w as usize, h as usize) || panel.fonts_due()
     }
 }
 

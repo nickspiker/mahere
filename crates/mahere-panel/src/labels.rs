@@ -272,6 +272,8 @@ struct LabelJob {
     family: u8,
     route: Vec<(f64, f64)>,
     key: ViewKey,
+    /// The font packs fetched so far, for the worker to load before it lays out.
+    fonts: Option<std::sync::Arc<crate::fonts::FontPacks>>,
 }
 
 /// The worker's side: the text renderer, the master atlas, the advances measured, the last layout's names (placed first again), and the cells' names read so far.
@@ -290,6 +292,10 @@ struct Letterer {
     amount: [f32; 2],
     previous: HashSet<(u8, String, String)>,
     names: mahere_engine::labels::NamesCache,
+    /// How far through the font packs' arrivals this renderer has loaded.
+    font_cursor: usize,
+    /// The regional face the view's Han draws in (its names' kana or Hangul decide).
+    han: fluor::packs::Han,
 }
 
 /// Labels (Nick 2026-10-13): laid out on a worker thread, never the drawing thread (a layout once fetched cells mid-frame and hung the app); each frame draws from the latest finished layout.
@@ -300,6 +306,9 @@ pub struct Labeller {
     busy: bool,
     asked: Option<ViewKey>,
     last: std::time::Instant,
+    /// The font packs, when the host gave them, and how many had arrived when the shown layout was asked for.
+    fonts: Option<std::sync::Arc<crate::fonts::FontPacks>>,
+    fonts_laid: usize,
 }
 
 impl Default for Labeller {
@@ -524,7 +533,7 @@ impl Labeller {
                 for data in LABEL_FONT_FILES {
                     text.load_font_data_named(data.to_vec());
                 }
-                let mut l = Letterer { text, family: 0, w: 0, h: 0, atlas: Atlas::new(), sent: 0, shared: std::sync::Arc::new(Atlas::new()), advance: HashMap::new(), look: mahere_engine::theme::LABEL_LOOK, amount: mahere_engine::theme::LABEL_AMOUNT, previous: HashSet::new(), names: Default::default() };
+                let mut l = Letterer { text, family: 0, w: 0, h: 0, atlas: Atlas::new(), sent: 0, shared: std::sync::Arc::new(Atlas::new()), advance: HashMap::new(), look: mahere_engine::theme::LABEL_LOOK, amount: mahere_engine::theme::LABEL_AMOUNT, previous: HashSet::new(), names: Default::default() , font_cursor: 0, han: fluor::packs::Han::Simplified };
                 while let Ok(mut job) = jobs.recv() {
                     // Only the newest job matters: a camera that moved on has made the others stale.
                     while let Ok(newer) = jobs.try_recv() {
@@ -536,7 +545,17 @@ impl Labeller {
                 }
             })
             .expect("labels thread");
-        Labeller { tx, rx, shown: Lettering::default(), busy: false, asked: None, last: std::time::Instant::now() }
+        Labeller { tx, rx, shown: Lettering::default(), busy: false, asked: None, last: std::time::Instant::now(), fonts: None, fonts_laid: 0 }
+    }
+
+    /// The font packs to draw names in scripts the binary lacks (Nick 2026-10-16): a layout that needed one asks for it, and one arriving lays the view out again.
+    pub fn set_fonts(&mut self, fonts: std::sync::Arc<crate::fonts::FontPacks>) {
+        self.fonts = Some(fonts);
+    }
+
+    /// Font packs arrived since the shown layout was asked for.
+    fn fonts_new(&self) -> bool {
+        self.fonts.as_ref().is_some_and(|f| f.arrived() != self.fonts_laid)
     }
 
     /// Whether the lettering shown is out of date for this view: the camera, the depth or the cells resident changed since it was laid out (a cell arriving, leaving or replaced by a newer copy).
@@ -546,15 +565,16 @@ impl Labeller {
 
     /// Whether a layout is running or due: a host keeps drawing frames until it lands.
     pub fn pending(&self, map: &mahere_engine::MapCore, w: usize, h: usize) -> bool {
-        self.busy || (Self::wanted(map) && self.stale(map, w, h))
+        // A pack being fetched keeps frames coming, so its arrival is seen and the view lettered again in it.
+        self.busy || (Self::wanted(map) && (self.stale(map, w, h) || self.fonts_new() || self.fonts.as_ref().is_some_and(|f| f.busy())))
     }
 
-    fn job(map: &mut mahere_engine::MapCore, w: usize, h: usize, font: f32) -> LabelJob {
+    fn job(&self, map: &mut mahere_engine::MapCore, w: usize, h: usize, font: f32) -> LabelJob {
         let (palette, look, amount) = map.themes.get(map.theme).map_or((mahere_engine::theme::LABELS_LIGHT, mahere_engine::theme::LABEL_LOOK, mahere_engine::theme::LABEL_AMOUNT), |t| (t.label, t.label_look, t.label_amount));
         let family = map.themes.get(map.theme).and_then(|t| mahere_engine::theme::LABEL_FONTS.iter().position(|f| *f == t.label_font)).unwrap_or(0) as u8;
         let key = Self::view_key(map, w, h);
         let names = map.layers().labels.then(|| map.name_job(w, h));
-        LabelJob { names, cam: map.cam, w, h, font, palette, look, amount, family, route: map.route_points().map_or(Vec::new(), |p| p.to_vec()), key }
+        LabelJob { names, cam: map.cam, w, h, font, palette, look, amount, family, route: map.route_points().map_or(Vec::new(), |p| p.to_vec()), key, fonts: self.fonts.clone() }
     }
 
     /// Ask the worker for a layout when one is due: the view rests, the lettering is stale, none is running, and every cell is in or a second has passed since the last ask (so cells still arriving never hold the labels back). Never waits.
@@ -566,17 +586,19 @@ impl Labeller {
             return;
         }
         let key = Self::view_key(map, w, h);
-        if self.busy || !at_rest || self.shown.drawn_for == Some(key) || self.asked == Some(key) {
+        let fonts_new = self.fonts_new();
+        if self.busy || !at_rest || (!fonts_new && (self.shown.drawn_for == Some(key) || self.asked == Some(key))) {
             return;
         }
         if !map.converged() && self.last.elapsed() < std::time::Duration::from_secs(1) {
             return;
         }
-        let job = Self::job(map, w, h, font);
+        let job = self.job(map, w, h, font);
         if self.tx.send(job).is_ok() {
             self.busy = true;
             self.asked = Some(key);
             self.last = std::time::Instant::now();
+            self.fonts_laid = self.fonts.as_ref().map_or(0, |f| f.arrived());
         }
     }
 
@@ -595,7 +617,7 @@ impl Labeller {
 
     /// Lay out the view now and wait for it (a check or a test).
     pub fn update(&mut self, map: &mut mahere_engine::MapCore, w: usize, h: usize, font: f32) {
-        let job = Self::job(map, w, h, font);
+        let job = self.job(map, w, h, font);
         let key = job.key;
         if self.tx.send(job).is_ok() {
             while let Ok(l) = self.rx.recv() {
@@ -650,8 +672,13 @@ impl Letterer {
         }
     }
 
+    /// A glyph's cache family: the theme's typeface, or for a CJK character its regional face (one character's Japanese and Chinese forms differ, and the theme does not draw either).
+    fn key_family(&self, ch: char) -> u8 {
+        if fluor::packs::is_cjk(ch) { 0x80 | self.han as u8 } else { self.family }
+    }
+
     fn advance(&mut self, ch: char, size: f32, weight: u16) -> f32 {
-        let key = (ch, self.family, weight, (size * 16.0) as u32);
+        let key = (ch, self.key_family(ch), weight, (size * 16.0) as u32);
         if let Some(&a) = self.advance.get(&key) {
             return a;
         }
@@ -673,11 +700,22 @@ impl Letterer {
         self.look = job.look;
         self.amount = job.amount;
         self.family = job.family;
+        // Font packs arrived since the last layout: loaded, and every advance and glyph measured before them measured again.
+        if let Some(f) = &job.fonts {
+            if crate::fonts::load_into(&mut self.text, f, &mut self.font_cursor) {
+                self.advance.clear();
+                let side = self.atlas.side;
+                self.atlas.clear(side);
+            }
+        }
         let font = job.font * self.look[0];
         let texels = match &job.names {
             Some(n) => mahere_engine::labels::gather(n, &mut self.names),
             None => NamedTexels::default(),
         };
+        let han = crate::fonts::han_for(texels.lines.iter().map(|(n, _)| n.name.as_str()).chain(texels.areas.iter().map(|(n, _)| n.name.as_str())).chain(texels.points.iter().map(|(n, _)| n.name.as_str())));
+        self.han = han;
+        self.text.set_han(han);
         let gathered = t.elapsed();
         let previous = std::mem::take(&mut self.previous);
         let laid = self.layout(&texels, w, h, font, &previous);
@@ -686,6 +724,10 @@ impl Letterer {
         if self.atlas.version != self.sent {
             self.shared = std::sync::Arc::new(Atlas { side: self.atlas.side, rg: self.atlas.rg.clone(), version: self.atlas.version, x: self.atlas.x, y: self.atlas.y, row: self.atlas.row, slots: self.atlas.slots.clone() });
             self.sent = self.atlas.version;
+        }
+        // The packs this layout's names needed and lacked, fetched for the next.
+        if let Some(f) = &job.fonts {
+            f.want(self.text.wanted_packs());
         }
         let route_width = (font * 0.32).max(3.0);
         let (a, b) = ([w as f64 * 0.25, h as f64 * 0.5], [w as f64 * 0.75, h as f64 * 0.5]);
@@ -729,7 +771,7 @@ impl Letterer {
     /// A glyph's place in the atlas, rasterised by fluor the first time it is asked for, its outline turned to the angle's bin: the letter's coverage, and around it the halo, a distance out from the letter's edge.
     fn glyph(&mut self, ch: char, size: f32, weight: u16, shear: f32, halo: u32, angle: f32) -> GlyphKey {
         let bin = (angle / bin_step(size)).round() as i32;
-        let key = GlyphKey { ch, family: self.family, size: (size * 16.0) as u32, weight, shear: shear.to_bits(), halo, bin };
+        let key = GlyphKey { ch, family: self.key_family(ch), size: (size * 16.0) as u32, weight, shear: shear.to_bits(), halo, bin };
         if self.atlas.slots.contains_key(&key) {
             return key;
         }

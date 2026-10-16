@@ -2,6 +2,7 @@
 //!
 //! Painted with fluor's widgets and text into the panel's own buffer in fluor's pixel convention (α + darkness, topmost first), then composited by whichever renderer owns the screen: the GPU takes it as a premultiplied RGBA overlay over the engine's marks, the CPU frontend lays it over its canvas. Taps are routed here first; a tap the panel does not take is the map's.
 
+pub mod fonts;
 pub mod labels;
 
 use fluor::canvas::{Canvas, Damage};
@@ -411,6 +412,9 @@ pub struct Panel {
     hits: HitId,
     checks: Vec<(Layer, Checkbox)>,
     text: TextRenderer,
+    /// The font packs, when the host gave them, and how far through their arrivals this renderer has loaded.
+    fonts: Option<std::sync::Arc<fonts::FontPacks>>,
+    font_cursor: usize,
     buf: Vec<u32>,
     w: usize,
     h: usize,
@@ -458,10 +462,20 @@ impl Default for Panel {
 }
 
 impl Panel {
+    /// The font packs to draw text in scripts the binary lacks, shared with the labels ([`labels::Labeller::set_fonts`]).
+    pub fn set_fonts(&mut self, fonts: std::sync::Arc<fonts::FontPacks>) {
+        self.fonts = Some(fonts);
+    }
+
+    /// Whether a font pack is being fetched or has arrived unloaded: a host keeps a frame coming until it is painted.
+    pub fn fonts_due(&self) -> bool {
+        self.fonts.as_ref().is_some_and(|f| f.busy() || f.arrived() > self.font_cursor)
+    }
+
     pub fn new() -> Panel {
         let mut hits: HitId = HIT_NONE;
         let checks = LAYERS.iter().map(|&(l, label)| (l, Checkbox::new(&mut hits, label, 0.0, 0.0, 10.0, 10.0, 10.0, false))).collect();
-        Panel { open: false, dirty: true, ru: 1.0, stack: vec![Page::Layers], theme_rows: Vec::new(), edit_rows: Vec::new(), edit_scroll: 0.0, edit_extent: 0.0, press: None, sliders: Vec::new(), field_vals: [0.0; 4], held: None, edits: Vec::new(), hits, checks, text: TextRenderer::new(), buf: Vec::new(), w: 0, h: 0, font: 16.0, gear: (0.0, 0.0, 0.0), panel_w: 0.0, theme_row: (0.0, 0.0, 0.0), slider: (0.0, 0.0, 0.0), slider_held: false, cache_max: CACHE_MIN + 1, strip_close: None, clear_measure: false, area_rows: Vec::new(), area_acts: Vec::new(), areas: AreasView::default(), update_rows: Vec::new(), update_acts: Vec::new(), updates: UpdatesView::default(), host_orb: None, layers_scroll: 0.0, layers_extent: 0.0, layers_press: None, layers_band: (0.0, 0.0), orb_icon: fluor::host::icon::Icon::from_vsf_bytes(APP_ORB_VSF).ok(), orb_scaled: (0, Vec::new()), locate_btn: None, tool_btn: None, toolbox_open: false, tool_rows: Vec::new() }
+        Panel { fonts: None, font_cursor: 0, open: false, dirty: true, ru: 1.0, stack: vec![Page::Layers], theme_rows: Vec::new(), edit_rows: Vec::new(), edit_scroll: 0.0, edit_extent: 0.0, press: None, sliders: Vec::new(), field_vals: [0.0; 4], held: None, edits: Vec::new(), hits, checks, text: TextRenderer::new(), buf: Vec::new(), w: 0, h: 0, font: 16.0, gear: (0.0, 0.0, 0.0), panel_w: 0.0, theme_row: (0.0, 0.0, 0.0), slider: (0.0, 0.0, 0.0), slider_held: false, cache_max: CACHE_MIN + 1, strip_close: None, clear_measure: false, area_rows: Vec::new(), area_acts: Vec::new(), areas: AreasView::default(), update_rows: Vec::new(), update_acts: Vec::new(), updates: UpdatesView::default(), host_orb: None, layers_scroll: 0.0, layers_extent: 0.0, layers_press: None, layers_band: (0.0, 0.0), orb_icon: fluor::host::icon::Icon::from_vsf_bytes(APP_ORB_VSF).ok(), orb_scaled: (0, Vec::new()), locate_btn: None, tool_btn: None, toolbox_open: false, tool_rows: Vec::new() }
     }
 
     pub fn is_open(&self) -> bool {
@@ -1036,6 +1050,13 @@ impl Panel {
     #[allow(clippy::too_many_arguments)]
     pub fn paint(&mut self, w: usize, h: usize, mask: LayerMask, ctl: Controls, r: &Readouts, measure: Option<&MeasureView>, themes: &[Theme], areas: &AreasView, orb: Option<&dyn Fn(usize) -> Option<Vec<[u8; 4]>>>) -> &[u32] {
         self.layout(w, h);
+        // Font packs (Nick 2026-10-16): what arrived loaded and painted; what the last paint's text lacked asked for.
+        if let Some(f) = self.fonts.clone() {
+            if fonts::load_into(&mut self.text, &f, &mut self.font_cursor) {
+                self.dirty = true;
+            }
+            f.want(self.text.wanted_packs());
+        }
         if self.areas != *areas {
             self.areas = areas.clone();
             self.dirty = true;
