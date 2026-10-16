@@ -18,6 +18,8 @@ pub struct Way {
     pub speed_kmh: u8,
     pub oneway: i8,
     pub layer: i8,
+    /// Difficulty low, roughness high ([`mahere_osm::Travel::grade`], 2026-10-16); 0 in a cell made before.
+    pub grade: u8,
     /// What turn-by-turn calls it.
     pub name: String,
 }
@@ -84,6 +86,7 @@ impl RouteCell {
         s.add_field("speed", VsfType::t_u3(Tensor::new(vec![n], self.ways.iter().map(|w| w.speed_kmh).collect())));
         s.add_field("oneway", VsfType::t_u3(Tensor::new(vec![n], self.ways.iter().map(|w| (w.oneway + 1) as u8).collect())));
         s.add_field("layer", VsfType::t_u3(Tensor::new(vec![n], self.ways.iter().map(|w| (w.layer as i16 + 128) as u8).collect())));
+        s.add_field("grade", VsfType::t_u3(Tensor::new(vec![n], self.ways.iter().map(|w| w.grade).collect())));
         s.add_field("name", VsfType::x(self.ways.iter().map(|w| w.name.replace(['\n', '\r'], " ")).collect::<Vec<_>>().join("\n")));
         // The sparse lists, each in two or three parallel tensors; an empty list is left out.
         if !self.stack.is_empty() {
@@ -131,7 +134,9 @@ impl RouteCell {
         if [class.len(), uses.len(), speed.len(), oneway.len(), layer.len(), names.len()].iter().any(|&l| l != n) {
             return None;
         }
-        let ways = (0..n).map(|i| Way { osm: osm[i], class: class[i], uses: uses[i], speed_kmh: speed[i], oneway: oneway[i] as i8 - 1, layer: (layer[i] as i16 - 128) as i8, name: names[i].clone() }).collect();
+        // A cell made before grades read every way as graded 0.
+        let grade = u8s("grade");
+        let ways = (0..n).map(|i| Way { osm: osm[i], class: class[i], uses: uses[i], speed_kmh: speed[i], oneway: oneway[i] as i8 - 1, layer: (layer[i] as i16 - 128) as i8, grade: grade.get(i).copied().unwrap_or(0), name: names[i].clone() }).collect();
         let way = first("way").and_then(raw_u16).filter(|d| d.len() == TRI).map(|d| disk_to_mem(&d)).unwrap_or_default();
         let stack = u32s("stack").into_iter().zip(u16s("stackway")).collect();
         let dir = u32s("dir").into_iter().zip(u16s("dirway")).zip(u8s("dirangle")).map(|((t, w), a)| (t, w, a)).collect();
@@ -159,6 +164,7 @@ pub fn bake_routes(roads: &[Road], names: &[Named], junctions: &[(f32, f32)], de
             speed_kmh: road.travel.speed_kmh,
             oneway: road.travel.oneway,
             layer: road.travel.layer,
+            grade: road.travel.grade(),
             name: names.get(road.name as usize).map(|n| n.label()).unwrap_or_default(),
         };
         let mut prev: Option<(u8, f64, f64)> = None;
@@ -212,7 +218,7 @@ mod tests {
     use mahere_osm::{RoadClass, Travel};
 
     fn road(class: RoadClass, osm: i64, pts: Vec<(f32, f32)>, oneway: i8, layer: i8) -> Road {
-        Road { class, pts, weight: 0.5, uses: 0, name: 0, travel: Travel { way: osm, speed_kmh: 0, oneway, layer } }
+        Road { class, pts, weight: 0.5, uses: 0, name: 0, travel: Travel { way: osm, speed_kmh: 0, oneway, layer, ..Default::default() } }
     }
 
     #[test]

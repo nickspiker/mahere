@@ -693,7 +693,7 @@ fn osm_lines(out: &Path, dir: &str, depth: u8, region_depth: u8, bbox: Option<Ve
         let t = std::time::Instant::now();
         // At a hundred metres a texel the fine classes (streets, service roads, tracks, paths) are noise, and the waterways are HydroRIVERS': the roads that carry a map at this scale, rail, power and the boundaries.
         // Dropped as the extract is read, so a region as dense as central Europe fits in memory; the areas kept are the named lakes, for their names.
-        let keep = mahere_osm::Keep { line: major_line, area: if named { named_lake } else { no_area } };
+        let keep = mahere_osm::Keep { line: major_line, area: if named { named_lake } else { no_area }, outlines: false };
         let feats = mahere_osm::load_features_keeping(path.to_str().unwrap(), &keep).expect("osm extract");
         let roads = feats.roads;
         let n = if named {

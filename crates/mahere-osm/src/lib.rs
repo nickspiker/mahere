@@ -35,9 +35,17 @@ pub enum RoadClass {
     NationalForest,
     Protected,
     Admin,
+    // Added 2026-10-16 after the first seventeen, so the ids in every published cell keep their meaning (an older reader draws these in its last class's style).
+    /// Ferry routes: drawn across the water, and a way a route may take.
+    Ferry,
+    /// Cable cars, gondolas, chair and drag lifts.
+    Aerialway,
+    /// Named ridges and arêtes: a line for their name to follow.
+    Ridge,
+    Cliff,
 }
 
-pub const CLASS_COUNT: usize = 17;
+pub const CLASS_COUNT: usize = 21;
 
 /// Line `use` bits: what a way is for, from its tags. A theme draws a path differently when bikes or horses are allowed, hides motor roads on a ski map, and so on.
 pub mod use_bits {
@@ -84,6 +92,21 @@ impl RoadClass {
         }
     }
 
+    fn from_aerialway(v: &str) -> Option<RoadClass> {
+        match v {
+            "cable_car" | "gondola" | "mixed_lift" | "chair_lift" | "drag_lift" | "t-bar" | "j-bar" | "platter" | "rope_tow" | "magic_carpet" => Some(RoadClass::Aerialway),
+            _ => None,
+        }
+    }
+
+    fn from_natural(v: &str) -> Option<RoadClass> {
+        match v {
+            "ridge" | "arete" => Some(RoadClass::Ridge),
+            "cliff" => Some(RoadClass::Cliff),
+            _ => None,
+        }
+    }
+
     fn from_power(v: &str) -> Option<RoadClass> {
         match v {
             "line" | "minor_line" => Some(RoadClass::Power),
@@ -111,6 +134,10 @@ impl RoadClass {
             NationalPark | Wilderness | NationalForest => 6.0,
             Protected => 5.0,
             Admin => 8.0,
+            Ferry => 6.0,
+            Aerialway => 3.0,
+            Ridge => 4.0,
+            Cliff => 3.0,
         }
     }
 
@@ -186,7 +213,8 @@ impl AreaClass {
                     area_no = true;
                     None
                 }
-                ("natural", "water") | ("landuse", "reservoir") | ("landuse", "basin") => Some(Water),
+                // A bay's or a strait's outline is water, and names it as a lake's does (Puget Sound, Elliott Bay).
+                ("natural", "water") | ("landuse", "reservoir") | ("landuse", "basin") | ("natural", "bay") | ("natural", "strait") => Some(Water),
                 ("natural", "wetland") | ("natural", "mud") => Some(Wetland),
                 ("natural", "wood") | ("landuse", "forest") => Some(Forest),
                 ("natural", "scrub") | ("natural", "heath") => Some(Scrub),
@@ -229,7 +257,7 @@ pub struct Road {
     pub travel: Travel,
 }
 
-/// How a way is travelled (Nick 2026-10-13: navigation by flood fill): its OSM id, so a route knows it across cells; its speed limit; whether it is one-way and which way; its layer, so a bridge never meets the road beneath it.
+/// How a way is travelled (Nick 2026-10-13: navigation by flood fill): its OSM id, so a route knows it across cells; its speed limit; whether it is one-way and which way; its layer, so a bridge never meets the road beneath it; how hard and how rough it is.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Travel {
     pub way: i64,
@@ -239,12 +267,23 @@ pub struct Travel {
     pub oneway: i8,
     /// OSM's layer: above 0 a bridge, below 0 a tunnel, an untagged bridge 1 and an untagged tunnel -1.
     pub layer: i8,
+    /// A trail's difficulty, OSM's sac_scale: 0 untagged, 1 hiking (T1) .. 6 difficult alpine (T6).
+    pub difficulty: u8,
+    /// How rough the going is, from surface, tracktype and smoothness: 0 smooth or untagged, 1 gravel, 2 rough, 3 for high clearance or worse.
+    pub rough: u8,
+}
+
+impl Travel {
+    /// Difficulty and roughness in one byte, as a route cell keeps them: difficulty low, roughness high.
+    pub fn grade(&self) -> u8 {
+        self.difficulty.min(15) | self.rough.min(15) << 4
+    }
 }
 
 impl RoadClass {
-    /// Ways a route may follow: the roads and the trails.
+    /// Ways a route may follow: the roads, the trails and the ferries.
     pub fn routable(self) -> bool {
-        self <= RoadClass::Path
+        self <= RoadClass::Path || self == RoadClass::Ferry
     }
 }
 
@@ -261,6 +300,10 @@ pub fn parse_speed(v: &str) -> u8 {
 /// How a way of a class is travelled, from its tags.
 fn travel_of<'a>(class: RoadClass, way: i64, tags: impl Iterator<Item = (&'a str, &'a str)>) -> Travel {
     let mut t = Travel { way, oneway: (class == RoadClass::Motorway) as i8, ..Default::default() };
+    // A ferry's crossing at a ferry's pace where its timetable speed is not tagged.
+    if class == RoadClass::Ferry {
+        t.speed_kmh = 20;
+    }
     let (mut layer, mut bridge, mut tunnel) = (None, false, false);
     for (k, v) in tags {
         match k {
@@ -276,6 +319,40 @@ fn travel_of<'a>(class: RoadClass, way: i64, tags: impl Iterator<Item = (&'a str
             "layer" => layer = v.trim().parse::<i8>().ok(),
             "bridge" if v != "no" => bridge = true,
             "tunnel" if v != "no" => tunnel = true,
+            "sac_scale" => {
+                t.difficulty = match v {
+                    "hiking" => 1,
+                    "mountain_hiking" => 2,
+                    "demanding_mountain_hiking" => 3,
+                    "alpine_hiking" => 4,
+                    "demanding_alpine_hiking" => 5,
+                    "difficult_alpine_hiking" => 6,
+                    _ => 0,
+                }
+            }
+            "surface" => {
+                t.rough = t.rough.max(match v {
+                    "gravel" | "fine_gravel" | "compacted" | "unpaved" | "dirt" | "ground" | "earth" | "grass" | "pebblestone" => 1,
+                    "rock" | "mud" | "sand" | "stone" | "rocks" => 2,
+                    _ => 0,
+                })
+            }
+            "tracktype" => {
+                t.rough = t.rough.max(match v {
+                    "grade2" => 1,
+                    "grade3" | "grade4" => 2,
+                    "grade5" => 3,
+                    _ => 0,
+                })
+            }
+            "smoothness" => {
+                t.rough = t.rough.max(match v {
+                    "bad" => 1,
+                    "very_bad" => 2,
+                    "horrible" | "very_horrible" | "impassable" => 3,
+                    _ => 0,
+                })
+            }
             _ => {}
         }
     }
@@ -292,7 +369,8 @@ fn uses_and_magnitude<'a>(class: RoadClass, tags: impl Iterator<Item = (&'a str,
         Trunk | Primary | Secondary | Tertiary | Residential | Service => MOTOR | BIKE | FOOT,
         Track => MOTOR | BIKE | FOOT | HORSE | UNPAVED,
         Path => FOOT | BIKE,
-        Rail | Power | Waterway | NationalPark | Wilderness | NationalForest | Protected | Admin => 0,
+        Ferry => MOTOR | BIKE | FOOT,
+        Rail | Power | Waterway | NationalPark | Wilderness | NationalForest | Protected | Admin | Aerialway | Ridge | Cliff => 0,
     };
     let mut mag: Option<f32> = None;
     let mut lanes: Option<f32> = None;
@@ -355,6 +433,9 @@ fn uses_and_magnitude<'a>(class: RoadClass, tags: impl Iterator<Item = (&'a str,
         Power => 0.3,
         NationalPark | Wilderness | NationalForest | Protected | Admin => class.boundary_weight(),
         Waterway => 0.0,
+        Ferry => 0.4,
+        Aerialway => 0.3,
+        Ridge | Cliff => 0.3,
     });
     // Lanes refine a road's magnitude until traffic counts exist: log over 1..8 lanes, blended with the class default.
     let mag = match lanes {
@@ -411,14 +492,26 @@ pub struct Features {
     pub junctions: Vec<(f32, f32)>,
 }
 
-/// A feature's `name` and `ref` tags, empty when it has none.
+/// A feature's `name` and `ref` tags, empty when it has none. A freeway ramp without a name says where it goes (Nick 2026-10-16: "take exit 165A toward Seneca St"): "toward" its destinations, its destination refs as its ref.
 fn name_tags<'a>(tags: impl Iterator<Item = (&'a str, &'a str)>) -> (String, String) {
     let (mut name, mut reference) = (String::new(), String::new());
+    let (mut link, mut destination, mut destination_ref) = (false, String::new(), String::new());
     for (k, v) in tags {
         match k {
             "name" => name = v.to_string(),
             "ref" => reference = v.to_string(),
+            "highway" => link = v.ends_with("_link"),
+            "destination" => destination = v.split(';').map(str::trim).filter(|d| !d.is_empty()).collect::<Vec<_>>().join(", "),
+            "destination:ref" => destination_ref = v.split(';').map(str::trim).collect::<Vec<_>>().join(", "),
             _ => {}
+        }
+    }
+    if link && name.is_empty() {
+        if !destination.is_empty() {
+            name = format!("toward {destination}");
+        }
+        if reference.is_empty() {
+            reference = destination_ref;
         }
     }
     (name, reference)
@@ -427,6 +520,8 @@ fn name_tags<'a>(tags: impl Iterator<Item = (&'a str, &'a str)>) -> (String, Str
 enum WayRec {
     Line(RoadClass, Vec<i64>, u8, f32, (String, String), Travel),
     Area(AreaClass, Vec<i64>, (String, String)),
+    /// A named outline whose name goes at a point inside it: an island, a cape, a locality.
+    Outline(names::PointKind, Vec<i64>, (String, String)),
     /// A multipolygon member, kept by id for ring assembly.
     Member(i64, Vec<i64>),
 }
@@ -436,10 +531,12 @@ enum WayRec {
 pub struct Keep {
     pub line: fn(RoadClass) -> bool,
     pub area: fn(AreaClass, bool) -> bool,
+    /// Named outlines labelled at a point inside them (islands, capes, localities): their member ways and nodes cost memory a planet pass may not have.
+    pub outlines: bool,
 }
 
 impl Keep {
-    pub const ALL: Keep = Keep { line: keep_any_line, area: keep_any_area };
+    pub const ALL: Keep = Keep { line: keep_any_line, area: keep_any_area, outlines: true };
 }
 
 fn keep_any_line(_: RoadClass) -> bool {
@@ -458,14 +555,15 @@ pub fn load_features(path: &str) -> Result<Features, osmpbf::Error> {
 /// Load the lines and areas `keep` passes from a .osm.pbf extract.
 pub fn load_features_keeping(path: &str, keep: &Keep) -> Result<Features, osmpbf::Error> {
     // Pass 1: relations — multipolygons with a drawable area class, and boundaries, which become rings of line.
-    let rels: Vec<(Option<AreaClass>, Option<RoadClass>, Vec<i64>, (String, String))> = ElementReader::from_path(path)?.par_map_reduce(
+    let rels: Vec<(Option<AreaClass>, Option<RoadClass>, Option<names::PointKind>, Vec<i64>, (String, String))> = ElementReader::from_path(path)?.par_map_reduce(
         |element| match element {
             Element::Relation(r) => {
                 let is_mp = r.tags().any(|(k, v)| k == "type" && v == "multipolygon");
                 let names = name_tags(r.tags());
                 let area = if is_mp { AreaClass::from_tags(r.tags()).filter(|&a| (keep.area)(a, !names.0.is_empty())) } else { None };
                 let bound = RoadClass::from_boundary(r.tags()).filter(|&b| (keep.line)(b));
-                if area.is_none() && bound.is_none() {
+                let outline = if is_mp && !names.0.is_empty() && keep.outlines { names::PointKind::of_outline(r.tags()) } else { None };
+                if area.is_none() && bound.is_none() && outline.is_none() {
                     return Vec::new();
                 }
                 let members: Vec<i64> = r
@@ -473,7 +571,7 @@ pub fn load_features_keeping(path: &str, keep: &Keep) -> Result<Features, osmpbf
                     .filter(|m| m.member_type == osmpbf::RelMemberType::Way)
                     .map(|m| m.member_id)
                     .collect();
-                vec![(area, bound, members, names)]
+                vec![(area, bound, outline, members, names)]
             }
             _ => Vec::new(),
         },
@@ -483,9 +581,10 @@ pub fn load_features_keeping(path: &str, keep: &Keep) -> Result<Features, osmpbf
             a
         },
     )?;
-    let relations: Vec<(AreaClass, Vec<i64>, (String, String))> = rels.iter().filter_map(|(a, _, m, n)| a.map(|a| (a, m.clone(), n.clone()))).collect();
-    let bounds: Vec<(RoadClass, Vec<i64>, (String, String))> = rels.iter().filter_map(|(_, b, m, n)| b.map(|b| (b, m.clone(), n.clone()))).collect();
-    let mut member_ids: Vec<i64> = rels.iter().flat_map(|(_, _, m, _)| m.iter().copied()).collect();
+    let relations: Vec<(AreaClass, Vec<i64>, (String, String))> = rels.iter().filter_map(|(a, _, _, m, n)| a.map(|a| (a, m.clone(), n.clone()))).collect();
+    let bounds: Vec<(RoadClass, Vec<i64>, (String, String))> = rels.iter().filter_map(|(_, b, _, m, n)| b.map(|b| (b, m.clone(), n.clone()))).collect();
+    let outlines: Vec<(names::PointKind, Vec<i64>, (String, String))> = rels.iter().filter_map(|(_, _, o, m, n)| o.map(|o| (o, m.clone(), n.clone()))).collect();
+    let mut member_ids: Vec<i64> = rels.iter().flat_map(|(_, _, _, m, _)| m.iter().copied()).collect();
     member_ids.sort_unstable();
     member_ids.dedup();
 
@@ -518,6 +617,9 @@ pub fn load_features_keeping(path: &str, keep: &Keep) -> Result<Features, osmpbf
                     "waterway" => RoadClass::from_waterway(v),
                     "railway" => RoadClass::from_railway(v),
                     "power" => RoadClass::from_power(v),
+                    "route" if v == "ferry" => Some(RoadClass::Ferry),
+                    "aerialway" => RoadClass::from_aerialway(v),
+                    "natural" => RoadClass::from_natural(v),
                     _ => None,
                 }).or(border.then_some(RoadClass::Admin)).filter(|&c| (keep.line)(c));
                 // Sidewalks, crossings and traffic islands are footways that only shadow a street: a trail map leaves them out, or every downtown street grows a trail-coloured fringe.
@@ -527,6 +629,14 @@ pub fn load_features_keeping(path: &str, keep: &Keep) -> Result<Features, osmpbf
                     out.push(WayRec::Line(class, refs.clone(), uses, mag, name_tags(w.tags()), travel_of(class, w.id(), w.tags())));
                 }
                 let closed = refs.len() >= 4 && refs.first() == refs.last();
+                if closed && !is_member && keep.outlines {
+                    if let Some(kind) = names::PointKind::of_outline(w.tags()) {
+                        let names = name_tags(w.tags());
+                        if !names.0.is_empty() {
+                            out.push(WayRec::Outline(kind, refs.clone(), names));
+                        }
+                    }
+                }
                 if closed && !is_member {
                     if let Some(class) = AreaClass::from_tags(w.tags()) {
                         let names = name_tags(w.tags());
@@ -549,7 +659,7 @@ pub fn load_features_keeping(path: &str, keep: &Keep) -> Result<Features, osmpbf
     let mut needed: Vec<i64> = ways
         .iter()
         .flat_map(|r| match r {
-            WayRec::Line(_, refs, _, _, _, _) | WayRec::Area(_, refs, _) | WayRec::Member(_, refs) => refs.iter().copied(),
+            WayRec::Line(_, refs, _, _, _, _) | WayRec::Area(_, refs, _) | WayRec::Outline(_, refs, _) | WayRec::Member(_, refs) => refs.iter().copied(),
         })
         .collect();
     needed.sort_unstable();
@@ -571,8 +681,18 @@ pub fn load_features_keeping(path: &str, keep: &Keep) -> Result<Features, osmpbf
             if needed.binary_search(&id).is_ok() {
                 out.push(NodeRec::At(id, lat, lon));
             }
-            if let Some(((kind, rank), label)) = point.filter(|(_, (n, _))| !n.is_empty()) {
-                out.push(NodeRec::Point(kind, rank, label, lat, lon));
+            if let Some(((kind, rank), (name, reference))) = point {
+                // An exit by its number alone; a tap or a gate unnamed, carrying its kind's word for the tap card.
+                let label = if !name.is_empty() || (kind == names::PointKind::Exit && !reference.is_empty()) {
+                    Some((name, reference))
+                } else if kind.marks_unnamed() && kind != names::PointKind::Exit {
+                    Some((String::new(), names::POINT_NAMES[kind as usize].to_string()))
+                } else {
+                    None
+                };
+                if let Some(label) = label {
+                    out.push(NodeRec::Point(kind, rank, label, lat, lon));
+                }
             }
             out
         },
@@ -635,6 +755,14 @@ pub fn load_features_keeping(path: &str, keep: &Keep) -> Result<Features, osmpbf
             WayRec::Member(id, refs) => {
                 members.insert(id, refs);
             }
+            WayRec::Outline(kind, refs, (name, reference)) => {
+                let ring = locate_all(&refs);
+                if let Some((lat, lon)) = names::interior_point(std::slice::from_ref(&ring)) {
+                    let rank = names::ring_area_m2(&ring).min(u32::MAX as f64) as u32;
+                    let name = table.intern(names::POINT + kind as u8, rank, &name, &reference);
+                    points.push(names::Point { name, lat, lon });
+                }
+            }
         }
     }
     let weights = waterway_weights(&lines, &locate);
@@ -676,6 +804,17 @@ pub fn load_features_keeping(path: &str, keep: &Keep) -> Result<Features, osmpbf
             let size = rings.iter().map(|r| names::ring_area_m2(r)).fold(0.0, f64::max);
             let name = table.intern(names::AREA + class as u8, size.min(u32::MAX as f64) as u32, &name, &reference);
             areas.push(Area { class, rings, name });
+        }
+    }
+
+    // Islands, capes and localities drawn as multipolygons: their names at a point inside the largest ring.
+    for (kind, member_ids, (name, reference)) in outlines {
+        let parts: Vec<&Vec<i64>> = member_ids.iter().filter_map(|id| members.get(id)).collect();
+        let rings: Vec<Vec<(f32, f32)>> = assemble_rings(&parts).into_iter().map(|ring| locate_all(&ring)).filter(|r| r.len() >= 4).collect();
+        if let Some((lat, lon)) = names::interior_point(&rings) {
+            let rank = rings.iter().map(|r| names::ring_area_m2(r)).fold(0.0, f64::max).min(u32::MAX as f64) as u32;
+            let name = table.intern(names::POINT + kind as u8, rank, &name, &reference);
+            points.push(names::Point { name, lat, lon });
         }
     }
 

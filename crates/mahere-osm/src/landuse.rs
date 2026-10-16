@@ -194,3 +194,75 @@ mod tests {
         assert_eq!(mvum::NAMES.len(), mvum::SPECIAL as usize + 2);
     }
 }
+
+/// The sea (Nick 2026-10-16: Puget Sound drew as land in the 1 m areas, whose OSM extracts mark the sea only by its coastline): OSM's water polygons (osmdata.openstreetmap.de, water-polygons-split-4326, built from the same coastline as everything else), those touching a box (lat0, lon0, lat1, lon1), each as its rings.
+pub fn load_sea(shp: &str, bbox: (f64, f64, f64, f64)) -> Result<Vec<Vec<Vec<(f64, f64)>>>, String> {
+    let (lat0, lon0, lat1, lon1) = bbox;
+    let mut reader = shapefile::ShapeReader::from_path(shp).map_err(|e| format!("{shp}: {e}"))?;
+    let mut out = Vec::new();
+    for shape in reader.iter_shapes() {
+        let rings = polygon_rings(shape.map_err(|e| format!("{shp}: {e}"))?);
+        let touches = rings.iter().flatten().fold((90.0f64, 180.0f64, -90.0f64, -180.0f64), |(a, b, c, d), &(lat, lon)| (a.min(lat), b.min(lon), c.max(lat), d.max(lon)));
+        if touches.0 <= lat1 && touches.2 >= lat0 && touches.1 <= lon1 && touches.3 >= lon0 && !rings.is_empty() {
+            out.push(rings);
+        }
+    }
+    Ok(out)
+}
+
+/// A ring clipped to a box (lat0, lon0, lat1, lon1), Sutherland and Hodgman: edges along the box where the ring leaves it, which an even-odd fill inside the box reads the same as the whole ring.
+pub fn clip_ring(ring: &[(f64, f64)], bbox: (f64, f64, f64, f64)) -> Vec<(f64, f64)> {
+    let (lat0, lon0, lat1, lon1) = bbox;
+    // Each side of the box: inside test and the crossing point along an edge.
+    let sides: [(&dyn Fn((f64, f64)) -> bool, &dyn Fn((f64, f64), (f64, f64)) -> (f64, f64)); 4] = [
+        (&|p| p.0 >= lat0, &|a, b| (lat0, a.1 + (lat0 - a.0) / (b.0 - a.0) * (b.1 - a.1))),
+        (&|p| p.0 <= lat1, &|a, b| (lat1, a.1 + (lat1 - a.0) / (b.0 - a.0) * (b.1 - a.1))),
+        (&|p| p.1 >= lon0, &|a, b| (a.0 + (lon0 - a.1) / (b.1 - a.1) * (b.0 - a.0), lon0)),
+        (&|p| p.1 <= lon1, &|a, b| (a.0 + (lon1 - a.1) / (b.1 - a.1) * (b.0 - a.0), lon1)),
+    ];
+    let mut pts: Vec<(f64, f64)> = ring.to_vec();
+    if pts.first() == pts.last() {
+        pts.pop();
+    }
+    for (inside, cross) in sides {
+        if pts.is_empty() {
+            break;
+        }
+        let mut next = Vec::with_capacity(pts.len() + 4);
+        for i in 0..pts.len() {
+            let (a, b) = (pts[i], pts[(i + 1) % pts.len()]);
+            match (inside(a), inside(b)) {
+                (true, true) => next.push(b),
+                (true, false) => next.push(cross(a, b)),
+                (false, true) => {
+                    next.push(cross(a, b));
+                    next.push(b);
+                }
+                (false, false) => {}
+            }
+        }
+        pts = next;
+    }
+    if pts.len() >= 3 {
+        pts.push(pts[0]);
+        pts
+    } else {
+        Vec::new()
+    }
+}
+
+#[cfg(test)]
+mod sea_tests {
+    use super::*;
+
+    /// A square straddling a box keeps the part inside, closed.
+    #[test]
+    fn a_ring_clips_to_its_box() {
+        let square = vec![(-1.0, -1.0), (-1.0, 1.0), (1.0, 1.0), (1.0, -1.0), (-1.0, -1.0)];
+        let clipped = clip_ring(&square, (0.0, 0.0, 2.0, 2.0));
+        assert_eq!(clipped.first(), clipped.last());
+        assert!(clipped.iter().all(|&(lat, lon)| (0.0..=1.0).contains(&lat) && (0.0..=1.0).contains(&lon)));
+        assert_eq!(clipped.len(), 5, "the quarter inside is a square: {clipped:?}");
+        assert!(clip_ring(&square, (5.0, 5.0, 6.0, 6.0)).is_empty());
+    }
+}

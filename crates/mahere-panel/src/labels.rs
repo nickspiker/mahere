@@ -152,6 +152,51 @@ const VILLAGE: u8 = POINT + 2;
 const HAMLET: u8 = POINT + 3;
 const PEAK: u8 = POINT + 4;
 const VOLCANO: u8 = POINT + 5;
+// The details of 2026-10-16 (Nick: exit numbers, islands, bays, lookouts, hot springs "and other goodies").
+const FERRY: u8 = mahere_tiles::osm::RoadClass::Ferry as u8 + 1;
+const AERIALWAY: u8 = mahere_tiles::osm::RoadClass::Aerialway as u8 + 1;
+const RIDGE: u8 = mahere_tiles::osm::RoadClass::Ridge as u8 + 1;
+const CLIFF: u8 = mahere_tiles::osm::RoadClass::Cliff as u8 + 1;
+use mahere_tiles::osm::names::PointKind as Pk;
+const EXIT: u8 = POINT + Pk::Exit as u8;
+const ISLAND: u8 = POINT + Pk::Island as u8;
+const ISLET: u8 = POINT + Pk::Islet as u8;
+const BAY: u8 = POINT + Pk::Bay as u8;
+const STRAIT: u8 = POINT + Pk::Strait as u8;
+const SEA: u8 = POINT + Pk::Sea as u8;
+const CAPE: u8 = POINT + Pk::Cape as u8;
+const NEIGHBOURHOOD: u8 = POINT + Pk::Neighbourhood as u8;
+const LOCALITY: u8 = POINT + Pk::Locality as u8;
+const DRINKING_WATER: u8 = POINT + Pk::DrinkingWater as u8;
+const TOILETS: u8 = POINT + Pk::Toilets as u8;
+const SHELTER: u8 = POINT + Pk::Shelter as u8;
+const RANGER_STATION: u8 = POINT + Pk::RangerStation as u8;
+const LOOKOUT: u8 = POINT + Pk::Lookout as u8;
+const HOT_SPRING: u8 = POINT + Pk::HotSpring as u8;
+const CAVE: u8 = POINT + Pk::Cave as u8;
+const GATE: u8 = POINT + Pk::Gate as u8;
+const FORD: u8 = POINT + Pk::Ford as u8;
+
+/// A point's mark: its symbol, the theme colour it takes, its size against the label's. Every symbol is in the fonts every build carries (Open Sans, Noto Sans Symbols 2).
+fn mark_of(kind: u8) -> (char, usize, f32) {
+    match kind {
+        PEAK | VOLCANO => ('\u{25B2}', SUMMIT, 0.7),
+        LOOKOUT => ('\u{265C}', SUMMIT, 0.9),
+        HOT_SPRING => ('\u{2668}', WATER, 0.95),
+        DRINKING_WATER => ('\u{25C9}', WATER, 0.7),
+        FORD => ('\u{2248}', WATER, 0.9),
+        SHELTER => ('\u{1F6D6}', MARK, 0.9),
+        RANGER_STATION => ('\u{25C6}', MARK, 0.7),
+        CAVE => ('\u{25D3}', MARK, 0.8),
+        GATE => ('\u{25A0}', MARK, 0.5),
+        _ => ('\u{2022}', MARK, 1.0),
+    }
+}
+
+/// The points whose names sit centred on them with no mark: settlements, districts, islands, capes, waters, exits.
+fn centred(kind: u8) -> bool {
+    kind <= HAMLET || matches!(kind, EXIT | ISLAND | ISLET | BAY | STRAIT | SEA | CAPE | NEIGHBOURHOOD | LOCALITY)
+}
 
 /// Who is lettered first: lower first. None for what is not lettered at all.
 fn tier(n: &Named) -> Option<u8> {
@@ -166,6 +211,11 @@ fn tier(n: &Named) -> Option<u8> {
         PARK..=ADMIN => 6,
         RESIDENTIAL | SERVICE | RAIL => 7,
         POWER => return None,
+        ISLAND | BAY | STRAIT | SEA => 2,
+        NEIGHBOURHOOD => 5,
+        FERRY | RIDGE => 6,
+        EXIT => 7,
+        ISLET | CAPE | LOCALITY | AERIALWAY | CLIFF => 8,
         k if k >= POINT => 9,
         k if k >= AREA => 8,
         _ => 7,
@@ -210,6 +260,18 @@ fn style_of(n: &Named) -> (f32, usize, u16, f32) {
         MOTORWAY..=PRIMARY => (0.82, ROAD, 700, 0.0),
         TRACK | PATH => (0.78, TRAIL, 400, 0.0),
         PARK..=ADMIN => (0.78, BOUNDARY, 400, 0.0),
+        EXIT => (0.72, ROAD, 700, 0.0),
+        ISLAND => (1.0, PLACE, 600, 0.0),
+        ISLET | CAPE => (0.8, PLACE, 400, 0.0),
+        NEIGHBOURHOOD => (0.82, PLACE, 500, 0.0),
+        LOCALITY => (0.78, GREEN, 400, ITALIC),
+        BAY | STRAIT => (1.0, WATER, 400, ITALIC),
+        SEA => (1.2, WATER, 400, ITALIC),
+        LOOKOUT => (0.75, SUMMIT, 400, 0.0),
+        HOT_SPRING | DRINKING_WATER | FORD => (0.75, WATER, 400, 0.0),
+        FERRY => (0.75, WATER, 400, ITALIC),
+        RIDGE => (0.8, SUMMIT, 400, ITALIC),
+        AERIALWAY | CLIFF => (0.7, ROAD, 400, 0.0),
         k if k >= POINT => (0.75, MARK, 400, 0.0),
         k if k >= AREA => (0.8, GREEN, 400, 0.0),
         _ => (0.78, ROAD, 400, 0.0),
@@ -231,8 +293,8 @@ struct Laid {
     colour: usize,
     weight: u16,
     shear: f32,
-    /// A mark drawn at the point: a summit's triangle, a dot for the small marks.
-    mark: Option<([f32; 2], bool)>,
+    /// A mark drawn at the point, by its kind ([`mark_of`]): a summit's triangle, a lookout's tower, a dot for the small marks.
+    mark: Option<([f32; 2], u8)>,
 }
 
 /// The view a layout is for: the camera, the depth and the resident cells, the route, the labels layer and the theme. A different key is a stale layout.
@@ -751,16 +813,20 @@ impl Letterer {
         let mut kept = Vec::new();
         for l in laid {
             let n = l.glyphs.len().max(1) as f32;
-            let centre = l.glyphs.iter().fold([0.0f32; 2], |c, g| [c[0] + g.at[0] / n, c[1] + g.at[1] / n]);
+            // A mark alone (an unnamed tap or gate) anchors at its mark.
+            let centre = match (l.glyphs.is_empty(), l.mark) {
+                (true, Some((p, _))) => p,
+                _ => l.glyphs.iter().fold([0.0f32; 2], |c, g| [c[0] + g.at[0] / n, c[1] + g.at[1] / n]),
+            };
             let anchor = cam.screen_to_geo(centre[0] as f64, centre[1] as f64, w, h);
             let halo = (l.size * self.look[1] * 16.0) as u32;
             let letters = l.glyphs.iter().map(|g| (self.glyph(g.ch, l.size, l.weight, l.shear, halo, g.angle), [g.at[0] - centre[0], g.at[1] - centre[1]], g.angle)).collect();
             // A point's name stays level; a line's and an area's turn with the map.
             let turns = !l.name.is_point();
             kept.push(Kept { name: l.name.clone(), anchor, letters, turns, colour: l.colour, halo: halo > 0 });
-            if let Some((p, summit)) = l.mark {
-                // A summit's triangle, point up; a dot for the small marks. Level, no halo.
-                let (ch, colour, scale) = if summit { ('\u{25B2}', SUMMIT, 0.7) } else { ('\u{2022}', MARK, 1.0) };
+            if let Some((p, kind)) = l.mark {
+                // The kind's symbol, level, no halo.
+                let (ch, colour, scale) = mark_of(kind);
                 let key = self.glyph(ch, l.size * scale, 400, 0.0, 0, 0.0);
                 kept.push(Kept { name: l.name.clone(), anchor: cam.screen_to_geo(p[0] as f64, p[1] as f64, w, h), letters: vec![(key, [0.0, 0.0], 0.0)], turns: false, colour, halo: false });
             }
@@ -922,7 +988,11 @@ impl Letterer {
                 Shape::Line(pts) => self.line(n, &label, pts, texels.texel_px, size, colour, weight, shear, &mut room, pad),
             };
             for l in laid {
-                let boxes: Vec<[f32; 4]> = l.glyphs.iter().map(|g| glyph_box(g, l.size, pad)).collect();
+                let mut boxes: Vec<[f32; 4]> = l.glyphs.iter().map(|g| glyph_box(g, l.size, pad)).collect();
+                // The mark holds its ground too, so marks never pile on one another.
+                if let Some((p, _)) = l.mark {
+                    boxes.push([p[0] - l.size * 0.4, p[1] - l.size * 0.4, p[0] + l.size * 0.4, p[1] + l.size * 0.4]);
+                }
                 room.take(&boxes);
                 out.push(l);
             }
@@ -933,8 +1003,15 @@ impl Letterer {
     /// A point's label: beside its mark, right of it first, then left, above and below; a town's name centred on it.
     #[allow(clippy::too_many_arguments)]
     fn point(&mut self, n: &Named, label: &str, p: [f32; 2], size: f32, colour: usize, weight: u16, room: &Room, pad: f32) -> Option<Laid> {
-        let place = n.kind <= HAMLET;
-        let summit = n.kind == PEAK || n.kind == VOLCANO;
+        let place = centred(n.kind);
+        // An unnamed tap, gate or lookout is its mark alone (its label is only its kind's word, for the tap card); an unnamed toilet says WC.
+        let unnamed = n.name.is_empty() && n.kind >= DRINKING_WATER;
+        if unnamed && n.kind != TOILETS {
+            let mark_box = [p[0] - size * 0.4, p[1] - size * 0.4, p[0] + size * 0.4, p[1] + size * 0.4];
+            return room.free(&[mark_box]).then(|| Laid { name: n.clone(), glyphs: Vec::new(), size, colour, weight, shear: 0.0, mark: Some((p, n.kind)) });
+        }
+        let label = if unnamed { "WC" } else { label };
+        let place = place || unnamed;
         let width = self.width(label, size, weight);
         let gap = size * 0.55;
         let spots: Vec<[f32; 2]> = if place {
@@ -955,7 +1032,7 @@ impl Letterer {
                 boxes.push([p[0] - size * 0.4, p[1] - size * 0.4, p[0] + size * 0.4, p[1] + size * 0.4]);
             }
             if room.free(&boxes) {
-                let mark = (!place).then_some((p, summit));
+                let mark = (!place).then_some((p, n.kind));
                 return Some(Laid { name: n.clone(), glyphs, size, colour, weight, shear: 0.0, mark });
             }
         }

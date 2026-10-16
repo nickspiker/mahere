@@ -1955,6 +1955,7 @@ dependencies = [
  "mahere-engine",
  "mahere-panel",
  "mahere-tiles",
+ "naga",
  "png",
  "pollster",
  "rustc-hash 2.1.3",

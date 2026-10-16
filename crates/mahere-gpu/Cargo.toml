@@ -21,6 +21,7 @@ wgpu = { version = "28", default-features = false, features = ["wgsl", "vulkan"]
 wgpu = { version = "28", default-features = false, features = ["wgsl", "metal"] }
 
 [dev-dependencies]
+naga = { version = "28", features = ["wgsl-in"] }
 pollster = "0.4"
 png = "0.17"
 mahere-panel = { path = "../mahere-panel" }

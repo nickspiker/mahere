@@ -83,6 +83,17 @@ pub const LAND_NAMES: [&str; 14] = ["", "Grass", "Farmland", "Orchard", "Scrub",
 /// Line classes in table order (1-based ids; 0 is empty).
 pub const CLASS_NAMES: [&str; 18] = ["", "Motorway", "Trunk", "Primary", "Secondary", "Tertiary", "Residential", "Service", "Track", "Path", "Rail", "Power", "Waterway", "National park", "Wilderness", "National forest", "Protected", "County and state"];
 
+/// A line class's word for a reader (the tap card, turn-by-turn): the editor's eighteen, then the classes added after them, whose colours each theme derives ([`Theme::lines`]).
+pub fn class_word(class: u8) -> &'static str {
+    match class {
+        18 => "Ferry",
+        19 => "Lift",
+        20 => "Ridge",
+        21 => "Cliff",
+        c => CLASS_NAMES.get(c as usize).copied().filter(|s| !s.is_empty()).unwrap_or("Line"),
+    }
+}
+
 const ALL: LayerMask = LayerMask { dem: true, land: true, water: true, line: true, debug: false, imagery: false, contours: true, slope: false, infrared: false, hypso: true, boundaries: true, own: true, mvum: true, raw: false, labels: true };
 
 /// The ownership colours every built-in starts from (Nick 2026-10-10): the agencies' customary map colours, Forest Service green, BLM yellow, Park Service purple, state blue, tribal brown; the alpha is the boundary's, the wash a fifth of it.
@@ -924,7 +935,20 @@ impl Theme {
         lut
     }
 
+    /// The theme's line colours with the classes added after its eighteen (2026-10-16), from its own palette so every theme, saved or built in, has them: a ferry the water deepened toward the rail ink, a lift in the rail's colour, a ridge no line at all (its name alone follows it), a cliff in the index contour's colour.
+    pub fn lines(&self) -> [[u8; 4]; 22] {
+        let mut out = [[0u8; 4]; 22];
+        out[..18].copy_from_slice(&self.line);
+        let rail = self.line[10];
+        let mix = |a: u8, b: u8| ((a as u16 * 5 + b as u16 * 3) / 8) as u8;
+        out[18] = [mix(self.water[0], rail[0]), mix(self.water[1], rail[1]), mix(self.water[2], rail[2]), 230];
+        out[19] = [rail[0], rail[1], rail[2], 255];
+        out[20] = [0, 0, 0, 0];
+        out[21] = [self.contour_index[0], self.contour_index[1], self.contour_index[2], 220];
+        out
+    }
+
     pub fn style(&self) -> Style {
-        Style { land: self.land, line: self.line, water: self.water, contour: self.contour, contour_index: self.contour_index, sea: self.sea, flat: self.flat, bg: self.bg, no_dem: self.no_dem, own: self.own, wild: self.wild, mvum: self.mvum }
+        Style { land: self.land, line: self.lines(), water: self.water, contour: self.contour, contour_index: self.contour_index, sea: self.sea, flat: self.flat, bg: self.bg, no_dem: self.no_dem, own: self.own, wild: self.wild, mvum: self.mvum }
     }
 }

@@ -1198,3 +1198,13 @@ fn rgba(c: [u8; 4]) -> [f32; 4] {
 }
 
 
+
+#[cfg(test)]
+mod shader_tests {
+    /// The map shader parses and validates (a WGSL mistake otherwise shows only on a phone, as a black map).
+    #[test]
+    fn the_map_shader_validates() {
+        let module = naga::front::wgsl::parse_str(include_str!("map.wgsl")).unwrap_or_else(|e| panic!("{}", e.emit_to_string(include_str!("map.wgsl"))));
+        naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::all()).validate(&module).expect("valid");
+    }
+}

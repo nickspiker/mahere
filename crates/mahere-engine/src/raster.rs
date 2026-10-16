@@ -201,7 +201,8 @@ impl ElevRange {
 #[derive(Clone, Copy, Debug)]
 pub struct Style {
     pub land: [[u8; 4]; 14],
-    pub line: [[u8; 4]; 18],
+    /// Indexed by line class id: the theme's 18, then ferry, aerialway, ridge and cliff derived from its palette (2026-10-16).
+    pub line: [[u8; 4]; 22],
     pub water: [u8; 4],
     pub contour: [u8; 4],
     pub contour_index: [u8; 4],
@@ -297,10 +298,18 @@ pub const CLASS_LUT: [[u8; 3]; 18] = [
     [110, 190, 150],
     [190, 150, 210],
 ];
-pub const CLASS_MAX: usize = 17;
+pub const CLASS_MAX: usize = 21;
 pub const WATERWAY_CLASS: usize = 12;
 /// Classes from here up are boundaries (national park, wilderness, national forest, other protected land, state and county lines), gated by the boundaries layer.
 pub const BOUNDARY_FIRST: usize = 13;
+/// The last boundary class (Admin); the classes after it (ferry, aerialway, ridge, cliff) are lines of their own.
+pub const BOUNDARY_LAST: usize = 17;
+
+/// Whether a line class is a boundary (gated by the boundaries layer, drawn faint).
+#[inline(always)]
+pub fn is_boundary(class: usize) -> bool {
+    (BOUNDARY_FIRST..=BOUNDARY_LAST).contains(&class)
+}
 
 /// The coarsest view depth a line class draws at: a raster pyramid of lines sums coverage upward, so without this every texel of a continent at depth 3 holds a road and a river and the continent paints as lines. Interstates at every zoom, trunks from depth 2, primaries from 4, secondaries from 6, tertiaries from 7, streets, tracks and paths from 9, service roads from 10, rail from 4, power from 8, waterways by their magnitude (the great rivers at every zoom, a trickle from 8), parks and the like from 5, borders from 3. The GPU shader carries the same table (Nick 2026-10-10: roads should fade out as the map zooms out).
 #[inline(always)]
@@ -328,6 +337,10 @@ pub fn line_min_depth(class: usize, mag: u8) -> u8 {
         }
         13..=16 => 5,
         17 => 3,
+        // Ferries from a region's view, lifts and named ridges from a valley's, cliffs close in.
+        18 => 6,
+        19 | 20 => 9,
+        21 => 10,
         _ => 0,
     }
 }
@@ -840,7 +853,7 @@ fn compose_rgb(dem: &DemRef, vec: &VecRef, pool: &Pool, diamond: u8, uq: i64, vq
     if let VecRef::Cell { line, land, water, own, mvum, shift, .. } = vec {
         let i = tri_index(uq, vq, *shift);
         if mask.imagery && imaged {
-            let line_cov = |line: &ClassCell| -> u8 { if mask.line && (mask.boundaries || (line.class[i] as usize) < BOUNDARY_FIRST) && luts.dem_depth >= line_min_depth(line.class[i] as usize, line.mag_at(i)) { line.cov[i] } else { 0 } };
+            let line_cov = |line: &ClassCell| -> u8 { if mask.line && (mask.boundaries || !is_boundary(line.class[i] as usize)) && luts.dem_depth >= line_min_depth(line.class[i] as usize, line.mag_at(i)) { line.cov[i] } else { 0 } };
             // Under the water, as over the ground: the waterway lines, so a lake covers the river running into it (Nick 2026-10-10).
             if let Some(line) = line {
                 if line_cov(line) != 0 && line.class[i] as usize == WATERWAY_CLASS {
@@ -892,7 +905,7 @@ fn compose_rgb(dem: &DemRef, vec: &VecRef, pool: &Pool, diamond: u8, uq: i64, vq
         if contour.0 > 0.0 {
             rgb = lerp3(rgb, lin(rgb3(if contour.1 { st.contour_index } else { st.contour })), contour.0 * alpha(if contour.1 { st.contour_index } else { st.contour }));
         }
-        let line_cov = |line: &ClassCell| -> u8 { if mask.line && (mask.boundaries || (line.class[i] as usize) < BOUNDARY_FIRST) && luts.dem_depth >= line_min_depth(line.class[i] as usize, line.mag_at(i)) { line.cov[i] } else { 0 } };
+        let line_cov = |line: &ClassCell| -> u8 { if mask.line && (mask.boundaries || !is_boundary(line.class[i] as usize)) && luts.dem_depth >= line_min_depth(line.class[i] as usize, line.mag_at(i)) { line.cov[i] } else { 0 } };
         if let Some(line) = line {
             if line_cov(line) != 0 && line.class[i] as usize == WATERWAY_CLASS {
                 rgb = lerp3(rgb, line_colour(line, i, &luts.style), line_cov(line) as f32 / 255.0 * line_opacity(line, i, &luts.style));
@@ -914,7 +927,7 @@ fn compose_rgb(dem: &DemRef, vec: &VecRef, pool: &Pool, diamond: u8, uq: i64, vq
         if let Some(line) = line {
             if line_cov(line) != 0 && line.class[i] as usize != WATERWAY_CLASS {
                 // Boundaries sit under the map, never competing with a road or a trail.
-                let a = if line.class[i] as usize >= BOUNDARY_FIRST { 0.55 } else { 1.0 };
+                let a = if is_boundary(line.class[i] as usize) { 0.55 } else { 1.0 };
                 rgb = lerp3(rgb, line_colour(line, i, &luts.style), line_cov(line) as f32 / 255.0 * line_opacity(line, i, &luts.style) * a);
             }
         }

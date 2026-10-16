@@ -73,8 +73,9 @@ const M_RAW: u32 = 8192u;
 // Where the style tables sit in the LUT buffer after the 4096 hypsometric rows.
 const CLASS_BASE: u32 = 4096u;
 const LAND_BASE: u32 = 4128u;
-const CLASS_MAX: u32 = 17u;
+const CLASS_MAX: u32 = 21u;
 const BOUNDARY_FIRST: u32 = 13u;
+const BOUNDARY_LAST: u32 = 17u;
 const WATERWAY_CLASS: u32 = 12u;
 // The overlays' tables, the CPU's OWN_FILL, and the wilderness flag on an ownership class.
 const OWN_BASE: u32 = 4160u;
@@ -412,6 +413,9 @@ fn line_min_depth(cls: u32, mag: u32) -> u32 {
         }
         case 13u, 14u, 15u, 16u: { return 5u; }
         case 17u: { return 3u; }
+        case 18u: { return 6u; }
+        case 19u, 20u: { return 9u; }
+        case 21u: { return 10u; }
         default: { return 0u; }
     }
 }
@@ -425,7 +429,7 @@ fn line_alpha(cls_id: u32, cov: u32, mag: u32) -> f32 {
         return f32(cov) / 255.0 * a;
     }
     // Boundaries sit under the map, never competing with a road or a trail.
-    if (cls >= BOUNDARY_FIRST) {
+    if (cls >= BOUNDARY_FIRST && cls <= BOUNDARY_LAST) {
         return f32(cov) / 255.0 * 0.55 * a;
     }
     return f32(cov) / 255.0 * (0.5 + 0.5 * line_scale(cls, mag)) * a;
@@ -707,7 +711,7 @@ fn compose(d: u32, u: u32, v: u32, pos: vec2<f32>) -> Composed {
     }
     if (vi != NONE) {
         let flags = vflags;
-        let draw_line = (mask & M_LINE) != 0u && line.y != 0u && (line.x < BOUNDARY_FIRST || (mask & M_BOUND) != 0u) && U.depths.x >= line_min_depth(line.x, line.z);
+        let draw_line = (mask & M_LINE) != 0u && line.y != 0u && (line.x < BOUNDARY_FIRST || line.x > BOUNDARY_LAST || (mask & M_BOUND) != 0u) && U.depths.x >= line_min_depth(line.x, line.z);
         if ((mask & M_IMAGERY) != 0u && (im.x != 0u || im.y != 0u || im.z != 0u || im.w != 0u)) {
             // Imagery stands in for the ground: nothing lights it. True colour, or the near-infrared band as grey, unrolled to scene light.
             out.ground = false;

@@ -1923,7 +1923,7 @@ impl MapCore {
                 out.push(format!("{} \u{b7} {what}", e.label()));
             }
             if let Some((class, uses, named)) = line {
-                let name = theme::CLASS_NAMES.get(class as usize).copied().unwrap_or("Line");
+                let name = theme::class_word(class);
                 let name = match &named {
                     Some(e) => format!("{} \u{b7} {name}", e.label()),
                     None => name.to_string(),
@@ -2219,6 +2219,6 @@ pub fn named_kind(n: &mahere_tiles::Named) -> &'static str {
     } else if n.is_area() {
         theme::LAND_NAMES.get((n.kind - mahere_tiles::names::AREA + 1) as usize).copied().filter(|s| !s.is_empty()).unwrap_or("Area")
     } else {
-        theme::CLASS_NAMES.get(n.kind as usize).copied().unwrap_or("Line")
+        theme::class_word(n.kind)
     }
 }

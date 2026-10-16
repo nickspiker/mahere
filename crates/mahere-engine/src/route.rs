@@ -25,6 +25,9 @@ pub enum Travel {
     Foot,
 }
 
+/// A ferry's line class id (`RoadClass::Ferry` + 1).
+const FERRY: u8 = mahere_tiles::osm::RoadClass::Ferry as u8 + 1;
+
 impl Travel {
     pub fn word(self) -> &'static str {
         match self {
@@ -46,11 +49,19 @@ impl Travel {
     /// The speed on a way, m/s; None where this way of travelling may not go.
     fn speed(self, w: &mahere_tiles::route::Way) -> Option<f64> {
         let unpaved = w.uses & use_bits::UNPAVED != 0;
+        // Trail difficulty (sac_scale, 1 T1 .. 6 T6) and roughness (1 gravel .. 3 high clearance) from the grade byte (2026-10-16).
+        let (difficulty, rough) = (w.grade & 15, w.grade >> 4);
+        // A ferry carries every way of travelling at its own pace.
+        if w.class == FERRY {
+            return Some(if w.speed_kmh > 0 { w.speed_kmh as f64 } else { 20.0 } / 3.6);
+        }
         let kmh = match self {
             Travel::Car => {
                 if w.uses & use_bits::MOTOR == 0 {
                     return None;
                 }
+                // A road for high clearance only where nothing else goes.
+                let rough_factor = [1.0, 0.8, 0.5, 0.15][rough.min(3) as usize];
                 let class = match w.class {
                     1 => 105.0,
                     2 => 90.0,
@@ -63,19 +74,25 @@ impl Travel {
                 let posted = if w.speed_kmh > 0 { w.speed_kmh as f64 } else { class };
                 // A gated, private or seasonal way only where nothing else goes.
                 let penalty = if w.uses & use_bits::RESTRICTED != 0 { 0.2 } else { 1.0 };
-                posted * if unpaved { 0.6 } else { 1.0 } * penalty
+                posted * if unpaved { 0.6 } else { 1.0 } * penalty * rough_factor
             }
             Travel::Bike => {
                 if w.uses & use_bits::BIKE == 0 {
                     return None;
                 }
-                if unpaved || w.class >= 8 { 12.0 } else { 18.0 }
+                // Alpine routes are no place for a bike; demanding mountain trails are walked alongside it.
+                match difficulty {
+                    4.. => return None,
+                    3 => 5.0,
+                    _ => (if unpaved || w.class >= 8 { 12.0 } else { 18.0 }) * [1.0, 0.9, 0.6, 0.4][rough.min(3) as usize],
+                }
             }
             Travel::Foot => {
                 if w.uses & use_bits::FOOT == 0 {
                     return None;
                 }
-                4.8
+                // Walking pace by the trail's difficulty: a hiking trail at 4.8 km/h down to hands-on scrambling at 1.
+                [4.8, 4.8, 4.0, 3.0, 2.0, 1.5, 1.0][difficulty.min(6) as usize]
             }
         };
         Some(kmh / 3.6)
@@ -449,6 +466,24 @@ fn ground_time(store: &Arc<dyn CellStore>, path: &[T], travel: Travel) -> (Optio
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Ferries carry everyone at a ferry's pace; a trail's difficulty slows a walker and turns a bike away; a high-clearance road slows a car to a crawl.
+    #[test]
+    fn grades_and_ferries_set_the_pace() {
+        let way = |class: u8, uses: u8, grade: u8| mahere_tiles::route::Way { class, uses, grade, ..Default::default() };
+        let all = use_bits::FOOT | use_bits::BIKE | use_bits::MOTOR;
+        for t in [Travel::Car, Travel::Bike, Travel::Foot] {
+            assert_eq!(t.speed(&way(FERRY, all, 0)), Some(20.0 / 3.6), "{} by ferry", t.word());
+        }
+        let path = 9;
+        assert_eq!(Travel::Foot.speed(&way(path, all, 1)), Some(4.8 / 3.6));
+        assert_eq!(Travel::Foot.speed(&way(path, all, 6)), Some(1.0 / 3.6), "T6 is hands-on");
+        assert_eq!(Travel::Bike.speed(&way(path, all, 4)), None, "no bikes on alpine routes");
+        let track = 8;
+        let smooth = Travel::Car.speed(&way(track, all, 0)).unwrap();
+        let rough = Travel::Car.speed(&way(track, all, 3 << 4)).unwrap();
+        assert!(rough < smooth * 0.2);
+    }
     use mahere_tiles::osm::{Road, RoadClass, Travel as Tags};
 
     struct Baked(HashMap<CellKey, Vec<u8>>);
@@ -459,7 +494,7 @@ mod tests {
     }
 
     fn road(osm: i64, pts: Vec<(f32, f32)>, oneway: i8, layer: i8) -> Road {
-        Road { class: RoadClass::Residential, pts, weight: 0.5, uses: use_bits::MOTOR | use_bits::FOOT | use_bits::BIKE, name: osm as u32, travel: Tags { way: osm, speed_kmh: 0, oneway, layer } }
+        Road { class: RoadClass::Residential, pts, weight: 0.5, uses: use_bits::MOTOR | use_bits::FOOT | use_bits::BIKE, name: osm as u32, travel: Tags { way: osm, speed_kmh: 0, oneway, layer, ..Default::default() } }
     }
 
     fn baked(roads: &[Road], junctions: &[(f32, f32)]) -> Arc<dyn CellStore> {
