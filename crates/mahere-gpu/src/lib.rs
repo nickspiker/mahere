@@ -683,6 +683,27 @@ impl GpuMap {
                 }
             }
         }
+        // A cell whose planes went to the GPU and were released, but which holds no slot for them now (a GPU map made afresh, after a lost device or a panic): dropped from the pool, so residency loads it again from the device and it uploads whole.
+        // Found 2026-10-16 on the Pixel: the ocean drew as land in cell-shaped triangles, coasts and roads gone, while cells loaded since drew right.
+        use mahere_engine::residency::{PRESENT_IMG, PRESENT_LAND, PRESENT_LINE, PRESENT_MVUM, PRESENT_OWN, PRESENT_WATER};
+        let stale: Vec<CellKey> = pool
+            .map
+            .iter()
+            .filter(|(k, e)| {
+                let lost = |bits: u8, held: bool, plane: &Plane| e.present & bits != 0 && !held && !plane.map.contains_key(k);
+                lost(PRESENT_LINE, e.line.is_some(), &self.line)
+                    || lost(PRESENT_LAND | PRESENT_WATER, e.land.is_some() || e.water.is_some(), &self.lw)
+                    || lost(PRESENT_OWN | PRESENT_MVUM, e.own.is_some() || e.mvum.is_some(), &self.ov)
+                    || lost(PRESENT_IMG, e.img.is_some(), &self.img)
+            })
+            .map(|(k, _)| *k)
+            .collect();
+        if !stale.is_empty() {
+            eprintln!("gpu: {} cells lost their planes, loading them again", stale.len());
+        }
+        for k in stale {
+            pool.map.remove(&k);
+        }
         if grew {
             self.map_bind = None;
         }
