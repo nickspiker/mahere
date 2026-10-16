@@ -2,6 +2,19 @@
 
 ## 0.21x · October 2026
 
+### More on the map
+- Freeway exits with their numbers and names, and ramps that say where they go ("toward Seneca St"), in directions too.
+- Islands, bays, straits, capes, neighbourhoods and named backcountry places.
+- Ferries across the water, which directions can take; ski lifts; named ridges and cliffs.
+- Fire lookouts, hot springs, caves, shelters, ranger stations, drinking water, toilets, gates and fords, each with its own mark.
+- Directions know how hard a trail is and how rough a road is: walking slows on scrambles, bikes stay off alpine routes, cars keep to roads they can drive.
+- Puget Sound and the rest of the sea in the Seattle area are water again, not land.
+
+### Fixes
+- A place's name shows once, not twice side by side.
+- The zoom number under the compass turns amber when you zoom past the map's detail, white while there is more to come.
+- The sea no longer turns to land in patches after the app recovers its graphics.
+
 ### Names in their own scripts
 - Place names everywhere read as the people there write them: 北京市, 東京都, 서울, القاهرة, תל אביב, Москва.
 - The fonts for each script download the first time you look at a place that needs one, then stay on the phone; the app itself stays small.
