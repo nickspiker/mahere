@@ -17,6 +17,7 @@
 - Puget Sound and the rest of the sea in the Seattle area are water again, not land.
 
 ### Fixes
+- Changing the phone's screen resolution no longer makes the app crash and restart over and over.
 - A place's name shows once, not twice side by side.
 - The zoom number under the compass turns amber when you zoom past the map's detail, white while there is more to come.
 - The sea no longer turns to land in patches after the app recovers its graphics.
