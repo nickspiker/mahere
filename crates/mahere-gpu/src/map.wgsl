@@ -1018,10 +1018,22 @@ fn vs_glyph(@builtin(vertex_index) vi: u32, @location(0) a: vec4<f32>, @location
     return out;
 }
 
-// The letter over its halo, premultiplied (the atlas holds the letter's coverage in red, the halo's in green).
+// Atlas texels per screen pixel: the labeller's ATLAS_DENSITY (Nick 2026-10-16: letters drawn into the still frame's 3× layer and binned with the map).
+const ATLAS_DENSITY: f32 = 3.0;
+
+// The letter over its halo, premultiplied (the atlas holds the letter's coverage in red, the halo's in green). Drawn into the map layer at its scale: a target pixel spans ATLAS_DENSITY / scale texels each way, box-averaged (one sample at 3×, nine at 1×), as binning would.
 @fragment
 fn fs_glyph(in: GlyphOut) -> @location(0) vec4<f32> {
-    let m = textureSample(atlas_tex, atlas_samp, in.uv);
+    let n = max(i32(round(ATLAS_DENSITY / U.scale)), 1);
+    let texel = 1.0 / vec2<f32>(textureDimensions(atlas_tex));
+    var m = vec4<f32>(0.0);
+    for (var j = 0; j < n; j++) {
+        for (var i = 0; i < n; i++) {
+            let off = (vec2<f32>(f32(i), f32(j)) + 0.5 - f32(n) * 0.5) * texel;
+            m += textureSampleLevel(atlas_tex, atlas_samp, in.uv + off, 0.0);
+        }
+    }
+    m /= f32(n * n);
     let ta = m.r * in.text.a;
     let ha = m.g * in.halo.a;
     return vec4<f32>(in.text.rgb * ta + in.halo.rgb * ha * (1.0 - ta), ta + ha * (1.0 - ta));
@@ -1062,6 +1074,7 @@ fn fs_segment(in: SegOut) -> @location(0) vec4<f32> {
     let ab = in.ends.zw - in.ends.xy;
     let t = clamp(dot(in.at - in.ends.xy, ab) / max(dot(ab, ab), 1e-6), 0.0, 1.0);
     let d = length(in.at - (in.ends.xy + ab * t));
-    let cov = clamp(in.half - d + 0.5, 0.0, 1.0) * in.colour.a;
+    // Feathered over one pixel of the layer it is drawn into (a third of a screen pixel at 3×), the binning doing the rest, as for the map's own lines.
+    let cov = clamp((in.half - d) * U.scale + 0.5, 0.0, 1.0) * in.colour.a;
     return vec4<f32>(in.colour.rgb * cov, cov);
 }

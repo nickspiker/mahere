@@ -57,6 +57,9 @@ const LABEL_FONT_FILES: [&[u8]; 11] = [
     include_bytes!("../assets/fonts/RobotoCondensed.ttf"),
 ];
 
+/// Atlas pixels per screen pixel (Nick 2026-10-16: letters composite into the still frame's 3× layer and bin down with the map, for the same organic scaling as its lines): a glyph is rasterised this much larger, drawn texel for pixel into a 3× target and box-filtered into a 1× one. The GPU shader's ATLAS_DENSITY is the same number.
+pub const ATLAS_DENSITY: f32 = 3.0;
+
 /// A glyph's rotation bins, radians apart: one pixel of arc at half its size.
 fn bin_step(size: f32) -> f32 {
     2.0 / size.max(4.0)
@@ -82,7 +85,7 @@ pub struct Atlas {
 
 impl Atlas {
     fn new() -> Atlas {
-        Atlas { side: 1024, rg: vec![0; 1024 * 1024 * 2], version: 1, x: 0, y: 0, row: 0, slots: HashMap::new() }
+        Atlas { side: 2048, rg: vec![0; 2048 * 2048 * 2], version: 1, x: 0, y: 0, row: 0, slots: HashMap::new() }
     }
 
     fn clear(&mut self, side: usize) {
@@ -843,12 +846,14 @@ impl Letterer {
         }
         let r = halo as f32 / 16.0;
         let adv = self.advance(ch, size, weight).max(size * 0.3);
+        let turn = bin as f32 * bin_step(size);
+        // Rasterised at the atlas's density: from here every length is atlas pixels.
+        let (size, r, adv) = (size * ATLAS_DENSITY, r * ATLAS_DENSITY, adv * ATLAS_DENSITY);
         // A square that holds the glyph at any angle, its halo around it.
         // Even, so the glyph's centre is a pixel corner and every glyph of a label snaps to the grid alike (an odd one rounds half a pixel off its neighbours).
         let side = ((adv + size * 0.4).hypot(size * 1.6) + 2.0 * r + 4.0).ceil() as usize;
         let side = side + side % 2;
         let (cw, chh) = (side, side);
-        let turn = bin as f32 * bin_step(size);
         let mut px = vec![0u32; cw * chh];
         {
             let mut damage = Damage::new();
@@ -1357,11 +1362,13 @@ impl Lettering {
                 let residual = a - key.bin as f32 * bin_step(key.size as f32 / 16.0);
                 let (sx, sy, sw, sh) = (slot[0] as f32, slot[1] as f32, slot[2] as f32, slot[3] as f32);
                 let (mut cx, mut cy) = (ax + o[0], ay + o[1]);
+                // At rest the glyph sits on the atlas's own grid (a third of a screen pixel), texel for pixel in the 3× layer.
+                let k = ATLAS_DENSITY;
                 if residual.abs() < 1e-3 {
-                    cx = (cx - sw / 2.0).round() + sw / 2.0;
-                    cy = (cy - sh / 2.0).round() + sh / 2.0;
+                    cx = ((cx * k - sw / 2.0).round() + sw / 2.0) / k;
+                    cy = ((cy * k - sh / 2.0).round() + sh / 2.0) / k;
                 }
-                out.push([cx, cy, sw / 2.0, sh / 2.0, residual, 0.0, 0.0, 0.0, sx / side, sy / side, (sx + sw) / side, (sy + sh) / side, text[0], text[1], text[2], text[3], halo[0], halo[1], halo[2], halo[3]]);
+                out.push([cx, cy, sw / (2.0 * k), sh / (2.0 * k), residual, 0.0, 0.0, 0.0, sx / side, sy / side, (sx + sw) / side, (sy + sh) / side, text[0], text[1], text[2], text[3], halo[0], halo[1], halo[2], halo[3]]);
             }
         }
         out
@@ -1442,7 +1449,19 @@ impl Lettering {
                         continue;
                     }
                     let (u, v) = (g[8] + (lx / hx * 0.5 + 0.5) * (g[10] - g[8]), g[9] + (ly / hy * 0.5 + 0.5) * (g[11] - g[9]));
-                    let (ta, ha) = sample(u, v);
+                    // A screen pixel spans the atlas's density in texels each way: their box average, as the GPU's 1× frame takes it.
+                    let n = ATLAS_DENSITY as i32;
+                    let (mut ta, mut ha) = (0.0, 0.0);
+                    for j in 0..n {
+                        for i in 0..n {
+                            let du = ((i as f32 + 0.5) / n as f32 - 0.5) * ATLAS_DENSITY / side as f32;
+                            let dv = ((j as f32 + 0.5) / n as f32 - 0.5) * ATLAS_DENSITY / side as f32;
+                            let (t, hh) = sample(u + du, v + dv);
+                            ta += t;
+                            ha += hh;
+                        }
+                    }
+                    let (ta, ha) = (ta / (n * n) as f32, ha / (n * n) as f32);
                     let i = y * w + x;
                     blend(canvas, i, [g[16], g[17], g[18]], ha * g[19]);
                     blend(canvas, i, [g[12], g[13], g[14]], ta * g[15]);
@@ -1459,7 +1478,7 @@ impl Lettering {
             let (ax, ay) = cam.geo_to_screen(k.anchor.0, k.anchor.1, w, h);
             k.letters.iter().any(|(key, off, _)| {
                 let o = if k.turns { [off[0] * cp - off[1] * sp, off[0] * sp + off[1] * cp] } else { *off };
-                let r = self.atlas.slots.get(key).map_or(8.0, |s| s[3] as f32 / 2.0);
+                let r = self.atlas.slots.get(key).map_or(8.0, |s| s[3] as f32 / (2.0 * ATLAS_DENSITY));
                 (x - (ax as f32 + o[0])).hypot(y - (ay as f32 + o[1])) <= r
             })
         }).map(|k| &k.name)

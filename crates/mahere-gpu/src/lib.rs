@@ -272,7 +272,7 @@ pub struct GpuMap {
     /// Each resident dem plane.s quantisation (base, step), set when it is uploaded.
     dem_scale: FxHashMap<CellKey, (f32, f32)>,
     map_bind: Option<wgpu::BindGroup>,
-    /// One supersampled target per factor in use (a host draws at 2× while moving and 3× when still), each with its present bind group.
+    /// One supersampled target per factor in use (a host draws at 1× while moving and 3× when still), each with its present bind group.
     offscreen: Vec<(u32, wgpu::Texture, wgpu::TextureView, u32, u32)>,
     present_binds: FxHashMap<u32, wgpu::BindGroup>,
     overlay: Option<(wgpu::Texture, wgpu::TextureView, u32, u32)>,
@@ -358,7 +358,7 @@ impl GpuMap {
         let present_pipeline = pipeline("present", &[&map_layout, &present_layout], "vs_present", "fs_present", &[present_format]);
         // Premultiplied over: what the labels and the top layer cover, they cover by their own opacity.
         let over = wgpu::BlendState { color: wgpu::BlendComponent { src_factor: wgpu::BlendFactor::One, dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha, operation: wgpu::BlendOperation::Add }, alpha: wgpu::BlendComponent { src_factor: wgpu::BlendFactor::One, dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha, operation: wgpu::BlendOperation::Add } };
-        let blended = |label: &str, layouts: &[&wgpu::BindGroupLayout], vs: &str, fs: &str, buffers: &[wgpu::VertexBufferLayout]| -> wgpu::RenderPipeline {
+        let blended = |label: &str, layouts: &[&wgpu::BindGroupLayout], vs: &str, fs: &str, buffers: &[wgpu::VertexBufferLayout], format: wgpu::TextureFormat| -> wgpu::RenderPipeline {
             let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some(label), bind_group_layouts: layouts, immediate_size: 0 });
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some(label),
@@ -367,12 +367,12 @@ impl GpuMap {
                 primitive: wgpu::PrimitiveState { topology: wgpu::PrimitiveTopology::TriangleList, cull_mode: None, ..Default::default() },
                 depth_stencil: None,
                 multisample: wgpu::MultisampleState::default(),
-                fragment: Some(wgpu::FragmentState { module: &shader, entry_point: Some(fs), compilation_options: Default::default(), targets: &[Some(wgpu::ColorTargetState { format: present_format, blend: Some(over), write_mask: wgpu::ColorWrites::ALL })] }),
+                fragment: Some(wgpu::FragmentState { module: &shader, entry_point: Some(fs), compilation_options: Default::default(), targets: &[Some(wgpu::ColorTargetState { format, blend: Some(over), write_mask: wgpu::ColorWrites::ALL })] }),
                 multiview_mask: None,
                 cache: None,
             })
         };
-        let top_pipeline = blended("top", &[&map_layout, &present_layout], "vs_present", "fs_top", &[]);
+        let top_pipeline = blended("top", &[&map_layout, &present_layout], "vs_present", "fs_top", &[], present_format);
         let glyph_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("glyph atlas"),
             entries: &[
@@ -383,9 +383,9 @@ impl GpuMap {
         let atlas_sampler = device.create_sampler(&wgpu::SamplerDescriptor { label: Some("glyph atlas"), mag_filter: wgpu::FilterMode::Linear, min_filter: wgpu::FilterMode::Linear, ..Default::default() });
         // A letter: centre and half extents, angle, atlas rectangle, letter colour, halo colour (20 floats); a stretch of route: its ends, half width, colour (12).
         let glyph_attrs = wgpu::vertex_attr_array![0 => Float32x4, 1 => Float32x4, 2 => Float32x4, 3 => Float32x4, 4 => Float32x4];
-        let glyph_pipeline = blended("glyphs", &[&map_layout, &glyph_layout], "vs_glyph", "fs_glyph", &[wgpu::VertexBufferLayout { array_stride: 80, step_mode: wgpu::VertexStepMode::Instance, attributes: &glyph_attrs }]);
+        let glyph_pipeline = blended("glyphs", &[&map_layout, &glyph_layout], "vs_glyph", "fs_glyph", &[wgpu::VertexBufferLayout { array_stride: 80, step_mode: wgpu::VertexStepMode::Instance, attributes: &glyph_attrs }], wgpu::TextureFormat::Rgba8Unorm);
         let segment_attrs = wgpu::vertex_attr_array![0 => Float32x4, 1 => Float32x4, 2 => Float32x4];
-        let segment_pipeline = blended("route", &[&map_layout], "vs_segment", "fs_segment", &[wgpu::VertexBufferLayout { array_stride: 48, step_mode: wgpu::VertexStepMode::Instance, attributes: &segment_attrs }]);
+        let segment_pipeline = blended("route", &[&map_layout], "vs_segment", "fs_segment", &[wgpu::VertexBufferLayout { array_stride: 48, step_mode: wgpu::VertexStepMode::Instance, attributes: &segment_attrs }], wgpu::TextureFormat::Rgba8Unorm);
         // The relight pass reads the G-buffer at group 2 and must not bind the present group (it renders into that group's map texture), so group 1 is empty for it.
         let empty_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some("empty"), entries: &[] });
         let empty_bind = device.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("empty"), layout: &empty_layout, entries: &[] });
@@ -1116,6 +1116,31 @@ impl GpuMap {
                 self.range_copied = Some(i);
             }
         }
+        // The route, then the letters, each a quad drawn into the map's own layer at its scale (Nick 2026-10-16: native while moving, the 3× layer when still), so the binning below scales them as it does the map's lines.
+        let route = self.segments.as_ref().filter(|_| self.segment_count > 0);
+        let letters = self.glyphs.as_ref().zip(self.atlas.as_ref()).filter(|_| self.glyph_count > 0);
+        if route.is_some() || letters.is_some() {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("labels"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment { view: map_view, depth_slice: None, resolve_target: None, ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store } })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_bind_group(0, self.map_bind.as_ref().unwrap(), &[]);
+            if let Some((buf, _)) = route {
+                pass.set_pipeline(&self.segment_pipeline);
+                pass.set_vertex_buffer(0, buf.slice(..(self.segment_count as u64 * 48)));
+                pass.draw(0..6, 0..self.segment_count);
+            }
+            if let Some(((buf, _), (_, _, atlas))) = letters {
+                pass.set_pipeline(&self.glyph_pipeline);
+                pass.set_bind_group(1, atlas, &[]);
+                pass.set_vertex_buffer(0, buf.slice(..(self.glyph_count as u64 * 80)));
+                pass.draw(0..6, 0..self.glyph_count);
+            }
+        }
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("present"),
@@ -1134,22 +1159,7 @@ impl GpuMap {
             pass.set_bind_group(0, self.map_bind.as_ref().unwrap(), &[]);
             pass.set_bind_group(1, &self.present_binds[&scale], &[]);
             pass.draw(0..3, 0..1);
-            // The route, then the letters, each a quad over the map; then the top layer.
-            if let (Some((buf, _)), n) = (&self.segments, self.segment_count) {
-                if n > 0 {
-                    pass.set_pipeline(&self.segment_pipeline);
-                    pass.set_vertex_buffer(0, buf.slice(..(n as u64 * 48)));
-                    pass.draw(0..6, 0..n);
-                }
-            }
-            if let (Some((buf, _)), Some((_, _, atlas)), n) = (&self.glyphs, &self.atlas, self.glyph_count) {
-                if n > 0 {
-                    pass.set_pipeline(&self.glyph_pipeline);
-                    pass.set_bind_group(1, atlas, &[]);
-                    pass.set_vertex_buffer(0, buf.slice(..(n as u64 * 80)));
-                    pass.draw(0..6, 0..n);
-                }
-            }
+            // The top layer (panel, pin, measurement) at the screen's own resolution, over the binned map and its labels.
             pass.set_pipeline(&self.top_pipeline);
             pass.set_bind_group(1, &self.present_binds[&scale], &[]);
             pass.draw(0..3, 0..1);
