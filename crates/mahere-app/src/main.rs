@@ -1,3 +1,5 @@
+// A window, not a console, for a release build on Windows (2026-10-16, the first Windows build).
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 //! mahere desktop app — a thin fluor frontend over mahere-engine's MapCore.
 //! Chrome, desktop input mapping, and the bg-layer blit live here; all map state and rendering live in the engine (shared with the Android shell).
 
@@ -106,7 +108,7 @@ impl MahereApp {
             label_cam: ((0, 0, 0, 0), Instant::now()),
             cache_budget: 2 << 30,
             areas,
-            updater: mahere_update::Updater::new(std::path::PathBuf::from("data/user")),
+            updater: mahere_update::Updater::new(mahere_store::user_dir()),
         }
     }
 
@@ -190,7 +192,7 @@ impl MahereApp {
                 AreaAct::Cancel(i) => self.areas.cancel(i),
                 AreaAct::Share(i) => {
                     if let Some((name, bytes)) = self.areas.share_bytes(i) {
-                        let dir = std::path::PathBuf::from("data/user/share");
+                        let dir = mahere_store::user_dir().join("share");
                         let _ = std::fs::create_dir_all(&dir);
                         let path = dir.join(format!("{}.vsf.zst", name.replace(' ', "-")));
                         match std::fs::write(&path, &bytes) {
@@ -701,7 +703,7 @@ fn main() {
     }
     let mut map = MapCore::layered(store, layer_stores, cam);
     // The user's own cells, as files beside the data; the areas as files under them.
-    let user_dir = std::path::PathBuf::from("data/user");
+    let user_dir = mahere_store::user_dir();
     let _ = std::fs::create_dir_all(user_dir.join("areas"));
     areas.set_store(std::sync::Arc::new(DirAreas(user_dir.join("areas"))));
     map.set_user_store(std::sync::Arc::new(DirUser(user_dir)));

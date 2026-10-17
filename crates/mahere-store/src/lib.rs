@@ -31,10 +31,20 @@ pub fn open(base: Option<&str>) -> Result<Arc<FlatStorage>, String> {
 }
 
 fn dirs_config() -> Option<String> {
+    // Windows has no HOME, as a rule: its per-user application data (2026-10-16, the first Windows build).
     std::env::var("XDG_CONFIG_HOME")
         .ok()
         .or_else(|| std::env::var("HOME").ok().map(|h| format!("{h}/.config")))
+        .or_else(|| std::env::var("APPDATA").ok())
         .map(|c| format!("{c}/mahere"))
+}
+
+/// Where a desktop app keeps the user's own files (their cells, areas, staged updates): `data/user` in the source tree, where a developer runs it, else beside the vault in the user's config directory, never wherever the program happened to be started from.
+pub fn user_dir() -> std::path::PathBuf {
+    if std::path::Path::new("data").is_dir() {
+        return std::path::PathBuf::from("data/user");
+    }
+    dirs_config().map(|c| std::path::PathBuf::from(c).join("user")).unwrap_or_else(|| std::path::PathBuf::from("data/user"))
 }
 
 /// The vault's value here is crash-proofness, not secrecy — but kete wants a device secret, so mint 32 random bytes once and keep them beside the rings.

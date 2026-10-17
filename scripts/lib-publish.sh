@@ -94,3 +94,32 @@ build_linux() {
     cp target/release/mahere-app "$BIN"
     $MANIFEST sign "$BIN"
 }
+
+# build_macos: the Apple Silicon desktop app, cross-built with osxcross (as Photon's is), given the stable Apple code signature (Photon's self-signed certificate, identifier nz.mahere.app) and then the author's Ed25519 signature appended, in that order or the Apple signature would not cover the binary macOS loads; BIN names it.
+build_macos() {
+    echo "mahere macos arm64 $MAHERE_VERSION_NAME"
+    OSX=/mnt/Harbor/Code/osxcross/target/bin
+    SDK=$(ls -d /mnt/Harbor/Code/osxcross/target/SDK/MacOSX*.sdk | sort -V | tail -1)
+    CC_aarch64_apple_darwin=$OSX/aarch64-apple-darwin-clang-wrapper CXX_aarch64_apple_darwin=$OSX/aarch64-apple-darwin-clang-wrapper CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER=$OSX/aarch64-apple-darwin-clang-wrapper COREAUDIO_SDK_PATH=$SDK OSXCROSS_TRIPLE=aarch64-apple-darwin CMAKE_TOOLCHAIN_FILE_aarch64_apple_darwin=/mnt/Harbor/Code/photon/scripts/lib/osxcross-cmake.toolchain \
+        cargo build --release -q -p mahere-app --target aarch64-apple-darwin
+    mkdir -p target/publish
+    BIN=target/publish/mahere-macos-arm64
+    cp target/aarch64-apple-darwin/release/mahere-app "$BIN"
+    CERT=/mnt/Harbor/Code/keys/photon-macos-codesign
+    if command -v rcodesign >/dev/null && [ -f "$CERT.crt" ]; then
+        rcodesign sign --pem-file "$CERT.crt" --pem-file "$CERT.key" --binary-identifier nz.mahere.app "$BIN" >/dev/null
+    else
+        echo "WARN: rcodesign or the certificate missing: an ad-hoc Apple signature only" >&2
+    fi
+    $MANIFEST sign "$BIN"
+}
+
+# build_windows: the x86_64 Windows desktop app, cross-built with mingw-w64, the author's Ed25519 signature appended (a PE file carries trailing bytes as an overlay); BIN names it.
+build_windows() {
+    echo "mahere windows x86_64 $MAHERE_VERSION_NAME"
+    cargo build --release -q -p mahere-app --target x86_64-pc-windows-gnu
+    mkdir -p target/publish
+    BIN=target/publish/mahere-windows-x86_64.exe
+    cp target/x86_64-pc-windows-gnu/release/mahere-app.exe "$BIN"
+    $MANIFEST sign "$BIN"
+}
