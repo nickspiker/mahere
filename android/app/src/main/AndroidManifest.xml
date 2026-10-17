@@ -21,7 +21,7 @@
         <activity
             android:name=".MahereActivity"
             android:exported="true"
-            android:configChanges="orientation|screenSize|keyboardHidden"
+            android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|density|keyboardHidden|uiMode|fontScale"
             android:screenOrientation="portrait"
             android:launchMode="singleTop">
             <intent-filter>

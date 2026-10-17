@@ -201,6 +201,10 @@ class MahereActivity : Activity(), SurfaceHolder.Callback, Choreographer.FrameCa
     private fun maybeInit() {
         val (w, h) = pendingSize ?: return
         if (!assetsStaged || !surfaceReady) return
+        // An activity made again (a configuration change it does not handle) adopts the engine the process already has: a second nativeInit would build a whole second app beside the first (vault, loaders, labeller, GPU), never freed, and a few display changes would stall and kill the process (2026-10-16, the Pixel switching resolution).
+        if (nativePtr == 0L && sharedPtr != 0L) {
+            nativePtr = sharedPtr
+        }
         if (nativePtr == 0L) {
             if (initInFlight) return
             initInFlight = true
