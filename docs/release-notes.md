@@ -2,6 +2,12 @@
 
 ## 0.21x · October 2026
 
+### On your computer
+- Mahere for Mac (Apple Silicon) and Windows, beside Linux, updating itself like the phone.
+
+### Lettering
+- Names and the route are drawn into the map's own detailed layer and smoothed with it, so letters and lines scale together as one picture.
+
 ### More on the map
 - Freeway exits with their numbers and names, and ramps that say where they go ("toward Seneca St"), in directions too.
 - Islands, bays, straits, capes, neighbourhoods and named backcountry places.
