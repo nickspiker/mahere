@@ -1,10 +1,10 @@
-//! `mahere-publish <baked dir> <published dir> [--min-depth n] [--max-depth n] [--check k]`: every baked cell in the directory (one level, `*.vsf.zst`) written as its published layers, `<published>/<layer>/<cell>.vsf` ([`mahere_tiles::publish`]), a cell already published and newer than its bake skipped, so a run can stop and go on.
+//! `mahere-publish <baked dir> <published dir> [--min-depth n] [--max-depth n] [--check k]`: every baked cell in the directory (one level, `*.vsf.zst`) written as its published layers, `<published>/<layer>/<cell>.vsf` ([`mahere_tiles::publish`]), a cell already published and newer than its bake skipped, so a run can stop and go on; a layer whose contents did not change keeps its document, and so its hash.
 //! `--check k` decodes every k-th cell both ways and stops on any difference; a summary of bytes in and out per layer at the end.
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use mahere_tiles::CellKey;
-use mahere_tiles::publish::{Layer, decode_layers, split};
+use mahere_tiles::publish::{Layer, decode_layers, split_keeping};
 use rayon::prelude::*;
 
 fn main() {
@@ -41,7 +41,7 @@ fn main() {
         }
         let bytes = std::fs::read(path).unwrap();
         bytes_in.fetch_add(bytes.len() as u64, Ordering::Relaxed);
-        let layers = match split(&bytes) {
+        let layers = match split_keeping(&bytes, |l| std::fs::read(out.join(l.path(*key))).ok()) {
             Ok(l) => l,
             Err(e) => {
                 eprintln!("{}: {e}", key.name());

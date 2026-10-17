@@ -46,6 +46,11 @@ const NIR_FIELDS: [&str; 2] = ["nir", "nirmask"];
 
 /// A baked cell (the working form: one VSF document, zstd around it) as its published layers, each a document of its own; a layer the cell lacks is absent.
 pub fn split(bytes: &[u8]) -> Result<HashMap<Layer, Vec<u8>>, String> {
+    split_keeping(bytes, |_| None)
+}
+
+/// [`split`], keeping a layer's document as `kept` gives it when its contents are the new one's (only the header's time and hashes differ), so a republish of an unchanged layer leaves its bytes, its hash and the bucket's copy as they were (2026-10-17: a republish gave every layer a new hash at the same size, and a size-only upload left the bases naming layers the bucket did not hold).
+pub fn split_keeping(bytes: &[u8], kept: impl Fn(Layer) -> Option<Vec<u8>>) -> Result<HashMap<Layer, Vec<u8>>, String> {
     let plain: Vec<u8>;
     let data = if bytes.starts_with(&[0x28, 0xB5, 0x2F, 0xFD]) {
         plain = zstd::decode_all(bytes).map_err(|e| e.to_string())?;
@@ -96,7 +101,10 @@ pub fn split(bytes: &[u8]) -> Result<HashMap<Layer, Vec<u8>>, String> {
     let mut links = VsfSection::new("layers");
     for layer in [Layer::Dem, Layer::Img, Layer::Nir] {
         if let Some(b) = docs.remove(&layer) {
-            let d = b.build().map_err(|e| format!("{e:?}"))?;
+            let mut d = b.build().map_err(|e| format!("{e:?}"))?;
+            if let Some(old) = kept(layer).filter(|old| same_contents(old, &d)) {
+                d = old;
+            }
             links.add_field(layer.dir(), provenance(&d).ok_or("a layer without its provenance hash")?);
             out.insert(layer, d);
         }
@@ -104,6 +112,15 @@ pub fn split(bytes: &[u8]) -> Result<HashMap<Layer, Vec<u8>>, String> {
     let base = docs.remove(&Layer::Base).unwrap_or_default().add_section_direct(links);
     out.insert(Layer::Base, base.build().map_err(|e| format!("{e:?}"))?);
     Ok(out)
+}
+
+/// Whether two documents hold the same sections, byte for byte past their headers (which differ in their time and hashes alone).
+pub fn same_contents(a: &[u8], b: &[u8]) -> bool {
+    let body = |d: &[u8]| vsf::VsfHeader::decode(d).ok().map(|(_, end)| end);
+    match (body(a), body(b)) {
+        (Some(x), Some(y)) => a.len() == b.len() && a[x..] == b[y..],
+        _ => false,
+    }
 }
 
 /// A document's provenance hash (`hp`), from its header.
@@ -164,5 +181,23 @@ mod tests {
         let base = VsfBuilder::new().add_section_direct(links).build().unwrap();
         assert_eq!(link_name(&base, Layer::Dem).as_deref(), Some("000102030405060708090a0b0c0d0e0f"));
         assert_eq!(link_name(&base, Layer::Img), None);
+    }
+
+    /// A republish keeps an unchanged layer's document and the base names it as before; a changed layer gets a document of its own.
+    #[test]
+    fn a_republish_keeps_an_unchanged_layer() {
+        let cell = |v: u32| {
+            let mut dem = VsfSection::new("dem");
+            dem.add_field("elev", VsfType::u5(v));
+            VsfBuilder::new().add_section_direct(dem).build().unwrap()
+        };
+        let first = split(&cell(7)).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let again = split_keeping(&cell(7), |l| first.get(&l).cloned()).unwrap();
+        assert_eq!(again[&Layer::Dem], first[&Layer::Dem]);
+        assert_eq!(link_name(&again[&Layer::Base], Layer::Dem), link_name(&first[&Layer::Base], Layer::Dem));
+        let changed = split_keeping(&cell(8), |l| first.get(&l).cloned()).unwrap();
+        assert!(!same_contents(&changed[&Layer::Dem], &first[&Layer::Dem]));
+        assert_ne!(link_name(&changed[&Layer::Base], Layer::Dem), link_name(&first[&Layer::Base], Layer::Dem));
     }
 }
