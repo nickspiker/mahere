@@ -4,6 +4,10 @@
 
 ### On your computer
 - Mahere for Mac (Apple Silicon) and Windows, beside Linux, updating itself like the phone.
+- One line to install on Mac, Linux and Windows: paste it into Terminal or PowerShell and press Enter.
+- The map is drawn on your graphics card, as on the phone: much faster, with smooth contour lines.
+- The map grows and shrinks with the window; Ctrl+scroll (Cmd+scroll on a Mac) sizes the controls and text.
+- The compass and zoom sit below the window buttons instead of under them.
 
 ### Lettering
 - Names and the route are drawn into the map's own detailed layer and smoothed with it, so letters and lines scale together as one picture.
