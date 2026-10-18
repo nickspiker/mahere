@@ -54,6 +54,14 @@
         <receiver
             android:name=".MahereInstallReceiver"
             android:exported="false" />
+        <!-- After an update: the map opened again (MY_PACKAGE_REPLACED is sent by the system alone, so exporting it is safe). -->
+        <receiver
+            android:name=".MahereUpdatedReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+            </intent-filter>
+        </receiver>
         <!-- The app's own files for the share sheet (an area document under files/share). -->
         <provider
             android:name=".ShareProvider"
