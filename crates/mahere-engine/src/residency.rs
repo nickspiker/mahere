@@ -632,19 +632,23 @@ fn load_cell(store: &dyn CellStore, layers: Option<&LayerStores>, want: u8, key:
     let mut dem_bytes: Vec<u8> = Vec::new();
     if let Some(l) = layers {
         use mahere_tiles::publish::Layer;
-        // A layer the base does not name (a copy kept from an older publish, in the vault or the bucket's edge cache) is fetched again by the name the base gives it, past every copy; still not the one named, the cell shows without it rather than mixing publishes.
+        // A layer is the one its base names (its provenance hash): the copy kept on the device when it is that one, else fetched by that name, past every cache between (Nick 2026-10-18: the bucket's edge kept serving an older publish at the plain address, the vault's check of its copy against that address put the old one back every session, and every 1 m cell was downloaded twice a session). Never from the plain address, which an edge may hold for its whole cache life; still not the one named, the cell shows without it rather than mixing publishes.
+        // A base that names no layers (one from before the links) is read as before: the plain address, then by name if it names one after all.
         let get = |store: &dyn CellStore, layer: Layer| -> Option<Vec<u8>> {
-            let b = layer_bytes(store, key, layer.dir())?;
-            if b.is_empty() || bytes.is_empty() || mahere_tiles::publish::linked(&bytes, layer, &b) {
-                return Some(b);
-            }
-            let fresh = match mahere_tiles::publish::link_name(&bytes, layer) {
-                Some(name) => store.refresh_named(key, &name),
-                None => store.refresh(key),
+            let Some(name) = mahere_tiles::publish::link_name(&bytes, layer) else {
+                return layer_bytes(store, key, layer.dir());
             };
-            match fresh {
+            if let Fetch::Bytes(b) = store.get_local(key) {
+                if mahere_tiles::publish::linked(&bytes, layer, &b) {
+                    return Some(b);
+                }
+            }
+            match store.refresh_named(key, &name) {
                 Fetch::Bytes(fresh) if mahere_tiles::publish::linked(&bytes, layer, &fresh) => Some(fresh),
-                Fetch::Failed(_) => None,
+                Fetch::Failed(e) => {
+                    eprintln!("cell {} {} fetch failed: {e}", key.name(), layer.dir());
+                    None
+                }
                 _ => {
                     eprintln!("cell {} {}: not the layer its base names", key.name(), layer.dir());
                     Some(Vec::new())
@@ -1137,6 +1141,69 @@ mod tests {
         assert!(matches!(store.refresh(key), Fetch::Bytes(b) if b == b"stale"), "the plain address is what the edge kept");
         assert!(matches!(store.refresh_named(key, "abc"), Fetch::Bytes(b) if b == b"fresh"));
         assert!(matches!(store.get(key), Fetch::Bytes(b) if b == b"fresh"), "the vault keeps what the name fetched");
+    }
+
+    /// A layer the vault keeps as its base names it is used with no network at all, its check against a stale edge never putting the old one back; one kept from an older publish is fetched once by name and kept (2026-10-18: every 1 m cell downloaded twice a session).
+    #[test]
+    fn a_layer_is_the_one_its_base_names_from_the_vault_or_by_name() {
+        use mahere_tiles::publish::{Layer, split};
+        use std::sync::Mutex;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let cell = |v: u32| {
+            let mut dem = vsf::VsfSection::new("dem");
+            dem.add_field("elev", vsf::VsfType::u5(v));
+            vsf::VsfBuilder::new().add_section_direct(dem).build().unwrap()
+        };
+        let now = split(&cell(7)).unwrap();
+        let older = split(&cell(8)).unwrap();
+        let (base, dem, stale) = (now[&Layer::Base].clone(), now[&Layer::Dem].clone(), older[&Layer::Dem].clone());
+        #[derive(Default)]
+        struct Kept(Mutex<FxHashMap<CellKey, Vec<u8>>>);
+        impl CellStore for Kept {
+            fn get(&self, key: CellKey) -> Fetch {
+                self.0.lock().unwrap().get(&key).map_or(Fetch::Absent, |b| Fetch::Bytes(b.clone()))
+            }
+        }
+        impl CellCache for Kept {
+            fn put(&self, key: CellKey, bytes: &[u8]) {
+                self.0.lock().unwrap().insert(key, bytes.to_vec());
+            }
+        }
+        // The edge serves the older publish at the plain address; the name reaches the bucket's current one.
+        struct Edge {
+            stale: Vec<u8>,
+            fresh: Vec<u8>,
+            plain: AtomicUsize,
+            named: AtomicUsize,
+        }
+        impl RemoteStore for Edge {
+            fn fetch(&self, _key: CellKey) -> Fetch {
+                self.plain.fetch_add(1, Ordering::SeqCst);
+                Fetch::Bytes(self.stale.clone())
+            }
+            fn fetch_named(&self, _key: CellKey, _name: &str) -> Fetch {
+                self.named.fetch_add(1, Ordering::SeqCst);
+                Fetch::Bytes(self.fresh.clone())
+            }
+        }
+        let key = CellKey { depth: 14, prefix: 1 };
+        let bases = Arc::new(Kept::default());
+        bases.put(key, &base);
+        for (kept_first, named_fetches) in [(dem.clone(), 0), (stale.clone(), 1)] {
+            let vault = Arc::new(Kept::default());
+            vault.put(key, &kept_first);
+            let edge = Arc::new(Edge { stale: stale.clone(), fresh: dem.clone(), plain: AtomicUsize::new(0), named: AtomicUsize::new(0) });
+            let none: Arc<dyn CellStore> = Arc::new(Kept::default());
+            let layers = LayerStores { dem: Arc::new(TieredStore::new(vault.clone(), edge.clone())), img: none.clone(), nir: none };
+            // Two sessions' loads, with time for any check of the kept copy to run.
+            for _ in 0..2 {
+                let _ = load_cell(bases.as_ref(), Some(&layers), WANT_DEM, key, false);
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            assert_eq!(edge.plain.load(Ordering::SeqCst), 0, "a layer never comes from the plain address");
+            assert_eq!(edge.named.load(Ordering::SeqCst), named_fetches, "fetched by name only when the kept copy is not the one named");
+            assert!(matches!(vault.get(key), Fetch::Bytes(b) if b == dem), "the vault ends with the layer the base names");
+        }
     }
 
     /// A settled view's ring is fetched into the store once, decoded for nothing; nothing is fetched under a cell known absent, nor a layer for a cell with no base.
