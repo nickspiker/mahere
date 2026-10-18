@@ -40,6 +40,8 @@ struct MahereApp {
     areas: mahere_engine::areas::Areas,
     /// Updates (after Photon's): a verified build is swapped in for this one, which then starts again as it.
     updater: mahere_update::Updater,
+    /// The window's span (fluor's harmonic mean of width and height) the map's scale was last set for: a resize scales the map by the change, as fluor scales everything else (Nick 2026-10-17).
+    map_span: f64,
 }
 
 impl MahereApp {
@@ -109,6 +111,7 @@ impl MahereApp {
             cache_budget: 2 << 30,
             areas,
             updater: mahere_update::Updater::new(mahere_store::user_dir()),
+            map_span: 0.0,
         }
     }
 
@@ -232,6 +235,7 @@ impl FluorApp for MahereApp {
 
     fn init(&mut self, ctx: &mut Context) {
         self.chrome.resize(ctx.viewport);
+        self.map_span = ctx.viewport.span as f64;
     }
 
     /// Pinch zooms the MAP, not fluor's UI scale.
@@ -254,6 +258,15 @@ impl FluorApp for MahereApp {
     fn on_resize(&mut self, width: u32, height: u32, ctx: &mut Context) {
         self.chrome.resize(ctx.viewport);
         self.chrome.set_full_edge(ctx.is_maximized);
+        // The map scales with the window about its centre, so the same ground fills it; a change of fluor's own zoom (Ctrl +/-) leaves the span, and the map, as they were.
+        let span = ctx.viewport.span as f64;
+        if self.map_span > 0.0 && span > 0.0 && span != self.map_span {
+            let (w, h) = (width as usize, height as usize);
+            self.map.zoom_about(span / self.map_span, w as f64 / 2.0, h as f64 / 2.0, w, h);
+        }
+        if span > 0.0 {
+            self.map_span = span;
+        }
         self.map.camera_moved(width as usize, height as usize);
     }
 
