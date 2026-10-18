@@ -1913,11 +1913,14 @@ dependencies = [
  "fluor",
  "mahere-coord",
  "mahere-engine",
+ "mahere-gpu",
  "mahere-panel",
  "mahere-store",
  "mahere-tiles",
  "mahere-update",
  "png",
+ "pollster",
+ "wgpu",
 ]
 
 [[package]]

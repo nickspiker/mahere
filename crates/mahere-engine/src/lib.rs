@@ -254,6 +254,8 @@ pub struct MapCore {
     home: Camera,
     /// Measured cost of the last `render` call in milliseconds.
     pub last_frame_ms: f32,
+    /// Pixels the screen's top-right marks (the compass, the heading and the zoom) move down, below a host's own controls there (the desktop's window buttons, Nick 2026-10-17); 0 on the phone.
+    pub marks_top: f32,
     pub last_straddle_blocks: usize,
     /// Something changed since the last render (camera, sun, GPS). Reported by `tick` so shells that only draw on demand get a frame.
     dirty: bool,
@@ -373,6 +375,7 @@ impl MapCore {
             dem_depth: DEM_BASE_DEPTH,
             home,
             last_frame_ms: 0.0,
+            marks_top: 0.0,
             last_straddle_blocks: 0,
             dirty: true,
             last_range: ElevRange::EMPTY,
@@ -1485,11 +1488,11 @@ impl MapCore {
 
     /// North arrow, top-right, with the view's heading below it: degrees the screen's up is turned from true north, clockwise positive, -180..180. No letters.
     fn draw_compass(&mut self, w: usize, h: usize) {
-        if w < 120 || h < 160 {
+        if w < 120 || (h as f32) < 160.0 + self.marks_top {
             return;
         }
         const INK: [u8; 3] = [236, 238, 244];
-        let (cx, cy) = (w as f32 - 46.0, 78.0);
+        let (cx, cy) = (w as f32 - 46.0, 78.0 + self.marks_top);
         // Screen direction of true north: up = (sin B, cos B) in east/north, so north on screen is (-sin B, -cos B) in (x right, y down).
         let (sb, cb) = self.cam.bearing().sin_cos();
         let (nx, ny) = (-(sb as f32), -(cb as f32));

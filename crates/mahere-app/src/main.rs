@@ -3,6 +3,8 @@
 //! mahere desktop app — a thin fluor frontend over mahere-engine's MapCore.
 //! Chrome, desktop input mapping, and the bg-layer blit live here; all map state and rendering live in the engine (shared with the Android shell).
 
+mod gpu;
+
 use fluor::coord::Coord as Px;
 use fluor::event::{CursorIcon, ElementState, Event as FEvent, MouseButton, MouseScrollDelta};
 use fluor::geom::Viewport;
@@ -42,6 +44,8 @@ struct MahereApp {
     updater: mahere_update::Updater,
     /// The window's span (fluor's harmonic mean of width and height) the map's scale was last set for: a resize scales the map by the change, as fluor scales everything else (Nick 2026-10-17).
     map_span: f64,
+    /// The map on the GPU (the phone's compositor, read back into fluor's buffer); None draws it on the CPU.
+    gpu: Option<gpu::Gpu>,
 }
 
 impl MahereApp {
@@ -112,6 +116,7 @@ impl MahereApp {
             areas,
             updater: mahere_update::Updater::new(mahere_store::user_dir()),
             map_span: 0.0,
+            gpu: None,
         }
     }
 
@@ -235,28 +240,19 @@ impl FluorApp for MahereApp {
 
     fn init(&mut self, ctx: &mut Context) {
         self.chrome.resize(ctx.viewport);
+        self.map.marks_top = chrome::strip_height(ctx.viewport) as f32;
+        self.gpu = gpu::Gpu::new();
+        if self.gpu.is_some() {
+            // The cells go to the GPU as they are; the CPU's own unpacked copies are not kept.
+            self.map.set_gpu_only();
+        }
         self.map_span = ctx.viewport.span as f64;
-    }
-
-    /// Pinch zooms the MAP, not fluor's UI scale.
-    fn owns_zoom_gesture(&self) -> bool {
-        true
-    }
-
-    fn on_zoom(&mut self, factor: f32, anchor_x: Px, anchor_y: Px, ctx: &mut Context) {
-        let (w, h) = Self::dims(ctx);
-        self.map.zoom_about(
-            (factor as f64).clamp(0.5, 2.0),
-            anchor_x as f64,
-            anchor_y as f64,
-            w,
-            h,
-        );
-        ctx.window.request_redraw();
     }
 
     fn on_resize(&mut self, width: u32, height: u32, ctx: &mut Context) {
         self.chrome.resize(ctx.viewport);
+        // The compass and the zoom below the window buttons, which sit where the phone has its status bar.
+        self.map.marks_top = chrome::strip_height(ctx.viewport) as f32;
         self.chrome.set_full_edge(ctx.is_maximized);
         // The map scales with the window about its centre, so the same ground fills it; a change of fluor's own zoom (Ctrl +/-) leaves the span, and the map, as they were.
         let span = ctx.viewport.span as f64;
@@ -604,12 +600,15 @@ impl FluorApp for MahereApp {
         }
         // Labels waiting for the camera to rest keep the ticks coming until they are drawn.
         let labels_due = self.labeller.poll() || self.labeller.pending(&self.map, w, h);
-        self.map.tick(w, h) || areas_changed || labels_due
+        self.map.tick(w, h) || areas_changed || labels_due || self.gpu.as_ref().is_some_and(|g| g.wants_frame())
     }
 
     fn render(&mut self, target: &mut [u32], ctx: &mut Context) {
         let (w, h) = Self::dims(ctx);
-        if self.map.needs_render(w, h) {
+        if let Some(g) = self.gpu.as_mut() {
+            g.render(&mut self.map, &mut self.labeller, self.panel.font_px(), w, h);
+            self.chrome.invalidate_bg();
+        } else if self.map.needs_render(w, h) {
             self.map.render(w, h);
             self.chrome.invalidate_bg();
         }
@@ -643,14 +642,18 @@ impl FluorApp for MahereApp {
         }
         let areas = self.areas.view(self.map.user.has_selection());
         self.panel.paint(w, h, self.map.layers(), Controls { real_sun: self.map.real_sun, real_light: self.map.real_light, follow_heading: self.map.follow_heading, lock_to_fix: self.map.lock_to_fix, cache_budget: self.cache_budget, theme: self.map.theme, compressed: self.map.compressed(), tool: self.map.tool as u8, pen_rgba: self.map.pen_colour, travel: travel_code(self.map.travel), record: false, clear_ink: false, clear_sel: false, locate: false, ruler: self.map.ruler }, &readouts, measure.as_ref(), &themes, &areas, None);
-        let mut map = self.map.canvas.clone();
+        let mut map = match &self.gpu {
+            Some(g) => g.frame.clone(),
+            None => self.map.canvas.clone(),
+        };
         // The labels, laid out a quarter second after the camera stops, drawn every frame letter by letter over the map and under the panel.
         let c = self.map.cam;
         let cam_key = (c.lat().to_bits(), c.lon().to_bits(), c.ppd.to_bits(), c.bearing().to_bits());
         if cam_key != self.label_cam.0 {
             self.label_cam = (cam_key, Instant::now());
         }
-        if mahere_panel::labels::Labeller::wanted(&self.map) {
+        // On the GPU the labels are in the frame already.
+        if self.gpu.is_none() && mahere_panel::labels::Labeller::wanted(&self.map) {
             let at_rest = self.label_cam.1.elapsed().as_millis() >= 250;
             self.labeller.ask(&mut self.map, w, h, self.panel.font_px(), at_rest);
             self.labeller.draw_cpu(&mut map, &self.map.cam, w, h);

@@ -12,6 +12,10 @@ mahere-engine = { path = "../mahere-engine" }
 mahere-store = { path = "../mahere-store" }
 mahere-panel = { path = "../mahere-panel" }
 mahere-update = { path = "../mahere-update" }
+mahere-gpu = { path = "../mahere-gpu" }
+# The backends come from mahere-gpu (Vulkan on Linux and Windows, Metal on the Mac); the app names wgpu's types for its headless device.
+wgpu = { version = "28", default-features = false, features = ["wgsl"] }
+pollster = "0.4"
 fluor = { git = "https://github.com/nickspiker/fluor", rev = "e8bbfd43119cc510abfc85b304a583377a5a1e81", features = ["host-winit"] }
 
 [dev-dependencies]
