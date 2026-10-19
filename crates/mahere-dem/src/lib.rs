@@ -10,6 +10,8 @@ use tiff::tags::Tag;
 
 /// Below this a source's elevation is no data: 3DEP writes -999999, other rasters -3.4e38 or -32768; no ground on Earth is lower than -11 km.
 const NODATA_BELOW: f32 = -12_000.0;
+/// How much deeper than a flat water surface a later source must reach to be taken as the bottom beneath it, metres.
+const WATER_DEEPER: f32 = 0.25;
 
 const EARTH_RADIUS_M: f64 = 6_371_000.0;
 
@@ -111,6 +113,19 @@ impl DemTile {
 
     fn grid(&self, x: usize, y: usize) -> f32 {
         self.data[y * self.width + x]
+    }
+
+    /// Whether the source wrote a constant surface here: the nine pixels about the point bit for bit the same, as a hydro-flattened lidar DEM writes over water and natural ground never is.
+    fn flattened(&self, px: f64, py: f64) -> bool {
+        let (cx, cy) = (px.round() as usize, py.round() as usize);
+        if cx == 0 || cy == 0 || cx + 1 >= self.width || cy + 1 >= self.height {
+            return false;
+        }
+        let c = self.grid(cx, cy);
+        if !(c.is_finite() && c > NODATA_BELOW) {
+            return false;
+        }
+        (cy - 1..=cy + 1).all(|y| (cx - 1..=cx + 1).all(|x| self.grid(x, y).to_bits() == c.to_bits()))
     }
 
     /// Bilinear elevation from the four pixels around a point, the no-data ones left out and the rest re-weighted; -inf when all four are no-data. Blending a no-data pixel in (3DEP marks it -999999) at a data edge, a lakeshore or a project's boundary, gave a value that passed for ground: -9000 m on 1% of the weight (Flathead Lake, 2026-10-11).
@@ -250,38 +265,32 @@ impl DemStore {
             .collect()
     }
 
+    /// The tile that answers a point, and where in it: the first with data, except that where it wrote a flat water surface (hydro-flattened lidar: King County's sits at -0.558 m over all of Puget Sound) a later tile reaching deeper there, the topo-bathymetry, answers instead (Nick 2026-10-19: half the Sound showed no seabed, the lidar's flat water ahead of NOAA's CUDEM in the stack).
+    fn answer(&self, lat: f64, lon: f64) -> Option<(&DemTile, f64, f64, f32)> {
+        let mut found = self.tiles.iter().filter_map(|t| {
+            let (px, py) = t.pixel_at(lat, lon)?;
+            let e = t.bilinear(px, py);
+            (e > NODATA_BELOW).then_some((t, px, py, e))
+        });
+        let first = found.next()?;
+        if !first.0.flattened(first.1, first.2) {
+            return Some(first);
+        }
+        Some(found.find(|&(_, _, _, e)| e < first.3 - WATER_DEEPER).unwrap_or(first))
+    }
+
     /// Bilinear elevation in meters, or None outside coverage / on nodata.
     pub fn elevation(&self, lat: f64, lon: f64) -> Option<f32> {
-        for t in &self.tiles {
-            if let Some((px, py)) = t.pixel_at(lat, lon) {
-                let e = t.bilinear(px, py);
-                if e > NODATA_BELOW {
-                    return Some(e);
-                }
-            }
-        }
-        None
+        self.answer(lat, lon).map(|(_, _, _, e)| e)
     }
 
     /// Elevation plus gradient (east, north) in meters of rise per meter of ground, from central differences on the source grid.
     pub fn elev_and_gradient(&self, lat: f64, lon: f64) -> Option<(f32, (f32, f32))> {
-        for t in &self.tiles {
-            if let Some((px, py)) = t.pixel_at(lat, lon) {
-                let e = t.bilinear(px, py);
-                if e <= NODATA_BELOW {
-                    continue;
-                }
-                let east = t.bilinear((px + 1.0).min((t.width - 1) as f64), py)
-                    - t.bilinear((px - 1.0).max(0.0), py);
-                let south = t.bilinear(px, (py + 1.0).min((t.height - 1) as f64))
-                    - t.bilinear(px, (py - 1.0).max(0.0));
-                let (mx, my) = t.m_per_px(lat);
-                let ge = east / (2.0 * mx);
-                let gn = -south / (2.0 * my);
-                return Some((e, (ge, gn)));
-            }
-        }
-        None
+        let (t, px, py, e) = self.answer(lat, lon)?;
+        let east = t.bilinear((px + 1.0).min((t.width - 1) as f64), py) - t.bilinear((px - 1.0).max(0.0), py);
+        let south = t.bilinear(px, (py + 1.0).min((t.height - 1) as f64)) - t.bilinear(px, (py - 1.0).max(0.0));
+        let (mx, my) = t.m_per_px(lat);
+        Some((e, (east / (2.0 * mx), -south / (2.0 * my))))
     }
 }
 
@@ -319,6 +328,29 @@ mod img_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn tile(value: impl Fn(usize, usize) -> f32) -> DemTile {
+        let (width, height) = (8, 8);
+        let data = (0..height).flat_map(|y| (0..width).map(move |x| (x, y))).map(|(x, y)| value(x, y)).collect();
+        DemTile { width, height, grid: Grid::Geographic, origin: (-122.5, 47.5), step: (0.001, 0.001), data }
+    }
+
+    /// A flat water surface in the first source gives way to a later source's bottom beneath it; ground that is not flat, and water with nothing deeper beneath, stay the first source's.
+    #[test]
+    fn the_bottom_shows_through_flattened_water() {
+        let (lat, lon) = (47.4955, -122.4955);
+        let water = tile(|_, _| -0.5577851);
+        let ground = tile(|x, y| 3.0 + x as f32 * 0.37 + y as f32 * 0.11);
+        let bottom = tile(|x, _| -100.0 - x as f32);
+        let shallow = tile(|_, _| -0.5);
+        let store = |tiles: Vec<DemTile>| DemStore { tiles, land_squares: None };
+        let e = store(vec![water, bottom]).elevation(lat, lon).unwrap();
+        assert!(e < -100.0, "the seabed under the flat water: {e}");
+        assert!(store(vec![ground, tile(|_, _| -50.0)]).elevation(lat, lon).unwrap() > 3.0, "ground keeps its own height");
+        assert_eq!(store(vec![tile(|_, _| -0.5577851), shallow]).elevation(lat, lon), Some(-0.5577851), "nothing deeper: the water surface stays");
+        let (_, g) = store(vec![tile(|_, _| -0.5577851), tile(|x, _| -100.0 - x as f32)]).elev_and_gradient(lat, lon).unwrap();
+        assert!(g.0 < 0.0, "the gradient is the bottom's, deepening east: {g:?}");
+    }
 
     /// Port Orchard, UTM 10N — reference values from PROJ (EPSG:26910).
     #[test]

@@ -9,7 +9,11 @@ fn main() {
     let tri = mahere_tiles::TRI as f64;
     let pct = |n: usize| n as f64 * 100.0 / tri;
     println!("{} ({} bytes)", k.name(), bytes.len());
-    println!("  dem   {}", p.dem.as_ref().map_or("none".into(), |d| format!("{:.0}% with elevation", pct(d.elev.iter().filter(|e| !e.is_nan()).count()))));
+    println!("  dem   {}", p.dem.as_ref().map_or("none".into(), |d| {
+        let v: Vec<f32> = d.elev.iter().copied().filter(|e| !e.is_nan()).collect();
+        let (lo, hi) = v.iter().fold((f32::MAX, f32::MIN), |(a, b), &e| (a.min(e), b.max(e)));
+        format!("{:.0}% with elevation, {lo:.1} to {hi:.1} m", pct(v.len()))
+    }));
     println!("  water {}", p.water.as_ref().map_or("none".into(), |w| format!("{:.0}% covered", pct(w.cov.iter().filter(|&&c| c > 0).count()))));
     println!("  land  {}", p.land.as_ref().map_or("none".into(), |l| format!("{:.0}% covered", pct(l.cov.iter().filter(|&&c| c > 0).count()))));
     println!("  line  {}", p.line.as_ref().map_or("none".into(), |l| format!("{:.1}% covered", pct(l.cov.iter().filter(|&&c| c > 0).count()))));
