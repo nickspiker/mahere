@@ -132,6 +132,34 @@ pub fn han_for<'a>(names: impl Iterator<Item = &'a str>) -> fluor::packs::Han {
     if hangul { Han::Korean } else { Han::Simplified }
 }
 
+/// The regional face for one name at a place (Nick 2026-10-19: Chinese names drew as boxes beside Japan, the whole view lettered in the Japanese face, which lacks the simplified forms): kana means Japanese and Hangul Korean wherever they are; Han alone takes the face of the place it names, Japan, the Koreas, Taiwan, Hong Kong and Macau by their boxes, Simplified Chinese everywhere else.
+pub fn han_at(name: &str, lat: f64, lon: f64) -> fluor::packs::Han {
+    use fluor::packs::{Han, Need, need};
+    let mut hangul = false;
+    for c in name.chars() {
+        match need(c) {
+            Some(Need::Kana) => return Han::Japanese,
+            Some(Need::Hangul) => hangul = true,
+            _ => {}
+        }
+    }
+    if hangul {
+        return Han::Korean;
+    }
+    let inside = |s: f64, n: f64, w: f64, e: f64| (s..=n).contains(&lat) && (w..=e).contains(&lon);
+    if inside(22.1, 22.6, 113.5, 114.5) {
+        Han::HongKong
+    } else if inside(21.8, 26.5, 118.0, 122.2) && !inside(21.8, 26.5, 118.0, 119.2) {
+        Han::Traditional
+    } else if inside(33.0, 43.1, 124.2, 131.0) {
+        Han::Korean
+    } else if inside(24.0, 46.0, 128.0, 154.0) || inside(30.0, 34.5, 129.0, 132.0) {
+        Han::Japanese
+    } else {
+        Han::Simplified
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -144,5 +172,17 @@ mod tests {
         assert_eq!(han_for(["東京都", "さいたま市"].into_iter()), Han::Japanese);
         assert_eq!(han_for(["서울특별시", "中區"].into_iter()), Han::Korean);
         assert_eq!(han_for(["Seattle"].into_iter()), Han::Simplified);
+    }
+
+    /// One name's face: its own kana or Hangul first, then the place it names.
+    #[test]
+    fn a_names_place_chooses_its_han() {
+        assert_eq!(han_at("黑龙江", 47.0, 128.0), Han::Simplified, "north-east China beside Japan");
+        assert_eq!(han_at("東京都", 35.68, 139.69), Han::Japanese);
+        assert_eq!(han_at("さいたま", 0.0, 0.0), Han::Japanese);
+        assert_eq!(han_at("臺北市", 25.03, 121.56), Han::Traditional);
+        assert_eq!(han_at("香港", 22.3, 114.17), Han::HongKong);
+        assert_eq!(han_at("中區", 37.56, 126.98), Han::Korean);
+        assert_eq!(han_at("上海", 31.23, 121.47), Han::Simplified);
     }
 }

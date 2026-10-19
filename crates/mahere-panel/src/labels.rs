@@ -739,6 +739,15 @@ impl Letterer {
         }
     }
 
+    /// The regional face for a label's Han characters, from its name and where it sits ([`crate::fonts::han_at`]).
+    fn use_han(&mut self, name: &str, at: (f64, f64)) {
+        let han = crate::fonts::han_at(name, at.0, at.1);
+        if han != self.han {
+            self.han = han;
+            self.text.set_han(han);
+        }
+    }
+
     /// A glyph's cache family: the theme's typeface, or for a CJK character its regional face (one character's Japanese and Chinese forms differ, and the theme does not draw either).
     fn key_family(&self, ch: char) -> u8 {
         if fluor::packs::is_cjk(ch) { 0x80 | self.han as u8 } else { self.family }
@@ -785,7 +794,7 @@ impl Letterer {
         self.text.set_han(han);
         let gathered = t.elapsed();
         let previous = std::mem::take(&mut self.previous);
-        let laid = self.layout(&texels, w, h, font, &previous);
+        let laid = self.layout(&texels, &job.cam, w, h, font, &previous);
         let kept = self.keep(&laid, &job.cam, w, h);
         self.previous = kept.iter().map(|k| (k.name.kind, k.name.name.clone(), k.name.reference.clone())).collect();
         if self.atlas.version != self.sent {
@@ -825,6 +834,7 @@ impl Letterer {
                 _ => l.glyphs.iter().fold([0.0f32; 2], |c, g| [c[0] + g.at[0] / n, c[1] + g.at[1] / n]),
             };
             let anchor = cam.screen_to_geo(centre[0] as f64, centre[1] as f64, w, h);
+            self.use_han(&l.name.name, anchor);
             let halo = (l.size * self.look[1] * 16.0) as u32;
             let letters = l.glyphs.iter().map(|g| (self.glyph(g.ch, l.size, l.weight, l.shear, halo, g.angle), [g.at[0] - centre[0], g.at[1] - centre[1]], g.angle)).collect();
             // A point's name stays level; a line's and an area's turn with the map.
@@ -937,7 +947,7 @@ impl Letterer {
         key
     }
 
-    fn layout(&mut self, texels: &NamedTexels, w: usize, h: usize, font: f32, previous: &HashSet<(u8, String, String)>) -> Vec<Laid> {
+    fn layout(&mut self, texels: &NamedTexels, cam: &mahere_engine::Camera, w: usize, h: usize, font: f32, previous: &HashSet<(u8, String, String)>) -> Vec<Laid> {
         enum Shape<'a> {
             Point([f32; 2]),
             Area(&'a [[f32; 2]]),
@@ -990,6 +1000,12 @@ impl Letterer {
                 None => (rel, weight),
             };
             let size = font * rel;
+            // Measured in the face its letters will be drawn in.
+            let at = match &shape {
+                Shape::Point(p) => *p,
+                Shape::Area(pts) | Shape::Line(pts) => pts[pts.len() / 2],
+            };
+            self.use_han(&n.name, cam.screen_to_geo(at[0] as f64, at[1] as f64, w, h));
             let laid: Vec<Laid> = match shape {
                 Shape::Point(p) => self.point(n, &label, p, size, colour, weight, &room, pad).into_iter().collect(),
                 Shape::Area(pts) => self.area(n, &label, pts, texels.area_step_px, size, colour, weight, shear, &room, pad).into_iter().collect(),
