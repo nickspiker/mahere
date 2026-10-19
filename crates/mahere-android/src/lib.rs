@@ -664,6 +664,10 @@ pub extern "system" fn Java_nz_mahere_app_MahereActivity_nativeInit(
     // The vault: session, tracks, and the on-device cell cache (kete).
     let store = mahere_store::open(Some(&dir)).ok();
     lap("vault open");
+    // What the vault holds, for its open time: entries and the blocks they pin.
+    if let Some(st) = store.as_ref().and_then(|s| s.vault_stats().ok()) {
+        eprintln!("vault: {} entries in {} blocks of {} bytes, generation {}", st.live_entries, st.live_blocks, st.block_bytes, st.generation);
+    }
     // Cells stream from the bucket through the cell files; `cells-local` (pushed by hand) overrides for offline development.
     let local = std::path::PathBuf::from(format!("{dir}/cells-local"));
     // The cells as files beside the vault (2026-10-18); those an older Mahere kept in the vault move out on a thread of their own.
