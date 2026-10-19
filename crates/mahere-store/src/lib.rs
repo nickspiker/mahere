@@ -14,6 +14,10 @@ use vsf::VsfType;
 mod cells;
 pub use cells::{CellFileLayer, CellFiles};
 
+/// Tests that open a vault take this first: kete's vault directory is one setting for the process, and two tests pointing it at their own directories at once open each other's vaults.
+#[cfg(test)]
+static VAULT_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 pub const APP: kete::App<'static> = kete::App { id: "mahere", dir: "mahere" };
 
 /// Open THE mahere vault (shared registry underneath — concurrent opens receive the same engine). `base`: Android passes filesDir; desktop passes None (XDG config/data dirs).
@@ -336,6 +340,7 @@ mod tests {
     /// One serial test: set_vault_dirs_override is process-global, so parallel vault tests would race each other's directories.
     #[test]
     fn vault_round_trips_and_persists() {
+        let _one_at_a_time = crate::VAULT_TESTS.lock().unwrap_or_else(|e| e.into_inner());
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -707,6 +712,7 @@ mod index_tests {
     /// Cells an older Mahere kept in the vault move into the files with their tags and last use, and leave the vault, its index of them included; a cell the files have already is not copied over.
     #[test]
     fn vault_cells_move_into_the_files() {
+        let _one_at_a_time = crate::VAULT_TESTS.lock().unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!("mahere-move-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         kete::set_vault_dirs_override(dir.join("vault").to_string_lossy().into(), dir.join("shadow").to_string_lossy().into());
