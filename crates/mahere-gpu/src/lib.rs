@@ -285,6 +285,8 @@ pub struct GpuMap {
     preview: Option<(wgpu::Texture, wgpu::TextureView, u32, u32)>,
     preview_version: u64,
     pub uploads: usize,
+    /// When a full plane was last reported.
+    full_warned: std::time::Instant,
     /// Supersampling factor in use; a change takes effect at the next frame.
     pub scale: u32,
     /// Where inside a screen pixel the shader samples, in pixels; the CPU raster samples the top-left corner, which is (-0.5, -0.5) here, and the default centre is 0.
@@ -461,6 +463,7 @@ impl GpuMap {
             present_binds: FxHashMap::default(),
             overlay: None,
             uploads: 0,
+            full_warned: std::time::Instant::now() - std::time::Duration::from_secs(60),
             scale: SCALE,
             sample_offset: [0.0, 0.0],
             pin: None,
@@ -599,10 +602,18 @@ impl GpuMap {
         self.dem_scale.retain(|k, _| pool.map.contains_key(k));
         let (w, h) = (2 * TEX as u32, TEX as u32);
         let mut scratch = vec![0u8; TRI * 4];
+        // A plane full to the GPU's limit leaves a cell without a slot, and it draws as bare ground: said, not silent.
+        let unplaced = |slot: &Option<(u32, bool)>, n: &mut usize| {
+            if slot.is_none() {
+                *n += 1;
+            }
+        };
+        let mut no_slot = 0usize;
         for (key, e) in pool.map.iter_mut() {
             if let Some(d) = &e.dem_q {
                 let (slot, g) = self.dem.alloc(device, queue, *key);
                 grew |= g;
+                unplaced(&slot, &mut no_slot);
                 if let Some((slot, true)) = slot {
                     write_layer(queue, &self.dem.tex, slot, DEMQ_W as u32, DEMQ_H as u32, 2, bytemuck::cast_slice(&d.tex));
                     self.dem_scale.insert(*key, (d.base, d.step));
@@ -612,6 +623,7 @@ impl GpuMap {
             if let Some(l) = &e.line {
                 let (slot, g) = self.line.alloc(device, queue, *key);
                 grew |= g;
+                unplaced(&slot, &mut no_slot);
                 if let Some((slot, true)) = slot {
                     for i in 0..TRI {
                         scratch[4 * i] = l.class[i];
@@ -629,6 +641,7 @@ impl GpuMap {
             if e.land.is_some() || e.water.is_some() {
                 let (slot, g) = self.lw.alloc(device, queue, *key);
                 grew |= g;
+                unplaced(&slot, &mut no_slot);
                 if let Some((slot, true)) = slot {
                     for i in 0..TRI {
                         let (lc, lv) = e.land.as_ref().map_or((0, 0), |l| (l.class[i], l.cov[i]));
@@ -648,6 +661,7 @@ impl GpuMap {
             if e.own.is_some() || e.mvum.is_some() {
                 let (slot, g) = self.ov.alloc(device, queue, *key);
                 grew |= g;
+                unplaced(&slot, &mut no_slot);
                 if let Some((slot, true)) = slot {
                     for i in 0..TRI {
                         let (oc, ov) = e.own.as_ref().map_or((0, 0), |o| (o.class[i], o.cov[i]));
@@ -668,6 +682,7 @@ impl GpuMap {
             if let Some(im) = &e.img {
                 let (slot, g) = self.img.alloc(device, queue, *key);
                 grew |= g;
+                unplaced(&slot, &mut no_slot);
                 if let Some((slot, true)) = slot {
                     for i in 0..TRI {
                         scratch[4 * i] = im.red[i];
@@ -682,6 +697,10 @@ impl GpuMap {
                     }
                 }
             }
+        }
+        if no_slot > 0 && self.full_warned.elapsed() > std::time::Duration::from_secs(10) {
+            self.full_warned = std::time::Instant::now();
+            eprintln!("gpu: {no_slot} planes found no slot ({} cells resident, layers {:?}): they draw as bare ground", pool.map.len(), self.layers());
         }
         // A cell whose planes went to the GPU and were released, but which holds no slot for them now (a GPU map made afresh, after a lost device or a panic): dropped from the pool, so residency loads it again from the device and it uploads whole.
         // Found 2026-10-16 on the Pixel: the ocean drew as land in cell-shaped triangles, coasts and roads gone, while cells loaded since drew right.

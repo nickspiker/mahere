@@ -276,8 +276,8 @@ pub struct Residency {
 
 const RETRY_AFTER: std::time::Duration = std::time::Duration::from_secs(3);
 
-/// Cells at this depth and above are never evicted.
-pub const PIN_DEPTH: u8 = 4;
+/// Cells at this depth and above are never evicted: at most 850 over the whole globe (10 + 40 + 160 + 640). Depth 4 was kept too until 2026-10-19, when a phone that had panned around the planet held over two thousand of them, more than the GPU's 2048 layers per plane, and the cells past them drew as bare ground in cell-shaped patches (South America at z4, Nick); depth 4 now comes and goes with the view, from the device's cell files.
+pub const PIN_DEPTH: u8 = 3;
 
 impl Residency {
     pub fn new(store: Arc<dyn CellStore>) -> Residency {
