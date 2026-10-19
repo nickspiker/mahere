@@ -1869,8 +1869,9 @@ impl MapCore {
     pub fn point_info(&self, x: f64, y: f64, w: usize, h: usize) -> Vec<String> {
         use mahere_tiles::CellKey;
         use mahere_tiles::landuse::{mvum, own};
-        let mut cells: rustc_hash::FxHashMap<CellKey, Option<mahere_tiles::CellPlanes>> = Default::default();
-        let mut planes_of = |key: CellKey| -> Option<mahere_tiles::CellPlanes> { cells.entry(key).or_insert_with(|| self.res.read_planes(key)).clone() };
+        // Each cell read once and shared: the ring search below looks up hundreds of points, and a whole cell (terrain, imagery, lines, names) copied for each froze the phone's input for five seconds (2026-10-19, Android's "not responding").
+        let mut cells: rustc_hash::FxHashMap<CellKey, Option<std::rc::Rc<mahere_tiles::CellPlanes>>> = Default::default();
+        let mut planes_of = |key: CellKey| -> Option<std::rc::Rc<mahere_tiles::CellPlanes>> { cells.entry(key).or_insert_with(|| self.res.read_planes(key).map(std::rc::Rc::new)).clone() };
         let at = |px: f64, py: f64| -> Option<(u64, i64, i64)> {
             if !self.cam.on_globe(px, py, w, h) {
                 return None;
