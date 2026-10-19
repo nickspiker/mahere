@@ -574,6 +574,43 @@ pub fn move_vault_cells(vault: &FlatStorage, files: &CellFiles) -> Option<usize>
     Some(moved)
 }
 
+/// What the vault holds, by kind (2026-10-19: with the cells moved out it still held 26,457 entries): every live entry read and named by its VSF sections (sorted, joined by `+`), or `zstd` (a whole cell from before the flag day), `etag` (a short quoted string, a cell's tag), `raw` (anything else), `unreadable`; each kind with its count and bytes, the most numerous first.
+pub fn vault_census(vault: &FlatStorage) -> Result<Vec<(String, usize, u64)>, StorageError> {
+    let mut kinds: std::collections::HashMap<String, (usize, u64)> = std::collections::HashMap::new();
+    for addr in vault.live_addrs()? {
+        let (kind, bytes) = match vault.read_device_addr(&addr) {
+            Ok(Some(b)) => (signature(&b), b.len() as u64),
+            Ok(None) => continue,
+            Err(_) => ("unreadable".to_string(), 0),
+        };
+        let e = kinds.entry(kind).or_default();
+        e.0 += 1;
+        e.1 += bytes;
+    }
+    let mut out: Vec<(String, usize, u64)> = kinds.into_iter().map(|(k, (n, b))| (k, n, b)).collect();
+    out.sort_by(|a, b| b.1.cmp(&a.1));
+    Ok(out)
+}
+
+/// An entry's kind for [`vault_census`].
+fn signature(b: &[u8]) -> String {
+    if b.starts_with(&[0x28, 0xB5, 0x2F, 0xFD]) {
+        return "zstd".into();
+    }
+    if b.len() < 80 && b.first() == Some(&b'"') && b.last() == Some(&b'"') {
+        return "etag".into();
+    }
+    if let Ok((header, end)) = vsf::VsfHeader::decode(b) {
+        if let Ok(sections) = header.sections(b, end) {
+            let mut names: Vec<String> = sections.into_iter().map(|s| s.name).collect();
+            names.sort();
+            names.dedup();
+            return if names.is_empty() { "vsf".into() } else { names.join("+") };
+        }
+    }
+    "raw".into()
+}
+
 // ==================== USER CELLS ====================
 
 /// The user's own cells (ink and selection) in the vault, keyed `d` user, `u` depth, `wm` cell, with an index document (`d` user, `d` index) naming every one, so they all load at start.

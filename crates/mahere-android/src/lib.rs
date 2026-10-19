@@ -667,6 +667,18 @@ pub extern "system" fn Java_nz_mahere_app_MahereActivity_nativeInit(
     // What the vault holds, for its open time: entries and the blocks they pin.
     if let Some(st) = store.as_ref().and_then(|s| s.vault_stats().ok()) {
         eprintln!("vault: {} entries in {} blocks of {} bytes, generation {}", st.live_entries, st.live_blocks, st.block_bytes, st.generation);
+        // A vault far past the user's own data: what is in it, by kind, from a thread of its own.
+        if st.live_entries > 1000 {
+            let v = store.clone().unwrap();
+            let _ = std::thread::Builder::new().name("vault census".into()).spawn(move || match mahere_store::vault_census(&v) {
+                Ok(kinds) => {
+                    for (kind, n, bytes) in kinds {
+                        eprintln!("vault census: {n} {kind} ({} KB)", bytes / 1024);
+                    }
+                }
+                Err(e) => eprintln!("vault census failed: {e:?}"),
+            });
+        }
     }
     // Cells stream from the bucket through the cell files; `cells-local` (pushed by hand) overrides for offline development.
     let local = std::path::PathBuf::from(format!("{dir}/cells-local"));
