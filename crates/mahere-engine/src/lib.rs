@@ -789,6 +789,19 @@ impl MapCore {
     }
 
     /// The client's layer filter: which of dem / land / water / line draw.
+    /// A view's wanted cells, with the ten depth-0 cells while the geoid layer shows: it draws from their geoid at every zoom, and a map opened zoomed in has never loaded them (2026-10-19).
+    fn with_geoid(&self, mut want: Vec<mahere_tiles::CellKey>) -> Vec<mahere_tiles::CellKey> {
+        if self.layer_mask.geoid {
+            for d in 0..10u8 {
+                let k = mahere_tiles::CellKey::from_grid(d, 0, 0, 0);
+                if !want.contains(&k) {
+                    want.push(k);
+                }
+            }
+        }
+        want
+    }
+
     pub fn layers(&self) -> LayerMask {
         self.layer_mask
     }
@@ -1134,7 +1147,7 @@ impl MapCore {
                 // Residency still hears the want: it re-sends an unchanged missing list once a second.
                 let center = Coord::from_lat_lon(self.cam.lat(), self.cam.lon());
                 let (cu, cv) = center.uv();
-                self.res.want(p.want.clone(), (cu, cv));
+                self.res.want(self.with_geoid(p.want.clone()), (cu, cv));
                 self.last_frame_ms = t0.elapsed().as_secs_f32() * 1000.0;
                 return p;
             }
@@ -1143,7 +1156,7 @@ impl MapCore {
         self.last_straddle_blocks = p.straddle_blocks;
         let center = Coord::from_lat_lon(self.cam.lat(), self.cam.lon());
         let (cu, cv) = center.uv();
-        self.res.want(p.want.clone(), (cu, cv));
+        self.res.want(self.with_geoid(p.want.clone()), (cu, cv));
         self.plan_cache = Some((key, p.clone()));
         self.last_frame_ms = t0.elapsed().as_secs_f32() * 1000.0;
         p
@@ -1451,7 +1464,7 @@ impl MapCore {
         // Residency: request what the lattice says we need, nearest-first.
         let center = Coord::from_lat_lon(self.cam.lat(), self.cam.lon());
         let (cu, cv) = center.uv();
-        self.res.want(want, (cu, cv));
+        self.res.want(self.with_geoid(want), (cu, cv));
 
         self.draw_gps(w, h);
         self.draw_compass(w, h);

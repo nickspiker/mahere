@@ -89,7 +89,7 @@ pub struct LayerMask {
     pub raw: bool,
     /// Names lettered on the map (Nick 2026-10-13). Stored as its absence (bit 14 set = hidden), so settings and themes from before it show labels.
     pub labels: bool,
-    /// The geoid's height above the WGS84 ellipsoid, the gap between sea level and the GPS's own heights, as a wash over the map with contours every ten metres (Nick 2026-10-19).
+    /// The geoid's height above the WGS84 ellipsoid, the gap between sea level and the GPS's own heights, in place of the elevation: the ground coloured by it, the contours drawn from it (Nick 2026-10-19).
     pub geoid: bool,
 }
 
@@ -106,7 +106,27 @@ impl LayerMask {
         let im = self.imagery;
         // Raw elevation stands in for the ground's whole colour and its light: the terrain shading, the tint, land cover, slope bands and imagery go quiet under it.
         let raw = self.raw;
-        LayerMask { dem: raw, land: im || raw, water: false, line: false, debug: false, imagery: raw, contours: false, slope: im || raw, infrared: !im || raw, hypso: self.land || !self.dem || raw, boundaries: !self.line, own: false, mvum: false, raw: false, labels: false, geoid: false }
+        // The geoid stands in for the elevation itself (Nick 2026-10-19: "should basically swap out elevation"): the ground coloured by it and the contours drawn from it, so everything that shows the terrain goes quiet, the water fill too (the sea is half of what it shows), and raw elevation with them.
+        let geo = self.geoid;
+        // Under imagery the terrain's shading and tint do not show (Nick 2026-10-19), greyed; they still draw where the imagery runs out and at sea ([`LayerMask::effective`]).
+        LayerMask {
+            dem: raw || geo || im,
+            land: im || raw || geo,
+            water: geo,
+            line: false,
+            debug: false,
+            imagery: raw || geo,
+            contours: false,
+            slope: im || raw || geo,
+            infrared: !im || raw || geo,
+            hypso: self.land || !self.dem || raw || geo || im,
+            boundaries: !self.line,
+            own: false,
+            mvum: false,
+            raw: geo,
+            labels: false,
+            geoid: false,
+        }
     }
 
     /// The mask as bits, one per field in declaration order, for a shader or a settings document.
@@ -136,8 +156,10 @@ impl LayerMask {
     /// The mask as drawn: every inert row off.
     pub fn effective(self) -> LayerMask {
         let i = self.inert();
+        // The terrain and its tint greyed by imagery alone still draw: they are what shows where the imagery runs out, and the sea.
+        let drawn = LayerMask { imagery: false, ..self }.inert();
         LayerMask {
-            dem: self.dem && !i.dem,
+            dem: self.dem && !drawn.dem,
             land: self.land && !i.land,
             water: self.water && !i.water,
             line: self.line,
@@ -146,11 +168,11 @@ impl LayerMask {
             contours: self.contours && !i.contours,
             slope: self.slope && !i.slope,
             infrared: self.infrared && !i.infrared,
-            hypso: self.hypso && !i.hypso,
+            hypso: self.hypso && !drawn.hypso,
             boundaries: self.boundaries && !i.boundaries,
             own: self.own,
             mvum: self.mvum,
-            raw: self.raw,
+            raw: self.raw && !i.raw,
             labels: self.labels,
             geoid: self.geoid,
         }

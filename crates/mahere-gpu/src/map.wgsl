@@ -401,6 +401,14 @@ fn geoid_at(d: u32, u: u32, v: u32) -> vec3<f32> {
     return vec3<f32>(g, sqrt(du * du + dv * dv), 1.0);
 }
 
+// The geoid's contour interval at a zoom, metres: a 1-2-5 step near a metre per 150 m a pixel, from a tenth of a metre to ten.
+fn geoid_interval(m_per_px: f32) -> f32 {
+    let x = clamp(m_per_px / 150.0, 0.1, 10.0);
+    let p = pow(10.0, floor(log2(x) / log2(10.0)));
+    let m = x / p;
+    return clamp(p * select(select(select(10.0, 5.0, m < 7.0), 2.0, m < 3.0), 1.0, m < 1.5), 0.1, 10.0);
+}
+
 fn light_eval(n: vec3<f32>) -> vec3<f32> {
     var m = array<f32, 10>(n.x * n.x, n.y * n.y, n.z * n.z, n.x * n.y, n.x * n.z, n.y * n.z, n.x, n.y, n.z, 1.0);
     var out = vec3<f32>(0.0);
@@ -651,13 +659,36 @@ fn compose(d: u32, u: u32, v: u32, pos: vec2<f32>) -> Composed {
     out.c2 = vec3<f32>(0.0);
     var contour_cov = 0.0;
     var contour_index = false;
+    // The theme's contour inks; the geoid's own, darker, over its pale wash.
+    var contour_ink = U.style_contour;
+    var contour_ink_index = U.style_contour_index;
     var band = vec3<f32>(0.0);
     var have_band = false;
     var found_depth = NONE;
     var is_sea = false;
     var elev_m = 0.0;
-    // The terrain sample feeds the tint and light (terrain on), and the contours and slope bands on their own.
-    let want_dem = (mask & (M_DEM | M_CONTOURS | M_SLOPE | M_RAW)) != 0u;
+    // Sea level against the ellipsoid in place of the elevation (Nick 2026-10-19): the ground the geoid's height above WGS84, unlit, blue where sea level sits below the ellipsoid and orange above, full at a hundred metres; the contours drawn from it, at an interval that follows the zoom (ten metres at the globe, a metre at a city, a tenth up close), every fifth heavier.
+    let geo = (mask & M_GEOID) != 0u;
+    if (geo) {
+        let g = geoid_at(d, u, v);
+        if (g.z > 0.0) {
+            let t = clamp(g.x / 100.0, -1.0, 1.0);
+            let neutral = dec(vec3<f32>(236.0, 236.0, 232.0));
+            out.base = select(lerp3(neutral, dec(vec3<f32>(40.0, 110.0, 230.0)), -t), lerp3(neutral, dec(vec3<f32>(236.0, 110.0, 40.0)), t), t >= 0.0);
+            if ((mask & M_CONTOURS) != 0u) {
+                contour_ink = vec4<f32>(dec(vec3<f32>(28.0, 28.0, 32.0)), 0.6);
+                contour_ink_index = vec4<f32>(dec(vec3<f32>(28.0, 28.0, 32.0)), 0.9);
+                let interval = geoid_interval(U.contour.z);
+                let level = round(g.x / interval);
+                let d_px = abs(g.x - level * interval) / max(g.y / GEOID_TEXEL_M * U.contour.z, 1e-6);
+                let li = i32(level);
+                contour_index = ((li % 5) + 5) % 5 == 0;
+                contour_cov = clamp(select(0.55, 0.9, contour_index) + 0.5 - d_px, 0.0, 1.0);
+            }
+        }
+    }
+    // The terrain sample feeds the tint and light (terrain on), and the contours and slope bands on their own; the geoid stands in for all of it.
+    let want_dem = !geo && (mask & (M_DEM | M_CONTOURS | M_SLOPE | M_RAW)) != 0u;
     if (want_dem) {
         let s = sample_dem(d, u, v);
         if (s.ok) {
@@ -773,7 +804,7 @@ fn compose(d: u32, u: u32, v: u32, pos: vec2<f32>) -> Composed {
         out.ground = false;
         out.base = select(vec3<f32>(img_light(im.x), img_light(im.y), img_light(im.z)), vec3<f32>(img_light(im.w)), (mask & M_INFRARED) != 0u);
         if (contour_cov > 0.0) {
-            let ink = select(U.style_contour, U.style_contour_index, contour_index);
+            let ink = select(contour_ink, contour_ink_index, contour_index);
             { let f = fold(Fold(out.k2, out.c2), ink.rgb, contour_cov * ink.a); out.k2 = f.k; out.c2 = f.c; }
         }
         return user_marks(out, d, u, v);
@@ -800,7 +831,7 @@ fn compose(d: u32, u: u32, v: u32, pos: vec2<f32>) -> Composed {
             }
             // Contours over the imagery and the water, under the other lines.
             if (contour_cov > 0.0) {
-                let ink = select(U.style_contour, U.style_contour_index, contour_index);
+                let ink = select(contour_ink, contour_ink_index, contour_index);
                 { let f = fold(Fold(out.k2, out.c2), ink.rgb, contour_cov * ink.a); out.k2 = f.k; out.c2 = f.c; }
             }
             out = overlays(out, ov, ov_layer, ov_t);
@@ -817,7 +848,7 @@ fn compose(d: u32, u: u32, v: u32, pos: vec2<f32>) -> Composed {
         }
         // Under the water: the contours and the waterway lines, so a lake covers the river running into it. Over it: every other line.
         if (contour_cov > 0.0) {
-            let ink = select(U.style_contour, U.style_contour_index, contour_index);
+            let ink = select(contour_ink, contour_ink_index, contour_index);
             { let f = fold(Fold(out.k1, out.c1), ink.rgb, contour_cov * ink.a); out.k1 = f.k; out.c1 = f.c; }
         }
         if (draw_line && line.x == WATERWAY_CLASS) {
@@ -835,7 +866,7 @@ fn compose(d: u32, u: u32, v: u32, pos: vec2<f32>) -> Composed {
             { let f = fold(Fold(out.k1, out.c1), band, 0.45); out.k1 = f.k; out.c1 = f.c; }
         }
         if (contour_cov > 0.0) {
-            let ink = select(U.style_contour, U.style_contour_index, contour_index);
+            let ink = select(contour_ink, contour_ink_index, contour_index);
             { let f = fold(Fold(out.k2, out.c2), ink.rgb, contour_cov * ink.a); out.k2 = f.k; out.c2 = f.c; }
         }
     }
@@ -860,23 +891,6 @@ fn compose(d: u32, u: u32, v: u32, pos: vec2<f32>) -> Composed {
         }
     }
     out = user_marks(out, d, u, v);
-    // Sea level against the ellipsoid (Nick 2026-10-19): the geoid's height above WGS84 as a wash, blue where sea level sits below the ellipsoid and orange above, full at a hundred metres, with contours every ten metres and every fifty heavier, over everything.
-    if ((mask & M_GEOID) != 0u) {
-        let g = geoid_at(d, u, v);
-        if (g.z > 0.0) {
-            let t = clamp(g.x / 100.0, -1.0, 1.0);
-            let neutral = dec(vec3<f32>(236.0, 236.0, 232.0));
-            let tint = select(lerp3(neutral, dec(vec3<f32>(40.0, 110.0, 230.0)), -t), lerp3(neutral, dec(vec3<f32>(236.0, 110.0, 40.0)), t), t >= 0.0);
-            { let f = fold(Fold(out.k2, out.c2), tint, 0.5); out.k2 = f.k; out.c2 = f.c; }
-            let level = round(g.x / 10.0);
-            let d_px = abs(g.x - level * 10.0) / max(g.y / GEOID_TEXEL_M * U.contour.z, 1e-6);
-            let index = (i32(level) % 5) == 0;
-            let cov = clamp(select(0.6, 1.1, index) + 0.5 - d_px, 0.0, 1.0);
-            if (cov > 0.0) {
-                { let f = fold(Fold(out.k2, out.c2), dec(vec3<f32>(28.0, 28.0, 32.0)), cov * select(0.55, 0.85, index)); out.k2 = f.k; out.c2 = f.c; }
-            }
-        }
-    }
     // Detail: tinted by the depth of the terrain cell drawn, the CPU's DETAIL_COLOURS from depth 8 (the global base) to 14 (the finest bakes); magenta where there is none.
     if ((mask & M_DEBUG) != 0u) {
         var tintd = dec(vec3<f32>(255.0, 0.0, 255.0));

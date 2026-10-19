@@ -721,6 +721,7 @@ impl GpuMap {
                 let q: Vec<u16> = g.iter().map(|&cm| (cm as i32 + 32768).clamp(1, 65535) as u16).collect();
                 write_layer(queue, &self.geoid_tex, d, 2 * TEX as u32, TEX as u32, 2, bytemuck::cast_slice(&q));
                 self.geoid_in |= 1 << d;
+                eprintln!("gpu: the geoid of diamond {d} is in");
             }
         }
         // A cell whose planes went to the GPU and were released, but which holds no slot for them now (a GPU map made afresh, after a lost device or a panic): dropped from the pool, so residency loads it again from the device and it uploads whole.
