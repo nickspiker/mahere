@@ -143,6 +143,8 @@ enum Layer {
     Own,
     Mvum,
     Raw,
+    /// The geoid's height above the ellipsoid (Nick 2026-10-19).
+    Geoid,
     Land,
     Water,
     Line,
@@ -160,7 +162,7 @@ enum Layer {
     Record,
 }
 
-const LAYERS: [(Layer, &str); 23] = [
+const LAYERS: [(Layer, &str); 24] = [
     (Layer::Dem, "Terrain"),
     (Layer::Hypso, "Elevation tint"),
     (Layer::Raw, "Raw elevation"),
@@ -175,6 +177,7 @@ const LAYERS: [(Layer, &str); 23] = [
     (Layer::Slope, "Slope bands"),
     (Layer::Imagery, "Imagery"),
     (Layer::Infrared, "Infrared"),
+    (Layer::Geoid, "Sea level vs ellipsoid"),
     (Layer::Debug, "Detail"),
     (Layer::RealSun, "Real sun"),
     (Layer::RealLight, "Real light"),
@@ -212,6 +215,7 @@ fn get(mask: &LayerMask, ctl: &Controls, l: Layer) -> bool {
         Layer::Boundaries => mask.boundaries,
         Layer::Own => mask.own,
         Layer::Raw => mask.raw,
+        Layer::Geoid => mask.geoid,
         Layer::Mvum => mask.mvum,
         Layer::Contours => mask.contours,
         Layer::Slope => mask.slope,
@@ -239,6 +243,7 @@ fn set(mask: &mut LayerMask, ctl: &mut Controls, l: Layer, v: bool) {
         Layer::Boundaries => mask.boundaries = v,
         Layer::Own => mask.own = v,
         Layer::Raw => mask.raw = v,
+        Layer::Geoid => mask.geoid = v,
         Layer::Mvum => mask.mvum = v,
         Layer::Contours => mask.contours = v,
         Layer::Slope => mask.slope = v,

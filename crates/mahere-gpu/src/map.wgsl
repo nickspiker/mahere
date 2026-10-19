@@ -69,6 +69,9 @@ const M_BOUND: u32 = 1024u;
 const M_OWN: u32 = 2048u;
 const M_MVUM: u32 = 4096u;
 const M_RAW: u32 = 8192u;
+const M_GEOID: u32 = 32768u;
+// A depth-0 texel's edge on the ground, metres (a 7054 km diamond edge over 256 texels): the geoid's gradient per texel into metres per metre.
+const GEOID_TEXEL_M: f32 = 27555.0;
 
 // Where the style tables sit in the LUT buffer after the 4096 hypsometric rows.
 const CLASS_BASE: u32 = 4096u;
@@ -136,6 +139,8 @@ struct Slot { tag: u32, cu: u32, cv: u32, index: u32 };
 @group(0) @binding(11) var ov_tex: texture_2d_array<u32>;
 // The elevations this map pass draws, lowest and highest as quantised elevations: read back for the next frame's contour interval and raw elevation range (Nick 2026-10-10: the final gather, not a sampling).
 @group(0) @binding(12) var<storage, read_write> view_range: array<atomic<u32>, 2>;
+// The geoid's height above the ellipsoid per depth-0 texel, centimetres offset by 32768, a layer per diamond; 0 where that diamond's cell has not arrived.
+@group(0) @binding(13) var geoid_tex: texture_2d_array<u32>;
 
 struct VOut {
     @builtin(position) pos: vec4<f32>,
@@ -330,6 +335,70 @@ fn dem_smooth(d: Dem, u: u32, v: u32) -> f32 {
         return d.elev;
     }
     return d.base + (la * a.x / a.y + lb * b.x / b.y + lc * c.x / c.y) * d.step;
+}
+
+// The geoid at a depth-0 texel (x = 2 × column + half, y = row), metres; NaN-free: `ok` is false outside the cell or where its diamond has not arrived.
+struct Geo { ok: bool, m: f32 };
+
+fn geoid_texel(d: u32, x: i32, y: i32) -> Geo {
+    if (x < 0 || y < 0 || x > 511 || y > 255) {
+        return Geo(false, 0.0);
+    }
+    let q = textureLoad(geoid_tex, vec2<i32>(x, y), i32(d), 0).x;
+    return Geo(q != 0u, (f32(q) - 32768.0) / 100.0);
+}
+
+// The six centroid samples about a vertex of the depth-0 texel grid (the terrain's dem_vertex, with no apron): (sum, count).
+fn geoid_vertex(d: u32, x: i32, y: i32) -> vec2<f32> {
+    var sum = 0.0;
+    var n = 0.0;
+    let lows = array<vec2<i32>, 3>(vec2<i32>(x, y), vec2<i32>(x - 1, y), vec2<i32>(x, y - 1));
+    let ups = array<vec2<i32>, 3>(vec2<i32>(x - 1, y - 1), vec2<i32>(x, y - 1), vec2<i32>(x - 1, y));
+    for (var i = 0; i < 3; i++) {
+        let l = geoid_texel(d, 2 * lows[i].x, lows[i].y);
+        if (l.ok) {
+            sum += l.m;
+            n += 1.0;
+        }
+        let p = geoid_texel(d, 2 * ups[i].x + 1, ups[i].y);
+        if (p.ok) {
+            sum += p.m;
+            n += 1.0;
+        }
+    }
+    return vec2<f32>(sum, n);
+}
+
+// The geoid interpolated across the depth-0 texel as the terrain is (barycentric between vertex means), and its gradient, metres per texel: (metres, gradient, 1 when found).
+fn geoid_at(d: u32, u: u32, v: u32) -> vec3<f32> {
+    let s = 22u;
+    let m = (1u << s) - 1u;
+    let tx = i32((u >> s) & 255u);
+    let ty = i32((v >> s) & 255u);
+    let fu = f32(u & m) / f32(1u << s);
+    let fv = f32(v & m) / f32(1u << s);
+    let lower = fu + fv < 1.0;
+    let va = select(vec2<i32>(tx + 1, ty + 1), vec2<i32>(tx, ty), lower);
+    let vb = select(vec2<i32>(tx, ty + 1), vec2<i32>(tx + 1, ty), lower);
+    let vc = select(vec2<i32>(tx + 1, ty), vec2<i32>(tx, ty + 1), lower);
+    let a = geoid_vertex(d, va.x, va.y);
+    let b = geoid_vertex(d, vb.x, vb.y);
+    let c = geoid_vertex(d, vc.x, vc.y);
+    if (a.y == 0.0 || b.y == 0.0 || c.y == 0.0) {
+        let own = geoid_texel(d, 2 * tx + select(1, 0, lower), ty);
+        return vec3<f32>(own.m, 0.0, select(0.0, 1.0, own.ok));
+    }
+    let ga = a.x / a.y;
+    let gb = b.x / b.y;
+    let gc = c.x / c.y;
+    // dem_smooth's weights: (1 − u − v, u, v) on the lower triangle, (u + v − 1, 1 − u, 1 − v) on the upper; the gradient along each texel axis from the same plane.
+    let la = select(fu + fv - 1.0, 1.0 - fu - fv, lower);
+    let lb = select(1.0 - fu, fu, lower);
+    let lc = select(1.0 - fv, fv, lower);
+    let g = la * ga + lb * gb + lc * gc;
+    let du = select(ga - gb, gb - ga, lower);
+    let dv = select(ga - gc, gc - ga, lower);
+    return vec3<f32>(g, sqrt(du * du + dv * dv), 1.0);
 }
 
 fn light_eval(n: vec3<f32>) -> vec3<f32> {
@@ -791,6 +860,23 @@ fn compose(d: u32, u: u32, v: u32, pos: vec2<f32>) -> Composed {
         }
     }
     out = user_marks(out, d, u, v);
+    // Sea level against the ellipsoid (Nick 2026-10-19): the geoid's height above WGS84 as a wash, blue where sea level sits below the ellipsoid and orange above, full at a hundred metres, with contours every ten metres and every fifty heavier, over everything.
+    if ((mask & M_GEOID) != 0u) {
+        let g = geoid_at(d, u, v);
+        if (g.z > 0.0) {
+            let t = clamp(g.x / 100.0, -1.0, 1.0);
+            let neutral = dec(vec3<f32>(236.0, 236.0, 232.0));
+            let tint = select(lerp3(neutral, dec(vec3<f32>(40.0, 110.0, 230.0)), -t), lerp3(neutral, dec(vec3<f32>(236.0, 110.0, 40.0)), t), t >= 0.0);
+            { let f = fold(Fold(out.k2, out.c2), tint, 0.5); out.k2 = f.k; out.c2 = f.c; }
+            let level = round(g.x / 10.0);
+            let d_px = abs(g.x - level * 10.0) / max(g.y / GEOID_TEXEL_M * U.contour.z, 1e-6);
+            let index = (i32(level) % 5) == 0;
+            let cov = clamp(select(0.6, 1.1, index) + 0.5 - d_px, 0.0, 1.0);
+            if (cov > 0.0) {
+                { let f = fold(Fold(out.k2, out.c2), dec(vec3<f32>(28.0, 28.0, 32.0)), cov * select(0.55, 0.85, index)); out.k2 = f.k; out.c2 = f.c; }
+            }
+        }
+    }
     // Detail: tinted by the depth of the terrain cell drawn, the CPU's DETAIL_COLOURS from depth 8 (the global base) to 14 (the finest bakes); magenta where there is none.
     if ((mask & M_DEBUG) != 0u) {
         var tintd = dec(vec3<f32>(255.0, 0.0, 255.0));

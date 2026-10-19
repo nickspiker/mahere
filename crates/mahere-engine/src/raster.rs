@@ -89,11 +89,13 @@ pub struct LayerMask {
     pub raw: bool,
     /// Names lettered on the map (Nick 2026-10-13). Stored as its absence (bit 14 set = hidden), so settings and themes from before it show labels.
     pub labels: bool,
+    /// The geoid's height above the WGS84 ellipsoid, the gap between sea level and the GPS's own heights, as a wash over the map with contours every ten metres (Nick 2026-10-19).
+    pub geoid: bool,
 }
 
 impl Default for LayerMask {
     fn default() -> Self {
-        LayerMask { dem: true, land: true, water: true, line: true, debug: false, imagery: false, contours: true, slope: false, infrared: false, hypso: true, boundaries: true, own: true, mvum: true, raw: false, labels: true }
+        LayerMask { dem: true, land: true, water: true, line: true, debug: false, imagery: false, contours: true, slope: false, infrared: false, hypso: true, boundaries: true, own: true, mvum: true, raw: false, labels: true, geoid: false }
     }
 }
 
@@ -104,7 +106,7 @@ impl LayerMask {
         let im = self.imagery;
         // Raw elevation stands in for the ground's whole colour and its light: the terrain shading, the tint, land cover, slope bands and imagery go quiet under it.
         let raw = self.raw;
-        LayerMask { dem: raw, land: im || raw, water: false, line: false, debug: false, imagery: raw, contours: false, slope: im || raw, infrared: !im || raw, hypso: self.land || !self.dem || raw, boundaries: !self.line, own: false, mvum: false, raw: false, labels: false }
+        LayerMask { dem: raw, land: im || raw, water: false, line: false, debug: false, imagery: raw, contours: false, slope: im || raw, infrared: !im || raw, hypso: self.land || !self.dem || raw, boundaries: !self.line, own: false, mvum: false, raw: false, labels: false, geoid: false }
     }
 
     /// The mask as bits, one per field in declaration order, for a shader or a settings document.
@@ -124,10 +126,11 @@ impl LayerMask {
             | (self.mvum as u32) << 12
             | (self.raw as u32) << 13
             | (!self.labels as u32) << 14
+            | (self.geoid as u32) << 15
     }
 
     pub fn from_bits(b: u32) -> LayerMask {
-        LayerMask { dem: b & 1 != 0, land: b & 2 != 0, water: b & 4 != 0, line: b & 8 != 0, debug: b & 16 != 0, imagery: b & 32 != 0, contours: b & 64 != 0, slope: b & 128 != 0, infrared: b & 256 != 0, hypso: b & 512 != 0, boundaries: b & 1024 != 0, own: b & 2048 != 0, mvum: b & 4096 != 0, raw: b & 8192 != 0, labels: b & 16384 == 0 }
+        LayerMask { dem: b & 1 != 0, land: b & 2 != 0, water: b & 4 != 0, line: b & 8 != 0, debug: b & 16 != 0, imagery: b & 32 != 0, contours: b & 64 != 0, slope: b & 128 != 0, infrared: b & 256 != 0, hypso: b & 512 != 0, boundaries: b & 1024 != 0, own: b & 2048 != 0, mvum: b & 4096 != 0, raw: b & 8192 != 0, labels: b & 16384 == 0, geoid: b & 32768 != 0 }
     }
 
     /// The mask as drawn: every inert row off.
@@ -149,6 +152,7 @@ impl LayerMask {
             mvum: self.mvum,
             raw: self.raw,
             labels: self.labels,
+            geoid: self.geoid,
         }
     }
 }
@@ -1157,6 +1161,7 @@ mod tests {
                 mvum: None,
                 layers: u8::MAX,
                 exists: true,
+                geoid: None,
             },
         );
 

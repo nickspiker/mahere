@@ -55,6 +55,7 @@ fn main() {
                 "slope" => m.slope = true,
                 "infrared" => m.infrared = true,
                 "debug" => m.debug = true,
+                "geoid" => m.geoid = true,
                 _ => {}
             }
         }

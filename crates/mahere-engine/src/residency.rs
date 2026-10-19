@@ -150,6 +150,8 @@ pub struct Entry {
     pub layers: u8,
     /// The cell exists (its base was there, if empty): a cell with only terrain or imagery is not absent.
     pub exists: bool,
+    /// The geoid's height above the ellipsoid, centimetres per texel, kept for the ten depth-0 cells alone: the geoid layer draws from them at every zoom (about 27 km a texel, finer than the geoid itself varies).
+    pub geoid: Option<Vec<i16>>,
 }
 
 impl Entry {
@@ -711,7 +713,7 @@ fn load_cell(store: &dyn CellStore, layers: Option<&LayerStores>, want: u8, key:
     if let Some(im) = &mut img {
         im.retone(mahere_tiles::tone::IMG_TAG);
     }
-    Loaded { key, entry: Some(Entry { present, line_mag_max, elev_lo, elev_hi, dem, dem_q, line: planes.line, land: planes.land, water: planes.water, img, own: planes.own, mvum: planes.mvum, layers: layers_loaded, exists: true }) }
+    Loaded { key, entry: Some(Entry { present, line_mag_max, elev_lo, elev_hi, dem, dem_q, line: planes.line, land: planes.land, water: planes.water, img, own: planes.own, mvum: planes.mvum, layers: layers_loaded, exists: true, geoid: if key.depth == 0 { planes.geoid } else { None } }) }
 }
 
 // ==================== TIERED STORE: VAULT CACHE OVER THE BUCKET ====================

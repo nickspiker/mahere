@@ -99,6 +99,9 @@ pub fn mask_bits(m: LayerMask) -> u32 {
     m.bits()
 }
 
+/// The dymaxion's diamonds: a layer of the geoid texture each.
+const GEOID_DIAMONDS: u32 = 10;
+
 /// One plane's texture array and its slots, keyed by cell. Grows by doubling, copying the old layers on the GPU.
 struct Plane {
     label: &'static str,
@@ -285,6 +288,9 @@ pub struct GpuMap {
     preview: Option<(wgpu::Texture, wgpu::TextureView, u32, u32)>,
     preview_version: u64,
     pub uploads: usize,
+    /// The geoid of the ten depth-0 cells, a layer per diamond (centimetres above the ellipsoid offset by 32768, 0 where none), and which diamonds are in.
+    geoid_tex: wgpu::Texture,
+    geoid_in: u16,
     /// When a full plane was last reported.
     full_warned: std::time::Instant,
     /// Supersampling factor in use; a change takes effect at the next frame.
@@ -312,7 +318,7 @@ impl GpuMap {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("mahere map"), source: wgpu::ShaderSource::Wgsl(include_str!("map.wgsl").into()) });
         let uint_array = wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Uint, view_dimension: wgpu::TextureViewDimension::D2Array, multisampled: false };
         let storage = wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: true }, has_dynamic_offset: false, min_binding_size: None };
-        let entries: Vec<wgpu::BindGroupLayoutEntry> = (0..13u32)
+        let entries: Vec<wgpu::BindGroupLayoutEntry> = (0..14u32)
             .map(|i| wgpu::BindGroupLayoutEntry {
                 binding: i,
                 // The elevation range the map pass writes is fragment-only: a vertex stage may not write storage.
@@ -463,6 +469,8 @@ impl GpuMap {
             present_binds: FxHashMap::default(),
             overlay: None,
             uploads: 0,
+            geoid_tex: plane_texture(device, "geoid", 2 * TEX as u32, TEX as u32, GEOID_DIAMONDS, wgpu::TextureFormat::R16Uint),
+            geoid_in: 0,
             full_warned: std::time::Instant::now() - std::time::Duration::from_secs(60),
             scale: SCALE,
             sample_offset: [0.0, 0.0],
@@ -491,6 +499,7 @@ impl GpuMap {
                 wgpu::BindGroupEntry { binding: 10, resource: wgpu::BindingResource::TextureView(&sv) },
                 wgpu::BindGroupEntry { binding: 11, resource: wgpu::BindingResource::TextureView(&ovv) },
                 wgpu::BindGroupEntry { binding: 12, resource: self.view_range.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 13, resource: wgpu::BindingResource::TextureView(&self.geoid_tex.create_view(&wgpu::TextureViewDescriptor { dimension: Some(wgpu::TextureViewDimension::D2Array), ..Default::default() })) },
             ],
         }));
     }
@@ -701,6 +710,18 @@ impl GpuMap {
         if no_slot > 0 && self.full_warned.elapsed() > std::time::Duration::from_secs(10) {
             self.full_warned = std::time::Instant::now();
             eprintln!("gpu: {no_slot} planes found no slot ({} cells resident, layers {:?}): they draw as bare ground", pool.map.len(), self.layers());
+        }
+        // The geoid, once per diamond as its depth-0 cell arrives: the cell keeps its copy, so a GPU map made afresh fills it again.
+        for (key, e) in pool.map.iter() {
+            let d = key.diamond() as u32;
+            if key.depth != 0 || d >= GEOID_DIAMONDS || self.geoid_in & (1 << d) != 0 {
+                continue;
+            }
+            if let Some(g) = &e.geoid {
+                let q: Vec<u16> = g.iter().map(|&cm| (cm as i32 + 32768).clamp(1, 65535) as u16).collect();
+                write_layer(queue, &self.geoid_tex, d, 2 * TEX as u32, TEX as u32, 2, bytemuck::cast_slice(&q));
+                self.geoid_in |= 1 << d;
+            }
         }
         // A cell whose planes went to the GPU and were released, but which holds no slot for them now (a GPU map made afresh, after a lost device or a panic): dropped from the pool, so residency loads it again from the device and it uploads whole.
         // Found 2026-10-16 on the Pixel: the ocean drew as land in cell-shaped triangles, coasts and roads gone, while cells loaded since drew right.
