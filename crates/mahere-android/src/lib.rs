@@ -593,7 +593,25 @@ const ACTION_MOVE: jint = 2;
 const ACTION_POINTER_UP: jint = 6;
 
 /// Android has no stderr: everything the engine prints with eprintln (fetch failures, decode failures) vanished. Dup a pipe over fd 2 and relay each line to logcat under the `mahere` tag, once per process.
+/// The log facade's records from the vault (kete, manifestus) onto stderr, and so into logcat.
+struct VaultLog;
+
+impl log::Log for VaultLog {
+    fn enabled(&self, m: &log::Metadata) -> bool {
+        m.target().starts_with("kete") || m.target().starts_with("manifestus")
+    }
+    fn log(&self, r: &log::Record) {
+        if self.enabled(r.metadata()) {
+            eprintln!("{} {}", r.level(), r.args());
+        }
+    }
+    fn flush(&self) {}
+}
+
 fn bridge_stderr_to_logcat() {
+    if log::set_logger(&VaultLog).is_ok() {
+        log::set_max_level(log::LevelFilter::Info);
+    }
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| unsafe {
         let mut fds = [0i32; 2];

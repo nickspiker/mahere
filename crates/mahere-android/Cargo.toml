@@ -11,6 +11,8 @@ name = "mahere_android"
 crate-type = ["cdylib"]
 
 [dependencies]
+# kete and manifestus report through the log facade: forwarded to logcat with everything else (the vault's open time, a refused write).
+log = "0.4"
 mahere-engine = { path = "../mahere-engine" }
 mahere-store = { path = "../mahere-store" }
 fluor = { git = "https://github.com/nickspiker/fluor", rev = "e8bbfd43119cc510abfc85b304a583377a5a1e81", features = ["host-android"] }
