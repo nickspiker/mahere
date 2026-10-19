@@ -311,6 +311,8 @@ pub struct Lettering {
     /// Two screen points of the laid-out view and where on the globe they were: how far the map has turned since, which the turning labels follow.
     reference: Option<([f64; 2], [f64; 2], (f64, f64), (f64, f64))>,
     drawn_for: Option<ViewKey>,
+    /// The camera's scale when it was laid out, pixels per degree.
+    ppd: f64,
     palette: [[u8; 4]; 11],
     /// The route, on the globe, and its width in pixels.
     route: Vec<(f64, f64)>,
@@ -320,7 +322,7 @@ pub struct Lettering {
 
 impl Default for Lettering {
     fn default() -> Self {
-        Lettering { kept: Vec::new(), atlas: std::sync::Arc::new(Atlas::new()), reference: None, drawn_for: None, palette: mahere_engine::theme::LABELS_LIGHT, route: Vec::new(), route_width: 4.0, route_casing: 6.0 }
+        Lettering { kept: Vec::new(), atlas: std::sync::Arc::new(Atlas::new()), reference: None, drawn_for: None, ppd: 0.0, palette: mahere_engine::theme::LABELS_LIGHT, route: Vec::new(), route_width: 4.0, route_casing: 6.0 }
     }
 }
 
@@ -804,6 +806,7 @@ impl Letterer {
             atlas: self.shared.clone(),
             reference: Some((a, b, job.cam.screen_to_geo(a[0], a[1], w, h), job.cam.screen_to_geo(b[0], b[1], w, h))),
             drawn_for: Some(job.key),
+            ppd: job.cam.ppd,
             palette: job.palette,
             route: job.route,
             route_width,
@@ -1340,8 +1343,16 @@ impl Lettering {
         ((by - ay).atan2(bx - ax) - (b[1] - a[1]).atan2(b[0] - a[0])) as f32
     }
 
+    /// Whether the map is still near the scale this lettering was laid out at: within twice either way it is drawn as it is while the next layout comes; past that it is a different view's lettering, crowded or sparse, and is not drawn (Nick 2026-10-18: a layout made zoomed in over Siberia stayed on the globe, piled up in one corner, while the globe's own was still coming).
+    fn near_scale(&self, cam: &mahere_engine::Camera) -> bool {
+        self.ppd <= 0.0 || (0.5..=2.0).contains(&(cam.ppd / self.ppd))
+    }
+
     /// The frame's letters, each a quad at its label's anchor as the camera has it now: a turning label's letters turned with the map about the anchor, a level one's as laid out.
     pub fn glyphs(&self, cam: &mahere_engine::Camera, w: usize, h: usize) -> Vec<GlyphQuad> {
+        if !self.near_scale(cam) {
+            return Vec::new();
+        }
         let phi = self.turned(cam, w, h);
         let (sp, cp) = phi.sin_cos();
         let halo = display(self.palette[HALO]);
@@ -1472,6 +1483,9 @@ impl Lettering {
 
     /// The label under a screen point, as the screen is now.
     pub fn hit(&self, cam: &mahere_engine::Camera, w: usize, h: usize, x: f32, y: f32) -> Option<&Named> {
+        if !self.near_scale(cam) {
+            return None;
+        }
         let phi = self.turned(cam, w, h);
         let (sp, cp) = phi.sin_cos();
         self.kept.iter().find(|k| {

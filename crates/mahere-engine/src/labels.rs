@@ -197,10 +197,13 @@ pub fn gather(job: &NameJob, cache: &mut NamesCache) -> NamedTexels {
         out.lines = lines.into_values().collect();
         out.areas = areas.into_values().collect();
         // One label a point (Nick 2026-10-16: "Madrid Madrid, Paris Paris? yeahnah"): the same place met in a parent cell and its child, or on two texels, lands a few pixels apart; copies of one point within a few label heights merge, and places sharing a name far apart stay apart. A city's limits lettered as an area are another label and stay.
+        // The copies of one point are found by its identity first, then by distance among those alone (2026-10-18: compared against every point kept, a globe's tens of thousands of points took minutes, and the lettering never caught up with the view).
         let mut points: Vec<(Named, [f32; 2])> = Vec::with_capacity(out.points.len());
+        let mut placed: HashMap<(u8, String, String), Vec<[f32; 2]>> = HashMap::new();
         for (n, p) in out.points.drain(..) {
-            let copy = points.iter().any(|(m, q)| m.kind == n.kind && m.name == n.name && m.reference == n.reference && (q[0] - p[0]).hypot(q[1] - p[1]) < POINT_MERGE_PX);
-            if !copy {
+            let at = placed.entry(identity(&n)).or_default();
+            if !at.iter().any(|q| (q[0] - p[0]).hypot(q[1] - p[1]) < POINT_MERGE_PX) {
+                at.push(p);
                 points.push((n, p));
             }
         }
