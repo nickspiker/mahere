@@ -640,13 +640,19 @@ pub extern "system" fn Java_nz_mahere_app_MahereActivity_nativeInit(
     };
     bridge_stderr_to_logcat();
     eprintln!("mahere native init: {dir}");
+    // How long each step of the start takes, in the log (2026-10-18: 74 s of black screen before the first cell).
+    let t0 = std::time::Instant::now();
+    let lap = |what: &str| eprintln!("start: {what} at {} ms", t0.elapsed().as_millis());
     // The vault: session, tracks, and the on-device cell cache (kete).
     let store = mahere_store::open(Some(&dir)).ok();
+    lap("vault open");
     // Cells stream from the bucket through the vault; `cells-local` (pushed by hand) overrides for offline development.
     let local = std::path::PathBuf::from(format!("{dir}/cells-local"));
     let (cell_store, layer_stores, cells_cache) = mahere_store::cell_stores(local.is_dir().then_some(local.as_path()), store.as_ref());
+    lap("cell stores");
     let session = store.as_ref().and_then(|s| mahere_store::load_session(s));
     let settings = store.as_ref().and_then(|s| mahere_store::load_settings(s));
+    lap("session and settings");
     // Mt St Helens until the first GPS fix recenters us; a saved view only if it is a view (finite, on the globe, at a zoom the map has).
     let home = Camera::new(46.2000, -122.1900, 12_000.0, 0.0);
     let cam = match session {
@@ -668,9 +674,11 @@ pub extern "system" fn Java_nz_mahere_app_MahereActivity_nativeInit(
     // The session's sun is not restored: the phone has no way to move the map's own sun, so it is always the default, and older sessions hold the real sun's last place in it.
     let _ = session.map(|s| (s.sun_az, s.sun_alt));
     // Themes from the vault (the built-ins written on first launch), then the saved choice, then the saved layers over the theme's defaults.
+    lap("map, ink and areas");
     if let Some(v) = &store {
         map.set_themes(mahere_store::themes::load_all(v));
     }
+    lap("themes");
     let mut ui_ru = 1.0f32;
     if let Some(s) = settings {
         map.set_theme(s.theme as usize);
