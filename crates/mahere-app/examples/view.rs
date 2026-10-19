@@ -12,8 +12,7 @@ fn main() {
     let num = |i: usize| a[i].parse::<f64>().expect("a number");
     let (out, lat, lon, ppd, w, h) = (a[1].clone(), num(2), num(3), num(4), num(5) as usize, num(6) as usize);
     let dir = format!("{out}.vault");
-    let vault = mahere_store::open(Some(&dir)).expect("vault");
-    let cache = Arc::new(mahere_store::VaultCells::new(vault.clone()));
+    let cache = mahere_store::CellFiles::open(&std::path::Path::new(&dir).join("cells"));
     let tiered = |c: Arc<dyn mahere_engine::residency::CellCache>, l: Layer| -> Arc<dyn mahere_engine::residency::CellStore> { Arc::new(TieredStore::new(c, Arc::new(HttpStore::layer(DEFAULT_CELLS_URL, l)))) };
     let layers = LayerStores { dem: tiered(cache.layer(Layer::Dem), Layer::Dem), img: tiered(cache.layer(Layer::Img), Layer::Img), nir: tiered(cache.layer(Layer::Nir), Layer::Nir) };
     let mut map = match std::env::var("CELLS") {

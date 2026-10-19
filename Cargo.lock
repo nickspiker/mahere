@@ -1757,7 +1757,7 @@ dependencies = [
 [[package]]
 name = "kete"
 version = "0.0.2"
-source = "git+https://github.com/nickspiker/kete?rev=6885551b94ad2dda349fff43dd77f1d45e84bca7#6885551b94ad2dda349fff43dd77f1d45e84bca7"
+source = "git+https://github.com/nickspiker/kete?rev=8724875ad47635a1e8e117e1b28b61c97317da63#8724875ad47635a1e8e117e1b28b61c97317da63"
 dependencies = [
  "blake3",
  "chacha20poly1305 0.11.0",
@@ -1892,6 +1892,7 @@ dependencies = [
  "fluor",
  "jni 0.21.1",
  "libc",
+ "log",
  "mahere-coord",
  "mahere-engine",
  "mahere-gpu",

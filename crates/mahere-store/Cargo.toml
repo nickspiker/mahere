@@ -7,7 +7,7 @@ repository.workspace = true
 description = "mahere's on-device database: session, tracks (and soon tiles) on the kete/manifestus crash-proof vault"
 
 [dependencies]
-kete = { git = "https://github.com/nickspiker/kete", rev = "6885551b94ad2dda349fff43dd77f1d45e84bca7" }
+kete = { git = "https://github.com/nickspiker/kete", rev = "8724875ad47635a1e8e117e1b28b61c97317da63" }
 mahere-engine = { path = "../mahere-engine" }
 mahere-tiles = { path = "../mahere-tiles" }
 mahere-coord = { path = "../mahere-coord" }

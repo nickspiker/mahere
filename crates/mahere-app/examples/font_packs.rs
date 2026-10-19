@@ -22,7 +22,7 @@ fn main() {
     let lon: f64 = a.get(3).and_then(|s| s.parse().ok()).unwrap_or(116.40);
     let ppd: f64 = a.get(4).and_then(|s| s.parse().ok()).unwrap_or(2000.0);
     let vault = mahere_store::open(Some(&format!("{out}/fontcheck-vault"))).expect("vault");
-    let cache = Arc::new(mahere_store::VaultCells::new(vault.clone()));
+    let cache = mahere_store::CellFiles::open(&std::path::Path::new(&format!("{out}/fontcheck-vault")).join("cells"));
     let tiered = |c: Arc<dyn mahere_engine::residency::CellCache>, l: Layer| -> Arc<dyn mahere_engine::residency::CellStore> { Arc::new(TieredStore::new(c, Arc::new(HttpStore::layer(DEFAULT_CELLS_URL, l)))) };
     let layers = LayerStores { dem: tiered(cache.layer(Layer::Dem), Layer::Dem), img: tiered(cache.layer(Layer::Img), Layer::Img), nir: tiered(cache.layer(Layer::Nir), Layer::Nir) };
     let mut map = MapCore::layered(tiered(cache.clone(), Layer::Base), Some(layers), Camera::new(lat, lon, ppd, 0.0));

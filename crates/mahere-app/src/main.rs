@@ -32,7 +32,7 @@ struct MahereApp {
     rotating: bool,
     last_cursor: (f64, f64),
     store: Option<std::sync::Arc<mahere_store::FlatStorage>>,
-    cells: Option<std::sync::Arc<mahere_store::VaultCells>>,
+    cells: Option<std::sync::Arc<mahere_store::CellFiles>>,
     last_save: Instant,
     panel: Panel,
     /// The map's lettering, and when the camera last moved: labels are laid out once it has rested a quarter second, and hidden while it moves.
@@ -700,14 +700,18 @@ fn main() {
         return;
     }
     let vault = mahere_store::open(None).ok();
-    // A local bake (argv[1], or data/cells) serves directly; otherwise cells come from the bucket through the vault, like the phone.
+    // A local bake (argv[1], or data/cells) serves directly; otherwise cells come from the bucket through the cell files, like the phone.
     let local = std::env::args().nth(1).map(std::path::PathBuf::from).unwrap_or_else(|| "data/cells".into());
     if local.is_dir() {
         eprintln!("cells: {}", local.display());
     } else {
-        eprintln!("cells: {} (vault-cached: {})", DEFAULT_CELLS_URL, vault.is_some());
+        eprintln!("cells: {} (kept in {})", DEFAULT_CELLS_URL, mahere_store::cells_dir(None).display());
     }
-    let (store, layer_stores, cells) = mahere_store::cell_stores(local.is_dir().then_some(local.as_path()), vault.as_ref());
+    let (store, layer_stores, cells) = mahere_store::cell_stores(local.is_dir().then_some(local.as_path()), Some(&mahere_store::cells_dir(None)));
+    // Cells an older Mahere kept in the vault move into the files on a thread of their own.
+    if let (Some(v), Some(c)) = (&vault, &cells) {
+        mahere_store::migrate_vault_cells(v.clone(), c.clone());
+    }
     let session = vault.as_ref().and_then(|s| mahere_store::load_session(s));
     let cam = match session {
         Some(s) => Camera::new(s.lat, s.lon, s.ppd, s.bearing),

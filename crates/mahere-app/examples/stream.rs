@@ -58,8 +58,7 @@ fn main() {
     let vault_dir = args.get(1).cloned().unwrap_or_else(|| "/tmp/claude-1000/mahere-stream-vault".into());
     let lat: f64 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(47.596);
     let lon: f64 = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(-120.661);
-    let vault = mahere_store::open(Some(&vault_dir)).expect("vault");
-    let cache = Arc::new(mahere_store::VaultCells::new(vault.clone()));
+    let cache = mahere_store::CellFiles::open(&std::path::Path::new(&vault_dir).join("cells"));
     let tiered = |c: Arc<dyn mahere_engine::residency::CellCache>, l: Layer| -> Arc<dyn CellStore> { Arc::new(TieredStore::new(c, Arc::new(Counting(HttpStore::layer(DEFAULT_CELLS_URL, l), l)))) };
     let layers = LayerStores { dem: tiered(cache.layer(Layer::Dem), Layer::Dem), img: tiered(cache.layer(Layer::Img), Layer::Img), nir: tiered(cache.layer(Layer::Nir), Layer::Nir) };
     let mut map = MapCore::layered(tiered(cache.clone(), Layer::Base), Some(layers), Camera::new(lat, lon, 12000.0, 0.0));

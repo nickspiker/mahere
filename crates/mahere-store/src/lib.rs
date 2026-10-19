@@ -11,6 +11,9 @@ use rand::RngCore;
 use vsf::types::{EtType, Tensor};
 use vsf::VsfType;
 
+mod cells;
+pub use cells::{CellFileLayer, CellFiles};
+
 pub const APP: kete::App<'static> = kete::App { id: "mahere", dir: "mahere" };
 
 /// Open THE mahere vault (shared registry underneath — concurrent opens receive the same engine). `base`: Android passes filesDir; desktop passes None (XDG config/data dirs).
@@ -393,118 +396,9 @@ mod tests {
 
 /// The vault as the on-device cell tier: every cell fetched from the bucket is written through here and served from here afterwards (offline included). Keyed by the VSF values (`d` cell, `u` depth, `wm` cell) through [`vault_key`], so cells, session and tracks share the vault with the type system as the namespace.
 ///
-/// Every cached cell is dated: an index document (`d` cells, `d` index) records each cell's last use as Eagle Time and its size, so the cache can be purged oldest-first to a byte budget ([`VaultCells::purge_to`]). The index is rewritten after every so many new cells and on demand ([`VaultCells::flush`], the pause moment).
-pub struct VaultCells {
-    store: Arc<FlatStorage>,
-    index: std::sync::Mutex<CellIndex>,
-    /// Cells an area keeps on the device: never purged, and not counted against the budget.
-    pinned: std::sync::Mutex<std::collections::HashSet<(u8, u64)>>,
-}
-
-#[derive(Default)]
-struct CellIndex {
-    /// (depth, raw cell) → (last use, Eagle Time; bytes).
-    entries: std::collections::HashMap<(u8, u64), (i64, u32)>,
-    /// New cells since the last flush.
-    unsaved: u32,
-}
-
+/// The vault's index of the cells it kept before 0.223 (`d` cells, `d` index): what [`migrate_vault_cells`] moves out.
 fn cells_index_key() -> String {
     vault_key(&[name("cells"), name("index")])
-}
-
-impl VaultCells {
-    pub fn new(store: Arc<FlatStorage>) -> VaultCells {
-        let mut index = CellIndex::default();
-        if let Ok(Some(bytes)) = store.read_device(&cells_index_key()) {
-            index.entries = decode_cell_index(&bytes);
-        }
-        VaultCells { store, index: std::sync::Mutex::new(index), pinned: std::sync::Mutex::new(Default::default()) }
-    }
-
-    /// The index's key for a cell's layer: the layer rides in the depth byte's top bits (depths stop at 30), so the index document keeps its form.
-    fn ix(key: mahere_tiles::CellKey, layer: u8) -> (u8, u64) {
-        (key.depth | layer << 6, key.raw())
-    }
-
-    fn touch(&self, key: mahere_tiles::CellKey, layer: u8, bytes: usize) {
-        let mut ix = self.index.lock().unwrap();
-        let fresh = ix.entries.insert(Self::ix(key, layer), (et_now(), bytes as u32)).is_none();
-        if fresh {
-            ix.unsaved += 1;
-        }
-        if ix.unsaved >= 64 {
-            drop(ix);
-            self.flush();
-        }
-    }
-
-    /// Write the index document.
-    pub fn flush(&self) {
-        let (bytes, n) = {
-            let mut ix = self.index.lock().unwrap();
-            ix.unsaved = 0;
-            (encode_cell_index(&ix.entries), ix.entries.len())
-        };
-        if let Some(b) = bytes {
-            let _ = self.store.write_device(&cells_index_key(), &b);
-        }
-        let _ = n;
-    }
-
-    /// Bytes of cells the index knows about, the pinned ones included.
-    pub fn cached_bytes(&self) -> u64 {
-        self.index.lock().unwrap().entries.values().map(|&(_, b)| b as u64).sum()
-    }
-
-    /// Bytes of pinned cells on the device.
-    pub fn pinned_bytes(&self) -> u64 {
-        let pinned = self.pinned.lock().unwrap();
-        self.index.lock().unwrap().entries.iter().filter(|(k, _)| pinned.contains(&(k.0 & 63, k.1))).map(|(_, &(_, b))| b as u64).sum()
-    }
-
-    /// The cells the areas keep: the whole set, replacing the last.
-    pub fn set_pinned(&self, keys: impl IntoIterator<Item = mahere_tiles::CellKey>) {
-        *self.pinned.lock().unwrap() = keys.into_iter().map(|k| (k.depth, k.raw())).collect();
-    }
-
-    /// Delete the least recently used unpinned cells until they fit `budget` bytes; returns how many went. The pinned cells stay whatever the budget.
-    pub fn purge_to(&self, budget: u64) -> usize {
-        let victims: Vec<(u8, u64)> = {
-            let ix = self.index.lock().unwrap();
-            let pinned = self.pinned.lock().unwrap();
-            let unpinned = |k: &(u8, u64)| !pinned.contains(&(k.0 & 63, k.1));
-            let mut total: u64 = ix.entries.iter().filter(|(k, _)| unpinned(k)).map(|(_, &(_, b))| b as u64).sum();
-            let mut by_age: Vec<(&(u8, u64), &(i64, u32))> = ix.entries.iter().filter(|(k, _)| unpinned(k)).collect();
-            // The image layers go first (a map without its photo still reads), then the terrain, the base last, oldest first within each.
-            let keep = |layer: u8| match layer {
-                0 => 2,
-                3 => 1,
-                _ => 0,
-            };
-            by_age.sort_by_key(|(k, v)| (keep(k.0 >> 6), v.0));
-            let mut out = Vec::new();
-            for (k, &(_, b)) in by_age {
-                if total <= budget {
-                    break;
-                }
-                total -= b as u64;
-                out.push(*k);
-            }
-            out
-        };
-        for &(packed, raw) in &victims {
-            let (depth, layer) = (packed & 63, packed >> 6);
-            let key = mahere_tiles::CellKey { depth, prefix: raw >> (60 - 2 * depth as u32) };
-            let _ = self.store.delete_device(&cell_key(key, layer));
-            let _ = self.store.delete_device(&tag_key(key, layer));
-            self.index.lock().unwrap().entries.remove(&(packed, raw));
-        }
-        if !victims.is_empty() {
-            self.flush();
-        }
-        victims.len()
-    }
 }
 
 fn encode_cell_index(entries: &std::collections::HashMap<(u8, u64), (i64, u32)>) -> Option<Vec<u8>> {
@@ -592,8 +486,8 @@ fn cell_key(key: mahere_tiles::CellKey, layer: u8) -> String {
     ])
 }
 
-/// Where a host's cells come from (the flag day's published layers): a local directory as it is, a published one by layer, or the bucket through the vault, each image layer through a cache of its own. Returns the base store, the image layers' stores when cells come in layers, and the vault's cell cache for the budget and the areas' pins.
-pub fn cell_stores(local: Option<&std::path::Path>, vault: Option<&Arc<FlatStorage>>) -> (Arc<dyn mahere_engine::residency::CellStore>, Option<mahere_engine::residency::LayerStores>, Option<Arc<VaultCells>>) {
+/// Where a host's cells come from (the flag day's published layers): a local directory as it is, a published one by layer, or the bucket through the device's cell files ([`CellFiles`], under `cells`), each layer through a cache of its own. Returns the base store, the other layers' stores when cells come in layers, and the cell files for the budget and the areas' pins.
+pub fn cell_stores(local: Option<&std::path::Path>, cells: Option<&std::path::Path>) -> (Arc<dyn mahere_engine::residency::CellStore>, Option<mahere_engine::residency::LayerStores>, Option<Arc<CellFiles>>) {
     use mahere_engine::residency::{DEFAULT_CELLS_URL, DirStore, HttpStore, LayerDir, LayerStores, TieredStore};
     use mahere_tiles::publish::Layer;
     if let Some(dir) = local {
@@ -604,9 +498,9 @@ pub fn cell_stores(local: Option<&std::path::Path>, vault: Option<&Arc<FlatStora
         return (Arc::new(DirStore(dir.to_path_buf())), None, None);
     }
     let remote = |l: Layer| Arc::new(HttpStore::layer(DEFAULT_CELLS_URL, l));
-    match vault {
-        Some(v) => {
-            let cache = Arc::new(VaultCells::new(v.clone()));
+    match cells {
+        Some(dir) => {
+            let cache = CellFiles::open(dir);
             let layers = LayerStores {
                 dem: Arc::new(TieredStore::new(cache.layer(Layer::Dem), remote(Layer::Dem))),
                 img: Arc::new(TieredStore::new(cache.layer(Layer::Img), remote(Layer::Img))),
@@ -616,6 +510,63 @@ pub fn cell_stores(local: Option<&std::path::Path>, vault: Option<&Arc<FlatStora
         }
         None => (remote(Layer::Base), Some(LayerStores { dem: remote(Layer::Dem), img: remote(Layer::Img), nir: remote(Layer::Nir) }), None),
     }
+}
+
+/// Where the cell files live: under `base` on Android (its files directory), else the user's data directory (`$XDG_DATA_HOME`, `~/.local/share`, or Windows' application data), `mahere/cells`.
+pub fn cells_dir(base: Option<&str>) -> std::path::PathBuf {
+    if let Some(b) = base {
+        return std::path::Path::new(b).join("cells");
+    }
+    let data = std::env::var("XDG_DATA_HOME")
+        .ok()
+        .or_else(|| std::env::var("HOME").ok().map(|h| format!("{h}/.local/share")))
+        .or_else(|| std::env::var("APPDATA").ok())
+        .unwrap_or_else(|| ".".into());
+    std::path::Path::new(&data).join("mahere").join("cells")
+}
+
+/// The cells an older Mahere kept in the vault, moved into the cell files on a thread of its own (2026-10-18: the vault opened by walking every one of them). Each is copied unless the files have it already (it may have been fetched again meanwhile), then the vault's copies are deleted a thousand cells at a time under one commit each, and the vault's index of them last. Stopped part way, the next start goes on: what was moved is skipped, and a delete of a key already gone is nothing.
+pub fn migrate_vault_cells(vault: Arc<FlatStorage>, files: Arc<CellFiles>) {
+    if !matches!(vault.read_device(&cells_index_key()), Ok(Some(_))) {
+        return;
+    }
+    if let Err(e) = std::thread::Builder::new().name("cells out of the vault".into()).spawn(move || move_vault_cells(&vault, &files)) {
+        eprintln!("cells: the move out of the vault did not start: {e}");
+    }
+}
+
+/// [`migrate_vault_cells`]'s work, here and now: the number of cells moved, or None when the vault's deletes failed and the move stopped for this run.
+pub fn move_vault_cells(vault: &FlatStorage, files: &CellFiles) -> Option<usize> {
+    let Ok(Some(index)) = vault.read_device(&cells_index_key()) else { return Some(0) };
+    let entries: Vec<((u8, u64), (i64, u32))> = decode_cell_index(&index).into_iter().collect();
+    let t = std::time::Instant::now();
+    eprintln!("cells: moving {} out of the vault", entries.len());
+    let mut moved = 0usize;
+    for chunk in entries.chunks(1000) {
+        let mut gone = Vec::with_capacity(chunk.len() * 2);
+        for &((packed, raw), (seen, _)) in chunk {
+            let (depth, code) = (packed & 63, packed >> 6);
+            let key = mahere_tiles::CellKey { depth, prefix: raw >> (60 - 2 * depth as u32) };
+            if !files.has(key, code) {
+                if let Ok(Some(bytes)) = vault.read_device(&cell_key(key, code)) {
+                    let tag = vault.read_device(&tag_key(key, code)).ok().flatten().and_then(|b| String::from_utf8(b).ok());
+                    files.adopt(key, code, &bytes, tag.as_deref(), seen);
+                    moved += 1;
+                }
+            }
+            gone.push(cell_key(key, code));
+            gone.push(tag_key(key, code));
+        }
+        if let Err(e) = vault.delete_device_batch(&gone) {
+            eprintln!("cells: the vault's copies not deleted, the move stops for this run: {e:?}");
+            files.flush();
+            return None;
+        }
+    }
+    files.flush();
+    let _ = vault.delete_device(&cells_index_key());
+    eprintln!("cells: {moved} moved out of the vault, its {} entries deleted, in {:.0} s", entries.len(), t.elapsed().as_secs_f32());
+    Some(moved)
 }
 
 // ==================== USER CELLS ====================
@@ -749,86 +700,41 @@ impl mahere_engine::areas::AreaStore for VaultAreas {
     }
 }
 
-impl VaultCells {
-    fn get_layer(&self, key: mahere_tiles::CellKey, layer: u8) -> mahere_engine::residency::Fetch {
-        use mahere_engine::residency::Fetch;
-        match self.store.read_device(&cell_key(key, layer)) {
-            Ok(Some(b)) => {
-                self.touch(key, layer, b.len());
-                Fetch::Bytes(b)
-            }
-            Ok(None) => Fetch::Absent,
-            Err(e) => Fetch::Failed(format!("{e:?}")),
-        }
-    }
-
-    fn put_layer(&self, key: mahere_tiles::CellKey, layer: u8, bytes: &[u8]) {
-        if self.store.write_device(&cell_key(key, layer), bytes).is_ok() {
-            self.touch(key, layer, bytes.len());
-        }
-    }
-
-    /// One of a published cell's other layers, as a cache of its own over the same vault, index and pins (1 the image, 2 the infrared, 3 the terrain).
-    pub fn layer(self: &Arc<Self>, layer: mahere_tiles::publish::Layer) -> Arc<VaultLayer> {
-        let code = match layer {
-            mahere_tiles::publish::Layer::Base => 0,
-            mahere_tiles::publish::Layer::Img => 1,
-            mahere_tiles::publish::Layer::Nir => 2,
-            mahere_tiles::publish::Layer::Dem => 3,
-        };
-        Arc::new(VaultLayer { cells: self.clone(), layer: code })
-    }
-}
-
-/// A published cell's layer other than its base, in the vault.
-pub struct VaultLayer {
-    cells: Arc<VaultCells>,
-    layer: u8,
-}
-
-impl mahere_engine::residency::CellStore for VaultCells {
-    fn get(&self, key: mahere_tiles::CellKey) -> mahere_engine::residency::Fetch {
-        self.get_layer(key, 0)
-    }
-}
-
-impl mahere_engine::residency::CellCache for VaultCells {
-    fn put(&self, key: mahere_tiles::CellKey, bytes: &[u8]) {
-        self.put_layer(key, 0, bytes);
-    }
-
-    fn tag(&self, key: mahere_tiles::CellKey) -> Option<String> {
-        self.store.read_device(&tag_key(key, 0)).ok().flatten().and_then(|b| String::from_utf8(b).ok())
-    }
-
-    fn set_tag(&self, key: mahere_tiles::CellKey, tag: &str) {
-        let _ = self.store.write_device(&tag_key(key, 0), tag.as_bytes());
-    }
-}
-
-impl mahere_engine::residency::CellStore for VaultLayer {
-    fn get(&self, key: mahere_tiles::CellKey) -> mahere_engine::residency::Fetch {
-        self.cells.get_layer(key, self.layer)
-    }
-}
-
-impl mahere_engine::residency::CellCache for VaultLayer {
-    fn put(&self, key: mahere_tiles::CellKey, bytes: &[u8]) {
-        self.cells.put_layer(key, self.layer, bytes);
-    }
-
-    fn tag(&self, key: mahere_tiles::CellKey) -> Option<String> {
-        self.cells.store.read_device(&tag_key(key, self.layer)).ok().flatten().and_then(|b| String::from_utf8(b).ok())
-    }
-
-    fn set_tag(&self, key: mahere_tiles::CellKey, tag: &str) {
-        let _ = self.cells.store.write_device(&tag_key(key, self.layer), tag.as_bytes());
-    }
-}
-
 #[cfg(test)]
 mod index_tests {
     use super::*;
+
+    /// Cells an older Mahere kept in the vault move into the files with their tags and last use, and leave the vault, its index of them included; a cell the files have already is not copied over.
+    #[test]
+    fn vault_cells_move_into_the_files() {
+        let dir = std::env::temp_dir().join(format!("mahere-move-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        kete::set_vault_dirs_override(dir.join("vault").to_string_lossy().into(), dir.join("shadow").to_string_lossy().into());
+        let vault = FlatStorage::open_device_shared(APP, [9u8; 32]).unwrap();
+        let (a, b) = (mahere_tiles::CellKey { depth: 14, prefix: 77 }, mahere_tiles::CellKey { depth: 9, prefix: 5 });
+        vault.write_device(&cell_key(a, 0), b"old base").unwrap();
+        vault.write_device(&tag_key(a, 0), b"\"t1\"").unwrap();
+        vault.write_device(&cell_key(a, 3), b"old terrain").unwrap();
+        vault.write_device(&cell_key(b, 0), b"old other").unwrap();
+        let mut ix = std::collections::HashMap::new();
+        ix.insert((a.depth, a.raw()), (1000, 8));
+        ix.insert((a.depth | 3 << 6, a.raw()), (1001, 11));
+        ix.insert((b.depth, b.raw()), (1002, 9));
+        vault.write_device(&cells_index_key(), &encode_cell_index(&ix).unwrap()).unwrap();
+        let files = CellFiles::open(&dir.join("cells"));
+        use mahere_engine::residency::{CellCache, CellStore, Fetch};
+        files.put(b, b"fetched since");
+        assert_eq!(move_vault_cells(&vault, &files), Some(2));
+        assert!(matches!(files.get(a), Fetch::Bytes(x) if x == b"old base"));
+        assert_eq!(files.tag(a).as_deref(), Some("\"t1\""));
+        assert!(matches!(files.layer(mahere_tiles::publish::Layer::Dem).get(a), Fetch::Bytes(x) if x == b"old terrain"));
+        assert!(matches!(files.get(b), Fetch::Bytes(x) if x == b"fetched since"), "a cell the files had is not replaced");
+        assert!(vault.read_device(&cell_key(a, 0)).unwrap().is_none());
+        assert!(vault.read_device(&cell_key(b, 0)).unwrap().is_none());
+        assert!(vault.read_device(&cells_index_key()).unwrap().is_none());
+        assert_eq!(move_vault_cells(&vault, &files), Some(0), "a second start finds nothing to move");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn cell_index_round_trips() {

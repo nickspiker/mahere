@@ -56,7 +56,7 @@ pub struct AndroidApp {
     centered_once: bool,
     store: Option<std::sync::Arc<mahere_store::FlatStorage>>,
     /// The dated cell cache, flushed at the pause moment.
-    cells_cache: Option<std::sync::Arc<mahere_store::VaultCells>>,
+    cells_cache: Option<std::sync::Arc<mahere_store::CellFiles>>,
     recorder: Option<std::sync::Arc<std::sync::Mutex<mahere_store::TrackRecorder>>>,
     /// Recording a track (Nick 2026-10-13): fixes go to the recorder only while this is on, and the activity runs the track service, which owns the GPS meanwhile.
     recording: bool,
@@ -664,9 +664,13 @@ pub extern "system" fn Java_nz_mahere_app_MahereActivity_nativeInit(
     // The vault: session, tracks, and the on-device cell cache (kete).
     let store = mahere_store::open(Some(&dir)).ok();
     lap("vault open");
-    // Cells stream from the bucket through the vault; `cells-local` (pushed by hand) overrides for offline development.
+    // Cells stream from the bucket through the cell files; `cells-local` (pushed by hand) overrides for offline development.
     let local = std::path::PathBuf::from(format!("{dir}/cells-local"));
-    let (cell_store, layer_stores, cells_cache) = mahere_store::cell_stores(local.is_dir().then_some(local.as_path()), store.as_ref());
+    // The cells as files beside the vault (2026-10-18); those an older Mahere kept in the vault move out on a thread of their own.
+    let (cell_store, layer_stores, cells_cache) = mahere_store::cell_stores(local.is_dir().then_some(local.as_path()), Some(&mahere_store::cells_dir(Some(&dir))));
+    if let (Some(v), Some(c)) = (&store, &cells_cache) {
+        mahere_store::migrate_vault_cells(v.clone(), c.clone());
+    }
     lap("cell stores");
     let session = store.as_ref().and_then(|s| mahere_store::load_session(s));
     let settings = store.as_ref().and_then(|s| mahere_store::load_settings(s));
