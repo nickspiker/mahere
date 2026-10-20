@@ -7,7 +7,7 @@ repository.workspace = true
 description = "mahere's updates: signed VSF manifests per channel (release, dev) and platform, checked, downloaded and verified (after Photon's)"
 
 [dependencies]
-vsf = { git = "https://github.com/nickspiker/vsf", rev = "7b19bd1508bf20f2bd6f208cb00c0e55c76db6a1", features = ["crypto-verify", "text-encode"] }
+vsf = { version = "0.10", features = ["crypto-verify", "text-encode"] }
 ed25519-dalek = "2"
 blake3 = "1"
 ureq = "2"

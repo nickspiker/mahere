@@ -11,4 +11,4 @@ flate2 = "1"
 tiff = "0.9"
 las = { version = "0.11", features = ["laz"] }
 rayon = "1"
-vsf = { git = "https://github.com/nickspiker/vsf", rev = "7b19bd1508bf20f2bd6f208cb00c0e55c76db6a1" }
+vsf = { version = "0.10" }

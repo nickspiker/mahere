@@ -20,19 +20,4 @@ edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/nickspiker/mahere"
 
-# fluor's dev tree declares vsf as a sibling path dep (../vsf), which a git checkout of fluor doesn't contain — point it at the pushed vsf repo. Every one of them and mahere's own crates on the one vsf 0.11.
-[patch."https://github.com/nickspiker/fluor"]
-vsf = { git = "https://github.com/nickspiker/vsf", rev = "7b19bd1508bf20f2bd6f208cb00c0e55c76db6a1" }
-
-# kete (and its manifestus/tohu deps) declare sibling path deps like fluor does — redirect each git source's path deps to the pushed repos, all vsf references unified on one rev.
-[patch."https://github.com/nickspiker/kete"]
-manifestus = { git = "https://github.com/nickspiker/manifestus", rev = "a6b885ed3f691453b87012e734205f10307d6bb2" }
-tohu = { git = "https://github.com/nickspiker/tohu", rev = "5f1f0cc5b50ce0f0d30dee9edf301ca8e80edd06" }
-vsf = { git = "https://github.com/nickspiker/vsf", rev = "7b19bd1508bf20f2bd6f208cb00c0e55c76db6a1" }
-
-[patch."https://github.com/nickspiker/manifestus"]
-vsf = { git = "https://github.com/nickspiker/vsf", rev = "7b19bd1508bf20f2bd6f208cb00c0e55c76db6a1" }
-
-[patch."https://github.com/nickspiker/tohu"]
-ihi = { git = "https://github.com/nickspiker/ihi", rev = "dea19a3ef9bf8c09a16089a115167f95cde4ea8a" }
-vsf = { git = "https://github.com/nickspiker/vsf", rev = "7b19bd1508bf20f2bd6f208cb00c0e55c76db6a1" }
+# vsf, fluor and kete (and kete's manifestus and tohu) come from crates.io since the v10 publish (2026-10-20). Until then mahere took them from GitHub at pinned commits, with [patch] blocks redirecting their sibling path dependencies, because a git checkout has no ../vsf next to it.

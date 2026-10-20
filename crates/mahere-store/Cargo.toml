@@ -7,13 +7,13 @@ repository.workspace = true
 description = "mahere's on-device database: session, tracks (and soon tiles) on the kete/manifestus crash-proof vault"
 
 [dependencies]
-kete = { git = "https://github.com/nickspiker/kete", rev = "8aebb704d2654c9b8306f8753ffde317fc3c4447" }
+kete = { version = "0.0.3" }
 mahere-engine = { path = "../mahere-engine" }
 mahere-tiles = { path = "../mahere-tiles" }
 mahere-coord = { path = "../mahere-coord" }
 zstd = "0.13"
 blake3 = "1"
-vsf = { git = "https://github.com/nickspiker/vsf", rev = "7b19bd1508bf20f2bd6f208cb00c0e55c76db6a1" }
+vsf = { version = "0.10" }
 rand = "0.8"
 ureq = "2"
 mahere-panel = { path = "../mahere-panel" }

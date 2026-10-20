@@ -318,10 +318,13 @@ mod img_tests {
         for c in v {
             assert!((c - 0.3).abs() < 1e-3, "{v:?}");
         }
+        // sRGB white is D65 light (vsf 0.10, colorimetric): the same point D65's xy (0.3127, 0.3290) reaches thru vsf's XYZ → VSF RGB, bluer than VSF white.
         let w = super::srgb_to_vsf([1.0, 1.0, 1.0]);
-        for c in w {
-            assert!((c - 1.0).abs() < 2e-3, "{w:?}");
+        let d65 = vsf::colour::convert::apply_matrix_3x3_f32(&vsf::colour::XYZ2VSF_RGB, &[0.3127 / 0.3290, 1.0, (1.0 - 0.3127 - 0.3290) / 0.3290]);
+        for i in 0..3 {
+            assert!((w[i] - d65[i]).abs() < 2e-3, "{w:?} vs D65 {d65:?}");
         }
+        assert!(w[2] > w[1] && w[1] > w[0], "D65 is bluer than E: {w:?}");
     }
 }
 
@@ -558,7 +561,7 @@ impl ImgTile {
     }
 }
 
-/// Linear sRGB to VSF RGB (vsf's matrix, D65 adapted to E; column-major there).
+/// Linear sRGB to VSF RGB (vsf's matrix, column-major there). Colorimetric since vsf 0.10: sRGB white is D65 light, which sits a little bluer than VSF white (Illuminant E), not adapted onto it.
 fn srgb_to_vsf(x: [f32; 3]) -> [f32; 3] {
     let m = &vsf::colour::SRGB2VSF_RGB;
     [m[0] * x[0] + m[3] * x[1] + m[6] * x[2], m[1] * x[0] + m[4] * x[1] + m[7] * x[2], m[2] * x[0] + m[5] * x[1] + m[8] * x[2]]

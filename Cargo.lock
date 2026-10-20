@@ -1124,8 +1124,9 @@ dependencies = [
 
 [[package]]
 name = "fluor"
-version = "0.0.4"
-source = "git+https://github.com/nickspiker/fluor?rev=e8bbfd43119cc510abfc85b304a583377a5a1e81#e8bbfd43119cc510abfc85b304a583377a5a1e81"
+version = "0.0.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d2a663b9e4d51c7fd90ee090b6f241f73755f042ff7b7f0173364f7864f4c300"
 dependencies = [
  "block2 0.6.2",
  "cosmic-text",
@@ -1602,7 +1603,8 @@ dependencies = [
 [[package]]
 name = "ihi"
 version = "0.0.48"
-source = "git+https://github.com/nickspiker/ihi?rev=dea19a3ef9bf8c09a16089a115167f95cde4ea8a#dea19a3ef9bf8c09a16089a115167f95cde4ea8a"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e820ef1c51d912e9c78a84cf71319ee3b758c66a264c96bdd2c8d6f2ab4c6969"
 dependencies = [
  "blake3",
  "i256",
@@ -1756,8 +1758,9 @@ dependencies = [
 
 [[package]]
 name = "kete"
-version = "0.0.2"
-source = "git+https://github.com/nickspiker/kete?rev=8aebb704d2654c9b8306f8753ffde317fc3c4447#8aebb704d2654c9b8306f8753ffde317fc3c4447"
+version = "0.0.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d63de2286686e9053508596f3e5cf82c7c3f4edd1f6536957bcdf3e089942552"
 dependencies = [
  "blake3",
  "chacha20poly1305 0.11.0",
@@ -2037,8 +2040,9 @@ dependencies = [
 
 [[package]]
 name = "manifestus"
-version = "0.0.2"
-source = "git+https://github.com/nickspiker/manifestus?rev=a6b885ed3f691453b87012e734205f10307d6bb2#a6b885ed3f691453b87012e734205f10307d6bb2"
+version = "0.0.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fd382738171c8fc6a53b09b2eafdd1398b6a76893a2c2eb897225f0b143e3c58"
 dependencies = [
  "blake3",
  "hashbrown 0.15.5",
@@ -3816,8 +3820,9 @@ checksum = "c7c4ceeeca15c8384bbc3e011dbd8fccb7f068a440b752b7d9b32ceb0ca0e2e8"
 
 [[package]]
 name = "tohu"
-version = "0.0.2"
-source = "git+https://github.com/nickspiker/tohu?rev=5f1f0cc5b50ce0f0d30dee9edf301ca8e80edd06#5f1f0cc5b50ce0f0d30dee9edf301ca8e80edd06"
+version = "0.0.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3d50206f52e870b9b5303bbe1836efafcab7ee90566112531a1e9cfb659a51d7"
 dependencies = [
  "base64",
  "blake3",
@@ -4027,8 +4032,9 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "vsf"
-version = "0.11.0"
-source = "git+https://github.com/nickspiker/vsf?rev=7b19bd1508bf20f2bd6f208cb00c0e55c76db6a1#7b19bd1508bf20f2bd6f208cb00c0e55c76db6a1"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "af2ba3812eb9d09b3fdfda670d0518bd731cb259b16137c235a10927984f0e4e"
 dependencies = [
  "aes-gcm",
  "bitvec",
