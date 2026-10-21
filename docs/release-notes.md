@@ -1,5 +1,27 @@
 # Mahere release notes
 
+## 0.223 · October 2026
+
+### Faster to open, and it remembers
+- Mahere opens in a few seconds instead of up to a minute: the map's downloads are kept as plain files, apart from your own data.
+- Downloaded detail stays downloaded instead of being fetched again each time.
+- After it updates itself, Mahere opens again where you were, with a notice to tap if it can't.
+
+### On the map
+- The seabed of Puget Sound around Vashon, Elliott Bay and the rest shows its depths, no longer a flat sheet of water.
+- A new layer, Sea level (geoid): how far sea level sits above or below the GPS's ellipsoid, coloured, with its own contour lines.
+- Labels appear on the whole globe again, and an old layout no longer piles up in one corner while you zoom.
+- Chinese names draw in a Chinese typeface even with Japan or Korea in view, without boxes.
+
+### Menu
+- The layers fold into groups you open and close: Ground, Imagery, Lines and names, Land and water, Light, Location.
+- Contours have an Auto interval switch: turn it off to keep the spacing as you move.
+- Turning on imagery greys out the terrain and tint, which don't show under it.
+
+### Fixes
+- Tapping the map no longer freezes the phone for several seconds.
+- Zoomed out over South America and elsewhere, the map no longer shows bare patches.
+
 ## 0.21x · October 2026
 
 ### On your computer
