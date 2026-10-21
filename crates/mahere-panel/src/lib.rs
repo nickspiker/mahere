@@ -21,7 +21,7 @@ use mahere_engine::theme::{Field, Theme};
 use mahere_engine::{LayerMask, MeasureView};
 
 /// The two modes the panel switches besides the layers.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Controls {
     pub real_sun: bool,
     /// The front camera lights the map.
@@ -52,6 +52,8 @@ pub struct Controls {
     pub ruler: bool,
     /// The contour interval fits each view; off, it holds where it was (Nick 2026-10-21).
     pub contour_auto: bool,
+    /// The contour interval, metres: the one in use, and the one held when the interval slider sets it.
+    pub contour_interval: f32,
 }
 
 /// What the toolbox offers (Nick 2026-10-14: a popup toolbox for ruler, nav, info and the rest, so a plain tap just shows info): the tool a tap or a touch is for, and the pen's and the clears' one-shots.
@@ -196,7 +198,7 @@ const LAYERS: [(Layer, &str); 25] = [
 
 /// The Layers page as a tree (Nick 2026-10-21: "a checkbox monolith"): each group a row that opens and closes over its rows; the pages (areas, updates) stay at the foot, always shown.
 const GROUPS: [(&str, &[Layer]); 7] = [
-    ("Ground", &[Layer::Dem, Layer::Hypso, Layer::Raw, Layer::Geoid, Layer::Contours, Layer::ContourAuto, Layer::Slope]),
+    ("Ground", &[Layer::Dem, Layer::Hypso, Layer::Raw, Layer::Geoid, Layer::Contours, Layer::Slope]),
     ("Imagery", &[Layer::Imagery, Layer::Infrared]),
     ("Lines and names", &[Layer::Line, Layer::Labels, Layer::Boundaries]),
     ("Land and water", &[Layer::Land, Layer::Water, Layer::Own, Layer::Mvum]),
@@ -211,6 +213,91 @@ const GROUPS_OPEN: [bool; 7] = [true, false, false, false, false, false, false];
 /// A row nested under another row of its group (Auto interval under Contours): set in one step further.
 fn nested(l: Layer) -> bool {
     l == Layer::ContourAuto
+}
+
+/// A row of the Layers tree: a group's header, a layer's checkbox (an index into the checks), one of a layer's theme fields, the contour interval, or one of the open field's sliders.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum TreeRow {
+    Group(usize),
+    Check(usize),
+    Field(Field),
+    Interval,
+    Slider(usize),
+}
+
+/// A layer's own settings, opened under its row (Nick 2026-10-21: "sliders under each element so we don't have to open separate pages"): the theme's fields that layer draws with, and for the contours their interval.
+fn settings_of(l: Layer) -> Vec<TreeRow> {
+    let fields = |keep: &dyn Fn(&Field) -> bool| Field::all().into_iter().filter(|f| keep(f)).map(TreeRow::Field).collect::<Vec<_>>();
+    match l {
+        Layer::Dem => fields(&|f| matches!(f, Field::Sun | Field::Sky | Field::Flat | Field::NoDem | Field::Bg)),
+        Layer::Hypso => fields(&|f| matches!(f, Field::Hypso(_) | Field::Sea)),
+        // The Auto row's checkbox first (its index found when laid out), then the interval it governs.
+        Layer::Contours => [TreeRow::Check(usize::MAX), TreeRow::Interval].into_iter().chain(fields(&|f| matches!(f, Field::Contour | Field::ContourIndex))).collect(),
+        Layer::Water => fields(&|f| matches!(f, Field::Water)),
+        Layer::Land => fields(&|f| matches!(f, Field::Land(_))),
+        Layer::Line => fields(&|f| matches!(f, Field::Line(_))),
+        Layer::Own => fields(&|f| matches!(f, Field::Own(_) | Field::Wild)),
+        Layer::Mvum => fields(&|f| matches!(f, Field::Mvum(_))),
+        Layer::Labels => fields(&|f| matches!(f, Field::LabelLook | Field::LabelAmount | Field::LabelFont | Field::Label(_))),
+        _ => Vec::new(),
+    }
+}
+
+/// The contour intervals the slider steps through, metres.
+const INTERVALS: [f32; 10] = [0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 50.0, 100.0, 200.0, 500.0];
+
+/// An interval's place on the slider, 0..1: the nearest step's.
+fn interval_pos(m: f32) -> f32 {
+    let i = INTERVALS.iter().enumerate().min_by(|a, b| (a.1.ln() - m.max(0.01).ln()).abs().total_cmp(&(b.1.ln() - m.max(0.01).ln()).abs())).map_or(0, |(i, _)| i);
+    i as f32 / (INTERVALS.len() - 1) as f32
+}
+
+fn interval_at(pos: f32) -> f32 {
+    INTERVALS[(pos.clamp(0.0, 1.0) * (INTERVALS.len() - 1) as f32).round() as usize]
+}
+
+/// How many sliders a field has, and each one's label and value as shown.
+fn field_sliders(f: Field) -> usize {
+    match f {
+        Field::Sun | Field::Sky => 3,
+        Field::LabelAmount => 2,
+        Field::LabelFont => 1,
+        _ => 4,
+    }
+}
+
+fn slider_text(f: Field, i: usize, vals: [f32; 4]) -> (&'static str, String) {
+    let labels: [&str; 4] = match f {
+        Field::Hypso(_) => ["R", "G", "B", "metres"],
+        Field::LabelLook => ["Size", "Glow", "Smoothing", "Spacing"],
+        Field::LabelAmount => ["Density", "Repeat", "", ""],
+        Field::LabelFont => ["Typeface", "", "", ""],
+        _ => ["R", "G", "B", "A"],
+    };
+    let val = match (f, i) {
+        (Field::Hypso(_), 3) => format!("{} m", vals[3].round() as i64),
+        (Field::Sun | Field::Sky, _) => format!("{:.2}", vals[i]),
+        (Field::LabelLook, 0) => format!("{:.2}\u{d7}", vals[i]),
+        (Field::LabelLook, 2) => format!("{:.2} letters", vals[i]),
+        (Field::LabelLook, _) => format!("{:.2} of a letter", vals[i]),
+        (Field::LabelAmount, 0) => format!("to {}", mahere_engine::theme::LABEL_TIERS[mahere_engine::theme::label_tier_limit(vals[0]) as usize]),
+        (Field::LabelAmount, _) => format!("every {:.2} screen", vals[i]),
+        (Field::LabelFont, _) => mahere_engine::theme::LABEL_FONTS[(vals[0].round().max(0.0) as usize).min(mahere_engine::theme::LABEL_FONTS.len() - 1)].to_string(),
+        _ => format!("{}", vals[i] as u8),
+    };
+    (labels[i], val)
+}
+
+/// A field's swatch as the map shows it: a colour unlit, a light as the colour it makes white ground, none for the lettering's numbers.
+fn field_swatch(f: Field, vals: [f32; 4]) -> Option<u32> {
+    if matches!(f, Field::LabelLook | Field::LabelAmount | Field::LabelFont) {
+        None
+    } else if f.is_colour() {
+        Some(swatch([vals[0] as u8, vals[1] as u8, vals[2] as u8]))
+    } else {
+        let c = mahere_engine::colour::Display::default().encode([vals[0] * 0.5, vals[1] * 0.5, vals[2] * 0.5], true);
+        Some((theme::dark(theme::fmt(((c[0] as u32) << 16) | ((c[1] as u32) << 8) | c[2] as u32)) & 0x00FF_FFFF) | 0xFF00_0000)
+    }
 }
 
 /// A row that takes a tap but changes nothing: a layer another layer has greyed, or the one of real sun and real light the other has taken (the sun is either the almanac's or the camera's).
@@ -448,6 +535,14 @@ pub struct Panel {
     shown: Vec<bool>,
     group_open: [bool; 7],
     group_rows: Vec<(f32, f32)>,
+    /// The tree as laid out: each row's centre y, half height and kind; the layer whose settings are open, the field whose sliders are, and the current theme as last painted (its values for a field opened by a tap).
+    tree: Vec<(f32, f32, TreeRow)>,
+    layer_open: Option<Layer>,
+    field_open: Option<Field>,
+    theme_now: Option<Theme>,
+    /// The contour interval's slider under Contours, and whether a finger is on it.
+    interval: Slider,
+    interval_held: bool,
     text: TextRenderer,
     /// The font packs, when the host gave them, and how far through their arrivals this renderer has loaded.
     fonts: Option<std::sync::Arc<fonts::FontPacks>>,
@@ -512,7 +607,8 @@ impl Panel {
     pub fn new() -> Panel {
         let mut hits: HitId = HIT_NONE;
         let checks = LAYERS.iter().map(|&(l, label)| (l, Checkbox::new(&mut hits, label, 0.0, 0.0, 10.0, 10.0, 10.0, false))).collect();
-        Panel { fonts: None, font_cursor: 0, open: false, dirty: true, ru: 1.0, stack: vec![Page::Layers], theme_rows: Vec::new(), edit_rows: Vec::new(), edit_scroll: 0.0, edit_extent: 0.0, press: None, sliders: Vec::new(), field_vals: [0.0; 4], held: None, edits: Vec::new(), hits, shown: vec![true; LAYERS.len()], group_open: GROUPS_OPEN, group_rows: Vec::new(), checks, text: TextRenderer::new(), buf: Vec::new(), w: 0, h: 0, font: 16.0, gear: (0.0, 0.0, 0.0), panel_w: 0.0, theme_row: (0.0, 0.0, 0.0), slider: (0.0, 0.0, 0.0), slider_held: false, cache_max: CACHE_MIN + 1, strip_close: None, clear_measure: false, area_rows: Vec::new(), area_acts: Vec::new(), areas: AreasView::default(), update_rows: Vec::new(), update_acts: Vec::new(), updates: UpdatesView::default(), host_orb: None, layers_scroll: 0.0, layers_extent: 0.0, layers_press: None, layers_band: (0.0, 0.0), orb_icon: fluor::host::icon::Icon::from_vsf_bytes(APP_ORB_VSF).ok(), orb_scaled: (0, Vec::new()), locate_btn: None, tool_btn: None, toolbox_open: false, tool_rows: Vec::new() }
+        let interval = Slider::new(&mut hits, 0.0, 0.0, 10.0, 10.0, 0.0);
+        Panel { fonts: None, font_cursor: 0, open: false, dirty: true, ru: 1.0, stack: vec![Page::Layers], theme_rows: Vec::new(), edit_rows: Vec::new(), edit_scroll: 0.0, edit_extent: 0.0, press: None, sliders: Vec::new(), field_vals: [0.0; 4], held: None, edits: Vec::new(), hits, shown: vec![true; LAYERS.len()], group_open: GROUPS_OPEN, group_rows: Vec::new(), tree: Vec::new(), layer_open: None, field_open: None, theme_now: None, interval, interval_held: false, checks, text: TextRenderer::new(), buf: Vec::new(), w: 0, h: 0, font: 16.0, gear: (0.0, 0.0, 0.0), panel_w: 0.0, theme_row: (0.0, 0.0, 0.0), slider: (0.0, 0.0, 0.0), slider_held: false, cache_max: CACHE_MIN + 1, strip_close: None, clear_measure: false, area_rows: Vec::new(), area_acts: Vec::new(), areas: AreasView::default(), update_rows: Vec::new(), update_acts: Vec::new(), updates: UpdatesView::default(), host_orb: None, layers_scroll: 0.0, layers_extent: 0.0, layers_press: None, layers_band: (0.0, 0.0), orb_icon: fluor::host::icon::Icon::from_vsf_bytes(APP_ORB_VSF).ok(), orb_scaled: (0, Vec::new()), locate_btn: None, tool_btn: None, toolbox_open: false, tool_rows: Vec::new() }
     }
 
     pub fn is_open(&self) -> bool {
@@ -686,6 +782,24 @@ impl Panel {
     }
 
     /// Open the toolbox's list, as a tap on its button does (for a check that renders it).
+    /// Open a layer's settings under its row, by the row's label, and with `field` the first theme field's sliders, as a tap would: for a headless check.
+    pub fn show_settings(&mut self, label: &str, field: bool, t: Option<&Theme>) {
+        let Some(&(l, _)) = LAYERS.iter().find(|(_, n)| *n == label) else { return };
+        if let Some(gi) = GROUPS.iter().position(|(_, ls)| ls.contains(&l)) {
+            self.group_open[gi] = true;
+        }
+        self.layer_open = Some(l);
+        self.field_open = None;
+        if let (true, Some(t)) = (field, t) {
+            if let Some(TreeRow::Field(f)) = settings_of(l).into_iter().find(|r| matches!(r, TreeRow::Field(_))) {
+                self.field_vals = t.get(f);
+                self.sliders = (0..field_sliders(f)).map(|k| Slider::new(&mut self.hits, 0.0, 0.0, 10.0, 10.0, Self::slider_pos(f, k, self.field_vals[k]))).collect();
+                self.field_open = Some(f);
+            }
+        }
+        self.dirty = true;
+    }
+
     pub fn show_toolbox(&mut self) {
         self.toolbox_open = true;
         self.dirty = true;
@@ -826,8 +940,12 @@ impl Panel {
         for v in self.shown.iter_mut() {
             *v = false;
         }
+        self.tree.clear();
+        let setting = row * 0.85;
+        let slider_row = self.font * 2.4;
         for (gi, (_, layers)) in GROUPS.iter().enumerate() {
             self.group_rows.push((y + row * 0.5, row * 0.5));
+            self.tree.push((y + row * 0.5, row * 0.5, TreeRow::Group(gi)));
             y += row;
             if !self.group_open[gi] {
                 continue;
@@ -837,14 +955,54 @@ impl Panel {
                 let inset = if nested(*l) { indent * 2.0 } else { indent };
                 let cb = &mut self.checks[i].1;
                 cb.set_font_size(self.font);
-                cb.set_rect(x0 + inset + (full - inset) * 0.5, y + row * 0.5, full - inset, row);
+                // Room at the row's right for its settings marker, where it has settings.
+                let room = if settings_of(*l).is_empty() { 0.0 } else { self.font * 1.6 };
+                cb.set_rect(x0 + inset + (full - inset - room) * 0.5, y + row * 0.5, full - inset - room, row);
                 self.shown[i] = true;
+                self.tree.push((y + row * 0.5, row * 0.5, TreeRow::Check(i)));
                 y += row;
+                if self.layer_open != Some(*l) {
+                    continue;
+                }
+                // The layer's settings under it, a step further in; the open field's sliders under the field.
+                let sx = x0 + inset + indent;
+                let sw = full - inset - indent;
+                for item in settings_of(*l) {
+                    match item {
+                        // A row of the layer's own that is a checkbox (Auto interval under Contours).
+                        TreeRow::Check(_) => {
+                            let Some(k) = self.checks.iter().position(|(c, _)| *c == Layer::ContourAuto) else { continue };
+                            let cb = &mut self.checks[k].1;
+                            cb.set_font_size(self.font);
+                            cb.set_rect(sx + sw * 0.5, y + row * 0.5, sw, row);
+                            self.shown[k] = true;
+                            self.tree.push((y + row * 0.5, row * 0.5, TreeRow::Check(k)));
+                            y += row;
+                        }
+                        TreeRow::Interval => {
+                            self.interval.set_rect(sx + sw * 0.5, y + slider_row * 0.72, sw, self.font * 1.1);
+                            self.tree.push((y + slider_row * 0.5, slider_row * 0.5, item));
+                            y += slider_row;
+                        }
+                        TreeRow::Field(f) => {
+                            self.tree.push((y + setting * 0.5, setting * 0.5, item));
+                            y += setting;
+                            if self.field_open == Some(f) {
+                                for (k, sl) in self.sliders.iter_mut().enumerate() {
+                                    sl.set_rect(sx + sw * 0.5, y + slider_row * 0.72, sw, self.font * 1.1);
+                                    self.tree.push((y + slider_row * 0.5, slider_row * 0.5, TreeRow::Slider(k)));
+                                    y += slider_row;
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
             }
         }
         y += row * 0.5;
         for (i, (l, cb)) in self.checks.iter_mut().enumerate() {
-            if GROUPS.iter().any(|(_, ls)| ls.contains(l)) {
+            if GROUPS.iter().any(|(_, ls)| ls.contains(l)) || nested(*l) {
                 if !self.shown[i] {
                     cb.set_rect(-10_000.0, -10_000.0, 1.0, 1.0);
                 }
@@ -881,12 +1039,36 @@ impl Panel {
             self.dirty = true;
             return false;
         }
-        if let Some(gi) = self.group_rows.iter().position(|&(cy, hh)| (y - cy).abs() <= hh) {
-            if x >= tx && x < self.panel_w {
+        let under = self.tree.iter().find(|&&(cy, hh, _)| (y - cy).abs() <= hh).map(|&(_, _, r)| r);
+        match under {
+            Some(TreeRow::Group(gi)) if x >= tx && x < self.panel_w => {
                 self.group_open[gi] = !self.group_open[gi];
                 self.dirty = true;
                 return false;
             }
+            // A layer row's right end opens and closes its settings.
+            Some(TreeRow::Check(i)) if x >= self.panel_w - self.font * 2.4 && !settings_of(self.checks[i].0).is_empty() => {
+                let l = self.checks[i].0;
+                self.layer_open = if self.layer_open == Some(l) { None } else { Some(l) };
+                self.field_open = None;
+                self.dirty = true;
+                return false;
+            }
+            // A field opens its sliders in place, the one field at a time; again closes them.
+            Some(TreeRow::Field(f)) => {
+                if self.field_open == Some(f) {
+                    self.field_open = None;
+                } else if let Some(t) = &self.theme_now {
+                    self.field_vals = t.get(f);
+                    self.sliders = (0..field_sliders(f)).map(|k| Slider::new(&mut self.hits, 0.0, 0.0, 10.0, 10.0, Self::slider_pos(f, k, self.field_vals[k]))).collect();
+                    self.field_open = Some(f);
+                }
+                self.held = None;
+                self.dirty = true;
+                return false;
+            }
+            Some(TreeRow::Interval | TreeRow::Slider(_)) => return false,
+            _ => {}
         }
         for (i, (l, cb)) in self.checks.iter_mut().enumerate() {
             if !self.shown[i] {
@@ -1105,6 +1287,29 @@ impl Panel {
             }
             Page::Layers => {}
         }
+        // An inline slider takes the press at once, as the footer's does: a field's, or the contour interval's.
+        if self.in_band(y) && self.page() == Page::Layers {
+            let grab = |b: fluor::region::Region| y >= b.y - b.h * 0.5 && y <= b.y + b.h * 1.5 && x >= b.x - self.font && x <= b.x + b.w + self.font;
+            if let Some(f) = self.field_open {
+                if let Some(k) = self.sliders.iter().position(|sl| grab(sl.bbox())) {
+                    let sl = &mut self.sliders[k];
+                    sl.set_value_from_x(x);
+                    self.field_vals[k] = Self::slider_val(f, k, sl.value());
+                    self.edits.push(ThemeEdit::Set(f, self.field_vals));
+                    self.held = Some(k);
+                    self.dirty = true;
+                    return true;
+                }
+            }
+            if self.layer_open == Some(Layer::Contours) && grab(self.interval.bbox()) {
+                self.interval.set_value_from_x(x);
+                ctl.contour_auto = false;
+                ctl.contour_interval = interval_at(self.interval.value());
+                self.interval_held = true;
+                self.dirty = true;
+                return true;
+            }
+        }
         // The list takes a press and acts on its release, so a drag scrolls it instead; the footer's slider acts at once.
         if self.in_band(y) {
             self.layers_press = Some((x, y, false));
@@ -1315,6 +1520,63 @@ impl Panel {
         let (tx, ty, _) = self.theme_row;
         let current = themes.get(ctl.theme).map_or("Trail", |t| t.name.as_str());
         self.text.draw_text_left(&mut canvas, &format!("Theme   {current}  \u{203a}"), tx, ty, &TextStyle::new(font, theme::TEXTBOX_TEXT), clip, None);
+        self.theme_now = themes.get(ctl.theme).cloned();
+        let row_ink = TextStyle::new(font * 0.9, theme::TEXTBOX_TEXT);
+        let dim = TextStyle::new(font * 0.72, READOUT_DIM);
+        let small = TextStyle::new(font * 0.8, READOUT);
+        for &(cy, hh, kind) in &self.tree {
+            if cy + hh < band_top || cy - hh > footer_top {
+                continue;
+            }
+            let indent = font * 1.2;
+            let col = |l: Layer| -> f32 { tx + if nested(l) { indent * 2.0 } else { indent } + indent };
+            match kind {
+                // A layer with settings: its marker at the row's right, open or folded.
+                TreeRow::Check(i) => {
+                    if !settings_of(self.checks[i].0).is_empty() {
+                        let m = if self.layer_open == Some(self.checks[i].0) { "\u{25be}" } else { "\u{2026}" };
+                        self.text.draw_text_left(&mut canvas, m, self.panel_w - font * 1.6, cy, &row_ink, clip, None);
+                    }
+                }
+                TreeRow::Field(f) => {
+                    let x = self.layer_open.map_or(tx, col);
+                    let vals = self.theme_now.as_ref().map_or([0.0; 4], |t| t.get(f));
+                    let open = self.field_open == Some(f);
+                    self.text.draw_text_left(&mut canvas, &format!("{}  {}", if open { "\u{25be}" } else { "\u{25b8}" }, f.name()), x, cy, &row_ink, clip, None);
+                    if let Some(c) = field_swatch(f, vals) {
+                        let s = font * 0.9;
+                        paint::fill_rect(&mut canvas, (self.panel_w - font * 2.2) as isize, (cy - s * 0.5) as isize, (font * 1.4) as isize, s as isize, c, clip, None);
+                    }
+                }
+                TreeRow::Interval => {
+                    let x = self.layer_open.map_or(tx, col);
+                    let auto = if ctl.contour_auto { "  (auto)" } else { "" };
+                    let m = ctl.contour_interval;
+                    let v = if m < 1.0 { format!("{m:.1} m") } else { format!("{} m", m.round() as i64) };
+                    self.text.draw_text_left(&mut canvas, "Interval", x, cy - font * 0.55, &dim, clip, None);
+                    self.text.draw_text_left(&mut canvas, &format!("{v}{auto}"), x + font * 4.5, cy - font * 0.55, &small, clip, None);
+                    if !self.interval_held {
+                        self.interval.set_value(interval_pos(m));
+                    }
+                    // Sliders take no clip: one only part in the band is left out.
+                    if cy - hh >= band_top && cy + hh <= footer_top {
+                        self.interval.render_content_into(&mut canvas, None, HIT_NONE);
+                    }
+                }
+                TreeRow::Slider(k) => {
+                    if let (Some(f), Some(sl)) = (self.field_open, self.sliders.get_mut(k)) {
+                        let x = self.layer_open.map_or(tx, col);
+                        let (label, val) = slider_text(f, k, self.field_vals);
+                        self.text.draw_text_left(&mut canvas, label, x, cy - font * 0.55, &dim, clip, None);
+                        self.text.draw_text_left(&mut canvas, &val, x + font * 4.5, cy - font * 0.55, &small, clip, None);
+                        if cy - hh >= band_top && cy + hh <= footer_top {
+                            sl.render_content_into(&mut canvas, None, HIT_NONE);
+                        }
+                    }
+                }
+                TreeRow::Group(_) => {}
+            }
+        }
         // The groups' headers: an open or folded marker and the name, in the theme row's ink.
         for (gi, &(cy, _)) in self.group_rows.iter().enumerate() {
             if cy < band_top || cy > footer_top {
@@ -1577,6 +1839,24 @@ impl Panel {
 
     /// A move while the slider is held: the budget follows the finger. True while it does.
     pub fn drag(&mut self, x: f32, y: f32, ctl: &mut Controls) -> bool {
+        if self.page() == Page::Layers {
+            if let (Some(k), Some(f)) = (self.held, self.field_open) {
+                if let Some(sl) = self.sliders.get_mut(k) {
+                    sl.set_value_from_x(x);
+                    self.field_vals[k] = Self::slider_val(f, k, sl.value());
+                    self.edits.push(ThemeEdit::Set(f, self.field_vals));
+                    self.dirty = true;
+                }
+                return true;
+            }
+            if self.interval_held {
+                self.interval.set_value_from_x(x);
+                ctl.contour_auto = false;
+                ctl.contour_interval = interval_at(self.interval.value());
+                self.dirty = true;
+                return true;
+            }
+        }
         if let (Some((px, py, moved)), Page::Layers) = (self.layers_press, self.page()) {
             let moved = moved || (y - py).abs() + (x - px).abs() > 12.0;
             if moved {
@@ -1637,6 +1917,7 @@ impl Panel {
     pub fn release(&mut self, mask: &mut LayerMask, ctl: &mut Controls) -> bool {
         self.slider_held = false;
         self.held = None;
+        self.interval_held = false;
         let mut changed = false;
         if let Some((x, y, moved)) = self.layers_press.take() {
             if !moved && self.page() == Page::Layers {
@@ -1812,26 +2093,9 @@ impl Panel {
             paint::fill_rect(canvas, x0 as isize, y as isize, sw as isize, (font * 1.6) as isize, (theme::dark(theme::fmt(((c[0] as u32) << 16) | ((c[1] as u32) << 8) | c[2] as u32)) & 0x00FF_FFFF) | 0xFF00_0000, None, None);
         }
         y += font * 2.4;
-        let labels: [&str; 4] = match f {
-            Field::Hypso(_) => ["R", "G", "B", "metres"],
-            Field::LabelLook => ["Size", "Glow", "Smoothing", "Spacing"],
-            Field::LabelAmount => ["Density", "Repeat", "", ""],
-            Field::LabelFont => ["Typeface", "", "", ""],
-            _ => ["R", "G", "B", "A"],
-        };
         for (i, sl) in sliders.iter_mut().enumerate() {
-            text.draw_text_left(canvas, labels[i], x0, y, &dim, None, None);
-            let val = match (f, i) {
-                (Field::Hypso(_), 3) => format!("{} m", vals[3].round() as i64),
-                (Field::Sun | Field::Sky, _) => format!("{:.2}", vals[i]),
-                (Field::LabelLook, 0) => format!("{:.2}\u{d7}", vals[i]),
-                (Field::LabelLook, 2) => format!("{:.2} letters", vals[i]),
-                (Field::LabelLook, _) => format!("{:.2} of a letter", vals[i]),
-                (Field::LabelAmount, 0) => format!("to {}", mahere_engine::theme::LABEL_TIERS[mahere_engine::theme::label_tier_limit(vals[0]) as usize]),
-                (Field::LabelAmount, _) => format!("every {:.2} screen", vals[i]),
-                (Field::LabelFont, _) => mahere_engine::theme::LABEL_FONTS[(vals[0].round().max(0.0) as usize).min(mahere_engine::theme::LABEL_FONTS.len() - 1)].to_string(),
-                _ => format!("{}", vals[i] as u8),
-            };
+            let (label, val) = slider_text(f, i, vals);
+            text.draw_text_left(canvas, label, x0, y, &dim, None, None);
             text.draw_text_left(canvas, &val, x0 + font * 4.5, y, &small, None, None);
             y += font * 0.9;
             sl.set_rect(x0 + sw * 0.5, y, sw, font * 1.1);

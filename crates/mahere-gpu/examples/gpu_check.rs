@@ -133,6 +133,12 @@ fn main() {
         if std::env::var_os("MAHERE_TOOLBOX").is_some() {
             panel.show_toolbox();
         }
+        // MAHERE_SETTINGS=<row label>[,field] opens that layer's settings under its row, and with ",field" its first field's sliders.
+        if let Ok(spec) = std::env::var("MAHERE_SETTINGS") {
+            let mut parts = spec.split(',');
+            let label = parts.next().unwrap_or_default().to_string();
+            panel.show_settings(&label, parts.next() == Some("field"), map.themes.get(map.theme));
+        }
         panel.set_open(panel_mode != "closed");
         if panel_mode == "themes" {
             panel.show_themes();
