@@ -1,5 +1,17 @@
 # Mahere release notes
 
+## 0.224 · October 2026
+
+### Notes
+- An eraser: pick it from the toolbox, or flip the S Pen to its eraser end or hold its side button. It cleans up ink at every zoom and leaves the rest; Clear ink sits with it for the rare fresh start.
+
+### Menu
+- Each layer's own colours and settings open right under it: tap the … at the end of a row, then a setting to adjust its sliders in place. No more separate pages.
+- Contours have an Interval slider from 1 cm to 1 km; moving it holds that spacing, and Auto interval fits each view again.
+
+### Lettering
+- The glow around map names is softer on every theme, and follows Linear highlights instead of staying bright white.
+
 ## 0.223 · October 2026
 
 ### Faster to open, and it remembers
