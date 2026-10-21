@@ -162,6 +162,9 @@ impl MahereApp {
             self.map.clear_selection();
         }
         self.map.ruler = ctl.ruler;
+        if ctl.contour_auto != self.map.contour_hold.is_none() {
+            self.map.hold_contours(!ctl.contour_auto);
+        }
         if ctl.locate {
             let (w, h) = self.chrome.dims();
             self.map.locate(w, h);
@@ -323,7 +326,7 @@ impl FluorApp for MahereApp {
                     return EventResponse::StartWindowDrag;
                 }
                 let mut mask = self.map.layers();
-                let mut ctl = Controls { real_sun: self.map.real_sun, real_light: self.map.real_light, follow_heading: self.map.follow_heading, lock_to_fix: self.map.lock_to_fix, cache_budget: self.cache_budget, theme: self.map.theme, compressed: self.map.compressed(), tool: self.map.tool as u8, pen_rgba: self.map.pen_colour, travel: travel_code(self.map.travel), record: false, clear_ink: false, clear_sel: false, locate: false, ruler: self.map.ruler };
+                let mut ctl = Controls { real_sun: self.map.real_sun, real_light: self.map.real_light, follow_heading: self.map.follow_heading, lock_to_fix: self.map.lock_to_fix, cache_budget: self.cache_budget, theme: self.map.theme, compressed: self.map.compressed(), tool: self.map.tool as u8, pen_rgba: self.map.pen_colour, travel: travel_code(self.map.travel), record: false, clear_ink: false, clear_sel: false, locate: false, ruler: self.map.ruler, contour_auto: self.map.contour_hold.is_none() };
                 let was_open = self.panel.is_open();
                 if self.panel.tap(cx as f32, cy as f32, w, h, &mut mask, &mut ctl, &self.map.themes) {
                     self.apply_controls(ctl, mask);
@@ -349,7 +352,7 @@ impl FluorApp for MahereApp {
             FEvent::MouseInput { state: ElementState::Released, button: MouseButton::Left } => {
                 // A press on the layer list acts when it lifts without having scrolled.
                 let mut mask = self.map.layers();
-                let mut ctl = Controls { real_sun: self.map.real_sun, real_light: self.map.real_light, follow_heading: self.map.follow_heading, lock_to_fix: self.map.lock_to_fix, cache_budget: self.cache_budget, theme: self.map.theme, compressed: self.map.compressed(), tool: self.map.tool as u8, pen_rgba: self.map.pen_colour, travel: travel_code(self.map.travel), record: false, clear_ink: false, clear_sel: false, locate: false, ruler: self.map.ruler };
+                let mut ctl = Controls { real_sun: self.map.real_sun, real_light: self.map.real_light, follow_heading: self.map.follow_heading, lock_to_fix: self.map.lock_to_fix, cache_budget: self.cache_budget, theme: self.map.theme, compressed: self.map.compressed(), tool: self.map.tool as u8, pen_rgba: self.map.pen_colour, travel: travel_code(self.map.travel), record: false, clear_ink: false, clear_sel: false, locate: false, ruler: self.map.ruler, contour_auto: self.map.contour_hold.is_none() };
                 if self.panel.release(&mut mask, &mut ctl) {
                     self.apply_controls(ctl, mask);
                     ctx.window.request_redraw();
@@ -382,7 +385,7 @@ impl FluorApp for MahereApp {
                     ctx.window.request_redraw();
                 }
                 let (x, y) = (hx as f64, hy as f64);
-                let mut ctl = Controls { real_sun: self.map.real_sun, real_light: self.map.real_light, follow_heading: self.map.follow_heading, lock_to_fix: self.map.lock_to_fix, cache_budget: self.cache_budget, theme: self.map.theme, compressed: self.map.compressed(), tool: self.map.tool as u8, pen_rgba: self.map.pen_colour, travel: travel_code(self.map.travel), record: false, clear_ink: false, clear_sel: false, locate: false, ruler: self.map.ruler };
+                let mut ctl = Controls { real_sun: self.map.real_sun, real_light: self.map.real_light, follow_heading: self.map.follow_heading, lock_to_fix: self.map.lock_to_fix, cache_budget: self.cache_budget, theme: self.map.theme, compressed: self.map.compressed(), tool: self.map.tool as u8, pen_rgba: self.map.pen_colour, travel: travel_code(self.map.travel), record: false, clear_ink: false, clear_sel: false, locate: false, ruler: self.map.ruler, contour_auto: self.map.contour_hold.is_none() };
                 if self.panel.drag(hx, hy, &mut ctl) {
                     self.cache_budget = ctl.cache_budget;
                     self.map.set_pen_colour(ctl.pen_rgba);
@@ -641,7 +644,7 @@ impl FluorApp for MahereApp {
             self.chrome.invalidate_chrome();
         }
         let areas = self.areas.view(self.map.user.has_selection());
-        self.panel.paint(w, h, self.map.layers(), Controls { real_sun: self.map.real_sun, real_light: self.map.real_light, follow_heading: self.map.follow_heading, lock_to_fix: self.map.lock_to_fix, cache_budget: self.cache_budget, theme: self.map.theme, compressed: self.map.compressed(), tool: self.map.tool as u8, pen_rgba: self.map.pen_colour, travel: travel_code(self.map.travel), record: false, clear_ink: false, clear_sel: false, locate: false, ruler: self.map.ruler }, &readouts, measure.as_ref(), &themes, &areas, None);
+        self.panel.paint(w, h, self.map.layers(), Controls { real_sun: self.map.real_sun, real_light: self.map.real_light, follow_heading: self.map.follow_heading, lock_to_fix: self.map.lock_to_fix, cache_budget: self.cache_budget, theme: self.map.theme, compressed: self.map.compressed(), tool: self.map.tool as u8, pen_rgba: self.map.pen_colour, travel: travel_code(self.map.travel), record: false, clear_ink: false, clear_sel: false, locate: false, ruler: self.map.ruler, contour_auto: self.map.contour_hold.is_none() }, &readouts, measure.as_ref(), &themes, &areas, None);
         let mut map = match &self.gpu {
             Some(g) => g.frame.clone(),
             None => self.map.canvas.clone(),

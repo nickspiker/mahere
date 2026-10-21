@@ -267,6 +267,8 @@ pub struct MapCore {
     pub contours_on_screen: f32,
     /// The interval the last frame drew, metres.
     pub contour_interval: f32,
+    /// The contour interval held by hand, metres; None fits it to the view's elevation span (Nick 2026-10-21: an Auto row to lock it in).
+    pub contour_hold: Option<f32>,
     /// Degrees the device is turned clockwise from north (0 when no sensor feeds it); the lighting turns against it.
     pub device_heading: f32,
     /// The device's rotation matrix from the orientation sensor, world (east, north, up) = R · device (x right, y up the screen, z out of it); identity without a sensor.
@@ -381,6 +383,7 @@ impl MapCore {
             last_range: ElevRange::EMPTY,
             contours_on_screen: 32.0,
             contour_interval: 0.0,
+            contour_hold: None,
             device_heading: 0.0,
             device_rot: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
             real_sun: false,
@@ -789,6 +792,12 @@ impl MapCore {
     }
 
     /// The client's layer filter: which of dem / land / water / line draw.
+    /// Hold the contour interval where it is now (true), or fit it to each view again (false).
+    pub fn hold_contours(&mut self, hold: bool) {
+        self.contour_hold = hold.then(|| self.contour_interval.max(0.5));
+        self.mark_dirty();
+    }
+
     /// A view's wanted cells, with the ten depth-0 cells while the geoid layer shows: it draws from their geoid at every zoom, and a map opened zoomed in has never loaded them (2026-10-19).
     fn with_geoid(&self, mut want: Vec<mahere_tiles::CellKey>) -> Vec<mahere_tiles::CellKey> {
         if self.layer_mask.geoid {
@@ -1398,7 +1407,9 @@ impl MapCore {
         self.dem_depth = select_depth(self.cam.ppd, self.dem_depth, DEM_BASE_DEPTH);
         self.luts.dem_depth = self.dem_depth;
         // Contours: fit N levels to the previous frame's elevation span.
-        let interval = if self.last_range.is_empty() {
+        let interval = if let Some(held) = self.contour_hold {
+            held
+        } else if self.last_range.is_empty() {
             0.0
         } else {
             ((self.last_range.hi - self.last_range.lo) as f32 * 0.25 / self.contours_on_screen).max(0.5)

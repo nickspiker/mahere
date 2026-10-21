@@ -50,6 +50,8 @@ pub struct Controls {
     pub locate: bool,
     /// A tap measures (the ruler) rather than only telling what is there.
     pub ruler: bool,
+    /// The contour interval fits each view; off, it holds where it was (Nick 2026-10-21).
+    pub contour_auto: bool,
 }
 
 /// What the toolbox offers (Nick 2026-10-14: a popup toolbox for ruler, nav, info and the rest, so a plain tap just shows info): the tool a tap or a touch is for, and the pen's and the clears' one-shots.
@@ -150,6 +152,8 @@ enum Layer {
     Line,
     Labels,
     Contours,
+    /// Under Contours: the interval fits each view, or holds.
+    ContourAuto,
     Slope,
     Infrared,
     Imagery,
@@ -162,7 +166,7 @@ enum Layer {
     Record,
 }
 
-const LAYERS: [(Layer, &str); 24] = [
+const LAYERS: [(Layer, &str); 25] = [
     (Layer::Dem, "Terrain"),
     (Layer::Hypso, "Elevation tint"),
     (Layer::Raw, "Raw elevation"),
@@ -174,10 +178,11 @@ const LAYERS: [(Layer, &str); 24] = [
     (Layer::Own, "Land ownership"),
     (Layer::Mvum, "Motor vehicle use"),
     (Layer::Contours, "Contours"),
+    (Layer::ContourAuto, "Auto interval"),
     (Layer::Slope, "Slope bands"),
     (Layer::Imagery, "Imagery"),
     (Layer::Infrared, "Infrared"),
-    (Layer::Geoid, "Sea level vs ellipsoid"),
+    (Layer::Geoid, "Sea level (geoid)"),
     (Layer::Debug, "Detail"),
     (Layer::RealSun, "Real sun"),
     (Layer::RealLight, "Real light"),
@@ -189,9 +194,30 @@ const LAYERS: [(Layer, &str); 24] = [
     (Layer::Updates, "Updates  \u{203a}"),
 ];
 
+/// The Layers page as a tree (Nick 2026-10-21: "a checkbox monolith"): each group a row that opens and closes over its rows; the pages (areas, updates) stay at the foot, always shown.
+const GROUPS: [(&str, &[Layer]); 7] = [
+    ("Ground", &[Layer::Dem, Layer::Hypso, Layer::Raw, Layer::Geoid, Layer::Contours, Layer::ContourAuto, Layer::Slope]),
+    ("Imagery", &[Layer::Imagery, Layer::Infrared]),
+    ("Lines and names", &[Layer::Line, Layer::Labels, Layer::Boundaries]),
+    ("Land and water", &[Layer::Land, Layer::Water, Layer::Own, Layer::Mvum]),
+    ("Light", &[Layer::RealSun, Layer::RealLight, Layer::Linear]),
+    ("Location", &[Layer::FollowHeading, Layer::LockToFix, Layer::Record]),
+    ("Diagnostics", &[Layer::Debug]),
+];
+
+/// Which groups start open: the ground's, the rest folded.
+const GROUPS_OPEN: [bool; 7] = [true, false, false, false, false, false, false];
+
+/// A row nested under another row of its group (Auto interval under Contours): set in one step further.
+fn nested(l: Layer) -> bool {
+    l == Layer::ContourAuto
+}
+
 /// A row that takes a tap but changes nothing: a layer another layer has greyed, or the one of real sun and real light the other has taken (the sun is either the almanac's or the camera's).
 fn inert(mask: &LayerMask, ctl: &Controls, l: Layer) -> bool {
     match l {
+        // The interval's hold is the terrain's contours': nothing to hold with them off, and the geoid keeps its own.
+        Layer::ContourAuto => !mask.contours || mask.geoid,
         Layer::RealSun => ctl.real_light,
         Layer::RealLight => ctl.real_sun,
         Layer::Linear | Layer::FollowHeading | Layer::LockToFix | Layer::Record | Layer::Areas | Layer::Updates => false,
@@ -218,6 +244,7 @@ fn get(mask: &LayerMask, ctl: &Controls, l: Layer) -> bool {
         Layer::Geoid => mask.geoid,
         Layer::Mvum => mask.mvum,
         Layer::Contours => mask.contours,
+        Layer::ContourAuto => ctl.contour_auto,
         Layer::Slope => mask.slope,
         Layer::Infrared => mask.infrared,
         Layer::Imagery => mask.imagery,
@@ -246,6 +273,7 @@ fn set(mask: &mut LayerMask, ctl: &mut Controls, l: Layer, v: bool) {
         Layer::Geoid => mask.geoid = v,
         Layer::Mvum => mask.mvum = v,
         Layer::Contours => mask.contours = v,
+        Layer::ContourAuto => ctl.contour_auto = v,
         Layer::Slope => mask.slope = v,
         Layer::Infrared => mask.infrared = v,
         Layer::Imagery => mask.imagery = v,
@@ -416,6 +444,10 @@ pub struct Panel {
     edits: Vec<ThemeEdit>,
     hits: HitId,
     checks: Vec<(Layer, Checkbox)>,
+    /// Which rows of `checks` the tree shows now (their groups open), and each group's state and header row (centre y, half height) from the last layout.
+    shown: Vec<bool>,
+    group_open: [bool; 7],
+    group_rows: Vec<(f32, f32)>,
     text: TextRenderer,
     /// The font packs, when the host gave them, and how far through their arrivals this renderer has loaded.
     fonts: Option<std::sync::Arc<fonts::FontPacks>>,
@@ -480,7 +512,7 @@ impl Panel {
     pub fn new() -> Panel {
         let mut hits: HitId = HIT_NONE;
         let checks = LAYERS.iter().map(|&(l, label)| (l, Checkbox::new(&mut hits, label, 0.0, 0.0, 10.0, 10.0, 10.0, false))).collect();
-        Panel { fonts: None, font_cursor: 0, open: false, dirty: true, ru: 1.0, stack: vec![Page::Layers], theme_rows: Vec::new(), edit_rows: Vec::new(), edit_scroll: 0.0, edit_extent: 0.0, press: None, sliders: Vec::new(), field_vals: [0.0; 4], held: None, edits: Vec::new(), hits, checks, text: TextRenderer::new(), buf: Vec::new(), w: 0, h: 0, font: 16.0, gear: (0.0, 0.0, 0.0), panel_w: 0.0, theme_row: (0.0, 0.0, 0.0), slider: (0.0, 0.0, 0.0), slider_held: false, cache_max: CACHE_MIN + 1, strip_close: None, clear_measure: false, area_rows: Vec::new(), area_acts: Vec::new(), areas: AreasView::default(), update_rows: Vec::new(), update_acts: Vec::new(), updates: UpdatesView::default(), host_orb: None, layers_scroll: 0.0, layers_extent: 0.0, layers_press: None, layers_band: (0.0, 0.0), orb_icon: fluor::host::icon::Icon::from_vsf_bytes(APP_ORB_VSF).ok(), orb_scaled: (0, Vec::new()), locate_btn: None, tool_btn: None, toolbox_open: false, tool_rows: Vec::new() }
+        Panel { fonts: None, font_cursor: 0, open: false, dirty: true, ru: 1.0, stack: vec![Page::Layers], theme_rows: Vec::new(), edit_rows: Vec::new(), edit_scroll: 0.0, edit_extent: 0.0, press: None, sliders: Vec::new(), field_vals: [0.0; 4], held: None, edits: Vec::new(), hits, shown: vec![true; LAYERS.len()], group_open: GROUPS_OPEN, group_rows: Vec::new(), checks, text: TextRenderer::new(), buf: Vec::new(), w: 0, h: 0, font: 16.0, gear: (0.0, 0.0, 0.0), panel_w: 0.0, theme_row: (0.0, 0.0, 0.0), slider: (0.0, 0.0, 0.0), slider_held: false, cache_max: CACHE_MIN + 1, strip_close: None, clear_measure: false, area_rows: Vec::new(), area_acts: Vec::new(), areas: AreasView::default(), update_rows: Vec::new(), update_acts: Vec::new(), updates: UpdatesView::default(), host_orb: None, layers_scroll: 0.0, layers_extent: 0.0, layers_press: None, layers_band: (0.0, 0.0), orb_icon: fluor::host::icon::Icon::from_vsf_bytes(APP_ORB_VSF).ok(), orb_scaled: (0, Vec::new()), locate_btn: None, tool_btn: None, toolbox_open: false, tool_rows: Vec::new() }
     }
 
     pub fn is_open(&self) -> bool {
@@ -786,19 +818,44 @@ impl Panel {
         let theme_y = self.gear.1 + r + self.font * 0.9 + row * 0.5 - scroll;
         self.theme_row = (x0, theme_y, row * 0.5);
         let top = theme_y + row * 0.8;
-        let mut last = top;
-        for (i, (l, cb)) in self.checks.iter_mut().enumerate() {
-            // The modes sit a little apart from the layers, the pages from the modes.
-            let gap = match l {
-                Layer::RealSun | Layer::RealLight | Layer::Linear | Layer::FollowHeading | Layer::LockToFix | Layer::Record => row * 0.5,
-                Layer::Areas | Layer::Updates => row,
-                _ => 0.0,
-            };
-            let cy = top + row * (i as f32 + 0.5) + gap;
-            cb.set_font_size(self.font);
-            cb.set_rect(x0 + (self.panel_w - x0 * 1.5) * 0.5, cy, self.panel_w - x0 * 1.5, row);
-            last = cy + row * 0.5;
+        // The tree: each group's header, then its rows while it is open, indented; the pages after, a row apart. A row out of the tree is parked off the page and not drawn.
+        let indent = self.font * 1.2;
+        let full = self.panel_w - x0 * 1.5;
+        let mut y = top;
+        self.group_rows.clear();
+        for v in self.shown.iter_mut() {
+            *v = false;
         }
+        for (gi, (_, layers)) in GROUPS.iter().enumerate() {
+            self.group_rows.push((y + row * 0.5, row * 0.5));
+            y += row;
+            if !self.group_open[gi] {
+                continue;
+            }
+            for l in layers.iter() {
+                let Some(i) = self.checks.iter().position(|(c, _)| c == l) else { continue };
+                let inset = if nested(*l) { indent * 2.0 } else { indent };
+                let cb = &mut self.checks[i].1;
+                cb.set_font_size(self.font);
+                cb.set_rect(x0 + inset + (full - inset) * 0.5, y + row * 0.5, full - inset, row);
+                self.shown[i] = true;
+                y += row;
+            }
+        }
+        y += row * 0.5;
+        for (i, (l, cb)) in self.checks.iter_mut().enumerate() {
+            if GROUPS.iter().any(|(_, ls)| ls.contains(l)) {
+                if !self.shown[i] {
+                    cb.set_rect(-10_000.0, -10_000.0, 1.0, 1.0);
+                }
+                continue;
+            }
+            cb.set_font_size(self.font);
+            cb.set_rect(x0 + full * 0.5, y + row * 0.5, full, row);
+            self.shown[i] = true;
+            y += row;
+        }
+        let last = y;
         // How far the list runs past the footer, from where it would sit unscrolled.
         self.layers_extent = (last + scroll + row * 0.5 - footer_top).max(0.0);
         if self.layers_scroll > self.layers_extent {
@@ -824,7 +881,17 @@ impl Panel {
             self.dirty = true;
             return false;
         }
-        for (l, cb) in &mut self.checks {
+        if let Some(gi) = self.group_rows.iter().position(|&(cy, hh)| (y - cy).abs() <= hh) {
+            if x >= tx && x < self.panel_w {
+                self.group_open[gi] = !self.group_open[gi];
+                self.dirty = true;
+                return false;
+            }
+        }
+        for (i, (l, cb)) in self.checks.iter_mut().enumerate() {
+            if !self.shown[i] {
+                continue;
+            }
             if cb.bbox().contains(x, y) {
                 if *l == Layer::Areas {
                     self.stack.push(Page::Areas);
@@ -1248,7 +1315,18 @@ impl Panel {
         let (tx, ty, _) = self.theme_row;
         let current = themes.get(ctl.theme).map_or("Trail", |t| t.name.as_str());
         self.text.draw_text_left(&mut canvas, &format!("Theme   {current}  \u{203a}"), tx, ty, &TextStyle::new(font, theme::TEXTBOX_TEXT), clip, None);
-        for (l, cb) in &mut self.checks {
+        // The groups' headers: an open or folded marker and the name, in the theme row's ink.
+        for (gi, &(cy, _)) in self.group_rows.iter().enumerate() {
+            if cy < band_top || cy > footer_top {
+                continue;
+            }
+            let marker = if self.group_open[gi] { "\u{25be}" } else { "\u{25b8}" };
+            self.text.draw_text_left(&mut canvas, &format!("{marker}  {}", GROUPS[gi].0), tx, cy, &TextStyle::new(font, theme::TEXTBOX_TEXT).weight(600), clip, None);
+        }
+        for (i, (l, cb)) in self.checks.iter_mut().enumerate() {
+            if !self.shown[i] {
+                continue;
+            }
             cb.set_checked(get(&mask, &ctl, *l));
             let b = cb.bbox();
             if b.y + b.h < band_top || b.y > footer_top {
