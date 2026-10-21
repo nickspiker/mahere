@@ -243,8 +243,23 @@ fn settings_of(l: Layer) -> Vec<TreeRow> {
     }
 }
 
-/// The contour intervals the slider steps through, metres.
-const INTERVALS: [f32; 10] = [0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 50.0, 100.0, 200.0, 500.0];
+/// The contour intervals the slider steps through, metres: a centimetre to a kilometre, 1-2-5 a decade, so the slider is logarithmic (Nick 2026-10-21).
+const INTERVALS: [f32; 16] = [0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 50.0, 100.0, 200.0, 500.0, 1000.0];
+
+/// An interval as read: centimetres under a metre, kilometres from one.
+fn interval_text(m: f32) -> String {
+    if m <= 0.0 {
+        "\u{2014}".into()
+    } else if m < 1.0 {
+        format!("{} cm", (m * 100.0).round() as i64)
+    } else if m >= 1000.0 {
+        format!("{} km", (m / 1000.0 * 10.0).round() / 10.0)
+    } else if m < 10.0 && m.fract() != 0.0 {
+        format!("{m:.1} m")
+    } else {
+        format!("{} m", m.round() as i64)
+    }
+}
 
 /// An interval's place on the slider, 0..1: the nearest step's.
 fn interval_pos(m: f32) -> f32 {
@@ -1552,7 +1567,7 @@ impl Panel {
                     let x = self.layer_open.map_or(tx, col);
                     let auto = if ctl.contour_auto { "  (auto)" } else { "" };
                     let m = ctl.contour_interval;
-                    let v = if m < 1.0 { format!("{m:.1} m") } else { format!("{} m", m.round() as i64) };
+                    let v = interval_text(m);
                     self.text.draw_text_left(&mut canvas, "Interval", x, cy - font * 0.55, &dim, clip, None);
                     self.text.draw_text_left(&mut canvas, &format!("{v}{auto}"), x + font * 4.5, cy - font * 0.55, &small, clip, None);
                     if !self.interval_held {

@@ -24,6 +24,14 @@ const ROUTE: usize = 9;
 const ROUTE_CASING: usize = 10;
 
 /// A theme colour (VSF RGB at gamma 2 with opacity) as display values 0..1 with its opacity, the way the screen takes it.
+/// A theme colour as stored (VSF RGB at gamma 2, 0..1, opacity last), for the GPU, which encodes it for the display as it does the map's own colours, through the same highlights (Nick 2026-10-21: a halo glaring white under linear highlights).
+fn stored(c: [u8; 4]) -> [f32; 4] {
+    [c[0] as f32 / 255.0, c[1] as f32 / 255.0, c[2] as f32 / 255.0, c[3] as f32 / 255.0]
+}
+
+/// How strong a halo is against its theme's opacity (Nick 2026-10-21: the halos read a little bright on every theme).
+const HALO_STRENGTH: f32 = 0.8;
+
 fn display(c: [u8; 4]) -> [f32; 4] {
     let d = theme::vsf(((c[0] as u32) << 16) | ((c[1] as u32) << 8) | c[2] as u32);
     [((d >> 16) & 255) as f32 / 255.0, ((d >> 8) & 255) as f32 / 255.0, (d & 255) as f32 / 255.0, c[3] as f32 / 255.0]
@@ -1371,7 +1379,7 @@ impl Lettering {
         }
         let phi = self.turned(cam, w, h);
         let (sp, cp) = phi.sin_cos();
-        let halo = display(self.palette[HALO]);
+        let halo = { let h = stored(self.palette[HALO]); [h[0], h[1], h[2], h[3] * HALO_STRENGTH] };
         let side = self.atlas.side as f32;
         let mut out = Vec::new();
         for k in &self.kept {
@@ -1380,7 +1388,7 @@ impl Lettering {
             if ax < -(w as f32) || ay < -(h as f32) || ax > 2.0 * w as f32 || ay > 2.0 * h as f32 || !cam.on_globe(ax as f64, ay as f64, w, h) {
                 continue;
             }
-            let text = display(self.palette[k.colour]);
+            let text = stored(self.palette[k.colour]);
             let halo = if k.halo { halo } else { [0.0; 4] };
             for (key, off, angle) in &k.letters {
                 let Some(slot) = self.atlas.slots.get(key) else { continue };
@@ -1463,6 +1471,9 @@ impl Lettering {
         };
         for g in self.glyphs(cam, w, h) {
             let (cx, cy, hx, hy, ang) = (g[0], g[1], g[2], g[3], g[4]);
+            // The glyph carries its colours as stored; the CPU's canvas takes them as the panel's own inks are made.
+            let ink = |c: &[f32]| { let d = display([(c[0] * 255.0).round() as u8, (c[1] * 255.0).round() as u8, (c[2] * 255.0).round() as u8, 255]); [d[0], d[1], d[2]] };
+            let (text_rgb, halo_rgb) = (ink(&g[12..15]), ink(&g[16..19]));
             let (sa, ca) = ang.sin_cos();
             let reach = hx.hypot(hy) + 1.0;
             let (x0, x1) = ((cx - reach).floor().max(0.0) as usize, ((cx + reach).ceil().max(0.0) as usize).min(w));
@@ -1490,8 +1501,8 @@ impl Lettering {
                     }
                     let (ta, ha) = (ta / (n * n) as f32, ha / (n * n) as f32);
                     let i = y * w + x;
-                    blend(canvas, i, [g[16], g[17], g[18]], ha * g[19]);
-                    blend(canvas, i, [g[12], g[13], g[14]], ta * g[15]);
+                    blend(canvas, i, halo_rgb, ha * g[19]);
+                    blend(canvas, i, text_rgb, ta * g[15]);
                 }
             }
         }

@@ -1136,7 +1136,10 @@ fn fs_glyph(in: GlyphOut) -> @location(0) vec4<f32> {
     m /= f32(n * n);
     let ta = m.r * in.text.a;
     let ha = m.g * in.halo.a;
-    return vec4<f32>(in.text.rgb * ta + in.halo.rgb * ha * (1.0 - ta), ta + ha * (1.0 - ta));
+    // The colours come as the theme stores them and are encoded as the map's are, through the same highlights: a white halo is the map's white, not the display's.
+    let text = to_display(dec(in.text.rgb * 255.0)) / 255.0;
+    let halo = to_display(dec(in.halo.rgb * 255.0)) / 255.0;
+    return vec4<f32>(text * ta + halo * ha * (1.0 - ta), ta + ha * (1.0 - ta));
 }
 
 struct SegOut {
