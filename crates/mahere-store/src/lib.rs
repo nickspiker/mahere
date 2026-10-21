@@ -191,7 +191,7 @@ pub fn load_settings(store: &FlatStorage) -> Option<Settings> {
     if d.len() < 3 {
         return None;
     }
-    Some(Settings { cache_budget: d[0], layer_bits: d[1], real_sun: d[2] & 1 != 0, follow_heading: d[2] & 2 != 0, lock_to_fix: d[2] & 4 != 0, theme: d.get(3).copied().unwrap_or(0), compressed: d[2] & 8 == 0, real_light: d[2] & 16 != 0, ui_ru: d.get(4).map_or(1.0, |&v| v as f32 / 1000.0), tool: d.get(5).map_or(0, |&v| v.min(2) as u8), pen_rgba: d.get(6).filter(|&&v| v != 0).map(|&v| ((v - 1) as u32).to_be_bytes()), travel: d.get(7).map_or(0, |&v| v.min(3) as u8), auto_update: d.get(8).is_none_or(|&v| v == 0), record: d.get(9).is_some_and(|&v| v != 0), ruler: d[2] & 32 != 0, contour_hold: d.get(10).filter(|&&v| v != 0).map(|&v| v as f32 / 1000.0) })
+    Some(Settings { cache_budget: d[0], layer_bits: d[1], real_sun: d[2] & 1 != 0, follow_heading: d[2] & 2 != 0, lock_to_fix: d[2] & 4 != 0, theme: d.get(3).copied().unwrap_or(0), compressed: d[2] & 8 == 0, real_light: d[2] & 16 != 0, ui_ru: d.get(4).map_or(1.0, |&v| v as f32 / 1000.0), tool: d.get(5).map_or(0, |&v| v.min(3) as u8), pen_rgba: d.get(6).filter(|&&v| v != 0).map(|&v| ((v - 1) as u32).to_be_bytes()), travel: d.get(7).map_or(0, |&v| v.min(3) as u8), auto_update: d.get(8).is_none_or(|&v| v == 0), record: d.get(9).is_some_and(|&v| v != 0), ruler: d[2] & 32 != 0, contour_hold: d.get(10).filter(|&&v| v != 0).map(|&v| v as f32 / 1000.0) })
 }
 
 /// Width-agnostic float-array read, per VSF doctrine.

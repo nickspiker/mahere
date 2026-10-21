@@ -35,7 +35,7 @@ pub struct Controls {
     pub theme: usize,
     /// Highlights compressed into white (exposure 2/3 into Opsin's rail); off, linear: the stored range straight, 2.3 stops darker. The row shows it the other way up, as "Linear highlights".
     pub compressed: bool,
-    /// What a touch on the map does: 0 navigates, 1 draws with the pen, 2 draws a selection. The pen's colour, an index into the engine's pens.
+    /// What a touch on the map does: 0 navigates, 1 draws with the pen, 2 draws a selection, 3 erases ink. The pen's colour, an index into the engine's pens.
     pub tool: u8,
     /// The pen's colour and opacity, VSF RGB at gamma 2.
     pub pen_rgba: [u8; 4],
@@ -65,6 +65,7 @@ enum Pick {
     Ride,
     Walk,
     Pen,
+    Eraser,
     Select,
     PenColour,
     ClearInk,
@@ -80,6 +81,7 @@ impl Pick {
             Pick::Ride => "Ride",
             Pick::Walk => "Walk",
             Pick::Pen => "Pen",
+            Pick::Eraser => "Eraser",
             Pick::Select => "Select",
             Pick::PenColour => "Pen colour",
             Pick::ClearInk => "Clear ink",
@@ -92,6 +94,7 @@ impl Pick {
         match (ctl.tool, ctl.travel, ctl.ruler) {
             (1, _, _) => Pick::Pen,
             (2, _, _) => Pick::Select,
+            (3, _, _) => Pick::Eraser,
             (_, 1, _) => Pick::Drive,
             (_, 2, _) => Pick::Ride,
             (_, 3, _) => Pick::Walk,
@@ -102,9 +105,11 @@ impl Pick {
 
     /// The toolbox's list for these controls: the tools, then the pen's colour and the clears beside the tool they belong to.
     fn list(ctl: &Controls) -> Vec<Pick> {
-        let mut v = vec![Pick::Info, Pick::Ruler, Pick::Drive, Pick::Ride, Pick::Walk, Pick::Pen, Pick::Select];
+        let mut v = vec![Pick::Info, Pick::Ruler, Pick::Drive, Pick::Ride, Pick::Walk, Pick::Pen, Pick::Eraser, Pick::Select];
         match Pick::current(ctl) {
-            Pick::Pen => v.extend([Pick::PenColour, Pick::ClearInk]),
+            Pick::Pen => v.push(Pick::PenColour),
+            // Clearing it all sits with the eraser, the tool for taking ink off (Nick 2026-10-21: the notes are cleaned up, rarely cleared).
+            Pick::Eraser => v.push(Pick::ClearInk),
             Pick::Select => v.push(Pick::ClearSel),
             _ => {}
         }
@@ -835,6 +840,7 @@ impl Panel {
             Pick::Walk => tool(ctl, 0, 3, false),
             Pick::Pen => tool(ctl, 1, 0, false),
             Pick::Select => tool(ctl, 2, 0, false),
+            Pick::Eraser => tool(ctl, 3, 0, false),
             Pick::PenColour => {
                 self.open = true;
                 let rgba = ctl.pen_rgba;

@@ -53,7 +53,7 @@ class MahereActivity : Activity(), SurfaceHolder.Callback, Choreographer.FrameCa
     private external fun nativeOnTouch(
         ptr: Long, action: Int, count: Int,
         x0: Float, y0: Float, x1: Float, y1: Float,
-        tool: Int, pressure: Float,
+        tool: Int, pressure: Float, buttons: Int,
     ): Int
     private external fun nativePenOut(ptr: Long, out: Boolean)
     private external fun nativeOnLocation(ptr: Long, lat: Double, lon: Double, accuracy: Float, height: Double, vAccuracy: Float)
@@ -426,7 +426,7 @@ class MahereActivity : Activity(), SurfaceHolder.Callback, Choreographer.FrameCa
         nativeOnTouch(
             nativePtr, event.actionMasked, count,
             event.getX(0), event.getY(0), x1, y1,
-            event.getToolType(0), event.getPressure(0),
+            event.getToolType(0), event.getPressure(0), event.buttonState,
         )
         return true
     }

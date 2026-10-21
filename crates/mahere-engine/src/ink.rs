@@ -49,6 +49,8 @@ pub enum Tool {
     None,
     Pen,
     Select,
+    /// Ink taken off where the stroke passes, at every zoom (Nick 2026-10-21: notes are cleaned up, not cleared).
+    Erase,
 }
 
 /// Where the user's cells live between runs: the phone's vault, a directory on a desktop.
@@ -311,6 +313,104 @@ impl UserLayer {
         }
         for k in touched.iter().copied().collect::<Vec<_>>() {
             self.push_down(k);
+        }
+        self.after_change(depth, touched);
+    }
+
+    /// An eraser's stroke along screen points, each with its width in pixels: under the brush the ink is taken off (soft over the last pixel, as the pen lays it on) at `depth`, in every finer cell beneath, and in any coarser cell drawn on there, so the mark is gone at every zoom and is not pushed back down from above.
+    pub fn erase(&mut self, cam: &Camera, w: usize, h: usize, depth: u8, pts: &[(f64, f64, f64)]) {
+        let mut touched: FxHashSet<CellKey> = FxHashSet::default();
+        // What each texel kept, by cell, for the cells above and below.
+        let mut kept: FxHashMap<CellKey, FxHashMap<usize, f32>> = FxHashMap::default();
+        let mut stamp = |x: f64, y: f64, width: f64| {
+            let r = (width * 0.5).max(0.5);
+            let (x0, x1) = (((x - r) * 2.0).floor() as i64, ((x + r) * 2.0).ceil() as i64);
+            let (y0, y1) = (((y - r) * 2.0).floor() as i64, ((y + r) * 2.0).ceil() as i64);
+            for py in y0..=y1 {
+                for px in x0..=x1 {
+                    let (cx, cy) = (px as f64 * 0.5 + 0.25, py as f64 * 0.5 + 0.25);
+                    let dist = ((cx - x) * (cx - x) + (cy - y) * (cy - y)).sqrt();
+                    if dist > r {
+                        continue;
+                    }
+                    let keep = 1.0 - (r - dist).clamp(0.0, 1.0) as f32;
+                    let Some((key, i)) = texel_at(cam, depth, cx, cy, w, h) else { continue };
+                    let ink = self.ink_cell(key);
+                    let p = ink.px(i);
+                    if p[3] != 0 {
+                        let d = unpack(p);
+                        ink.set(i, pack([d[0] * keep, d[1] * keep, d[2] * keep, d[3] * keep]));
+                    }
+                    let k = kept.entry(key).or_default().entry(i).or_insert(1.0);
+                    *k = k.min(keep);
+                    touched.insert(key);
+                }
+            }
+        };
+        match pts {
+            [] => {}
+            [p] => stamp(p.0, p.1, p.2),
+            _ => {
+                for s in pts.windows(2) {
+                    let (ax, ay, bx, by) = (s[0].0, s[0].1, s[1].0, s[1].1);
+                    let n = ((bx - ax).hypot(by - ay) * 2.0).ceil().max(1.0) as usize;
+                    for k in 0..=n {
+                        let t = k as f64 / n as f64;
+                        stamp(ax + (bx - ax) * t, ay + (by - ay) * t, s[0].2 + (s[1].2 - s[0].2) * t);
+                    }
+                }
+            }
+        }
+        let fade = |ink: &mut InkCell, i: usize, keep: f32| -> bool {
+            let p = ink.px(i);
+            if p[3] == 0 || keep >= 1.0 {
+                return false;
+            }
+            let d = unpack(p);
+            ink.set(i, pack([d[0] * keep, d[1] * keep, d[2] * keep, d[3] * keep]));
+            true
+        };
+        let mut also: Vec<CellKey> = Vec::new();
+        for (key, texels) in &kept {
+            // Finer cells beneath: each texel takes off what the coarse texel over it did.
+            let below: Vec<CellKey> = self.cells.keys().filter(|k| k.depth > key.depth && k.ancestor(key.depth) == *key).copied().collect();
+            for k in below {
+                let map = map_to_ancestor(k, *key);
+                self.remember(k);
+                let Some(fine) = self.cells.get_mut(&k).and_then(|c| c.ink.as_mut()) else { continue };
+                let mut changed = false;
+                for (i, j) in map.iter().enumerate() {
+                    if let Some(&keep) = texels.get(j) {
+                        changed |= fade(fine, i, keep);
+                    }
+                }
+                if changed {
+                    also.push(k);
+                }
+            }
+            // Coarser cells drawn on there keep their own marks over what is built from below: the texels over the erased ones are taken off too.
+            for d in (USER_MIN_DEPTH..key.depth).rev() {
+                let anc = key.ancestor(d);
+                if !self.drawn.contains_key(&anc) {
+                    continue;
+                }
+                let map = map_to_ancestor(*key, anc);
+                self.remember(anc);
+                let Some(coarse) = self.cells.get_mut(&anc).and_then(|c| c.ink.as_mut()) else { continue };
+                let mut changed = false;
+                for (&i, &keep) in texels {
+                    changed |= fade(coarse, map[i], keep);
+                }
+                if changed {
+                    also.push(anc);
+                }
+            }
+        }
+        for k in also {
+            if let Some(c) = self.cells.get_mut(&k) {
+                c.version += 1;
+            }
+            touched.insert(k);
         }
         self.after_change(depth, touched);
     }
@@ -886,6 +986,25 @@ mod tests {
         assert!(first[0] > first[1], "red: {first:?}");
         let second = pen(&u, 400.0, 200.0, 13).expect("the second stroke");
         assert!(second[1] > second[0], "green: {second:?}");
+    }
+
+    /// The eraser takes ink off where it passes and leaves the rest: at the depth it works at, in the finer cells a zoomed-in stroke made, and in a coarser cell drawn on, so the mark is gone at every zoom.
+    #[test]
+    fn the_eraser_cleans_up_at_every_zoom() {
+        let mut u = UserLayer::default();
+        let (w, h) = (800, 600);
+        // A stroke zoomed out across the view, one zoomed in down the middle.
+        u.stroke(&cam(), w, h, 10, &[(100.0, 300.0, 6.0), (700.0, 300.0, 6.0)], PENS[0], 1.0);
+        u.stroke(&cam(), w, h, 13, &[(400.0, 100.0, 6.0), (400.0, 500.0, 6.0)], PENS[3], 1.0);
+        assert!(pen(&u, 400.0, 200.0, 13).is_some() && pen(&u, 200.0, 300.0, 10).is_some());
+        // Erase both where they cross the view's left half, at depth 12.
+        u.erase(&cam(), w, h, 12, &[(150.0, 300.0, 40.0), (390.0, 300.0, 40.0)]);
+        u.erase(&cam(), w, h, 12, &[(400.0, 150.0, 40.0), (400.0, 250.0, 40.0)]);
+        assert!(pen(&u, 200.0, 300.0, 12).is_none(), "the coarse stroke is gone where erased");
+        assert!(pen(&u, 200.0, 300.0, 10).is_none(), "and from the coarse cell it was drawn in");
+        assert!(pen(&u, 400.0, 200.0, 13).is_none(), "the fine stroke is gone from its own cells");
+        assert!(pen(&u, 600.0, 300.0, 13).is_some(), "the rest of the coarse stroke stays");
+        assert!(pen(&u, 400.0, 450.0, 13).is_some(), "the rest of the fine stroke stays");
     }
 
     #[test]

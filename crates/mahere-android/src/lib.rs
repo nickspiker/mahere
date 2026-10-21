@@ -45,6 +45,8 @@ pub struct AndroidApp {
     /// A stroke of the pen or a selection in progress; the touch that is drawing is a stylus; its pressure; when a stylus last touched, since while the pen is out fingers only navigate.
     drawing: bool,
     stylus: bool,
+    /// The stylus is erasing: its eraser end, or its side button held.
+    erasing: bool,
     pressure: f32,
     stylus_seen: Option<Instant>,
     /// What the phone says about its pen being out (Samsung's slot broadcast, or a stylus hover); None when it has said nothing, and the last stylus touch decides.
@@ -232,6 +234,7 @@ impl AndroidApp {
         }
         self.map.set_tool(match ctl.tool {
             1 => mahere_engine::ink::Tool::Pen,
+            3 => mahere_engine::ink::Tool::Erase,
             2 => mahere_engine::ink::Tool::Select,
             _ => mahere_engine::ink::Tool::None,
         });
@@ -496,6 +499,7 @@ impl FluorApp for AndroidApp {
                     use mahere_engine::ink::Tool;
                     let pen_out = self.pen_out.unwrap_or_else(|| self.stylus_seen.is_some_and(|t| t.elapsed() < std::time::Duration::from_secs(3)));
                     let job = match (self.stylus, self.map.tool) {
+                        _ if self.stylus && self.erasing => Tool::Erase,
                         (true, Tool::None) => Tool::Pen,
                         (true, t) => t,
                         (false, _) if pen_out => Tool::None,
@@ -744,6 +748,7 @@ pub extern "system" fn Java_nz_mahere_app_MahereActivity_nativeInit(
         map.contour_hold = s.contour_hold;
         map.set_tool(match s.tool {
             1 => mahere_engine::ink::Tool::Pen,
+            3 => mahere_engine::ink::Tool::Erase,
             2 => mahere_engine::ink::Tool::Select,
             _ => mahere_engine::ink::Tool::None,
         });
@@ -763,6 +768,7 @@ pub extern "system" fn Java_nz_mahere_app_MahereActivity_nativeInit(
         had_two: false,
         drawing: false,
         stylus: false,
+        erasing: false,
         pressure: 0.5,
         stylus_seen: None,
         pen_out: None,
@@ -908,14 +914,17 @@ pub extern "system" fn Java_nz_mahere_app_MahereActivity_nativeOnTouch(
     y1: jfloat,
     tool: jint,
     pressure: jfloat,
+    buttons: jint,
 ) -> jint {
     if ptr == 0 {
         return 0;
     }
     let s = shell(ptr);
     // The touch's tool and pressure (Android's TOOL_TYPE_STYLUS is 2): a stylus draws at its pressure, a finger at a middle one.
-    let stylus = tool == 2;
+    // An eraser tip (TOOL_TYPE_ERASER, 4) is a stylus too, and it, or a stylus with its side button held (BUTTON_STYLUS_PRIMARY, 0x20, the S Pen's), erases whatever the tool (Nick 2026-10-21).
+    let stylus = tool == 2 || tool == 4;
     s.app().stylus = stylus;
+    s.app().erasing = tool == 4 || (stylus && buttons & 0x20 != 0);
     s.app().pressure = if stylus { pressure.clamp(0.0, 1.0) } else { 0.5 };
     if stylus {
         s.app().stylus_seen = Some(Instant::now());

@@ -232,6 +232,9 @@ pub struct GpsFix {
 }
 
 /// The map: all state and rendering, no host. Frontends call the input methods, drive `tick` until `converged`, and blit `canvas` (0xRRGGBB, row-major) after `render`.
+/// How much wider the eraser is than the pen at the same pressure: cleaning up is broader work than writing.
+const ERASER_WIDTH: f64 = 3.0;
+
 pub struct MapCore {
     pub cam: Camera,
     res: Residency,
@@ -609,6 +612,9 @@ impl MapCore {
             let c = self.pen_colour;
             self.user.stroke(&self.cam, w, h, depth, &[(x, y, width)], [c[0], c[1], c[2]], c[3] as f32 / 255.0);
         }
+        if tool == ink::Tool::Erase {
+            self.user.erase(&self.cam, w, h, depth, &[(x, y, width * ERASER_WIDTH)]);
+        }
         self.dirty = true;
     }
 
@@ -628,6 +634,7 @@ impl MapCore {
                 let c = self.pen_colour;
                 self.user.stroke(&self.cam, w, h, depth, &seg, [c[0], c[1], c[2]], c[3] as f32 / 255.0);
             }
+            ink::Tool::Erase => self.user.erase(&self.cam, w, h, depth, &[(last.0, last.1, last.2 * ERASER_WIDTH), (x, y, width * ERASER_WIDTH)]),
             ink::Tool::Select => self.rebuild_preview(w, h),
             ink::Tool::None => {}
         }

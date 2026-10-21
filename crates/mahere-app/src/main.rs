@@ -151,6 +151,7 @@ impl MahereApp {
         self.map.set_travel(travel_of(ctl.travel));
         self.map.set_tool(match ctl.tool {
             1 => mahere_engine::ink::Tool::Pen,
+            3 => mahere_engine::ink::Tool::Erase,
             2 => mahere_engine::ink::Tool::Select,
             _ => mahere_engine::ink::Tool::None,
         });
