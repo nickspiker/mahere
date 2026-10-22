@@ -51,6 +51,10 @@ struct GpuBlock {
     b: [u32; 4],
     c: [f32; 4],
     d: [f32; 4],
+    /// The block's candidate references: terrain, vector planes, imagery.
+    e: [u32; 4],
+    f: [u32; 4],
+    g: [u32; 4],
 }
 
 #[repr(C)]
@@ -1047,7 +1051,7 @@ impl GpuMap {
         let blocks: Vec<GpuBlock> = plan
             .blocks
             .iter()
-            .map(|b| GpuBlock { a: [b.x, b.y, b.size, b.diamond], b: [b.u0, b.v0, 0, 0], c: [b.du_dx, b.dv_dx, b.du_dy, b.dv_dy], d: [b.twist_u, b.twist_v, 0.0, 0.0] })
+            .map(|b| GpuBlock { a: [b.x, b.y, b.size, b.diamond], b: [b.u0, b.v0, 0, 0], c: [b.du_dx, b.dv_dx, b.du_dy, b.dv_dy], d: [b.twist_u, b.twist_v, 0.0, 0.0], e: b.cand[0], f: b.cand[1], g: b.cand[2] })
             .collect();
         let table: Vec<GpuSlot> = plan.table.iter().map(|s| GpuSlot { tag: s.tag, cu: s.cu, cv: s.cv, index: s.index }).collect();
         let mut rebind = self.map_bind.is_none();

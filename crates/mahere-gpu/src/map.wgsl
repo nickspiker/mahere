@@ -122,7 +122,8 @@ struct Uniforms {
 // a: diamond, depth, cu, cv. b: dem slot, line slot, land+water slot, img slot. c: flags. d: base, step, eu, nu. e: ev, nv, inv det.
 struct Ref { a: vec4<u32>, b: vec4<u32>, c: vec4<u32>, d: vec4<f32>, e: vec4<f32> };
 // a: x, y, size, diamond. b: u0, v0. c: du/dx, dv/dx, du/dy, dv/dy. d: twist u, twist v.
-struct Block { a: vec4<u32>, b: vec4<u32>, c: vec4<f32>, d: vec4<f32> };
+// e, f, g: the block's candidate references for the terrain, the vector planes and the imagery, NONE after the last.
+struct Block { a: vec4<u32>, b: vec4<u32>, c: vec4<f32>, d: vec4<f32>, e: vec4<u32>, f: vec4<u32>, g: vec4<u32> };
 struct Slot { tag: u32, cu: u32, cv: u32, index: u32 };
 
 @group(0) @binding(0) var<uniform> U: Uniforms;
@@ -202,6 +203,22 @@ fn find(d: u32, want: u32, u: u32, v: u32, need: u32) -> u32 {
     return NONE;
 }
 
+// The reference a pixel draws from: the block's candidate whose cell holds the UV, resolved by the plan once a block; a pixel none of them holds (a block touching more cells) searches the table as before (2026-10-21: a Pixel 3a's GPU spent a second a frame probing the table, several times a pixel).
+fn pick(c: vec4<u32>, d: u32, u: u32, v: u32, want: u32, need: u32) -> u32 {
+    for (var k = 0u; k < 4u; k++) {
+        let r = c[k];
+        if (r == NONE) {
+            break;
+        }
+        let a = refs[r].a;
+        let s = 30u - a.y;
+        if (a.x == d && (u >> s) == a.z && (v >> s) == a.w) {
+            return r;
+        }
+    }
+    return find(d, want, u, v, need);
+}
+
 // Triangle texel of a depth-30 UV in a cell at `depth`: the UV square, then the carry of the fractions.
 fn tri(u: u32, v: u32, depth: u32) -> vec3<u32> {
     let s = 22u - depth;
@@ -231,12 +248,18 @@ fn diffq(m: u32, p: u32, c: u32) -> f32 {
 struct Dem { ok: bool, elev: f32, n: vec3<f32>, depth: u32, slot: u32, base: f32, step: f32 };
 
 // Elevation and normal at a UV: the wanted depth's cell, or parents while the texel is no-data (a merged cell carries elevation only inside the newer bake's footprint).
-fn sample_dem(d: u32, u: u32, v: u32) -> Dem {
+fn sample_dem(d: u32, u: u32, v: u32, cand: vec4<u32>) -> Dem {
     var out: Dem;
     out.ok = false;
     var depth = U.depths.x;
     for (var k = 0u; k < 9u; k++) {
-        let ri = find(d, depth, u, v, FLAG_DEM);
+        // The block's candidate first; past a no-data texel the search goes on from the next depth up.
+        var ri: u32;
+        if (k == 0u) {
+            ri = pick(cand, d, u, v, depth, FLAG_DEM);
+        } else {
+            ri = find(d, depth, u, v, FLAG_DEM);
+        }
         if (ri == NONE) {
             return out;
         }
@@ -646,7 +669,8 @@ fn user_marks(composed: Composed, d: u32, u: u32, v: u32) -> Composed {
     return out;
 }
 
-fn compose(d: u32, u: u32, v: u32, pos: vec2<f32>) -> Composed {
+fn compose(d: u32, u: u32, v: u32, pos: vec2<f32>, bi: u32) -> Composed {
+    let blk = blocks[bi];
     let mask = U.mask;
     var out: Composed;
     out.base = U.style_no_dem.rgb;
@@ -690,7 +714,7 @@ fn compose(d: u32, u: u32, v: u32, pos: vec2<f32>) -> Composed {
     // The terrain sample feeds the tint and light (terrain on), and the contours and slope bands on their own; the geoid stands in for all of it.
     let want_dem = !geo && (mask & (M_DEM | M_CONTOURS | M_SLOPE | M_RAW)) != 0u;
     if (want_dem) {
-        let s = sample_dem(d, u, v);
+        let s = sample_dem(d, u, v, blk.e);
         if (s.ok) {
             found_depth = s.depth;
             elev_m = s.elev;
@@ -759,7 +783,7 @@ fn compose(d: u32, u: u32, v: u32, pos: vec2<f32>) -> Composed {
         }
     }
     // The vector cell first, for its water: a wet texel below sea level is seabed, tinted by depth, which the imagery leaves alone as it does the sea.
-    let vi = find(d, U.depths.y, u, v, FLAG_VEC);
+    let vi = pick(blk.f, d, u, v, U.depths.y, FLAG_VEC);
     var line = vec4<u32>(0u);
     var lw = vec4<u32>(0u);
     var ov = vec4<u32>(0u);
@@ -793,7 +817,7 @@ fn compose(d: u32, u: u32, v: u32, pos: vec2<f32>) -> Composed {
     // Imagery stands in for the lit ground where it has data and the terrain is not sea: the composite's own ocean pixels and the tiles' edges never show, the terrain's coastline does.
     var im = vec4<u32>(0u);
     if ((mask & (M_IMAGERY | M_INFRARED)) != 0u && !is_sea && !seabed) {
-        let ii = find(d, U.depths.y, u, v, FLAG_IMG);
+        let ii = pick(blk.g, d, u, v, U.depths.y, FLAG_IMG);
         if (ii != NONE) {
             let ri = refs[ii];
             let ti = tri(u, v, ri.a.y);
@@ -951,7 +975,7 @@ fn fs_map(in: VOut) -> @location(0) vec4<f32> {
         return vec4<f32>(to_display(U.style_bg.rgb) / 255.0, 1.0);
     }
     let s = sample_uv(in);
-    let p = compose(s.x, s.y, s.z, in.pos.xy);
+    let p = compose(s.x, s.y, s.z, in.pos.xy, in.block);
     return vec4<f32>(to_display(shade(p.base, p.ground, p.n, p.k1, p.c1, p.water, p.k2, p.c2)) / 255.0, 1.0);
 }
 
@@ -966,7 +990,7 @@ struct GOut {
 @fragment
 fn fs_map_g(in: VOut) -> GOut {
     let s = sample_uv(in);
-    var p = compose(s.x, s.y, s.z, in.pos.xy);
+    var p = compose(s.x, s.y, s.z, in.pos.xy, in.block);
     if (off_globe(in.pos.xy)) {
         p.base = U.style_bg.rgb;
         p.ground = false;
