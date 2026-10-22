@@ -1758,9 +1758,9 @@ dependencies = [
 
 [[package]]
 name = "kete"
-version = "0.0.3"
+version = "0.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d63de2286686e9053508596f3e5cf82c7c3f4edd1f6536957bcdf3e089942552"
+checksum = "840e2fea0ff8de23c0e7fa14d98f89d37639fa8a0ad255ff6e65d50ea9f14b4c"
 dependencies = [
  "blake3",
  "chacha20poly1305 0.11.0",
@@ -2040,9 +2040,9 @@ dependencies = [
 
 [[package]]
 name = "manifestus"
-version = "0.0.3"
+version = "0.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fd382738171c8fc6a53b09b2eafdd1398b6a76893a2c2eb897225f0b143e3c58"
+checksum = "a47504a3393cd7fe6f2468ab571365dc85f07c243f233acd679dd690ba787ccb"
 dependencies = [
  "blake3",
  "hashbrown 0.15.5",
