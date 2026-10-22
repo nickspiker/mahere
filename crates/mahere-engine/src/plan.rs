@@ -326,6 +326,10 @@ pub fn plan_frame(w: usize, h: usize, cam: &Camera, pool: &Pool, dem_depth: u8, 
                 }
             }
         }
+        // Finest first, as the search finds them: a coarse cell standing in for one corner's missing cell also covers its neighbours, and a pixel takes the first candidate holding it (2026-10-21: listed first, the coarse cell drew over the finer ones loaded beside it, a patchwork of stale tiles while cells arrived).
+        for c in &mut b.cand {
+            c.sort_by_key(|&r| if r == NONE { u32::MAX } else { 64 - refs[r as usize].key.depth as u32 });
+        }
     }
 
     let magnified = crate::raster::texel_px(cam.ppd, dem_depth) >= 1.5;
@@ -362,6 +366,54 @@ pub fn plan_frame(w: usize, h: usize, cam: &Camera, pool: &Pool, dem_depth: u8, 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_blocks_candidate_is_the_cell_the_search_finds() {
+        // The ancestors everywhere, and at the view's depth only the cell under the centre: around it the coarser cell stands in, in the same blocks as the fine one.
+        let mut pool = Pool::default();
+        let c = Coord::from_lat_lon(46.2, -122.19);
+        let water = || crate::residency::Entry { present: crate::residency::PRESENT_WATER, water: Some(mahere_tiles::CovCell::new()), ..Default::default() };
+        for depth in MIN_DEPTH..=12 {
+            let key = CellKey { depth, prefix: c.raw() >> (60 - 2 * depth as u32) };
+            pool.map.insert(key, water());
+        }
+        let cam = Camera::new(46.2, -122.19, 30000.0, 0.3);
+        let (w, h) = (640, 480);
+        let plan = plan_frame(w, h, &cam, &pool, 12, 12, &crate::ink::UserLayer::default());
+        let index: rustc_hash::FxHashMap<CellKey, usize> = plan.refs.iter().enumerate().map(|(i, r)| (r.key, i)).collect();
+        let search = |raw: u64| -> u32 {
+            for d in (MIN_DEPTH..=12).rev() {
+                if let Some(&i) = index.get(&CellKey { depth: d, prefix: raw >> (60 - 2 * d as u32) }) {
+                    if plan.refs[i].flags & FLAG_VEC != 0 {
+                        return i as u32;
+                    }
+                }
+            }
+            NONE
+        };
+        let mut mixed = 0;
+        for b in &plan.blocks {
+            let depths: Vec<u8> = b.cand[1].iter().filter(|&&r| r != NONE).map(|&r| plan.refs[r as usize].key.depth).collect();
+            if depths.windows(2).any(|p| p[0] != p[1]) {
+                mixed += 1;
+            }
+            assert!(depths.windows(2).all(|p| p[0] >= p[1]), "finest first: {depths:?}");
+            let n = b.size as f64;
+            for (x, y) in [(0.5, 0.5), (n - 0.5, 0.5), (0.5, n - 0.5), (n - 0.5, n - 0.5), (n * 0.5, n * 0.5)] {
+                let u = (b.u0 as f64 + b.du_dx as f64 * x + b.du_dy as f64 * y + b.twist_u as f64 * x * y) as u64;
+                let v = (b.v0 as f64 + b.dv_dx as f64 * x + b.dv_dy as f64 * y + b.twist_v as f64 * x * y) as u64;
+                let raw = raw_of(b.diamond as u8, (u as i64) << 16, (v as i64) << 16);
+                let picked = b.cand[1].iter().copied().take_while(|&r| r != NONE).find(|&r| {
+                    let k = plan.refs[r as usize].key;
+                    k == CellKey { depth: k.depth, prefix: raw >> (60 - 2 * k.depth as u32) }
+                });
+                if let Some(p) = picked {
+                    assert_eq!(p, search(raw), "the block's pick is the search's cell");
+                }
+            }
+        }
+        assert!(mixed > 0, "the view has blocks where a coarse cell stands in beside a fine one");
+    }
 
     #[test]
     fn table_finds_every_reference() {
