@@ -103,6 +103,20 @@ pub fn mask_bits(m: LayerMask) -> u32 {
     m.bits()
 }
 
+/// The GPU's own clock around the frame's passes (2026-10-21: a Pixel 3a ran at a frame a second, and a submit-to-done time could not tell the GPU's share from the CPU's): timestamps at the start and end of the map, labels and present passes, resolved and read back two frames behind, never waited on.
+struct PassTimer {
+    set: wgpu::QuerySet,
+    resolve: wgpu::Buffer,
+    read: [wgpu::Buffer; 2],
+    state: [std::sync::Arc<std::sync::atomic::AtomicU8>; 2],
+    copied: Option<usize>,
+    /// Nanoseconds a tick.
+    period: f32,
+}
+
+/// The timestamps a frame writes: map start and end, labels, present.
+const PASS_STAMPS: u32 = 6;
+
 /// The dymaxion's diamonds: a layer of the geoid texture each.
 const GEOID_DIAMONDS: u32 = 10;
 
@@ -295,6 +309,8 @@ pub struct GpuMap {
     /// The most plane uploads one sync makes (unlimited by default): a host drawing on its UI thread spreads a burst of arrivals over frames, so no one frame stalls input (2026-10-21, the Pixel 3a's "not responding"); and whether planes were left for the next.
     pub upload_budget: usize,
     uploads_left: bool,
+    /// The passes' GPU time, where the device can stamp it.
+    timer: Option<PassTimer>,
     /// The geoid of the ten depth-0 cells, a layer per diamond (centimetres above the ellipsoid offset by 32768, 0 where none), and which diamonds are in.
     geoid_tex: wgpu::Texture,
     geoid_in: u16,
@@ -478,6 +494,14 @@ impl GpuMap {
             uploads: 0,
             upload_budget: usize::MAX,
             uploads_left: false,
+            timer: device.features().contains(wgpu::Features::TIMESTAMP_QUERY).then(|| PassTimer {
+                set: device.create_query_set(&wgpu::QuerySetDescriptor { label: Some("pass times"), ty: wgpu::QueryType::Timestamp, count: PASS_STAMPS }),
+                resolve: device.create_buffer(&wgpu::BufferDescriptor { label: Some("pass times"), size: PASS_STAMPS as u64 * 8, usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC, mapped_at_creation: false }),
+                read: std::array::from_fn(|_| device.create_buffer(&wgpu::BufferDescriptor { label: Some("pass times readback"), size: PASS_STAMPS as u64 * 8, usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false })),
+                state: std::array::from_fn(|_| std::sync::Arc::new(std::sync::atomic::AtomicU8::new(RANGE_IDLE))),
+                copied: None,
+                period: _queue.get_timestamp_period(),
+            }),
             geoid_tex: plane_texture(device, "geoid", 2 * TEX as u32, TEX as u32, GEOID_DIAMONDS, wgpu::TextureFormat::R16Uint),
             geoid_in: 0,
             full_warned: std::time::Instant::now() - std::time::Duration::from_secs(60),
@@ -764,6 +788,20 @@ impl GpuMap {
         if grew {
             self.map_bind = None;
         }
+    }
+
+    /// The GPU's time in the map, labels and present passes of a frame drawn lately, milliseconds, once its stamps are back; None where the device cannot stamp or none are in yet. A pass a frame skipped reads 0.
+    pub fn take_pass_times(&mut self) -> Option<[f32; 3]> {
+        let t = self.timer.as_mut()?;
+        let i = (0..2).find(|&i| t.state[i].load(std::sync::atomic::Ordering::Acquire) == RANGE_READY)?;
+        let stamps: Vec<u64> = {
+            let view = t.read[i].slice(..).get_mapped_range();
+            bytemuck::cast_slice::<u8, u64>(&view).to_vec()
+        };
+        t.read[i].unmap();
+        t.state[i].store(RANGE_IDLE, std::sync::atomic::Ordering::Release);
+        let ms = |b: usize| if stamps[b + 1] > stamps[b] { (stamps[b + 1] - stamps[b]) as f32 * t.period / 1e6 } else { 0.0 };
+        Some([ms(0), ms(2), ms(4)])
     }
 
     /// Planes the last sync left for the next, its upload budget spent: the host keeps frames coming until they are in.
@@ -1162,7 +1200,7 @@ impl GpuMap {
                 label: Some("map"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment { view: map_view, depth_slice: None, resolve_target: None, ops: clear })],
                 depth_stencil_attachment: None,
-                timestamp_writes: None,
+                timestamp_writes: self.timer.as_ref().map(|t| wgpu::RenderPassTimestampWrites { query_set: &t.set, beginning_of_pass_write_index: Some(0), end_of_pass_write_index: Some(1) }),
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
@@ -1181,12 +1219,13 @@ impl GpuMap {
         // The route, then the letters, each a quad drawn into the map's own layer at its scale (Nick 2026-10-16: native while moving, the 3× layer when still), so the binning below scales them as it does the map's lines.
         let route = self.segments.as_ref().filter(|_| self.segment_count > 0);
         let letters = self.glyphs.as_ref().zip(self.atlas.as_ref()).filter(|_| self.glyph_count > 0);
-        if route.is_some() || letters.is_some() {
+        // Always, when the passes are timed: an empty pass still writes its stamps, which a resolve may not read unwritten.
+        if route.is_some() || letters.is_some() || self.timer.is_some() {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("labels"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment { view: map_view, depth_slice: None, resolve_target: None, ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store } })],
                 depth_stencil_attachment: None,
-                timestamp_writes: None,
+                timestamp_writes: self.timer.as_ref().map(|t| wgpu::RenderPassTimestampWrites { query_set: &t.set, beginning_of_pass_write_index: Some(2), end_of_pass_write_index: Some(3) }),
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
@@ -1213,7 +1252,7 @@ impl GpuMap {
                     ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Store },
                 })],
                 depth_stencil_attachment: None,
-                timestamp_writes: None,
+                timestamp_writes: self.timer.as_ref().map(|t| wgpu::RenderPassTimestampWrites { query_set: &t.set, beginning_of_pass_write_index: Some(4), end_of_pass_write_index: Some(5) }),
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
@@ -1226,12 +1265,30 @@ impl GpuMap {
             pass.set_bind_group(1, &self.present_binds[&scale], &[]);
             pass.draw(0..3, 0..1);
         }
+        if let Some(t) = &mut self.timer {
+            let idle = (0..2).find(|&i| t.state[i].load(std::sync::atomic::Ordering::Acquire) == RANGE_IDLE);
+            if let Some(i) = idle {
+                encoder.resolve_query_set(&t.set, 0..PASS_STAMPS, &t.resolve, 0);
+                encoder.copy_buffer_to_buffer(&t.resolve, 0, &t.read[i], 0, PASS_STAMPS as u64 * 8);
+                t.state[i].store(RANGE_COPIED, std::sync::atomic::Ordering::Release);
+                t.copied = Some(i);
+            }
+        }
     }
 }
 
 impl GpuMap {
     /// After the frame's submit: start mapping the readback buffer it copied the elevation range into. Never waits; the range arrives on a later poll.
     pub fn after_submit(&mut self) {
+        if let Some(t) = &mut self.timer {
+            if let Some(i) = t.copied.take() {
+                t.state[i].store(RANGE_MAPPING, std::sync::atomic::Ordering::Release);
+                let state = t.state[i].clone();
+                t.read[i].slice(..).map_async(wgpu::MapMode::Read, move |r| {
+                    state.store(if r.is_ok() { RANGE_READY } else { RANGE_IDLE }, std::sync::atomic::Ordering::Release);
+                });
+            }
+        }
         let Some(i) = self.range_copied.take() else { return };
         if self.range_state[i].load(std::sync::atomic::Ordering::Acquire) != RANGE_COPIED {
             return;

@@ -36,6 +36,12 @@ pub struct GpuHost {
     /// The device was lost: the host is made again.
     lost: std::sync::Arc<std::sync::atomic::AtomicBool>,
     cost_1x: Option<f32>,
+    /// The passes' GPU times summed over the report's frames (map, labels, present) and how many frames gave them; the CPU's labels, overlay and encode times summed likewise.
+    pass_ms: [f32; 3],
+    pass_n: u32,
+    labels_ms: f32,
+    overlay_ms: f32,
+    encode_ms: f32,
     work_ms: f32,
     plan_ms: f32,
     sync_ms: f32,
@@ -71,7 +77,9 @@ impl GpuHost {
         limits.max_texture_array_layers = adapter.limits().max_texture_array_layers.min(2048);
         // The still frame is drawn at three times the screen, larger than WebGPU's 8192 on a tall screen (a 1440 by 3040 Note 10+ needs 9120): ask for the GPU's own limit (Nick 2026-10-15: the screen flicked to black whenever the map came to rest).
         limits.max_texture_dimension_2d = adapter.limits().max_texture_dimension_2d.max(limits.max_texture_dimension_2d);
-        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor { label: Some("mahere"), required_limits: limits, ..Default::default() }))
+        // The GPU's own clock around the passes where it has one: what a frame costs it, apart from the CPU's share.
+        let required_features = adapter.features() & wgpu::Features::TIMESTAMP_QUERY;
+        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor { label: Some("mahere"), required_limits: limits, required_features, ..Default::default() }))
             .map_err(|e| eprintln!("gpu: no device: {e:?}"))
             .ok()?;
         // A validation error logs instead of killing the app: the map goes wrong on screen, the phone stays usable, logcat says why.
@@ -114,6 +122,11 @@ impl GpuHost {
             gpu_done: Default::default(),
             lost,
             cost_1x: None,
+            pass_ms: [0.0; 3],
+            pass_n: 0,
+            labels_ms: 0.0,
+            overlay_ms: 0.0,
+            encode_ms: 0.0,
             work_ms: 0.0,
             plan_ms: 0.0,
             sync_ms: 0.0,
@@ -216,7 +229,17 @@ impl GpuHost {
         let fits = (self.device.limits().max_texture_dimension_2d / w.max(h).max(1)).max(1);
         let budget = ((STILL_PIXELS as f64 / (w as f64 * h as f64).max(1.0)).sqrt().floor() as u32).max(1);
         // The GPU's own measure: a frame's cost goes as its pixels, the scale squared; until one is known a still frame is drawn at 1×.
-        if let Some((s, ms)) = self.gpu_done.lock().unwrap().take() {
+        // The map pass's own GPU time where the device stamps it (its scale the one it was drawn at, two frames back: near enough, the scale changes rarely); else the frame's time to done, which takes in the CPU between.
+        if let Some(t) = self.map.take_pass_times() {
+            for k in 0..3 {
+                self.pass_ms[k] += t[k];
+            }
+            self.pass_n += 1;
+            let s = self.map.scale.max(1) as f32;
+            let one = t[0] / (s * s);
+            self.cost_1x = Some(self.cost_1x.map_or(one, |c| c * 0.7 + one * 0.3));
+            self.gpu_done.lock().unwrap().take();
+        } else if let Some((s, ms)) = self.gpu_done.lock().unwrap().take() {
             let one = ms / (s * s) as f32;
             self.cost_1x = Some(self.cost_1x.map_or(one, |c| c * 0.7 + one * 0.3));
         }
@@ -253,6 +276,7 @@ impl GpuHost {
             hs.finish()
         });
         // Labels: laid out again when the view rests; every frame each letter is a quad at its label's place on the map now.
+        let t_labels = std::time::Instant::now();
         if mahere_panel::labels::Labeller::wanted(map) {
             self.labeller.ask(map, w as usize, h as usize, panel.font_px(), !in_motion);
             let a = self.labeller.atlas();
@@ -265,6 +289,8 @@ impl GpuHost {
         self.map.pin = map.gps_screen(w as usize, h as usize);
         self.map.measure = map.measure_view(w as usize, h as usize, 2).map(|m| (m.origin_px.0, m.origin_px.1, m.target_px.0, m.target_px.1));
         // A bearing or readout change repaints at most a few times a second (the orientation sensor would otherwise repaint the panel's text every frame); the panel opening, closing or a row flipping repaints at once.
+        self.labels_ms += t_labels.elapsed().as_secs_f32() * 1000.0;
+        let t_overlay = std::time::Instant::now();
         let structural = self.overlay_stamp.is_none_or(|s| (s.5, s.6, s.7, s.8, s.10, s.11) != (w, h, panel.is_open(), stamp.8, stamp.10, stamp.11));
         if self.overlay_stamp != Some(stamp) && (structural || self.overlay_at.elapsed().as_millis() >= 150) {
             self.overlay_at = std::time::Instant::now();
@@ -281,6 +307,7 @@ impl GpuHost {
             self.map.set_overlay_rgba(&self.device, &self.queue, w, h, &rgba);
             self.overlay_stamp = Some(stamp);
         }
+        self.overlay_ms += t_overlay.elapsed().as_secs_f32() * 1000.0;
         self.work_ms += t0.elapsed().as_secs_f32() * 1000.0;
         let frame = match self.surface.get_current_texture() {
             Ok(f) => f,
@@ -295,6 +322,7 @@ impl GpuHost {
         };
         let view = frame.texture.create_view(&Default::default());
         let mut enc = self.device.create_command_encoder(&Default::default());
+        let t_encode = std::time::Instant::now();
         self.map.set_user(&self.device, &self.queue, &map.user, &map.preview, map.preview_version, w, h);
         self.map.render(&self.device, &self.queue, &mut enc, &view, &plan, map.luts(), w, h, mode);
         self.queue.submit([enc.finish()]);
@@ -307,13 +335,20 @@ impl GpuHost {
         }
         self.map.after_submit();
         frame.present();
+        self.encode_ms += t_encode.elapsed().as_secs_f32() * 1000.0;
         // Reclaim what finished: staging buffers behind every upload and the arrays replaced by growth are only freed when the device is polled.
         self.device.poll(wgpu::PollType::Poll).ok();
         self.frames += 1;
         self.frame_ms += t0.elapsed().as_secs_f32() * 1000.0;
         if self.report.elapsed().as_secs() >= 10 {
             let n = self.frames.max(1) as f32;
-            eprintln!("gpu: a 1x frame costs {:.1} ms on the GPU, still frames at {}x", self.cost_1x.unwrap_or(f32::NAN), self.map.scale.max(1));
+            let pn = self.pass_n.max(1) as f32;
+            eprintln!("gpu: a 1x frame costs {:.1} ms on the GPU, still frames at {}x; GPU per frame: map {:.1} ms, labels {:.1}, present {:.1} ({} timed); CPU per frame: labels {:.1} ms, overlay {:.1}, encode and present {:.1}", self.cost_1x.unwrap_or(f32::NAN), self.map.scale.max(1), self.pass_ms[0] / pn, self.pass_ms[1] / pn, self.pass_ms[2] / pn, self.pass_n, self.labels_ms / self.frames.max(1) as f32, self.overlay_ms / self.frames.max(1) as f32, self.encode_ms / self.frames.max(1) as f32);
+            self.pass_ms = [0.0; 3];
+            self.pass_n = 0;
+            self.labels_ms = 0.0;
+            self.overlay_ms = 0.0;
+            self.encode_ms = 0.0;
             eprintln!("gpu: {} frames, per frame {:.2} ms plan + {:.2} ms sync + {:.2} ms overlay and encode + {:.2} ms waiting for the swapchain, {} resident, {} pending, {} uploads, layers {:?}", self.frames, self.plan_ms / n, self.sync_ms / n, (self.work_ms - self.plan_ms - self.sync_ms) / n, (self.frame_ms - self.work_ms) / n, map.pool().map.len(), map.pending_cells(), self.map.uploads, self.map.layers());
             self.frames = 0;
             self.frame_ms = 0.0;
