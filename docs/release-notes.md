@@ -17,6 +17,7 @@
 - The map no longer turns black after the graphics driver resets: it rebuilds itself and carries on.
 - Old, coarse tiles no longer flash over sharper ones that have already loaded, and no more brown patches where detail is still on its way.
 - Roads fade against the biggest road actually on screen, not one just out of view.
+- Your notes, tracks and settings take less room: their storage tidies itself up while Mahere sits idle, instead of in the middle of a save.
 
 ## Before 0.0.0
 
