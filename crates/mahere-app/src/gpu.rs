@@ -49,9 +49,9 @@ impl Gpu {
         Some(Gpu { device, queue, map, target: None, style_version: None, last_cam: None, last_move: Instant::now(), settled: false, frame: Vec::new() })
     }
 
-    /// The still frame is still to come: the host keeps ticking until it is drawn.
+    /// The still frame is still to come, or composites to bake: the host keeps ticking until they are done.
     pub fn wants_frame(&self) -> bool {
-        !self.settled
+        !self.settled || self.map.bakes_pending()
     }
 
     fn ensure_target(&mut self, w: u32, h: u32) {

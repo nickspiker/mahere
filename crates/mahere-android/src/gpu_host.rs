@@ -59,18 +59,19 @@ fn debug_prop(name: &str) -> Option<String> {
     (n > 0).then(|| String::from_utf8_lossy(&buf[..n as usize]).into_owned())
 }
 
-/// The profiling switches, read every two seconds: `mask_off` (layer bits the shader leaves out, decimal), `spin` (1: draw every frame, the view still), `overlay_off` (1: the panel's overlay not repainted).
+/// The profiling switches, read every two seconds: `mask_off` (layer bits the shader leaves out, decimal), `spin` (1: draw every frame, the view still), `overlay_off` (1: the panel's overlay not repainted), `comp_off` (1: every pixel composited whole, the baked composites unused).
 #[derive(Default, Clone, Copy)]
 struct Debug {
     mask_off: u32,
     spin: bool,
     overlay_off: bool,
+    comp_off: bool,
 }
 
 impl Debug {
     fn read() -> Debug {
         let num = |n: &str| debug_prop(n).and_then(|v| v.trim().parse::<u32>().ok()).unwrap_or(0);
-        Debug { mask_off: num("mask_off"), spin: num("spin") == 1, overlay_off: num("overlay_off") == 1 }
+        Debug { mask_off: num("mask_off"), spin: num("spin") == 1, overlay_off: num("overlay_off") == 1, comp_off: num("comp_off") == 1 }
     }
 }
 
@@ -78,6 +79,8 @@ impl Debug {
 const STILL_BUDGET_MS: f32 = 100.0;
 /// Plane uploads a frame makes at most: a burst of arriving cells spread over frames, never one long stall on the UI thread.
 const UPLOADS_PER_FRAME: usize = 24;
+/// Cells' composites baked a frame at most: each is a full composite of 131 072 texels, some 20 ms on a Pixel 3a.
+const BAKES_PER_FRAME: usize = 3;
 
 /// Supersampling while the camera moves and once it has stopped.
 const MOVING_SCALE: u32 = 1;
@@ -123,6 +126,7 @@ impl GpuHost {
         let alpha = caps.alpha_modes.first().copied().unwrap_or(wgpu::CompositeAlphaMode::Auto);
         let mut map = GpuMap::new(&device, &queue, format);
         map.upload_budget = UPLOADS_PER_FRAME;
+        map.bake_budget = BAKES_PER_FRAME;
         let info = adapter.get_info();
         eprintln!("gpu: {} ({:?}), surface {:?}", info.name, info.backend, format);
         Some(GpuHost {
@@ -231,8 +235,9 @@ impl GpuHost {
             self.debug = Debug::read();
             self.debug_read = std::time::Instant::now();
             self.map.mask_off = self.debug.mask_off;
+            self.map.composite = !self.debug.comp_off;
         }
-        let changed = map.tick(w as usize, h as usize) || fresh || panel_dirty || lettered || self.map.uploads_pending() || self.debug.spin;
+        let changed = map.tick(w as usize, h as usize) || fresh || panel_dirty || lettered || self.map.uploads_pending() || self.map.bakes_pending() || self.debug.spin;
         let quiet = std::time::Duration::from_millis(250);
         if !changed && (self.settled || self.last_low.elapsed() < quiet) {
             self.device.poll(wgpu::PollType::Poll).ok();
@@ -382,7 +387,7 @@ impl GpuHost {
             self.labels_ms = 0.0;
             self.overlay_ms = 0.0;
             self.encode_ms = 0.0;
-            eprintln!("gpu: {} frames, per frame {:.2} ms plan + {:.2} ms sync + {:.2} ms overlay and encode + {:.2} ms waiting for the swapchain, {} resident, {} pending, {} uploads, layers {:?}", self.frames, self.plan_ms / n, self.sync_ms / n, (self.work_ms - self.plan_ms - self.sync_ms) / n, (self.frame_ms - self.work_ms) / n, map.pool().map.len(), map.pending_cells(), self.map.uploads, self.map.layers());
+            eprintln!("gpu: {} frames, per frame {:.2} ms plan + {:.2} ms sync + {:.2} ms overlay and encode + {:.2} ms waiting for the swapchain, {} resident, {} pending, {} uploads, layers {:?}, {} of {} blocks from composites", self.frames, self.plan_ms / n, self.sync_ms / n, (self.work_ms - self.plan_ms - self.sync_ms) / n, (self.frame_ms - self.work_ms) / n, map.pool().map.len(), map.pending_cells(), self.map.uploads, self.map.layers(), self.map.fast_blocks.0, self.map.fast_blocks.1);
             self.frames = 0;
             self.frame_ms = 0.0;
             self.work_ms = 0.0;
@@ -391,7 +396,7 @@ impl GpuHost {
             self.report = std::time::Instant::now();
         }
         // Lettering held back by cells still arriving needs another frame once its second is up.
-        !map.converged() || self.labeller.pending(map, w as usize, h as usize) || panel.fonts_due() || self.map.uploads_pending()
+        !map.converged() || self.labeller.pending(map, w as usize, h as usize) || panel.fonts_due() || self.map.uploads_pending() || self.map.bakes_pending()
     }
 }
 

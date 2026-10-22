@@ -54,6 +54,8 @@ const FLAG_OWN: u32 = 64u;
 const FLAG_MVUM: u32 = 128u;
 // Line, land, water, and the overlays: whatever a vector cell may carry.
 const FLAG_VEC: u32 = 206u;
+// The reference's composite is baked and current: c.z and c.w are its slots.
+const FLAG_COMP: u32 = 256u;
 
 const M_DEM: u32 = 1u;
 const M_LAND: u32 = 2u;
@@ -145,6 +147,9 @@ struct Slot { tag: u32, cu: u32, cv: u32, index: u32 };
 @group(0) @binding(12) var<storage, read_write> view_range: array<atomic<u32>, 2>;
 // The geoid's height above the ellipsoid per depth-0 texel, centimetres offset by 32768, a layer per diamond; 0 where that diamond's cell has not arrived.
 @group(0) @binding(13) var geoid_tex: texture_2d_array<u32>;
+// A vector cell's static layers composited once (Nick 2026-10-21, a Pixel 3a drawing every layer every pixel every frame): the base before the light and the fold after it, slots in its reference's c.z and c.w ([`fs_bake`]).
+@group(0) @binding(14) var comp0_tex: texture_2d_array<f32>;
+@group(0) @binding(15) var comp1_tex: texture_2d_array<f32>;
 
 struct VOut {
     @builtin(position) pos: vec4<f32>,
@@ -553,6 +558,8 @@ struct Composed {
     water: f32,
     k2: f32,
     c2: vec3<f32>,
+    // The sample took the ground's path (not the imagery's, not a bare cell): the slope band applies.
+    banded: bool,
 };
 
 // A lerp toward `col` by `a` after the light, folded into (k, c).
@@ -694,8 +701,64 @@ fn user_marks(composed: Composed, d: u32, u: u32, v: u32, cand: vec4<u32>) -> Co
     return out;
 }
 
-fn compose(d: u32, u: u32, v: u32, pos: vec2<f32>, bi: u32) -> Composed {
-    let blk = blocks[bi];
+// The bake pass: a cell's static layers into its composite, the uniforms its own.
+fn baking() -> bool {
+    return U.tone.y > 0.5;
+}
+
+// The contour through a terrain sample: (coverage, 1 on an index line), none where the ground is near flat.
+fn contour_at(s: Dem, u: u32, v: u32) -> vec2<f32> {
+    let nzn = max(s.n.z, 1e-4);
+    let slope = sqrt(max(1.0 - nzn * nzn, 0.0)) / nzn;
+    if (slope < 0.02 || U.contour.x <= 0.0) {
+        return vec2<f32>(0.0);
+    }
+    let interval = U.contour.x;
+    // Always the interpolated elevation, at every zoom: from the texels' own values a contour is a chain of triangle facets (Nick 2026-10-09).
+    let elev_m = dem_smooth(s, u, v);
+    let level = round(elev_m / interval);
+    let d_m = abs(elev_m - level * interval);
+    let d_px = d_m / (slope * U.contour.z);
+    let li = i32(level);
+    let every = i32(U.contour.y);
+    let index = ((li % every) + every) % every == 0;
+    let w = select(0.55, 0.9, index);
+    return vec2<f32>(clamp(w + 0.5 - d_px, 0.0, 1.0), select(0.0, 1.0, index));
+}
+
+// The slope band a terrain sample falls in: its colour, and 1 when there is one.
+fn slope_band(s: Dem) -> vec4<f32> {
+    let nzn = max(s.n.z, 1e-4);
+    let deg = degrees(atan(sqrt(max(1.0 - nzn * nzn, 0.0)) / nzn));
+    if (deg >= 45.0) {
+        return vec4<f32>(dec(vec3<f32>(150.0, 40.0, 200.0)), 1.0);
+    }
+    if (deg >= 35.0) {
+        return vec4<f32>(dec(vec3<f32>(230.0, 50.0, 40.0)), 1.0);
+    }
+    if (deg >= 30.0) {
+        return vec4<f32>(dec(vec3<f32>(250.0, 150.0, 40.0)), 1.0);
+    }
+    if (deg >= 25.0) {
+        return vec4<f32>(dec(vec3<f32>(250.0, 220.0, 60.0)), 1.0);
+    }
+    return vec4<f32>(0.0);
+}
+
+// The elevation range in view, gathered every fragment (about 0.3 ms at 3× on a desktop GPU; subsampling saved nothing); the load first, so most fragments never touch the atomic.
+fn gather_range(elev: f32) {
+    // The renderer's quantum: half-metre steps from 11 km below the sea (the CPU's ELEV_OFFSET and ELEV_STEP).
+    let eq = u32(clamp((elev + 11000.0) * 2.0, 0.0, 65534.0));
+    if (eq < atomicLoad(&view_range[0])) {
+        atomicMin(&view_range[0], eq);
+    }
+    if (eq > atomicLoad(&view_range[1])) {
+        atomicMax(&view_range[1], eq);
+    }
+}
+
+// The composite at a sample: ce, cf, cg the block's candidates for the terrain, the vector planes and the imagery, ch its user cells (NONE throughout when baking: the search finds them).
+fn compose(d: u32, u: u32, v: u32, pos: vec2<f32>, ce: vec4<u32>, cf: vec4<u32>, cg: vec4<u32>, ch: vec4<u32>) -> Composed {
     let mask = U.mask & LAYERS;
     var out: Composed;
     out.base = U.style_no_dem.rgb;
@@ -706,6 +769,7 @@ fn compose(d: u32, u: u32, v: u32, pos: vec2<f32>, bi: u32) -> Composed {
     out.water = 0.0;
     out.k2 = 1.0;
     out.c2 = vec3<f32>(0.0);
+    out.banded = false;
     var contour_cov = 0.0;
     var contour_index = false;
     // The theme's contour inks; the geoid's own, darker, over its pale wash.
@@ -739,18 +803,13 @@ fn compose(d: u32, u: u32, v: u32, pos: vec2<f32>, bi: u32) -> Composed {
     // The terrain sample feeds the tint and light (terrain on), and the contours and slope bands on their own; the geoid stands in for all of it.
     let want_dem = !geo && (mask & (M_DEM | M_CONTOURS | M_SLOPE | M_RAW)) != 0u;
     if (want_dem) {
-        let s = sample_dem(d, u, v, blk.e);
+        let s = sample_dem(d, u, v, ce);
         if (s.ok) {
             found_depth = s.depth;
             elev_m = s.elev;
-            // The renderer's quantum: half-metre steps from 11 km below the sea (the CPU's ELEV_OFFSET and ELEV_STEP).
             let eq = u32(clamp((s.elev + 11000.0) * 2.0, 0.0, 65534.0));
-            // Gathered for the range in view, every fragment (about 0.3 ms at 3× on a desktop GPU; subsampling saved nothing); the load first, so most fragments never touch the atomic.
-            if (eq < atomicLoad(&view_range[0])) {
-                atomicMin(&view_range[0], eq);
-            }
-            if (eq > atomicLoad(&view_range[1])) {
-                atomicMax(&view_range[1], eq);
+            if (!baking()) {
+                gather_range(s.elev);
             }
             // Raw elevation: grey across the range in view as a byte, unlit (the CPU's raw_grey, from the same quantum).
             if ((mask & M_RAW) != 0u) {
@@ -772,43 +831,22 @@ fn compose(d: u32, u: u32, v: u32, pos: vec2<f32>, bi: u32) -> Composed {
                 }
                 out.ground = true;
             }
-            let nzn = max(s.n.z, 1e-4);
-            let slope = sqrt(max(1.0 - nzn * nzn, 0.0)) / nzn;
-            if ((mask & M_CONTOURS) != 0u && slope >= 0.02 && U.contour.x > 0.0) {
-                let interval = U.contour.x;
-                // Always the interpolated elevation, at every zoom: from the texels' own values a contour is a chain of triangle facets (Nick 2026-10-09).
-                let elev_m = dem_smooth(s, u, v);
-                let level = round(elev_m / interval);
-                let d_m = abs(elev_m - level * interval);
-                let d_px = d_m / (slope * U.contour.z);
-                let li = i32(level);
-                let every = i32(U.contour.y);
-                contour_index = ((li % every) + every) % every == 0;
-                let w = select(0.55, 0.9, contour_index);
-                contour_cov = clamp(w + 0.5 - d_px, 0.0, 1.0);
+            if ((mask & M_CONTOURS) != 0u) {
+                let c = contour_at(s, u, v);
+                contour_cov = c.x;
+                contour_index = c.y > 0.5;
             }
             if ((mask & M_SLOPE) != 0u) {
-                let deg = degrees(atan(slope));
-                if (deg >= 45.0) {
-                    band = dec(vec3<f32>(150.0, 40.0, 200.0));
-                    have_band = true;
-                } else if (deg >= 35.0) {
-                    band = dec(vec3<f32>(230.0, 50.0, 40.0));
-                    have_band = true;
-                } else if (deg >= 30.0) {
-                    band = dec(vec3<f32>(250.0, 150.0, 40.0));
-                    have_band = true;
-                } else if (deg >= 25.0) {
-                    band = dec(vec3<f32>(250.0, 220.0, 60.0));
-                    have_band = true;
-                }
+                let b = slope_band(s);
+                band = b.rgb;
+                have_band = b.a > 0.5;
             }
         } else if ((mask & (M_DEM | M_RAW)) != 0u) {
             out.base = U.style_bg.rgb;
         }
     }
     // The vector cell first, for its water: a wet texel below sea level is seabed, tinted by depth, which the imagery leaves alone as it does the sea.
-    let vi = pick(blk.f, d, u, v, U.depths.y, FLAG_VEC);
+    let vi = pick(cf, d, u, v, U.depths.y, FLAG_VEC);
     var line = vec4<u32>(0u);
     var lw = vec4<u32>(0u);
     var ov = vec4<u32>(0u);
@@ -842,7 +880,7 @@ fn compose(d: u32, u: u32, v: u32, pos: vec2<f32>, bi: u32) -> Composed {
     // Imagery stands in for the lit ground where it has data and the terrain is not sea: the composite's own ocean pixels and the tiles' edges never show, the terrain's coastline does.
     var im = vec4<u32>(0u);
     if ((mask & (M_IMAGERY | M_INFRARED)) != 0u && !is_sea && !seabed) {
-        let ii = pick(blk.g, d, u, v, U.depths.y, FLAG_IMG);
+        let ii = pick(cg, d, u, v, U.depths.y, FLAG_IMG);
         if (ii != NONE) {
             let ri = refs[ii];
             let ti = tri(u, v, ri.a.y);
@@ -856,7 +894,7 @@ fn compose(d: u32, u: u32, v: u32, pos: vec2<f32>, bi: u32) -> Composed {
             let ink = select(contour_ink, contour_ink_index, contour_index);
             { let f = fold(Fold(out.k2, out.c2), ink.rgb, contour_cov * ink.a); out.k2 = f.k; out.c2 = f.c; }
         }
-        return user_marks(out, d, u, v, blk.h);
+        return user_marks(out, d, u, v, ch);
     }
     if (vi != NONE) {
         let flags = vflags;
@@ -887,8 +925,10 @@ fn compose(d: u32, u: u32, v: u32, pos: vec2<f32>, bi: u32) -> Composed {
             if (draw_line && line.x != WATERWAY_CLASS) {
                 { let f = fold(Fold(out.k2, out.c2), line_colour(line.x, line.z), line_alpha(line.x, line.y, line.z)); out.k2 = f.k; out.c2 = f.c; }
             }
-            return user_marks(out, d, u, v, blk.h);
+            return user_marks(out, d, u, v, ch);
         }
+        // The slope band and the contours come under everything that follows, so a baked composite leaves them to the frame.
+        out.banded = true;
         if ((mask & M_LAND) != 0u && lw.y != 0u) {
             out.base = lerp3(out.base, unpack_rgb(lut[LAND_BASE + min(lw.x, 13u)]), f32(lw.y) / 255.0 * unpack_a(lut[LAND_BASE + min(lw.x, 13u)]));
         }
@@ -920,7 +960,7 @@ fn compose(d: u32, u: u32, v: u32, pos: vec2<f32>, bi: u32) -> Composed {
         }
     }
     // Where the wanted terrain cell has not arrived at all (no reference and no absent marker), the cell's two triangles each take a random dark colour of their own, the CPU's loading_noise, where nothing at any depth stands in; a coarser stand-in draws as it is.
-    if (want_dem && found_depth != U.depths.x && lookup(d, U.depths.x, u, v) == NONE) {
+    if (want_dem && !baking() && found_depth != U.depths.x && lookup(d, U.depths.x, u, v) == NONE) {
         let s = 30u - U.depths.x;
         let m = (1u << s) - 1u;
         let half = (((u & m) + (v & m)) >> s) & 1u;
@@ -939,7 +979,7 @@ fn compose(d: u32, u: u32, v: u32, pos: vec2<f32>, bi: u32) -> Composed {
             out.c2 = vec3<f32>(0.0);
         }
     }
-    out = user_marks(out, d, u, v, blk.h);
+    out = user_marks(out, d, u, v, ch);
     // Detail: tinted by the depth of the terrain cell drawn, the CPU's DETAIL_COLOURS from depth 8 (the global base) to 14 (the finest bakes); magenta where there is none.
     if ((mask & M_DEBUG) != 0u) {
         var tintd = dec(vec3<f32>(255.0, 0.0, 255.0));
@@ -1000,7 +1040,8 @@ fn fs_map(in: VOut) -> @location(0) vec4<f32> {
         return vec4<f32>(to_display(U.style_bg.rgb) / 255.0, 1.0);
     }
     let s = sample_uv(in);
-    let p = compose(s.x, s.y, s.z, in.pos.xy, in.block);
+    let blk = blocks[in.block];
+    let p = compose(s.x, s.y, s.z, in.pos.xy, blk.e, blk.f, blk.g, blk.h);
     return vec4<f32>(to_display(shade(p.base, p.ground, p.n, p.k1, p.c1, p.water, p.k2, p.c2)) / 255.0, 1.0);
 }
 
@@ -1015,7 +1056,8 @@ struct GOut {
 @fragment
 fn fs_map_g(in: VOut) -> GOut {
     let s = sample_uv(in);
-    var p = compose(s.x, s.y, s.z, in.pos.xy, in.block);
+    let blk = blocks[in.block];
+    var p = compose(s.x, s.y, s.z, in.pos.xy, blk.e, blk.f, blk.g, blk.h);
     if (off_globe(in.pos.xy)) {
         p.base = U.style_bg.rgb;
         p.ground = false;
@@ -1033,6 +1075,99 @@ fn fs_map_g(in: VOut) -> GOut {
     g.post1 = vec4<f32>(sqrt(p.c1), p.k1);
     g.post2 = vec4<f32>(sqrt(p.c2), p.k2);
     return g;
+}
+
+// ==================== COMPOSITE: a vector cell's static layers, baked once ====================
+
+// What the light leaves alone, folded: the frame's colour is `x × A + B + W × water`, x being the base lit (on the ground), with the slope band and the contours over it, all live from the terrain. T0 the base at gamma 2 with 2.8 headroom and A; T1 B at gamma 2 and a byte of W (six bits), the ground (64) and whether the band applies (128).
+struct BakeOut {
+    @location(0) t0: vec4<f32>,
+    @location(1) t1: vec4<f32>,
+};
+
+// A texel of the cell in U.raw (column, row, diamond, depth) at its triangle's centroid: the target is the cell's 512 × 256 texel layout.
+@fragment
+fn fs_bake(@builtin(position) pos: vec4<f32>) -> BakeOut {
+    let px = u32(pos.x);
+    let py = u32(pos.y);
+    let depth = u32(U.raw.w);
+    let s = 30u - depth;
+    let ts = 22u - depth;
+    let third = (1u << ts) / 3u;
+    let off = select(third, 2u * third + 1u, (px & 1u) == 1u);
+    let u = (u32(U.raw.x) << s) + ((px >> 1u) << ts) + off;
+    let v = (u32(U.raw.y) << s) + (py << ts) + off;
+    let none = vec4<u32>(NONE);
+    let p = compose(u32(U.raw.z), u, v, pos.xy, none, none, none, none);
+    let keep = 1.0 - p.water;
+    let a = p.k1 * keep * p.k2;
+    let b = p.c1 * keep * p.k2 + p.c2;
+    let w = p.water * p.k2;
+    var o: BakeOut;
+    o.t0 = vec4<f32>(sqrt(clamp(p.base / 2.8, vec3<f32>(0.0), vec3<f32>(1.0))), a);
+    let bits = round(clamp(w, 0.0, 1.0) * 63.0) + select(0.0, 64.0, p.ground) + select(0.0, 128.0, p.banded);
+    o.t1 = vec4<f32>(sqrt(clamp(b, vec3<f32>(0.0), vec3<f32>(1.0))), bits / 255.0);
+    return o;
+}
+
+// The map pass over blocks whose vector cells are all baked: two loads for every static layer, the terrain sampled only for the light, the slope band and the contours. A shader of its own, small, so a phone's GPU keeps more fragments in flight than the full composite's registers allow.
+@fragment
+fn fs_fast(in: VOut) -> @location(0) vec4<f32> {
+    if (off_globe(in.pos.xy)) {
+        return vec4<f32>(to_display(U.style_bg.rgb) / 255.0, 1.0);
+    }
+    let s = sample_uv(in);
+    let d = s.x;
+    let u = s.y;
+    let v = s.z;
+    let blk = blocks[in.block];
+    let mask = U.mask & LAYERS;
+    let ci = pick(blk.f, d, u, v, U.depths.y, FLAG_COMP);
+    if (ci == NONE) {
+        return vec4<f32>(to_display(U.style_bg.rgb) / 255.0, 1.0);
+    }
+    let r = refs[ci];
+    let t = tri(u, v, r.a.y);
+    let xy = vec2<i32>(i32(2u * t.x + t.z), i32(t.y));
+    let t0 = textureLoad(comp0_tex, xy, i32(r.c.z), 0);
+    let t1 = textureLoad(comp1_tex, xy, i32(r.c.w), 0);
+    let bits = u32(round(t1.a * 255.0));
+    let ground = (bits & 64u) != 0u;
+    let banded = (bits & 128u) != 0u;
+    let w = f32(bits & 63u) / 63.0;
+    var x = t0.rgb * t0.rgb * 2.8;
+    var diffuse = 1.0;
+    if ((mask & (M_DEM | M_CONTOURS | M_SLOPE)) != 0u) {
+        let dem = sample_dem(d, u, v, blk.e);
+        if (dem.ok) {
+            gather_range(dem.elev);
+            if (ground && (mask & M_DEM) != 0u) {
+                let n = view_normal(dem.n, in.pos.xy);
+                diffuse = max(dot(n, U.sun.xyz), 0.0);
+                x = x * max(light_eval(n), vec3<f32>(0.0));
+            }
+            if (banded && (mask & M_SLOPE) != 0u) {
+                let b = slope_band(dem);
+                if (b.a > 0.5) {
+                    x = lerp3(x, b.rgb, 0.45);
+                }
+            }
+            if ((mask & M_CONTOURS) != 0u) {
+                let c = contour_at(dem, u, v);
+                if (c.x > 0.0) {
+                    let ink = select(U.style_contour, U.style_contour_index, c.y > 0.5);
+                    x = lerp3(x, ink.rgb, c.x * ink.a);
+                }
+            }
+        }
+    }
+    var col = x * t0.a + t1.rgb * t1.rgb + w * U.style_water.rgb * (0.85 + 0.15 * diffuse);
+    var marks: Composed;
+    marks.k2 = 1.0;
+    marks.c2 = vec3<f32>(0.0);
+    marks = user_marks(marks, d, u, v, blk.h);
+    col = col * marks.k2 + marks.c2;
+    return vec4<f32>(to_display(col) / 255.0, 1.0);
 }
 
 // ==================== RELIGHT: the light alone, from the G-buffer ====================

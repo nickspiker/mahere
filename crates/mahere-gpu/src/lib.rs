@@ -1,7 +1,8 @@
 //! The #pagetable compositor on the GPU. The engine still owns residency and the frame plan; this crate mirrors the resident cells into texture arrays (one slot per cell per plane), uploads the plan's blocks, references and page table, and draws every frame in two passes: the map at 2× into an offscreen target, then a 2×2 bin down onto the surface with the screen-space marks laid over. Any host with a wgpu device and a target view can drive it.
 
 use bytemuck::{Pod, Zeroable};
-use mahere_engine::plan::{FLAG_DEM, FLAG_IMG, FLAG_INK, FLAG_LAND, FLAG_LINE, FLAG_MVUM, FLAG_OWN, FLAG_WATER, FramePlan, TABLE_N};
+use mahere_engine::plan::{FLAG_DEM, FLAG_IMG, FLAG_INK, FLAG_LAND, FLAG_LINE, FLAG_MVUM, FLAG_OWN, FLAG_VEC, FLAG_WATER, FramePlan, NONE, PlanBlock, TABLE_N};
+use std::hash::{Hash, Hasher};
 use mahere_engine::raster::{FrameLuts, LayerMask};
 use mahere_engine::residency::{DEMQ_H, DEMQ_W, Pool};
 use mahere_tiles::{CellKey, TEX, TRI};
@@ -119,6 +120,51 @@ struct PassTimer {
 /// The timestamps a frame writes: map start and end, labels, present.
 const PASS_STAMPS: u32 = 6;
 
+/// The map pass's pipelines: the full composite, the same writing the G-buffer, the baked cells' fast pass, and the bake.
+const KIND_FULL: u8 = 0;
+const KIND_G: u8 = 1;
+const KIND_FAST: u8 = 2;
+const KIND_BAKE: u8 = 3;
+
+/// The shader's layer bits the composite leaves to the frame (contours, slope bands: drawn live from the terrain) and those no composite is made under (raw elevation, the geoid, detail tinting).
+const LIVE_BITS: u32 = 64 | 128;
+const NO_COMPOSITE_BITS: u32 = 16 | 8192 | 32768;
+
+/// The reference's composite is baked and current (the shader's FLAG_COMP).
+const FLAG_COMP: u32 = 256;
+
+/// Most composites held, a megabyte each: the least recently drawn goes when a new cell needs the room.
+const COMP_LAYERS: u32 = 128;
+
+fn build_map_pipeline(device: &wgpu::Device, shader: &wgpu::ShaderModule, layout: &wgpu::PipelineLayout, layers: u32, kind: u8) -> wgpu::RenderPipeline {
+    let constants = [("LAYERS", layers as f64)];
+    let options = wgpu::PipelineCompilationOptions { constants: &constants, ..Default::default() };
+    let (label, vs, fs, formats): (&str, &str, &str, &[wgpu::TextureFormat]) = match kind {
+        KIND_G => ("map with g-buffer", "vs_map", "fs_map_g", &G_FORMATS),
+        KIND_FAST => ("map from composites", "vs_map", "fs_fast", &[wgpu::TextureFormat::Rgba8Unorm]),
+        KIND_BAKE => ("composite bake", "vs_present", "fs_bake", &[wgpu::TextureFormat::Rgba8Unorm; 2]),
+        _ => ("map", "vs_map", "fs_map", &[wgpu::TextureFormat::Rgba8Unorm]),
+    };
+    let targets: Vec<Option<wgpu::ColorTargetState>> = formats.iter().map(|&format| Some(wgpu::ColorTargetState { format, blend: None, write_mask: wgpu::ColorWrites::ALL })).collect();
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some(label),
+        layout: Some(layout),
+        vertex: wgpu::VertexState { module: shader, entry_point: Some(vs), compilation_options: options.clone(), buffers: &[] },
+        primitive: wgpu::PrimitiveState { topology: wgpu::PrimitiveTopology::TriangleList, cull_mode: None, ..Default::default() },
+        depth_stencil: None,
+        multisample: wgpu::MultisampleState::default(),
+        fragment: Some(wgpu::FragmentState { module: shader, entry_point: Some(fs), compilation_options: options, targets: &targets }),
+        multiview_mask: None,
+        cache: None,
+    })
+}
+
+/// A composite as baked: what it was made from, and the frame that last drew it.
+struct Baked {
+    sig: u64,
+    used: u64,
+}
+
 /// The dymaxion's diamonds: a layer of the geoid texture each.
 const GEOID_DIAMONDS: u32 = 10;
 
@@ -128,6 +174,8 @@ struct Plane {
     w: u32,
     h: u32,
     format: wgpu::TextureFormat,
+    /// Usage beyond sampling and copying (a composite plane is rendered into).
+    extra: wgpu::TextureUsages,
     tex: wgpu::Texture,
     cap: u32,
     max: u32,
@@ -139,8 +187,17 @@ struct Plane {
 
 impl Plane {
     fn new(device: &wgpu::Device, label: &'static str, w: u32, h: u32, format: wgpu::TextureFormat, max: u32) -> Plane {
+        Plane::with_usage(device, label, w, h, format, max, wgpu::TextureUsages::empty())
+    }
+
+    fn with_usage(device: &wgpu::Device, label: &'static str, w: u32, h: u32, format: wgpu::TextureFormat, max: u32, extra: wgpu::TextureUsages) -> Plane {
         let cap = INITIAL_LAYERS.min(max);
-        Plane { label, w, h, format, tex: plane_texture(device, label, w, h, cap, format), cap, max, map: FxHashMap::default(), free: (0..cap).rev().collect(), sparse_since: None }
+        Plane { label, w, h, format, extra, tex: plane_texture(device, label, w, h, cap, format, extra), cap, max, map: FxHashMap::default(), free: (0..cap).rev().collect(), sparse_since: None }
+    }
+
+    /// A view of one layer, to render into.
+    fn layer_view(&self, slot: u32) -> wgpu::TextureView {
+        self.tex.create_view(&wgpu::TextureViewDescriptor { dimension: Some(wgpu::TextureViewDimension::D2), base_array_layer: slot, array_layer_count: Some(1), ..Default::default() })
     }
 
     /// The cell's slot, allocating one if it has none and growing the array when it is full: `Some((slot, fresh))`, or None at the device's limit. True when the array was reallocated (bind groups must be rebuilt).
@@ -154,7 +211,7 @@ impl Plane {
                 return (None, false);
             }
             let new_cap = (self.cap * 2).min(self.max);
-            let new_tex = plane_texture(device, self.label, self.w, self.h, new_cap, self.format);
+            let new_tex = plane_texture(device, self.label, self.w, self.h, new_cap, self.format, self.extra);
             let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("grow plane") });
             enc.copy_texture_to_texture(
                 wgpu::TexelCopyTextureInfo { texture: &self.tex, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
@@ -201,7 +258,7 @@ impl Plane {
             _ => {}
         }
         let new_cap = (used * 2).max(INITIAL_LAYERS).next_power_of_two().min(self.cap / 2);
-        let new_tex = plane_texture(device, self.label, self.w, self.h, new_cap, self.format);
+        let new_tex = plane_texture(device, self.label, self.w, self.h, new_cap, self.format, self.extra);
         let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("shrink plane") });
         let mut new_map = FxHashMap::default();
         for (i, (k, old_slot)) in self.map.iter().enumerate() {
@@ -226,7 +283,7 @@ impl Plane {
     }
 }
 
-fn plane_texture(device: &wgpu::Device, label: &str, w: u32, h: u32, layers: u32, format: wgpu::TextureFormat) -> wgpu::Texture {
+fn plane_texture(device: &wgpu::Device, label: &str, w: u32, h: u32, layers: u32, format: wgpu::TextureFormat, extra: wgpu::TextureUsages) -> wgpu::Texture {
     device.create_texture(&wgpu::TextureDescriptor {
         label: Some(label),
         size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: layers },
@@ -234,7 +291,7 @@ fn plane_texture(device: &wgpu::Device, label: &str, w: u32, h: u32, layers: u32
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
         format,
-        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::COPY_SRC,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::COPY_SRC | extra,
         view_formats: &[],
     })
 }
@@ -256,7 +313,30 @@ pub struct GpuMap {
     map_layout: wgpu::BindGroupLayout,
     present_layout: wgpu::BindGroupLayout,
     /// The map pass's pipelines, one per set of layers in use and whether it writes the G-buffer, each built the first time its layers are drawn: what the frame does not show is compiled out ([`GpuMap::map_variant`]). The module and layout they are made from.
-    map_variants: FxHashMap<(u32, bool), wgpu::RenderPipeline>,
+    map_variants: FxHashMap<(u32, u8), wgpu::RenderPipeline>,
+    /// Pipelines being built on a thread of their own (the composite's: until one is in, the frame draws as before), and where they arrive.
+    building: rustc_hash::FxHashSet<(u32, u8)>,
+    built_tx: std::sync::mpsc::Sender<((u32, u8), wgpu::RenderPipeline)>,
+    built_rx: std::sync::mpsc::Receiver<((u32, u8), wgpu::RenderPipeline)>,
+    /// The vector cells' composites (two planes in step) and what each was baked from; a stand-in pair of layers bound while baking, which may not read the planes it writes.
+    comp0: Plane,
+    comp1: Plane,
+    baked: FxHashMap<CellKey, Baked>,
+    /// Each resident cell's largest line magnitude per class, kept from the pool for the bake's line weights.
+    line_max: FxHashMap<CellKey, [u8; 32]>,
+    bake_dummy: wgpu::Texture,
+    bake_uniforms: Vec<wgpu::Buffer>,
+    frame_no: u64,
+    /// Bumped by every theme upload, so composites made under the last theme are made again.
+    style_gen: u64,
+    /// Most composites baked a frame (each a full composite of a cell's 131 072 texels), and whether the frame draws from them at all.
+    pub bake_budget: usize,
+    pub composite: bool,
+    /// Cells the last frame left to bake: the host keeps frames coming until they are done.
+    bakes_left: bool,
+    /// Blocks the last frame drew from composites, and all of them; cells it baked.
+    pub fast_blocks: (usize, usize),
+    pub baked_last: usize,
     shader: wgpu::ShaderModule,
     map_pl: wgpu::PipelineLayout,
     present_pipeline: wgpu::RenderPipeline,
@@ -347,7 +427,8 @@ impl GpuMap {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("mahere map"), source: wgpu::ShaderSource::Wgsl(include_str!("map.wgsl").into()) });
         let uint_array = wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Uint, view_dimension: wgpu::TextureViewDimension::D2Array, multisampled: false };
         let storage = wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: true }, has_dynamic_offset: false, min_binding_size: None };
-        let entries: Vec<wgpu::BindGroupLayoutEntry> = (0..14u32)
+        let float_array = wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: false }, view_dimension: wgpu::TextureViewDimension::D2Array, multisampled: false };
+        let entries: Vec<wgpu::BindGroupLayoutEntry> = (0..16u32)
             .map(|i| wgpu::BindGroupLayoutEntry {
                 binding: i,
                 // The elevation range the map pass writes is fragment-only: a vertex stage may not write storage.
@@ -356,6 +437,7 @@ impl GpuMap {
                     0 => wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None },
                     1..=4 => storage,
                     12 => wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: false }, has_dynamic_offset: false, min_binding_size: None },
+                    14 | 15 => float_array,
                     _ => uint_array,
                 },
                 count: None,
@@ -448,11 +530,31 @@ impl GpuMap {
         let sel = Plane::new(device, "sel", 2 * TEX as u32, TEX as u32, wgpu::TextureFormat::Rgba8Uint, max_layers);
         // The overlays: ownership class and coverage, motor vehicle use class and coverage.
         let ov = Plane::new(device, "overlays", 2 * TEX as u32, TEX as u32, wgpu::TextureFormat::Rgba8Uint, max_layers);
+        let comp_max = COMP_LAYERS.min(max_layers);
+        let comp0 = Plane::with_usage(device, "composite base", 2 * TEX as u32, TEX as u32, wgpu::TextureFormat::Rgba8Unorm, comp_max, wgpu::TextureUsages::RENDER_ATTACHMENT);
+        let comp1 = Plane::with_usage(device, "composite fold", 2 * TEX as u32, TEX as u32, wgpu::TextureFormat::Rgba8Unorm, comp_max, wgpu::TextureUsages::RENDER_ATTACHMENT);
+        let (built_tx, built_rx) = std::sync::mpsc::channel();
 
         GpuMap {
             map_layout,
             present_layout,
             map_variants: FxHashMap::default(),
+            building: Default::default(),
+            built_tx,
+            built_rx,
+            comp0,
+            comp1,
+            baked: FxHashMap::default(),
+            line_max: FxHashMap::default(),
+            bake_dummy: plane_texture(device, "composite stand-in", 1, 1, 1, wgpu::TextureFormat::Rgba8Unorm, wgpu::TextureUsages::empty()),
+            bake_uniforms: Vec::new(),
+            frame_no: 0,
+            style_gen: 0,
+            bake_budget: 8,
+            composite: true,
+            bakes_left: false,
+            fast_blocks: (0, 0),
+            baked_last: 0,
             shader,
             map_pl,
             present_pipeline,
@@ -509,7 +611,7 @@ impl GpuMap {
                 copied: None,
                 period: _queue.get_timestamp_period(),
             }),
-            geoid_tex: plane_texture(device, "geoid", 2 * TEX as u32, TEX as u32, GEOID_DIAMONDS, wgpu::TextureFormat::R16Uint),
+            geoid_tex: plane_texture(device, "geoid", 2 * TEX as u32, TEX as u32, GEOID_DIAMONDS, wgpu::TextureFormat::R16Uint, wgpu::TextureUsages::empty()),
             geoid_in: 0,
             full_warned: std::time::Instant::now() - std::time::Duration::from_secs(60),
             scale: SCALE,
@@ -521,12 +623,19 @@ impl GpuMap {
     }
 
     fn make_map_bind(&mut self, device: &wgpu::Device) {
+        self.map_bind = Some(self.bind_with(device, &self.uniforms, false));
+    }
+
+    /// The map's bind group over a uniform buffer: the frame's, reading the composites; or a bake's, the composites stood in for, since a bake writes them.
+    fn bind_with(&self, device: &wgpu::Device, uniforms: &wgpu::Buffer, baking: bool) -> wgpu::BindGroup {
         let (dv, lv, wv, iv, kv, sv, ovv) = (self.dem.view(), self.line.view(), self.lw.view(), self.img.view(), self.ink.view(), self.sel.view(), self.ov.view());
-        self.map_bind = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("map"),
+        let array = |t: &wgpu::Texture| t.create_view(&wgpu::TextureViewDescriptor { dimension: Some(wgpu::TextureViewDimension::D2Array), ..Default::default() });
+        let (c0, c1) = if baking { (array(&self.bake_dummy), array(&self.bake_dummy)) } else { (self.comp0.view(), self.comp1.view()) };
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some(if baking { "bake" } else { "map" }),
             layout: &self.map_layout,
             entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: self.uniforms.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 0, resource: uniforms.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 1, resource: self.blocks.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 2, resource: self.refs.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 3, resource: self.table.as_entire_binding() },
@@ -539,9 +648,11 @@ impl GpuMap {
                 wgpu::BindGroupEntry { binding: 10, resource: wgpu::BindingResource::TextureView(&sv) },
                 wgpu::BindGroupEntry { binding: 11, resource: wgpu::BindingResource::TextureView(&ovv) },
                 wgpu::BindGroupEntry { binding: 12, resource: self.view_range.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 13, resource: wgpu::BindingResource::TextureView(&self.geoid_tex.create_view(&wgpu::TextureViewDescriptor { dimension: Some(wgpu::TextureViewDimension::D2Array), ..Default::default() })) },
+                wgpu::BindGroupEntry { binding: 13, resource: wgpu::BindingResource::TextureView(&array(&self.geoid_tex)) },
+                wgpu::BindGroupEntry { binding: 14, resource: wgpu::BindingResource::TextureView(&c0) },
+                wgpu::BindGroupEntry { binding: 15, resource: wgpu::BindingResource::TextureView(&c1) },
             ],
-        }));
+        })
     }
 
     /// The user's layer onto the GPU: every user cell's ink and selection into the ink plane (they are few; all of them again whenever the layer changes), and the selection being drawn as a screen mask the present pass washes over the frame.
@@ -649,6 +760,13 @@ impl GpuMap {
             }
         }
         self.dem_scale.retain(|k, _| pool.map.contains_key(k));
+        self.comp0.evict_absent(pool);
+        self.comp1.evict_absent(pool);
+        self.baked.retain(|k, _| pool.map.contains_key(k));
+        self.line_max.retain(|k, _| pool.map.contains_key(k));
+        for (k, e) in pool.map.iter() {
+            self.line_max.entry(*k).or_insert(e.line_mag_max);
+        }
         let (w, h) = (2 * TEX as u32, TEX as u32);
         let mut scratch = vec![0u8; TRI * 4];
         // A plane full to the GPU's limit leaves a cell without a slot, and it draws as bare ground: said, not silent.
@@ -812,28 +930,92 @@ impl GpuMap {
     }
 
     /// The map pass's pipeline for these layers (the uniform's mask bits), built now if it is the first frame to draw them: a second's compile on a slow phone, once a set.
-    fn map_variant(&mut self, device: &wgpu::Device, layers: u32, g: bool) {
-        if self.map_variants.contains_key(&(layers, g)) {
+    fn map_variant(&mut self, device: &wgpu::Device, layers: u32, kind: u8) {
+        if self.map_variants.contains_key(&(layers, kind)) {
             return;
         }
         let t = std::time::Instant::now();
-        let constants = [("LAYERS", layers as f64)];
-        let options = wgpu::PipelineCompilationOptions { constants: &constants, ..Default::default() };
-        let formats: &[wgpu::TextureFormat] = if g { &G_FORMATS } else { &[wgpu::TextureFormat::Rgba8Unorm] };
-        let targets: Vec<Option<wgpu::ColorTargetState>> = formats.iter().map(|&format| Some(wgpu::ColorTargetState { format, blend: None, write_mask: wgpu::ColorWrites::ALL })).collect();
-        let p = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some(if g { "map with g-buffer" } else { "map" }),
-            layout: Some(&self.map_pl),
-            vertex: wgpu::VertexState { module: &self.shader, entry_point: Some("vs_map"), compilation_options: options.clone(), buffers: &[] },
-            primitive: wgpu::PrimitiveState { topology: wgpu::PrimitiveTopology::TriangleList, cull_mode: None, ..Default::default() },
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState::default(),
-            fragment: Some(wgpu::FragmentState { module: &self.shader, entry_point: Some(if g { "fs_map_g" } else { "fs_map" }), compilation_options: options, targets: &targets }),
-            multiview_mask: None,
-            cache: None,
-        });
-        eprintln!("gpu: map pipeline for layers {layers:#x}{} built in {} ms", if g { " (g-buffer)" } else { "" }, t.elapsed().as_millis());
-        self.map_variants.insert((layers, g), p);
+        let p = build_map_pipeline(device, &self.shader, &self.map_pl, layers, kind);
+        eprintln!("gpu: map pipeline {kind} for layers {layers:#x} built in {} ms", t.elapsed().as_millis());
+        self.map_variants.insert((layers, kind), p);
+    }
+
+    /// A pipeline the frame can do without until it is in: built on a thread of its own the first time it is asked for, None until it arrives (a slow phone compiles for seconds, and the frame must not wait).
+    fn map_variant_later(&mut self, device: &wgpu::Device, layers: u32, kind: u8) -> bool {
+        while let Ok((k, p)) = self.built_rx.try_recv() {
+            self.building.remove(&k);
+            self.map_variants.insert(k, p);
+        }
+        if self.map_variants.contains_key(&(layers, kind)) {
+            return true;
+        }
+        if self.building.insert((layers, kind)) {
+            let (device, shader, layout, tx) = (device.clone(), self.shader.clone(), self.map_pl.clone(), self.built_tx.clone());
+            std::thread::spawn(move || {
+                let t = std::time::Instant::now();
+                let p = build_map_pipeline(&device, &shader, &layout, layers, kind);
+                eprintln!("gpu: map pipeline {kind} for layers {layers:#x} built in {} ms, aside", t.elapsed().as_millis());
+                tx.send(((layers, kind), p)).ok();
+            });
+        }
+        false
+    }
+
+    /// Cells the last frame left to bake: the host keeps frames coming until they are done.
+    pub fn bakes_pending(&self) -> bool {
+        self.bakes_left
+    }
+
+    /// A composite's two slots for a cell, the least recently drawn composite given up when the planes are at their most; None when every one is in this frame's view.
+    fn comp_alloc(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, key: CellKey) -> Option<(u32, u32)> {
+        let full = |p: &Plane| !p.map.contains_key(&key) && p.free.is_empty() && p.cap >= p.max;
+        if full(&self.comp0) || full(&self.comp1) {
+            let victim = self.baked.iter().filter(|(_, b)| b.used < self.frame_no).min_by_key(|(_, b)| b.used).map(|(k, _)| *k)?;
+            self.baked.remove(&victim);
+            for p in [&mut self.comp0, &mut self.comp1] {
+                if let Some(s) = p.map.remove(&victim) {
+                    p.free.push(s);
+                }
+            }
+        }
+        let (a, g0) = self.comp0.alloc(device, queue, key);
+        let (b, g1) = self.comp1.alloc(device, queue, key);
+        if g0 || g1 {
+            self.map_bind = None;
+        }
+        match (a, b) {
+            (Some((s0, _)), Some((s1, _))) => Some((s0, s1)),
+            _ => {
+                for p in [&mut self.comp0, &mut self.comp1] {
+                    if let Some(s) = p.map.remove(&key) {
+                        p.free.push(s);
+                    }
+                }
+                None
+            }
+        }
+    }
+
+    /// The line weights a cell bakes under: each class's largest magnitude over the cell and its parent three depths up (a few kilometres about it at street zoom), so a lane beside a highway falls back as it does against the view's largest, and the same everywhere in that parent, with no seam where neighbouring cells meet.
+    fn bake_line_hi(&self, key: CellKey) -> [u8; 32] {
+        let mut hi = self.line_max.get(&key).copied().unwrap_or([0; 32]);
+        let mut k = key;
+        let mut wide = None;
+        for _ in 0..3 {
+            if k.depth == 0 {
+                break;
+            }
+            k = k.parent();
+            if let Some(m) = self.line_max.get(&k) {
+                wide = Some(*m);
+            }
+        }
+        if let Some(m) = wide {
+            for (h, v) in hi.iter_mut().zip(m) {
+                *h = (*h).max(v);
+            }
+        }
+        hi
     }
 
     /// Planes the last sync left for the next, its upload budget spent: the host keeps frames coming until they are in.
@@ -1028,6 +1210,7 @@ impl GpuMap {
         }
         queue.write_buffer(&self.lut, 0, bytemuck::cast_slice(&lut_data));
         self.style_loaded = true;
+        self.style_gen += 1;
     }
 
     /// Whether a G-buffer for a `w × h` screen exists to relight from.
@@ -1078,7 +1261,7 @@ impl GpuMap {
             self.ensure_gbuffer(device, w, h);
         }
         // References: the plan's cells with the slots they hold here; a plane without a slot (array full) is dropped from the flags so the shader falls through to a parent.
-        let refs: Vec<GpuRef> = plan
+        let mut refs: Vec<GpuRef> = plan
             .refs
             .iter()
             .map(|r| {
@@ -1118,11 +1301,72 @@ impl GpuMap {
                 }
             })
             .collect();
-        let blocks: Vec<GpuBlock> = plan
-            .blocks
-            .iter()
-            .map(|b| GpuBlock { a: [b.x, b.y, b.size, b.diamond], b: [b.u0, b.v0, 0, 0], c: [b.du_dx, b.dv_dx, b.du_dy, b.dv_dy], d: [b.twist_u, b.twist_v, 0.0, 0.0], e: b.cand[0], f: b.cand[1], g: b.cand[2], h: b.ink })
-            .collect();
+        // The composites: a vector cell's static layers baked once, the blocks whose cells all have theirs drawn by the small pass (Nick 2026-10-21: a Pixel 3a at a frame a second, Google's map at twenty).
+        self.frame_no += 1;
+        let layers = mask_bits(luts.mask) & !self.mask_off;
+        let bake_mask = layers & !LIVE_BITS;
+        let mut bakes: Vec<(usize, u32, u32, [u8; 32])> = Vec::new();
+        let mut fast_ready = false;
+        self.bakes_left = false;
+        if self.composite && mode == RenderMode::Full && layers & NO_COMPOSITE_BITS == 0 {
+            let bake_ready = self.map_variant_later(device, u32::MAX, KIND_BAKE);
+            fast_ready = self.map_variant_later(device, layers, KIND_FAST);
+            // What every composite under this theme and these layers shares.
+            let mut hs = rustc_hash::FxHasher::default();
+            (self.style_gen, bake_mask, luts.style.water, luts.style.flat, luts.style.bg, luts.style.no_dem, luts.style.sea).hash(&mut hs);
+            let shared = hs.finish();
+            let by_key: FxHashMap<CellKey, usize> = plan.refs.iter().enumerate().filter(|(_, r)| r.flags & FLAG_INK == 0).map(|(i, r)| (r.key, i)).collect();
+            let mut seen = rustc_hash::FxHashSet::default();
+            // The blocks' own cells first; then every vector cell in view at the view's depth, which a pixel between a block's samples may fall in and the shader then finds by search.
+            let mut wanted: Vec<usize> = plan.blocks.iter().flat_map(|b| b.cand[1]).filter(|&r| r != NONE && seen.insert(r)).map(|r| r as usize).collect();
+            wanted.extend((0..plan.refs.len()).filter(|&i| plan.refs[i].key.depth == plan.vec_depth && plan.refs[i].flags & FLAG_INK == 0 && seen.insert(i as u32)));
+            for i in wanted {
+                if refs[i].c[0] & FLAG_VEC == 0 {
+                    continue;
+                }
+                let key = plan.refs[i].key;
+                let hi = self.bake_line_hi(key);
+                // Made from: the theme and layers, the cell's own planes, the terrain and imagery cells the bake's search can reach (this cell and its parents), the line weights.
+                let mut h = rustc_hash::FxHasher::default();
+                (shared, refs[i].c[0], hi).hash(&mut h);
+                let mut k = key;
+                loop {
+                    if let Some(&j) = by_key.get(&k) {
+                        (k.depth, refs[j].c[0] & (FLAG_DEM | FLAG_IMG)).hash(&mut h);
+                    }
+                    if k.depth == 0 {
+                        break;
+                    }
+                    k = k.parent();
+                }
+                let sig = h.finish();
+                let slots = self.comp0.map.get(&key).copied().zip(self.comp1.map.get(&key).copied());
+                if let (Some(b), Some((s0, s1))) = (self.baked.get_mut(&key), slots) {
+                    if b.sig == sig {
+                        b.used = self.frame_no;
+                        refs[i].c = [refs[i].c[0] | FLAG_COMP, refs[i].c[1], s0, s1];
+                        continue;
+                    }
+                }
+                if !bake_ready || bakes.len() >= self.bake_budget {
+                    self.bakes_left = true;
+                    continue;
+                }
+                if let Some((s0, s1)) = self.comp_alloc(device, queue, key) {
+                    self.baked.insert(key, Baked { sig, used: self.frame_no });
+                    refs[i].c = [refs[i].c[0] | FLAG_COMP, refs[i].c[1], s0, s1];
+                    bakes.push((i, s0, s1, hi));
+                }
+            }
+        }
+        // Blocks drawn from composites first, then the rest: two draws over one buffer.
+        let fast = |b: &PlanBlock| fast_ready && b.cand[1][0] != NONE && b.cand[1].iter().all(|&r| r == NONE || refs[r as usize].c[0] & FLAG_COMP != 0);
+        let gpu_block = |b: &PlanBlock| GpuBlock { a: [b.x, b.y, b.size, b.diamond], b: [b.u0, b.v0, 0, 0], c: [b.du_dx, b.dv_dx, b.du_dy, b.dv_dy], d: [b.twist_u, b.twist_v, 0.0, 0.0], e: b.cand[0], f: b.cand[1], g: b.cand[2], h: b.ink };
+        let mut blocks: Vec<GpuBlock> = plan.blocks.iter().filter(|b| fast(b)).map(gpu_block).collect();
+        let n_fast = blocks.len();
+        blocks.extend(plan.blocks.iter().filter(|b| !fast(b)).map(gpu_block));
+        self.fast_blocks = (n_fast, blocks.len());
+        self.baked_last = bakes.len();
         let table: Vec<GpuSlot> = plan.table.iter().map(|s| GpuSlot { tag: s.tag, cu: s.cu, cv: s.cv, index: s.index }).collect();
         let mut rebind = self.map_bind.is_none();
         if blocks.len() > self.blocks_cap {
@@ -1188,16 +1432,42 @@ impl GpuMap {
         let measure_on = self.measure.is_some();
         let u = Uniforms { depths: [plan.dem_depth as u32, plan.vec_depth as u32, plan.magnified as u32, measure_on as u32], ..u };
         queue.write_buffer(&self.uniforms, 0, bytemuck::bytes_of(&u));
+        // The bakes, each a pass over its cell's texels with uniforms of its own: the cell's depth wanted throughout, its texel grid in `raw`, the live layers left out, nothing gathered.
+        for (j, &(i, s0, s1, hi)) in bakes.iter().enumerate() {
+            if self.bake_uniforms.len() <= j {
+                self.bake_uniforms.push(device.create_buffer(&wgpu::BufferDescriptor { label: Some("bake uniforms"), size: std::mem::size_of::<Uniforms>() as u64, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false }));
+            }
+            let r = &plan.refs[i];
+            let depth = r.key.depth as u32;
+            let bu = Uniforms {
+                size: [(2 * TEX) as f32, TEX as f32],
+                scale: 1.0,
+                mask: bake_mask,
+                depths: [depth, depth, 0, 0],
+                line_hi: std::array::from_fn(|a| std::array::from_fn(|b| hi[4 * a + b].max(1) as f32)),
+                tone: [u.tone[0], 1.0, 0.0, 0.0],
+                globe: [0.0; 4],
+                raw: [r.cu as f32, r.cv as f32, r.diamond as f32, depth as f32],
+                ..u
+            };
+            queue.write_buffer(&self.bake_uniforms[j], 0, bytemuck::bytes_of(&bu));
+            let bind = self.bind_with(device, &self.bake_uniforms[j], true);
+            let (v0, v1) = (self.comp0.layer_view(s0), self.comp1.layer_view(s1));
+            let attach = |v| Some(wgpu::RenderPassColorAttachment { view: v, depth_slice: None, resolve_target: None, ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT), store: wgpu::StoreOp::Store } });
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor { label: Some("bake"), color_attachments: &[attach(&v0), attach(&v1)], depth_stencil_attachment: None, timestamp_writes: None, occlusion_query_set: None, multiview_mask: None });
+            pass.set_pipeline(&self.map_variants[&(u32::MAX, KIND_BAKE)]);
+            pass.set_bind_group(0, &bind, &[]);
+            pass.draw(0..3, 0..1);
+        }
 
         // The map pass gathers the elevations it draws: reset, then copied out after the pass into a free readback buffer (none free: this frame's range is skipped, the next one's read).
         let draws_map = mode != RenderMode::Relight;
         // The map pass's pipeline for the layers this frame shows, the rest compiled out.
-        let layers = mask_bits(luts.mask) & !self.mask_off;
         if mode == RenderMode::FullWithG {
-            self.map_variant(device, layers, true);
+            self.map_variant(device, layers, KIND_G);
         }
-        if mode == RenderMode::Full {
-            self.map_variant(device, layers, false);
+        if mode == RenderMode::Full && n_fast < blocks.len() {
+            self.map_variant(device, layers, KIND_FULL);
         }
         if draws_map {
             queue.write_buffer(&self.view_range, 0, bytemuck::cast_slice(&[u32::MAX, 0u32]));
@@ -1216,7 +1486,7 @@ impl GpuMap {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            pass.set_pipeline(&self.map_variants[&(layers, true)]);
+            pass.set_pipeline(&self.map_variants[&(layers, KIND_G)]);
             pass.set_bind_group(0, self.map_bind.as_ref().unwrap(), &[]);
             pass.draw(0..6, 0..blocks.len() as u32);
         }
@@ -1244,9 +1514,15 @@ impl GpuMap {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            pass.set_pipeline(&self.map_variants[&(layers, false)]);
             pass.set_bind_group(0, self.map_bind.as_ref().unwrap(), &[]);
-            pass.draw(0..6, 0..blocks.len() as u32);
+            if n_fast > 0 {
+                pass.set_pipeline(&self.map_variants[&(layers, KIND_FAST)]);
+                pass.draw(0..6, 0..n_fast as u32);
+            }
+            if n_fast < blocks.len() {
+                pass.set_pipeline(&self.map_variants[&(layers, KIND_FULL)]);
+                pass.draw(0..6, n_fast as u32..blocks.len() as u32);
+            }
         }
         if draws_map {
             let idle = (0..2).find(|&i| self.range_state[i].load(std::sync::atomic::Ordering::Acquire) == RANGE_IDLE);

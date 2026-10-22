@@ -315,11 +315,16 @@ pub fn plan_frame(w: usize, h: usize, cam: &Camera, pool: &Pool, dem_depth: u8, 
     let top = ((1u64 << 30) - 1) as f64;
     for b in &mut blocks {
         let n = b.size as f64;
-        for (x, y) in [(0.0, 0.0), (n, 0.0), (0.0, n), (n, n)] {
+        // The corners for every role; the edges' midpoints and the centre too for the vector planes, whose cell a block drawn from composites must hold (2026-10-21: the cell grid lies skewed on the screen, and a cell poking in along a block's edge between two corners was missed).
+        let h = n / 2.0;
+        for (i, (x, y)) in [(0.0, 0.0), (n, 0.0), (0.0, n), (n, n), (h, 0.0), (0.0, h), (n, h), (h, n), (h, h)].into_iter().enumerate() {
             let u = (b.u0 as f64 + b.du_dx as f64 * x + b.du_dy as f64 * y + b.twist_u as f64 * x * y).clamp(0.0, top);
             let v = (b.v0 as f64 + b.dv_dx as f64 * x + b.dv_dy as f64 * y + b.twist_v as f64 * x * y).clamp(0.0, top);
             let raw = raw_of(b.diamond as u8, (u as i64) << 16, (v as i64) << 16);
             for (k, &(want, need)) in roles.iter().enumerate() {
+                if i >= 4 && k != 1 {
+                    continue;
+                }
                 let r = resolve(raw, want, need);
                 let c = &mut b.cand[k];
                 if r != NONE && !c.contains(&r) {

@@ -102,7 +102,7 @@ fn main() {
     // Texture arrays hold one cell per layer: ask for the adapter.s real layer limit, not WebGPU.s 256.
     let mut limits = wgpu::Limits::default();
     limits.max_texture_array_layers = adapter.limits().max_texture_array_layers.min(2048);
-    let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor { label: Some("mahere"), required_limits: limits, ..Default::default() })).expect("device");
+    let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor { label: Some("mahere"), required_limits: limits, required_features: adapter.features() & wgpu::Features::TIMESTAMP_QUERY, ..Default::default() })).expect("device");
     let format = wgpu::TextureFormat::Rgba8Unorm;
     let mut gpu = GpuMap::new(&device, &queue, format);
     // MAHERE_SS=1 samples exactly where the CPU does (top-left of each pixel, no supersampling): the exactness check. The default is the anti-aliased frame.
@@ -273,6 +273,10 @@ fn main() {
     }
     if std::env::var("MAHERE_RELIGHT").as_deref() == Ok("1") {
         relight_check(&device, &queue, &mut gpu, &target, &view, &plan, luts, w, h);
+    }
+    if std::env::var("MAHERE_COMPOSITE").as_deref() == Ok("1") {
+        composite_check(&device, &queue, &mut gpu, &target, &view, &plan, luts, w, h, &out);
+        return;
     }
     // Read back.
     let bpr = ((w as u32 * 4) + 255) / 256 * 256;
@@ -482,4 +486,86 @@ fn ink_check(device: &wgpu::Device, queue: &wgpu::Queue, gpu: &mut GpuMap, targe
         let user_refs = plan.refs.iter().filter(|r| r.flags & mahere_engine::plan::FLAG_INK != 0).count();
         eprintln!("ppd {:.0} dem depth {}: red pixels cpu {cpu} gpu {g}; user cells {} (refs {user_refs}) at depths {:?}", map.cam.ppd, plan.dem_depth, map.user.cells.len(), map.user.cells.keys().map(|k| k.depth).collect::<std::collections::BTreeSet<_>>());
     }
+}
+
+/// MAHERE_COMPOSITE=1: the frame drawn whole every pixel, then from the baked composites once every cell in view has one; how far apart the two are, and each frame's GPU time.
+fn composite_check(device: &wgpu::Device, queue: &wgpu::Queue, gpu: &mut GpuMap, target: &wgpu::Texture, view: &wgpu::TextureView, plan: &mahere_engine::plan::FramePlan, luts: &mahere_engine::raster::FrameLuts, w: usize, h: usize, out: &str) {
+    let read = || -> Vec<u32> {
+        let bpr = ((w as u32 * 4) + 255) / 256 * 256;
+        let buf = device.create_buffer(&wgpu::BufferDescriptor { label: Some("readback"), size: (bpr * h as u32) as u64, usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ, mapped_at_creation: false });
+        let mut enc = device.create_command_encoder(&Default::default());
+        enc.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo { texture: target, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+            wgpu::TexelCopyBufferInfo { buffer: &buf, layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(bpr), rows_per_image: Some(h as u32) } },
+            wgpu::Extent3d { width: w as u32, height: h as u32, depth_or_array_layers: 1 },
+        );
+        queue.submit([enc.finish()]);
+        let slice = buf.slice(..);
+        slice.map_async(wgpu::MapMode::Read, |_| {});
+        device.poll(wgpu::PollType::wait_indefinitely()).ok();
+        let data = slice.get_mapped_range();
+        let mut px = vec![0u32; w * h];
+        for y in 0..h {
+            for x in 0..w {
+                let p = &data[y * bpr as usize + x * 4..];
+                px[y * w + x] = ((p[0] as u32) << 16) | ((p[1] as u32) << 8) | p[2] as u32;
+            }
+        }
+        px
+    };
+    let frame = |gpu: &mut GpuMap| -> f32 {
+        // Stamps left from earlier frames cleared, so the ones read below are this frame's.
+        while gpu.take_pass_times().is_some() {}
+        let t = std::time::Instant::now();
+        let mut enc = device.create_command_encoder(&Default::default());
+        gpu.render(device, queue, &mut enc, view, plan, luts, w as u32, h as u32, mahere_gpu::RenderMode::Full);
+        queue.submit([enc.finish()]);
+        gpu.after_submit();
+        device.poll(wgpu::PollType::wait_indefinitely()).ok();
+        let ms = t.elapsed().as_secs_f32() * 1000.0;
+        device.poll(wgpu::PollType::wait_indefinitely()).ok();
+        // The map pass's own time, where the device stamps it.
+        gpu.take_pass_times().map_or(ms, |p| p[0])
+    };
+    // The median of thirty frames each way: a desktop GPU's clocks wander more than the difference.
+    let median = |gpu: &mut GpuMap| -> f32 {
+        let mut t: Vec<f32> = (0..30).map(|_| frame(gpu)).collect();
+        t.sort_by(f32::total_cmp);
+        t[15]
+    };
+    gpu.composite = false;
+    frame(gpu);
+    let full_ms = median(gpu);
+    let full = read();
+    gpu.composite = true;
+    let t = std::time::Instant::now();
+    let mut frames = 0;
+    while t.elapsed().as_secs() < 60 {
+        frame(gpu);
+        frames += 1;
+        let (fast, all) = gpu.fast_blocks;
+        if fast == all && !gpu.bakes_pending() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    eprintln!("composites: {:?} blocks fast after {frames} frames, {:.1} s", gpu.fast_blocks, t.elapsed().as_secs_f32());
+    frame(gpu);
+    let fast_ms = median(gpu);
+    eprintln!("the timed frame baked {} cells", gpu.baked_last);
+    let fast = read();
+    let (mut beyond, mut worst, mut sum) = (0usize, 0u32, 0u64);
+    for i in 0..w * h {
+        let (a, b) = (full[i], fast[i]);
+        let m = [16, 8, 0].iter().map(|s| ((a >> s) & 255).abs_diff((b >> s) & 255)).max().unwrap();
+        if m > 8 {
+            beyond += 1;
+        }
+        worst = worst.max(m);
+        sum += m as u64;
+    }
+    println!("full frame {full_ms:.2} ms, from composites {fast_ms:.2} ms (median map pass); {:.2}% of pixels beyond 8 levels, worst {worst}, mean {:.3}", beyond as f64 * 100.0 / (w * h) as f64, sum as f64 / (w * h) as f64);
+    write_png(&format!("{out}_full.png"), w, h, |i| [(full[i] >> 16) as u8, (full[i] >> 8) as u8, full[i] as u8]);
+    write_png(&format!("{out}_fast.png"), w, h, |i| [(fast[i] >> 16) as u8, (fast[i] >> 8) as u8, fast[i] as u8]);
+    println!("wrote {out}_full.png and {out}_fast.png");
 }
