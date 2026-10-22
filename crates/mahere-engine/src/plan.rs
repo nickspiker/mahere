@@ -65,6 +65,8 @@ pub struct PlanBlock {
     pub twist_v: f32,
     /// The references this block's pixels draw from, resolved here once instead of searched for at every pixel (2026-10-21: a Pixel 3a's GPU took a second a frame, each pixel probing the table for its terrain, its lines and its imagery): for the terrain, the vector planes and the imagery, the cells its corners lie in at the wanted depth, or the nearest coarser ones carrying the plane, up to four each, [`NONE`] after the last. A pixel matching none of them (a block touching more cells) searches as before.
     pub cand: [[u32; 4]; 3],
+    /// The user's cells (ink and selection) its corners lie in, finest first, [`NONE`] after the last: a block with none skips the user's layer outright (2026-10-21: every pixel walked a dozen depths probing for ink that was not there).
+    pub ink: [u32; 4],
 }
 
 /// Which planes each kind of candidate is for, and the depth it is wanted at: the terrain at the terrain's depth, the vectors and the imagery at the vectors'.
@@ -137,6 +139,7 @@ fn block_of(x: usize, y: usize, size: usize, c00: CornerPt, c10: CornerPt, c01: 
         twist_u: (((f(c11.u) - f(c10.u)) - (f(c01.u) - f(c00.u))) / (n * n)) as f32,
         twist_v: (((f(c11.v) - f(c10.v)) - (f(c01.v) - f(c00.v))) / (n * n)) as f32,
         cand: [[NONE; 4]; 3],
+        ink: [NONE; 4],
     }
 }
 
@@ -355,6 +358,28 @@ pub fn plan_frame(w: usize, h: usize, cam: &Camera, pool: &Pool, dem_depth: u8, 
                 break;
             }
             h = (h + 1) & (TABLE_N - 1);
+        }
+    }
+    // Each block's user cells, from its corners: the finest user cell each lies in from the terrain's depth up, as the shader's own walk finds it.
+    if !user.cells.is_empty() {
+        let ink_index: rustc_hash::FxHashMap<CellKey, u32> = refs.iter().enumerate().filter(|(_, r)| r.flags & FLAG_INK != 0).map(|(i, r)| (r.key, i as u32)).collect();
+        let top = ((1u64 << 30) - 1) as f64;
+        for b in &mut blocks {
+            let n = b.size as f64;
+            for (x, y) in [(0.0, 0.0), (n, 0.0), (0.0, n), (n, n)] {
+                let u = (b.u0 as f64 + b.du_dx as f64 * x + b.du_dy as f64 * y + b.twist_u as f64 * x * y).clamp(0.0, top);
+                let v = (b.v0 as f64 + b.dv_dx as f64 * x + b.dv_dy as f64 * y + b.twist_v as f64 * x * y).clamp(0.0, top);
+                let raw = raw_of(b.diamond as u8, (u as i64) << 16, (v as i64) << 16);
+                let found = (0..=dem_depth).rev().find_map(|d| ink_index.get(&CellKey { depth: d, prefix: raw >> (60 - 2 * d as u32) }).copied());
+                if let Some(r) = found {
+                    if !b.ink.contains(&r) {
+                        if let Some(slot) = b.ink.iter_mut().find(|s| **s == NONE) {
+                            *slot = r;
+                        }
+                    }
+                }
+            }
+            b.ink.sort_by_key(|&r| if r == NONE { u32::MAX } else { 64 - refs[r as usize].key.depth as u32 });
         }
     }
     let globe = [w as f32 * 0.5, h as f32 * 0.5, cam.radius() as f32, cam.limb_visible(w, h) as u32 as f32];

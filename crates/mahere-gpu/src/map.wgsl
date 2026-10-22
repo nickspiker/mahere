@@ -123,7 +123,8 @@ struct Uniforms {
 struct Ref { a: vec4<u32>, b: vec4<u32>, c: vec4<u32>, d: vec4<f32>, e: vec4<f32> };
 // a: x, y, size, diamond. b: u0, v0. c: du/dx, dv/dx, du/dy, dv/dy. d: twist u, twist v.
 // e, f, g: the block's candidate references for the terrain, the vector planes and the imagery, NONE after the last.
-struct Block { a: vec4<u32>, b: vec4<u32>, c: vec4<f32>, d: vec4<f32>, e: vec4<u32>, f: vec4<u32>, g: vec4<u32> };
+// h: the block's user cells (ink, selection), finest first, NONE after the last.
+struct Block { a: vec4<u32>, b: vec4<u32>, c: vec4<f32>, d: vec4<f32>, e: vec4<u32>, f: vec4<u32>, g: vec4<u32>, h: vec4<u32> };
 struct Slot { tag: u32, cu: u32, cv: u32, index: u32 };
 
 @group(0) @binding(0) var<uniform> U: Uniforms;
@@ -635,12 +636,33 @@ fn overlays(composed: Composed, ov: vec4<u32>, layer: i32, t: vec3<u32>) -> Comp
 }
 
 // The user's marks over everything, from the finest user cell here (every cell carries what coarser ones have): the pen's ink in its colour, the selection as a wash with its edge. Applied at every exit of the composite, over imagery too, as the CPU's user_marks is.
-fn user_marks(composed: Composed, d: u32, u: u32, v: u32) -> Composed {
+fn user_marks(composed: Composed, d: u32, u: u32, v: u32, cand: vec4<u32>) -> Composed {
     var out = composed;
+    // A block none of whose corners lies in a user cell has nothing of the user's: nothing to look for (2026-10-21: every pixel walked a dozen depths probing for ink).
+    if (cand.x == NONE) {
+        return out;
+    }
+    // The block's user cell holding this pixel, finest first, as the plan resolved them; a pixel none holds walks the depths as before.
+    var picked = NONE;
+    for (var k = 0u; k < 4u; k++) {
+        let r = cand[k];
+        if (r == NONE) {
+            break;
+        }
+        let a = refs[r].a;
+        let s = 30u - a.y;
+        if (a.x == d && (u >> s) == a.z && (v >> s) == a.w) {
+            picked = r;
+            break;
+        }
+    }
     // From the finest user cell here (every cell carries what coarser ones have): the pen's ink in its colour, the selection as a wash.
     var udepth = U.depths.x;
     for (var k = 0u; k <= 30u; k++) {
-        let ui = lookup(d, udepth + INK_TAG_DEPTH, u, v);
+        var ui = picked;
+        if (picked == NONE) {
+            ui = lookup(d, udepth + INK_TAG_DEPTH, u, v);
+        }
         if (ui != NONE && ui != ABSENT) {
             let r = refs[ui];
             let t = tri(u, v, r.a.y);
@@ -832,7 +854,7 @@ fn compose(d: u32, u: u32, v: u32, pos: vec2<f32>, bi: u32) -> Composed {
             let ink = select(contour_ink, contour_ink_index, contour_index);
             { let f = fold(Fold(out.k2, out.c2), ink.rgb, contour_cov * ink.a); out.k2 = f.k; out.c2 = f.c; }
         }
-        return user_marks(out, d, u, v);
+        return user_marks(out, d, u, v, blk.h);
     }
     if (vi != NONE) {
         let flags = vflags;
@@ -863,7 +885,7 @@ fn compose(d: u32, u: u32, v: u32, pos: vec2<f32>, bi: u32) -> Composed {
             if (draw_line && line.x != WATERWAY_CLASS) {
                 { let f = fold(Fold(out.k2, out.c2), line_colour(line.x, line.z), line_alpha(line.x, line.y, line.z)); out.k2 = f.k; out.c2 = f.c; }
             }
-            return user_marks(out, d, u, v);
+            return user_marks(out, d, u, v, blk.h);
         }
         if ((mask & M_LAND) != 0u && lw.y != 0u) {
             out.base = lerp3(out.base, unpack_rgb(lut[LAND_BASE + min(lw.x, 13u)]), f32(lw.y) / 255.0 * unpack_a(lut[LAND_BASE + min(lw.x, 13u)]));
@@ -915,7 +937,7 @@ fn compose(d: u32, u: u32, v: u32, pos: vec2<f32>, bi: u32) -> Composed {
             out.c2 = vec3<f32>(0.0);
         }
     }
-    out = user_marks(out, d, u, v);
+    out = user_marks(out, d, u, v, blk.h);
     // Detail: tinted by the depth of the terrain cell drawn, the CPU's DETAIL_COLOURS from depth 8 (the global base) to 14 (the finest bakes); magenta where there is none.
     if ((mask & M_DEBUG) != 0u) {
         var tintd = dec(vec3<f32>(255.0, 0.0, 255.0));
