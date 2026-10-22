@@ -255,8 +255,10 @@ fn storage_buffer(device: &wgpu::Device, label: &str, bytes: u64) -> wgpu::Buffe
 pub struct GpuMap {
     map_layout: wgpu::BindGroupLayout,
     present_layout: wgpu::BindGroupLayout,
-    map_pipeline: wgpu::RenderPipeline,
-    map_g_pipeline: wgpu::RenderPipeline,
+    /// The map pass's pipelines, one per set of layers in use and whether it writes the G-buffer, each built the first time its layers are drawn: what the frame does not show is compiled out ([`GpuMap::map_variant`]). The module and layout they are made from.
+    map_variants: FxHashMap<(u32, bool), wgpu::RenderPipeline>,
+    shader: wgpu::ShaderModule,
+    map_pl: wgpu::PipelineLayout,
     present_pipeline: wgpu::RenderPipeline,
     /// The top layer (panel, pin, measurement, selection) blended over the map and its labels.
     top_pipeline: wgpu::RenderPipeline,
@@ -388,8 +390,7 @@ impl GpuMap {
                 cache: None,
             })
         };
-        let map_pipeline = pipeline("map", &[&map_layout], "vs_map", "fs_map", &[wgpu::TextureFormat::Rgba8Unorm]);
-        let map_g_pipeline = pipeline("map with g-buffer", &[&map_layout], "vs_map", "fs_map_g", &G_FORMATS);
+        let map_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("map"), bind_group_layouts: &[&map_layout], immediate_size: 0 });
         let present_pipeline = pipeline("present", &[&map_layout, &present_layout], "vs_present", "fs_present", &[present_format]);
         // Premultiplied over: what the labels and the top layer cover, they cover by their own opacity.
         let over = wgpu::BlendState { color: wgpu::BlendComponent { src_factor: wgpu::BlendFactor::One, dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha, operation: wgpu::BlendOperation::Add }, alpha: wgpu::BlendComponent { src_factor: wgpu::BlendFactor::One, dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha, operation: wgpu::BlendOperation::Add } };
@@ -451,8 +452,9 @@ impl GpuMap {
         GpuMap {
             map_layout,
             present_layout,
-            map_pipeline,
-            map_g_pipeline,
+            map_variants: FxHashMap::default(),
+            shader,
+            map_pl,
             present_pipeline,
             relight_pipeline,
             relight_layout,
@@ -807,6 +809,31 @@ impl GpuMap {
         t.state[i].store(RANGE_IDLE, std::sync::atomic::Ordering::Release);
         let ms = |b: usize| if stamps[b + 1] > stamps[b] { (stamps[b + 1] - stamps[b]) as f32 * t.period / 1e6 } else { 0.0 };
         Some([ms(0), ms(2), ms(4)])
+    }
+
+    /// The map pass's pipeline for these layers (the uniform's mask bits), built now if it is the first frame to draw them: a second's compile on a slow phone, once a set.
+    fn map_variant(&mut self, device: &wgpu::Device, layers: u32, g: bool) {
+        if self.map_variants.contains_key(&(layers, g)) {
+            return;
+        }
+        let t = std::time::Instant::now();
+        let constants = [("LAYERS", layers as f64)];
+        let options = wgpu::PipelineCompilationOptions { constants: &constants, ..Default::default() };
+        let formats: &[wgpu::TextureFormat] = if g { &G_FORMATS } else { &[wgpu::TextureFormat::Rgba8Unorm] };
+        let targets: Vec<Option<wgpu::ColorTargetState>> = formats.iter().map(|&format| Some(wgpu::ColorTargetState { format, blend: None, write_mask: wgpu::ColorWrites::ALL })).collect();
+        let p = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some(if g { "map with g-buffer" } else { "map" }),
+            layout: Some(&self.map_pl),
+            vertex: wgpu::VertexState { module: &self.shader, entry_point: Some("vs_map"), compilation_options: options.clone(), buffers: &[] },
+            primitive: wgpu::PrimitiveState { topology: wgpu::PrimitiveTopology::TriangleList, cull_mode: None, ..Default::default() },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            fragment: Some(wgpu::FragmentState { module: &self.shader, entry_point: Some(if g { "fs_map_g" } else { "fs_map" }), compilation_options: options, targets: &targets }),
+            multiview_mask: None,
+            cache: None,
+        });
+        eprintln!("gpu: map pipeline for layers {layers:#x}{} built in {} ms", if g { " (g-buffer)" } else { "" }, t.elapsed().as_millis());
+        self.map_variants.insert((layers, g), p);
     }
 
     /// Planes the last sync left for the next, its upload budget spent: the host keeps frames coming until they are in.
@@ -1164,6 +1191,14 @@ impl GpuMap {
 
         // The map pass gathers the elevations it draws: reset, then copied out after the pass into a free readback buffer (none free: this frame's range is skipped, the next one's read).
         let draws_map = mode != RenderMode::Relight;
+        // The map pass's pipeline for the layers this frame shows, the rest compiled out.
+        let layers = mask_bits(luts.mask) & !self.mask_off;
+        if mode == RenderMode::FullWithG {
+            self.map_variant(device, layers, true);
+        }
+        if mode == RenderMode::Full {
+            self.map_variant(device, layers, false);
+        }
         if draws_map {
             queue.write_buffer(&self.view_range, 0, bytemuck::cast_slice(&[u32::MAX, 0u32]));
         }
@@ -1181,7 +1216,7 @@ impl GpuMap {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            pass.set_pipeline(&self.map_g_pipeline);
+            pass.set_pipeline(&self.map_variants[&(layers, true)]);
             pass.set_bind_group(0, self.map_bind.as_ref().unwrap(), &[]);
             pass.draw(0..6, 0..blocks.len() as u32);
         }
@@ -1209,7 +1244,7 @@ impl GpuMap {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            pass.set_pipeline(&self.map_pipeline);
+            pass.set_pipeline(&self.map_variants[&(layers, false)]);
             pass.set_bind_group(0, self.map_bind.as_ref().unwrap(), &[]);
             pass.draw(0..6, 0..blocks.len() as u32);
         }

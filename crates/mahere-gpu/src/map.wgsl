@@ -70,6 +70,8 @@ const M_OWN: u32 = 2048u;
 const M_MVUM: u32 = 4096u;
 const M_RAW: u32 = 8192u;
 const M_GEOID: u32 = 32768u;
+// The layers a pipeline is built for (2026-10-21: one shader for every layer kept a Pixel 3a's GPU at a third of a second a frame): the frame's mask is taken through it, so a layer outside it is false at compile time and its code leaves the pipeline, the registers with it. The host builds a pipeline per set of layers in use; left at its default, every layer is live.
+override LAYERS: u32 = 4294967295u;
 // A depth-0 texel's edge on the ground, metres (a 7054 km diamond edge over 256 texels): the geoid's gradient per texel into metres per metre.
 const GEOID_TEXEL_M: f32 = 27555.0;
 
@@ -604,7 +606,7 @@ fn overlays(composed: Composed, ov: vec4<u32>, layer: i32, t: vec3<u32>) -> Comp
     if (layer < 0) {
         return out;
     }
-    let mask = U.mask;
+    let mask = U.mask & LAYERS;
     if ((mask & M_OWN) != 0u && ov.x != 0u && ov.y != 0u) {
         let m = own_mgr(ov.x);
         let col = lut[OWN_BASE + min(m, 12u)];
@@ -694,7 +696,7 @@ fn user_marks(composed: Composed, d: u32, u: u32, v: u32, cand: vec4<u32>) -> Co
 
 fn compose(d: u32, u: u32, v: u32, pos: vec2<f32>, bi: u32) -> Composed {
     let blk = blocks[bi];
-    let mask = U.mask;
+    let mask = U.mask & LAYERS;
     var out: Composed;
     out.base = U.style_no_dem.rgb;
     out.ground = false;
