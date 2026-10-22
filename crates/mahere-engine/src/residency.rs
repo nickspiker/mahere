@@ -1285,8 +1285,16 @@ mod tests {
             let none: Arc<dyn CellStore> = Arc::new(Kept::default());
             let layers = LayerStores { dem: Arc::new(TieredStore::new(vault.clone(), edge.clone())), img: none.clone(), nir: none };
             // Two sessions' loads, with time for any check of the kept copy to run.
+            // A base asked for alone takes the kept layer with it only when it is the one named, never fetching (2026-10-22: one decode on a relaunch).
+            let alone = load_cell(bases.as_ref(), Some(&layers), 0, key, false, WANT_DEM);
+            let e = alone.entry.expect("the base");
+            assert!(!alone.merge, "a base is the cell, not a merge");
+            assert_eq!(e.layers & WANT_DEM != 0, named_fetches == 0, "the kept layer comes with its base exactly when it is the one named");
+            assert_eq!(edge.named.load(Ordering::SeqCst), 0, "a base alone never fetches a layer");
             for _ in 0..2 {
-                let _ = load_cell(bases.as_ref(), Some(&layers), WANT_DEM, key, false);
+                let l = load_cell(bases.as_ref(), Some(&layers), WANT_DEM, key, false, 0);
+                assert!(l.merge, "a layer asked for after its base merges into the cell");
+                assert!(l.entry.is_some_and(|e| e.layers == WANT_DEM && e.line.is_none()), "the layer alone, the base not decoded again");
                 std::thread::sleep(std::time::Duration::from_millis(50));
             }
             assert_eq!(edge.plain.load(Ordering::SeqCst), 0, "a layer never comes from the plain address");
