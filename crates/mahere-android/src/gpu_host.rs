@@ -387,7 +387,7 @@ impl GpuHost {
             self.labels_ms = 0.0;
             self.overlay_ms = 0.0;
             self.encode_ms = 0.0;
-            eprintln!("gpu: {} frames, per frame {:.2} ms plan + {:.2} ms sync + {:.2} ms overlay and encode + {:.2} ms waiting for the swapchain, {} resident, {} pending, {} uploads, layers {:?}, {} of {} blocks from composites", self.frames, self.plan_ms / n, self.sync_ms / n, (self.work_ms - self.plan_ms - self.sync_ms) / n, (self.frame_ms - self.work_ms) / n, map.pool().map.len(), map.pending_cells(), self.map.uploads, self.map.layers(), self.map.fast_blocks.0, self.map.fast_blocks.1);
+            eprintln!("gpu: {} frames, per frame {:.2} ms plan + {:.2} ms sync + {:.2} ms overlay and encode + {:.2} ms waiting for the swapchain, {} resident, {} pending, {} uploads, layers {:?}, {} of {} blocks from composites, {} cells baked so far", self.frames, self.plan_ms / n, self.sync_ms / n, (self.work_ms - self.plan_ms - self.sync_ms) / n, (self.frame_ms - self.work_ms) / n, map.pool().map.len(), map.pending_cells(), self.map.uploads, self.map.layers(), self.map.fast_blocks.0, self.map.fast_blocks.1, self.map.bakes);
             self.frames = 0;
             self.frame_ms = 0.0;
             self.work_ms = 0.0;

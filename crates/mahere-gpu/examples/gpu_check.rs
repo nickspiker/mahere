@@ -544,12 +544,12 @@ fn composite_check(device: &wgpu::Device, queue: &wgpu::Queue, gpu: &mut GpuMap,
         frame(gpu);
         frames += 1;
         let (fast, all) = gpu.fast_blocks;
-        if fast == all && !gpu.bakes_pending() {
+        if (fast == all || frames > 50) && !gpu.bakes_pending() {
             break;
         }
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
-    eprintln!("composites: {:?} blocks fast after {frames} frames, {:.1} s", gpu.fast_blocks, t.elapsed().as_secs_f32());
+    eprintln!("composites: {:?} blocks fast after {frames} frames, {:.1} s, bakes pending {}", gpu.fast_blocks, t.elapsed().as_secs_f32(), gpu.bakes_pending());
     frame(gpu);
     let fast_ms = median(gpu);
     eprintln!("the timed frame baked {} cells", gpu.baked_last);

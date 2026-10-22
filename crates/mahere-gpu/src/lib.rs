@@ -337,6 +337,8 @@ pub struct GpuMap {
     /// Blocks the last frame drew from composites, and all of them; cells it baked.
     pub fast_blocks: (usize, usize),
     pub baked_last: usize,
+    /// Cells baked since the map was made.
+    pub bakes: usize,
     shader: wgpu::ShaderModule,
     map_pl: wgpu::PipelineLayout,
     present_pipeline: wgpu::RenderPipeline,
@@ -555,6 +557,7 @@ impl GpuMap {
             bakes_left: false,
             fast_blocks: (0, 0),
             baked_last: 0,
+            bakes: 0,
             shader,
             map_pl,
             present_pipeline,
@@ -1317,9 +1320,11 @@ impl GpuMap {
             let shared = hs.finish();
             let by_key: FxHashMap<CellKey, usize> = plan.refs.iter().enumerate().filter(|(_, r)| r.flags & FLAG_INK == 0).map(|(i, r)| (r.key, i)).collect();
             let mut seen = rustc_hash::FxHashSet::default();
-            // The blocks' own cells first; then every vector cell in view at the view's depth, which a pixel between a block's samples may fall in and the shader then finds by search.
+            // The blocks' own cells first; then every vector cell the view wants at its depth (not every resident one: past the planes' room, bakes evicted the cells being drawn, a few re-baked every frame), which a pixel between a block's samples may fall in and the shader then finds by search.
             let mut wanted: Vec<usize> = plan.blocks.iter().flat_map(|b| b.cand[1]).filter(|&r| r != NONE && seen.insert(r)).map(|r| r as usize).collect();
-            wanted.extend((0..plan.refs.len()).filter(|&i| plan.refs[i].key.depth == plan.vec_depth && plan.refs[i].flags & FLAG_INK == 0 && seen.insert(i as u32)));
+            wanted.extend((0..plan.refs.len()).filter(|&i| plan.refs[i].wanted && plan.refs[i].key.depth == plan.vec_depth && plan.refs[i].flags & FLAG_INK == 0 && seen.insert(i as u32)));
+            // Every current composite marked drawn first, so a bake making room never takes one this frame draws.
+            let mut stale: Vec<(usize, u64, [u8; 32])> = Vec::new();
             for i in wanted {
                 if refs[i].c[0] & FLAG_VEC == 0 {
                     continue;
@@ -1348,15 +1353,19 @@ impl GpuMap {
                         continue;
                     }
                 }
+                stale.push((i, sig, hi));
+            }
+            for (i, sig, hi) in stale {
                 if !bake_ready || bakes.len() >= self.bake_budget {
                     self.bakes_left = true;
-                    continue;
+                    break;
                 }
-                if let Some((s0, s1)) = self.comp_alloc(device, queue, key) {
-                    self.baked.insert(key, Baked { sig, used: self.frame_no });
-                    refs[i].c = [refs[i].c[0] | FLAG_COMP, refs[i].c[1], s0, s1];
-                    bakes.push((i, s0, s1, hi));
-                }
+                let key = plan.refs[i].key;
+                // No room left (every composite held is drawn this frame): the rest draw whole, and nothing spins waiting for room.
+                let Some((s0, s1)) = self.comp_alloc(device, queue, key) else { break };
+                self.baked.insert(key, Baked { sig, used: self.frame_no });
+                refs[i].c = [refs[i].c[0] | FLAG_COMP, refs[i].c[1], s0, s1];
+                bakes.push((i, s0, s1, hi));
             }
         }
         // Blocks drawn from composites first, then the rest: two draws over one buffer.
@@ -1367,6 +1376,7 @@ impl GpuMap {
         blocks.extend(plan.blocks.iter().filter(|b| !fast(b)).map(gpu_block));
         self.fast_blocks = (n_fast, blocks.len());
         self.baked_last = bakes.len();
+        self.bakes += bakes.len();
         let table: Vec<GpuSlot> = plan.table.iter().map(|s| GpuSlot { tag: s.tag, cu: s.cu, cv: s.cv, index: s.index }).collect();
         let mut rebind = self.map_bind.is_none();
         if blocks.len() > self.blocks_cap {

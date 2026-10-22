@@ -46,6 +46,8 @@ pub struct PlanRef {
     pub flags: u32,
     /// Metres east and north per texel step along u, then along v, and the inverse determinant.
     pub jac: [f32; 5],
+    /// The cell is one this frame's view wants (on screen, or a parent or neighbour of one), not merely resident.
+    pub wanted: bool,
 }
 
 /// A screen block with its corner UVs in depth-30 units and the per-pixel steps the shader interpolates with.
@@ -283,7 +285,7 @@ pub fn plan_frame(w: usize, h: usize, cam: &Camera, pool: &Pool, dem_depth: u8, 
         }
         let diamond = key.diamond();
         let index = refs.len() as u32;
-        refs.push(PlanRef { key: *key, diamond, cu: cu as u32, cv: cv as u32, flags, jac: if flags & FLAG_DEM != 0 { jacobian(*key) } else { [0.0; 5] } });
+        refs.push(PlanRef { key: *key, diamond, cu: cu as u32, cv: cv as u32, flags, jac: if flags & FLAG_DEM != 0 { jacobian(*key) } else { [0.0; 5] }, wanted: desired.contains(key) });
         let mut h = table_hash(diamond as u32, key.depth as u32, cu as u32, cv as u32) as usize;
         for _ in 0..TABLE_N {
             if table[h].index == NONE {
@@ -355,7 +357,7 @@ pub fn plan_frame(w: usize, h: usize, cam: &Camera, pool: &Pool, dem_depth: u8, 
         let (cu, cv) = key.grid();
         let diamond = key.diamond();
         let index = refs.len() as u32;
-        refs.push(PlanRef { key: *key, diamond, cu: cu as u32, cv: cv as u32, flags: FLAG_INK, jac: [0.0; 5] });
+        refs.push(PlanRef { key: *key, diamond, cu: cu as u32, cv: cv as u32, flags: FLAG_INK, jac: [0.0; 5], wanted: false });
         let mut h = table_hash(diamond as u32, key.depth as u32 + INK_TAG_DEPTH, cu as u32, cv as u32) as usize;
         for _ in 0..TABLE_N {
             if table[h].index == NONE {
