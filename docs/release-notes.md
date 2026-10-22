@@ -1,5 +1,19 @@
 # Mahere release notes
 
+## 0.225 · October 2026
+
+### Faster on older phones
+- The map draws several times faster on phones like the Pixel 3a: each part of the screen now looks up its map tiles once instead of at every pixel.
+- Map layers that don't change, like land, water, ownership and imagery, are combined once per tile, while the hillshade, slope bands, contours and every road and trail still draw live.
+- Only the layers you have switched on are drawn; the rest cost nothing.
+- A still view sharpens as far as the phone can manage instead of always aiming for the sharpest.
+
+### Fixes
+- Older phones no longer show "not responding" or stall while a burst of new map detail arrives.
+- The map no longer turns black after the graphics driver resets: it rebuilds itself and carries on.
+- Old, coarse tiles no longer flash over sharper ones that have already loaded, and no more brown patches where detail is still on its way.
+- Roads fade against the biggest road actually on screen, not one just out of view.
+
 ## 0.224 · October 2026
 
 ### Notes
