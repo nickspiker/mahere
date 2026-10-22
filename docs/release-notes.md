@@ -4,7 +4,8 @@
 
 ### Version numbers start over
 - Mahere is numbered from 0.0.0 again: the old numbers had run up to 0.225 after only a dozen releases.
-- A copy from before may not update to it on its own: open Updates in the menu and tap Get release once, and it takes care of itself after that.
+- On a phone, uninstall the old Mahere first, then install this one from the page: Android won't put it over the old numbers. Uninstalling clears what Mahere kept on the phone, notes included; downloaded maps come again as you look at them.
+- On a computer, open Updates in the menu and tap Get release once; it updates itself after that.
 
 ### Faster on older phones
 - The map draws several times faster on phones like the Pixel 3a: each part of the screen now looks up its map tiles once instead of at every pixel.

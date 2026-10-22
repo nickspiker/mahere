@@ -9,7 +9,7 @@ android {
         applicationId "nz.mahere.app"
         minSdk 26
         targetSdk 35
-        // The publish script passes the version from git (commit count + short hash); a local build is 1 / dev.
+        // The publish script passes the version code (the commit count, as Photon's) and the name (version + short hash); a local build is 1 / dev.
         def vcode = System.getenv("MAHERE_VERSION_CODE") ?: "1"
         def vname = System.getenv("MAHERE_VERSION_NAME") ?: "dev"
         versionCode vcode.toInteger()
