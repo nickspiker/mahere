@@ -178,6 +178,8 @@ impl Entry {
 
 pub struct Loaded {
     pub key: CellKey,
+    /// Layers alone, for a cell already resident: merged into its entry rather than replacing it (the base not decoded a second time).
+    pub merge: bool,
     /// `None` = the fetch failed; the cell is not resident and will be asked for again after a short backoff.
     pub entry: Option<Entry>,
 }
@@ -207,6 +209,8 @@ struct Queues {
     busy: FxHashSet<(CellKey, u8)>,
     /// Cells finished in the last moment: a newer list arrives before the main side has drained them, and would load them twice.
     done: FxHashMap<(CellKey, u8), std::time::Instant>,
+    /// The layers the view shows: a base loaded alone takes those already on the device with it.
+    warm: u8,
     closed: bool,
 }
 
@@ -351,6 +355,36 @@ impl Residency {
             self.pending.remove(&l.key);
             self.last_sent.retain(|(k, _)| *k != l.key);
             match l.entry {
+                // Layers for a resident cell, into it: the terrain with its range, the imagery bands asked for (a band not asked for keeps what the cell had). Gone from the pool meanwhile: dropped, asked for again with its base.
+                Some(e) if l.merge => {
+                    if let Some(old) = self.pool.map.get_mut(&l.key) {
+                        if e.layers & WANT_DEM != 0 {
+                            old.dem = e.dem;
+                            old.dem_q = e.dem_q;
+                            old.elev_lo = e.elev_lo;
+                            old.elev_hi = e.elev_hi;
+                            old.present = (old.present & !PRESENT_DEM) | (e.present & PRESENT_DEM);
+                        }
+                        if e.layers & (WANT_IMG | WANT_NIR) != 0 {
+                            let mut img = e.img;
+                            if let (Some(new), Some(had)) = (&mut img, &old.img) {
+                                if e.layers & WANT_IMG == 0 {
+                                    (new.red, new.green, new.blue) = (had.red.clone(), had.green.clone(), had.blue.clone());
+                                }
+                                if e.layers & WANT_NIR == 0 {
+                                    new.nir = had.nir.clone();
+                                }
+                            }
+                            if img.is_some() {
+                                old.img = img;
+                                old.present |= PRESENT_IMG;
+                            }
+                        }
+                        old.layers |= e.layers;
+                        self.pool_version += 1;
+                        n += 1;
+                    }
+                }
                 // A base arriving after the same cell with its layers (an older request overtaken) leaves the fuller copy on show.
                 Some(e) if self.pool.map.get(&l.key).is_some_and(|old| old.layers & !e.layers != 0 && e.layers & !old.layers == 0) => {}
                 Some(e) => {
@@ -563,6 +597,7 @@ fn loader_thread(store: Arc<dyn CellStore>, layers: Option<LayerStores>, want_rx
         let mut q = lock.lock().unwrap();
         let now = std::time::Instant::now();
         q.done.retain(|_, t| now.duration_since(*t) < std::time::Duration::from_millis(800));
+        q.warm = w.warm;
         let Queues { work, busy, done, .. } = &mut *q;
         work.clear();
         for &(k, want) in &w.list {
@@ -581,7 +616,7 @@ fn loader_thread(store: Arc<dyn CellStore>, layers: Option<LayerStores>, want_rx
 fn loader(store: &dyn CellStore, layers: Option<&LayerStores>, done_tx: &Sender<Loaded>, pack_cpu: &std::sync::atomic::AtomicBool, shared: &(std::sync::Mutex<Queues>, std::sync::Condvar)) {
     let (lock, wake) = shared;
     loop {
-        let job = {
+        let (job, warm) = {
             let mut q = lock.lock().unwrap();
             loop {
                 if q.closed {
@@ -591,7 +626,7 @@ fn loader(store: &dyn CellStore, layers: Option<&LayerStores>, done_tx: &Sender<
                     if let Work::Load(k, want) = j {
                         q.busy.insert((k, want));
                     }
-                    break j;
+                    break (j, q.warm);
                 }
                 q = wake.wait(q).unwrap();
             }
@@ -599,7 +634,7 @@ fn loader(store: &dyn CellStore, layers: Option<&LayerStores>, done_tx: &Sender<
         match job {
             Work::Load(k, want) => {
                 let t = std::time::Instant::now();
-                let l = load_cell(store, layers, want, k, pack_cpu.load(std::sync::atomic::Ordering::Relaxed));
+                let l = load_cell(store, layers, want, k, pack_cpu.load(std::sync::atomic::Ordering::Relaxed), warm);
                 let i = if want == 0 { 0 } else { 2 };
                 LOAD_STATS[i].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 LOAD_STATS[i + 1].fetch_add(t.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
@@ -646,17 +681,19 @@ fn non_empty(b: &[u8]) -> Option<&[u8]> {
     (!b.is_empty()).then_some(b)
 }
 
-fn load_cell(store: &dyn CellStore, layers: Option<&LayerStores>, want: u8, key: CellKey, pack_cpu: bool) -> Loaded {
+fn load_cell(store: &dyn CellStore, layers: Option<&LayerStores>, want: u8, key: CellKey, pack_cpu: bool, warm: u8) -> Loaded {
     // No base, no cell (a published cell always has one, if empty); a failure is tried again.
     let bytes = match store.get(key) {
         Fetch::Bytes(b) => b,
-        Fetch::Absent => return Loaded { key, entry: Some(Entry::default()) },
+        Fetch::Absent => return Loaded { key, merge: false, entry: Some(Entry::default()) },
         Fetch::Failed(e) => {
             eprintln!("cell {} fetch failed: {e}", key.name());
-            return Loaded { key, entry: None };
+            return Loaded { key, merge: false, entry: None };
         }
     };
-    let layers_loaded = if layers.is_some() { want } else { u8::MAX };
+    // Layers asked for after their base (the bucket's order: every base, then the layers) are decoded alone and merged into the resident cell: its base was decoded once already (2026-10-22: a relaunch on a Pixel 3a decoded every base twice, ten seconds before the screen filled).
+    let merge = layers.is_some() && want != 0;
+    let mut want = want;
     // The layers the view shows, beside the base.
     let mut img_bytes: (Vec<u8>, Vec<u8>) = Default::default();
     let mut dem_bytes: Vec<u8> = Vec::new();
@@ -685,28 +722,50 @@ fn load_cell(store: &dyn CellStore, layers: Option<&LayerStores>, want: u8, key:
                 }
             }
         };
-        if want & WANT_DEM != 0 {
-            let Some(b) = get(&*l.dem, Layer::Dem) else { return Loaded { key, entry: None } };
+        // A base asked for alone takes the layers the view shows that are on the device already, the one copy its base names: one read, one decode, and no second pass for them.
+        if want == 0 {
+            let local = |store: &dyn CellStore, layer: Layer| -> Option<Vec<u8>> {
+                mahere_tiles::publish::link_name(&bytes, layer)?;
+                match store.get_local(key) {
+                    Fetch::Bytes(b) if mahere_tiles::publish::linked(&bytes, layer, &b) => Some(b),
+                    _ => None,
+                }
+            };
+            for (bit, st, layer) in [(WANT_DEM, &l.dem, Layer::Dem), (WANT_IMG, &l.img, Layer::Img), (WANT_NIR, &l.nir, Layer::Nir)] {
+                if warm & bit != 0 {
+                    if let Some(b) = local(&**st, layer) {
+                        want |= bit;
+                        match bit {
+                            WANT_DEM => dem_bytes = b,
+                            WANT_IMG => img_bytes.0 = b,
+                            _ => img_bytes.1 = b,
+                        }
+                    }
+                }
+            }
+        } else if want & WANT_DEM != 0 {
+            let Some(b) = get(&*l.dem, Layer::Dem) else { return Loaded { key, merge: false, entry: None } };
             dem_bytes = b;
         }
-        if want & WANT_IMG != 0 {
-            let Some(b) = get(&*l.img, Layer::Img) else { return Loaded { key, entry: None } };
+        if merge && want & WANT_IMG != 0 {
+            let Some(b) = get(&*l.img, Layer::Img) else { return Loaded { key, merge: false, entry: None } };
             img_bytes.0 = b;
         }
-        if want & WANT_NIR != 0 {
-            let Some(b) = get(&*l.nir, Layer::Nir) else { return Loaded { key, entry: None } };
+        if merge && want & WANT_NIR != 0 {
+            let Some(b) = get(&*l.nir, Layer::Nir) else { return Loaded { key, merge: false, entry: None } };
             img_bytes.1 = b;
         }
     }
+    let layers_loaded = if layers.is_some() { want } else { u8::MAX };
     if bytes.is_empty() && dem_bytes.is_empty() && img_bytes.0.is_empty() && img_bytes.1.is_empty() {
-        return Loaded { key, entry: Some(Entry { layers: layers_loaded, exists: true, ..Entry::default() }) };
+        return Loaded { key, merge, entry: Some(Entry { layers: layers_loaded, exists: true, ..Entry::default() }) };
     }
-    let planes = match mahere_tiles::publish::decode_layers(non_empty(&bytes), non_empty(&dem_bytes), non_empty(&img_bytes.0), non_empty(&img_bytes.1)) {
+    let planes = match mahere_tiles::publish::decode_layers(if merge { None } else { non_empty(&bytes) }, non_empty(&dem_bytes), non_empty(&img_bytes.0), non_empty(&img_bytes.1)) {
         Ok(p) => p,
         Err(e) => {
             // A corrupt object: treat as a failure so it's retried (the vault may have a bad copy) rather than remembered as absent.
             eprintln!("cell {} decode failed ({} bytes): {e}", key.name(), bytes.len());
-            return Loaded { key, entry: None };
+            return Loaded { key, merge: false, entry: None };
         }
     };
     let (elev_lo, elev_hi) = planes.dem.as_ref().map_or((mahere_tiles::ELEV_NODATA, 0), |d| {
@@ -741,7 +800,7 @@ fn load_cell(store: &dyn CellStore, layers: Option<&LayerStores>, want: u8, key:
     if let Some(im) = &mut img {
         im.retone(mahere_tiles::tone::IMG_TAG);
     }
-    Loaded { key, entry: Some(Entry { present, line_mag_max, elev_lo, elev_hi, dem, dem_q, line: planes.line, land: planes.land, water: planes.water, img, own: planes.own, mvum: planes.mvum, layers: layers_loaded, exists: true, geoid: if key.depth == 0 { planes.geoid } else { None } }) }
+    Loaded { key, merge, entry: Some(Entry { present, line_mag_max, elev_lo, elev_hi, dem, dem_q, line: planes.line, land: planes.land, water: planes.water, img, own: planes.own, mvum: planes.mvum, layers: layers_loaded, exists: true, geoid: if key.depth == 0 { planes.geoid } else { None } }) }
 }
 
 // ==================== TIERED STORE: VAULT CACHE OVER THE BUCKET ====================

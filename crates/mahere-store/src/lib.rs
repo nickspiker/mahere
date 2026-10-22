@@ -1024,7 +1024,12 @@ pub mod themes {
     /// The built-ins into the vault where they are missing or an older revision, then every theme the vault holds, in index order, as authored (VSF RGB): the renderers convert to the display at their one encode.
     pub fn load_all(store: &FlatStorage) -> Vec<Theme> {
         // Each theme read once (2026-10-21: themes took 2.9 s of a Pixel 3a's start, each read twice), a built-in written back only when a newer revision ships.
-        let mut have: std::collections::HashMap<String, Theme> = names(store).into_iter().filter_map(|n| load(store, &n).map(|t| (n, t))).collect();
+        let t0 = std::time::Instant::now();
+        let listed = names(store);
+        let t_names = t0.elapsed().as_millis();
+        let mut have: std::collections::HashMap<String, Theme> = listed.into_iter().filter_map(|n| load(store, &n).map(|t| (n, t))).collect();
+        // Where a slow start goes (2026-10-22: themes 3.4 s of a Pixel 3a's): the index read, then each theme's.
+        eprintln!("themes: index read in {t_names} ms, {} themes read and parsed in {} ms", have.len(), t0.elapsed().as_millis() - t_names);
         let mut written = 0;
         for t in mahere_engine::theme::builtin() {
             // A newer shipped revision replaces the stored one unless the user has edited it; theirs stays until they reset.

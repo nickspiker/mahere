@@ -734,7 +734,9 @@ pub extern "system" fn Java_nz_mahere_app_MahereActivity_nativeInit(
     // Themes from the vault (the built-ins written on first launch), then the saved choice, then the saved layers over the theme's defaults.
     lap("map, ink and areas");
     if let Some(v) = &store {
-        map.set_themes(mahere_store::themes::load_all(v));
+        let themes = mahere_store::themes::load_all(v);
+        lap("themes read");
+        map.set_themes(themes);
     }
     lap("themes");
     let mut ui_ru = 1.0f32;
