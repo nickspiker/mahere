@@ -1,6 +1,10 @@
 # Mahere release notes
 
-## 0.225 · October 2026
+## 0.0.0 · October 2026
+
+### Version numbers start over
+- Mahere is numbered from 0.0.0 again: the old numbers had run up to 0.225 after only a dozen releases.
+- A copy from before may not update to it on its own: open Updates in the menu and tap Get release once, and it takes care of itself after that.
 
 ### Faster on older phones
 - The map draws several times faster on phones like the Pixel 3a: each part of the screen now looks up its map tiles once instead of at every pixel.
@@ -13,6 +17,10 @@
 - The map no longer turns black after the graphics driver resets: it rebuilds itself and carries on.
 - Old, coarse tiles no longer flash over sharper ones that have already loaded, and no more brown patches where detail is still on its way.
 - Roads fade against the biggest road actually on screen, not one just out of view.
+
+## Before 0.0.0
+
+Releases under the old numbers, newest first.
 
 ## 0.224 · October 2026
 

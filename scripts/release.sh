@@ -1,5 +1,5 @@
 #!/bin/sh
-# A release (Nick 2026-10-15: Photon's numbering): the version moved to the next minor's x.y.0 (or the one given, release.sh 0.216), built fresh for Android, Linux, macOS (Apple Silicon) and Windows, each published to the release channel and as the project page's mahere.apk, mahere-linux-x86_64, mahere-macos-arm64 and mahere-windows-x86_64.exe, with the one-line installers that fetch them (publish-installers.sh); then the tree opens the next dev line at x.y.1. Phones and desktops on any build older take it on their own.
+# A release (Nick 2026-10-15: Photon's numbering): the version moved to the next minor's x.y.0 (or the one given, release.sh 0.0 for 0.0.0), built fresh for Android, Linux, macOS (Apple Silicon) and Windows, each published to the release channel and as the project page's mahere.apk, mahere-linux-x86_64, mahere-macos-arm64 and mahere-windows-x86_64.exe, with the one-line installers that fetch them (publish-installers.sh); then the tree opens the next dev line at x.y.1. Phones and desktops on any build older take it on their own.
 . "$(dirname "$0")/lib-publish.sh"
 stamp
 NEXT="${1:-$MAJOR.$((MINOR + 1))}.0"

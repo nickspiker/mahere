@@ -22,13 +22,15 @@ set_version() {
 Built with Claude Opus 5.5"
 }
 
-# stamp: the environment a build carries, from the version and the commit: Android's version code (minor times a thousand plus patch) and the name a person reads.
+# stamp: the environment a build carries, from the version and the commit: Android's version code and the name a person reads.
+# The code is 300000 plus major times a million, minor times a thousand and patch: the numbers started again at 0.0.0 on 2026-10-22 (Nick: the minor had carried on from the old commit-count build numbers, 0.225 after a dozen releases), and Android installs no code lower than one it has, the highest the first numbering reached being 225012.
+VERSION_CODE_BASE=300000
 stamp() {
     V=$(version)
     MAJOR=$(echo "$V" | cut -d. -f1)
     MINOR=$(echo "$V" | cut -d. -f2)
     PATCH=$(echo "$V" | cut -d. -f3)
-    export MAHERE_VERSION_CODE=$((MAJOR * 1000000 + MINOR * 1000 + PATCH))
+    export MAHERE_VERSION_CODE=$((VERSION_CODE_BASE + MAJOR * 1000000 + MINOR * 1000 + PATCH))
     export MAHERE_VERSION_NAME="$V+$(git rev-parse --short HEAD)"
 }
 

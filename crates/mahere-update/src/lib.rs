@@ -51,7 +51,7 @@ impl Channel {
 pub struct Row {
     pub platform: String,
     pub arch: String,
-    /// Android's version code, minor times a thousand plus patch: what builds from before the version numbers compared (they take any release whose build is not theirs).
+    /// Android's version code ([`version_code`]): what builds from before the version numbers compared (they take any release whose build is not theirs).
     pub build: u64,
     /// The version, major, minor and patch (Nick 2026-10-15: Photon's numbering): a release is x.y.0, a dev build carries its patch. [0, 0, 0] for a row from before.
     pub version: [u64; 3],
@@ -75,9 +75,12 @@ pub fn our_version() -> [u64; 3] {
     parse_version(env!("CARGO_PKG_VERSION")).unwrap_or([0, 0, 0])
 }
 
-/// Android's version code for a version: minor times a thousand plus patch, rising with every build.
+/// Android's version code under the first numbering, which ran to 0.225 (minor times a thousand plus patch): every code from now on is above it.
+pub const VERSION_CODE_BASE: u64 = 300_000;
+
+/// Android's version code for a version: the base, then major times a million, minor times a thousand and patch, rising with every build (the numbers started again at 0.0.0 on 2026-10-22, the scripts' stamp the same sum).
 pub fn version_code(v: [u64; 3]) -> u64 {
-    v[0] * 1_000_000 + v[1] * 1000 + v[2]
+    VERSION_CODE_BASE + v[0] * 1_000_000 + v[1] * 1000 + v[2]
 }
 
 /// This build's number, stamped by the publish scripts (MAHERE_VERSION_CODE); 0 for a local build, which no channel ever counts as current.
