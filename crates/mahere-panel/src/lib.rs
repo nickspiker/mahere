@@ -581,6 +581,12 @@ pub struct Panel {
     cache_max: u64,
     /// The ruler strip's close button (centre and radius) while a measurement is shown, and whether a tap just hit it.
     strip_close: Option<(f32, f32, f32)>,
+    /// A notice along the top of the map, and the label of its one button (the unsaved session's "Open Photon").
+    notice: Option<(String, String)>,
+    /// Where the notice's button was painted.
+    notice_btn: Option<(f32, f32, f32, f32)>,
+    /// The notice's button was tapped since the host last asked.
+    notice_tapped: bool,
     clear_measure: bool,
     /// The areas pages' rows from the last paint (centre y, half height, the row), what they asked, and what was shown.
     area_rows: Vec<(f32, f32, AreaRow)>,
@@ -628,7 +634,7 @@ impl Panel {
         let mut hits: HitId = HIT_NONE;
         let checks = LAYERS.iter().map(|&(l, label)| (l, Checkbox::new(&mut hits, label, 0.0, 0.0, 10.0, 10.0, 10.0, false))).collect();
         let interval = Slider::new(&mut hits, 0.0, 0.0, 10.0, 10.0, 0.0);
-        Panel { fonts: None, font_cursor: 0, open: false, dirty: true, ru: 1.0, stack: vec![Page::Layers], theme_rows: Vec::new(), edit_rows: Vec::new(), edit_scroll: 0.0, edit_extent: 0.0, press: None, sliders: Vec::new(), field_vals: [0.0; 4], held: None, edits: Vec::new(), hits, shown: vec![true; LAYERS.len()], group_open: GROUPS_OPEN, group_rows: Vec::new(), tree: Vec::new(), layer_open: None, field_open: None, theme_now: None, interval, interval_held: false, checks, text: TextRenderer::new(), buf: Vec::new(), w: 0, h: 0, font: 16.0, gear: (0.0, 0.0, 0.0), panel_w: 0.0, theme_row: (0.0, 0.0, 0.0), slider: (0.0, 0.0, 0.0), slider_held: false, cache_max: CACHE_MIN + 1, strip_close: None, clear_measure: false, area_rows: Vec::new(), area_acts: Vec::new(), areas: AreasView::default(), update_rows: Vec::new(), update_acts: Vec::new(), updates: UpdatesView::default(), host_orb: None, layers_scroll: 0.0, layers_extent: 0.0, layers_press: None, layers_band: (0.0, 0.0), orb_icon: fluor::host::icon::Icon::from_vsf_bytes(APP_ORB_VSF).ok(), orb_scaled: (0, Vec::new()), locate_btn: None, tool_btn: None, toolbox_open: false, tool_rows: Vec::new() }
+        Panel { fonts: None, font_cursor: 0, open: false, dirty: true, ru: 1.0, stack: vec![Page::Layers], theme_rows: Vec::new(), edit_rows: Vec::new(), edit_scroll: 0.0, edit_extent: 0.0, press: None, sliders: Vec::new(), field_vals: [0.0; 4], held: None, edits: Vec::new(), hits, shown: vec![true; LAYERS.len()], group_open: GROUPS_OPEN, group_rows: Vec::new(), tree: Vec::new(), layer_open: None, field_open: None, theme_now: None, interval, interval_held: false, checks, text: TextRenderer::new(), buf: Vec::new(), w: 0, h: 0, font: 16.0, gear: (0.0, 0.0, 0.0), panel_w: 0.0, theme_row: (0.0, 0.0, 0.0), slider: (0.0, 0.0, 0.0), slider_held: false, cache_max: CACHE_MIN + 1, strip_close: None, notice: None, notice_btn: None, notice_tapped: false, clear_measure: false, area_rows: Vec::new(), area_acts: Vec::new(), areas: AreasView::default(), update_rows: Vec::new(), update_acts: Vec::new(), updates: UpdatesView::default(), host_orb: None, layers_scroll: 0.0, layers_extent: 0.0, layers_press: None, layers_band: (0.0, 0.0), orb_icon: fluor::host::icon::Icon::from_vsf_bytes(APP_ORB_VSF).ok(), orb_scaled: (0, Vec::new()), locate_btn: None, tool_btn: None, toolbox_open: false, tool_rows: Vec::new() }
     }
 
     pub fn is_open(&self) -> bool {
@@ -1139,6 +1145,10 @@ impl Panel {
             self.dirty = true;
             return true;
         }
+        if self.notice_btn.is_some_and(|r| inside(r)) {
+            self.notice_tapped = true;
+            return true;
+        }
         if let Some((cx, cy, cr)) = self.strip_close {
             if (x - cx).powi(2) + (y - cy).powi(2) <= (cr * 1.4).powi(2) {
                 self.clear_measure = true;
@@ -1417,6 +1427,22 @@ impl Panel {
         let mut damage = Damage::new();
         let mut canvas = Canvas::new(&mut self.buf, w, h, &mut damage);
         self.strip_close = None;
+        self.notice_btn = None;
+        if let Some((words, button)) = &self.notice {
+            // Along the top, centred, level with the orb: the words, then the button lit beside them.
+            let ph = font * 1.9;
+            let st = TextStyle::new(font * 0.8, READOUT);
+            let tw = self.text.measure_text(words, &st) + ph;
+            let bw = self.text.measure_text(button, &st) + ph;
+            let gap = font * 0.5;
+            let total = tw + gap + bw;
+            let x0 = ((w as f32 - total) * 0.5).max(gx + gr + font);
+            let y0 = gy - ph * 0.5;
+            let btn = (x0 + tw + gap, y0, bw, ph);
+            Self::paint_pill(&mut canvas, &mut self.text, btn, button, true, font);
+            Self::paint_pill(&mut canvas, &mut self.text, (x0, y0, tw, ph), words, false, font);
+            self.notice_btn = Some(btn);
+        }
         let mut bottom = h as f32;
         if let Some(m) = measure {
             self.strip_close = Some(Self::paint_strip(&mut canvas, &mut self.text, w, h, font, m));
@@ -1826,6 +1852,20 @@ impl Panel {
     }
 
     /// True once after a tap on the ruler's close button.
+    /// A notice along the top of the map with one button, or none. Repaints only when it changes.
+    pub fn set_notice(&mut self, notice: Option<(&str, &str)>) {
+        let n = notice.map(|(w, b)| (w.to_string(), b.to_string()));
+        if n != self.notice {
+            self.notice = n;
+            self.dirty = true;
+        }
+    }
+
+    /// Whether the notice's button was tapped since the last ask.
+    pub fn take_notice_tap(&mut self) -> bool {
+        std::mem::take(&mut self.notice_tapped)
+    }
+
     pub fn take_clear_measure(&mut self) -> bool {
         std::mem::take(&mut self.clear_measure)
     }
@@ -1855,6 +1895,16 @@ impl Panel {
         let t = ((x - sx) / sw.max(1.0)).clamp(0.0, 1.0);
         let max = self.cache_max.max(CACHE_MIN + 1);
         ctl.cache_budget = CACHE_MIN + ((max - CACHE_MIN) as f64 * t as f64) as u64;
+        self.dirty = true;
+    }
+
+    /// The wheel over an open panel: the page's list moves `dy` pixels, as a drag of that length would move it (positive down, toward the top). Pages that do not scroll take it and do nothing; the map never sees it.
+    pub fn scroll(&mut self, dy: f32) {
+        match self.page() {
+            Page::Layers => self.layers_scroll = (self.layers_scroll - dy).clamp(0.0, self.layers_extent),
+            Page::Edit => self.edit_scroll = (self.edit_scroll - dy).clamp(0.0, self.edit_extent),
+            _ => return,
+        }
         self.dirty = true;
     }
 

@@ -137,19 +137,6 @@ impl CellFiles {
         let _ = write_whole(&self.path(key, code).with_extension("tag"), tag.as_bytes());
     }
 
-    /// Whether a cell's layer is kept here.
-    pub(crate) fn has(&self, key: CellKey, code: u8) -> bool {
-        self.path(key, code).is_file()
-    }
-
-    /// A cell brought in from elsewhere (the vault of old), with when it was last used there.
-    pub(crate) fn adopt(&self, key: CellKey, code: u8, bytes: &[u8], tag: Option<&str>, seen: i64) {
-        self.put_layer(key, code, bytes, seen);
-        if let Some(t) = tag {
-            self.set_tag_of(key, code, t);
-        }
-    }
-
     /// Bytes of cells the index knows about, the pinned ones included.
     pub fn cached_bytes(&self) -> u64 {
         self.index.lock().unwrap().entries.values().map(|&(_, b)| b as u64).sum()
@@ -203,6 +190,20 @@ impl CellFiles {
             self.flush();
         }
         victims.len()
+    }
+
+    /// Every cell file here, handed to `f` with its layer code, bytes and tag — the move into the vault. Returns how many.
+    pub(crate) fn drain_into(&self, mut f: impl FnMut(CellKey, u8, &[u8], Option<&str>)) -> usize {
+        let mut n = 0;
+        for &(packed, raw) in scan(&self.root).keys() {
+            let (depth, code) = (packed & 63, packed >> 6);
+            let key = CellKey { depth, prefix: raw >> (60 - 2 * depth as u32) };
+            if let Ok(bytes) = std::fs::read(self.path(key, code)) {
+                f(key, code, &bytes, self.tag_of(key, code).as_deref());
+                n += 1;
+            }
+        }
+        n
     }
 
     /// One of a published cell's layers as a cache of its own over the same files, index and pins.

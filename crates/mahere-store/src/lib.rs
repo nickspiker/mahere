@@ -13,6 +13,10 @@ use vsf::VsfType;
 
 mod cells;
 pub use cells::{CellFileLayer, CellFiles};
+mod store;
+pub use store::Store;
+mod vault_cells;
+pub use vault_cells::{VaultCellLayer, VaultCells};
 
 /// Tests that open a vault take this first: kete's vault directory is one setting for the process, and two tests pointing it at their own directories at once open each other's vaults.
 #[cfg(test)]
@@ -20,21 +24,91 @@ static VAULT_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 pub const APP: kete::App<'static> = kete::App { id: "mahere", dir: "mahere" };
 
-/// Open THE mahere vault (shared registry underneath — concurrent opens receive the same engine). `base`: Android passes filesDir; desktop passes None (XDG config/data dirs).
-pub fn open(base: Option<&str>) -> Result<Arc<FlatStorage>, String> {
-    let secret_path = match base {
+/// Open THE mahere vault as the [`Store`] (2026-10-22). Desktop: the vault's secret is the machine's own (tohu's device secret), the vault beside the config; Android passes filesDir, where Rust has no device fact to read, and keeps the minted key the app's private storage has always held.
+/// A desktop vault from before (its secret a random `device.key`) has its person's data — session, settings, themes, ink, areas — brought into the store once someone is attested (see [`attest_from_photon`]); its files are left as they are.
+pub fn open(base: Option<&str>) -> Result<Arc<Store>, String> {
+    let (secret, older) = match base {
         Some(b) => {
             kete::set_vault_dirs_override(format!("{b}/vault"), format!("{b}/vault-shadow"));
-            format!("{b}/device.key")
+            (load_or_mint_secret(&format!("{b}/device.key"))?, None)
         }
         None => {
             let dir = dirs_config().ok_or("no config dir")?;
             std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-            format!("{dir}/device.key")
+            let secret = tohu::device::device_secret().map_err(|e| format!("device secret: {e}"))?;
+            let key_file = std::path::PathBuf::from(&dir).join("device.key");
+            let older = std::fs::read(&key_file).ok().and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok()).filter(|s| *s != secret);
+            (secret, older.map(|s| (s, key_file)))
         }
     };
-    let secret = load_or_mint_secret(&secret_path)?;
-    FlatStorage::open_device_shared(APP, secret).map_err(|e| format!("vault open: {e:?}"))
+    let vault = FlatStorage::open_device_shared(APP, secret).map_err(|e| format!("vault open: {e:?}"))?;
+    if base.is_some() {
+        // Android: the device scope, as before, until Photon's session reaches it.
+        return Ok(Store::device(vault));
+    }
+    let store = Store::new(vault);
+    store.set_older(older);
+    Ok(store)
+}
+
+/// Photon's attestation, if it has left one for the stack's apps (tohu's session): bind the store to that person, writing what this session held. Some(entries written) when the store is now attested; None while nobody is.
+pub fn attest_from_photon(store: &Store) -> Option<usize> {
+    if store.attested() {
+        return Some(0);
+    }
+    let session = tohu::session()?;
+    match store.attest(session.vault_seed) {
+        Ok(n) => {
+            // The vault from before belongs to whoever uses this machine: its data comes in now, under them, and only now is it marked done.
+            if let Some((old, key_file)) = store.take_older() {
+                import_older(store, old, &key_file);
+            }
+            Some(n)
+        }
+        Err(e) => {
+            eprintln!("store: attest refused: {e:?}");
+            None
+        }
+    }
+}
+
+/// The older vault's person data into the attested store, once — where the person has nothing newer — and the key file renamed so the next start does not copy again. The older vault's files stay; tracks, which have no index to find them by, stay there with them.
+fn import_older(store: &Store, old_secret: [u8; 32], key_file: &std::path::Path) {
+    let Ok(old) = FlatStorage::open_device_shared(APP, old_secret) else {
+        eprintln!("store: the older vault did not open; left as it is");
+        return;
+    };
+    let mut copied = 0usize;
+    let mut copy = |key: String| {
+        if let Ok(Some(v)) = old.read_device(&key) {
+            if !v.is_empty() && matches!(store.read(&key), Ok(None)) && store.write(&key, &v).is_ok() {
+                copied += 1;
+            }
+        }
+    };
+    copy(session_key());
+    copy(settings_key());
+    copy(user_index_key());
+    copy(area_index_key());
+    copy(themes::index_key());
+    if let Ok(Some(ix)) = old.read_device(&user_index_key()) {
+        for (&(depth, raw), _) in decode_cell_index(&ix).iter() {
+            copy(user_key(mahere_tiles::CellKey { depth, prefix: raw >> (60 - 2 * depth as u32) }));
+        }
+    }
+    if let Ok(Some(ix)) = old.read_device(&area_index_key()) {
+        for n in decode_names(&ix) {
+            copy(area_key(&n));
+        }
+    }
+    if let Ok(Some(ix)) = old.read_device(&themes::index_key()) {
+        for n in themes::decode_index(&ix) {
+            copy(themes::theme_key(&n));
+        }
+    }
+    drop(copy);
+    let _ = std::fs::rename(key_file, key_file.with_extension("key.imported"));
+    eprintln!("store: {copied} entries brought in from the older vault (its files are kept)");
 }
 
 fn dirs_config() -> Option<String> {
@@ -44,6 +118,11 @@ fn dirs_config() -> Option<String> {
         .or_else(|| std::env::var("HOME").ok().map(|h| format!("{h}/.config")))
         .or_else(|| std::env::var("APPDATA").ok())
         .map(|c| format!("{c}/mahere"))
+}
+
+/// The directory the vault lives in (the default `open(None)`), which two running copies must not share.
+pub fn config_dir() -> Option<std::path::PathBuf> {
+    dirs_config().map(std::path::PathBuf::from)
 }
 
 /// Where a desktop app keeps the user's own files (their cells, areas, staged updates): `data/user` in the source tree, where a developer runs it, else beside the vault in the user's config directory, never wherever the program happened to be started from.
@@ -117,16 +196,16 @@ fn track_count_key(start: i64) -> String {
     vault_key(&[name("track"), VsfType::e(EtType::e6(start)), name("chunks")])
 }
 
-pub fn save_session(store: &FlatStorage, s: &Session) -> Result<(), StorageError> {
+pub fn save_session(store: &Store, s: &Session) -> Result<(), StorageError> {
     let t = VsfType::t_f6(Tensor::new(
         vec![6],
         vec![s.lat, s.lon, s.ppd, s.bearing, s.sun_az, s.sun_alt],
     ));
-    store.write_device(&session_key(), &t.flatten())
+    store.write(&session_key(), &t.flatten())
 }
 
-pub fn load_session(store: &FlatStorage) -> Option<Session> {
-    let bytes = store.read_device(&session_key()).ok()??;
+pub fn load_session(store: &Store) -> Option<Session> {
+    let bytes = store.read(&session_key()).ok()??;
     let mut ptr = 0usize;
     let v = vsf::parse(&bytes, &mut ptr).ok()?;
     let d = tensor_f64(v)?;
@@ -171,18 +250,18 @@ fn settings_key() -> String {
     vault_key(&[name("settings")])
 }
 
-pub fn save_settings(store: &FlatStorage, s: &Settings) -> Result<(), StorageError> {
+pub fn save_settings(store: &Store, s: &Settings) -> Result<(), StorageError> {
     let flags = (s.real_sun as u64) | (s.follow_heading as u64) << 1 | (s.lock_to_fix as u64) << 2 | (!s.compressed as u64) << 3 | (s.real_light as u64) << 4 | (s.ruler as u64) << 5;
     // The pen's colour is stored one more than its packed RGBA, so 0 says there is none.
     let pen = s.pen_rgba.map_or(0, |c| u32::from_be_bytes(c) as u64 + 1);
     // The held contour interval in millimetres, 0 for none.
     let hold = s.contour_hold.map_or(0, |m| (m * 1000.0).round().max(1.0) as u64);
     let t = VsfType::t_u6(Tensor::new(vec![11], vec![s.cache_budget, s.layer_bits, flags, s.theme, (s.ui_ru * 1000.0).round() as u64, s.tool as u64, pen, s.travel as u64, !s.auto_update as u64, s.record as u64, hold]));
-    store.write_device(&settings_key(), &t.flatten())
+    store.write(&settings_key(), &t.flatten())
 }
 
-pub fn load_settings(store: &FlatStorage) -> Option<Settings> {
-    let bytes = store.read_device(&settings_key()).ok()??;
+pub fn load_settings(store: &Store) -> Option<Settings> {
+    let bytes = store.read(&settings_key()).ok()??;
     let mut ptr = 0usize;
     let d = match vsf::parse(&bytes, &mut ptr).ok()? {
         VsfType::t_u6(t) => t.data,
@@ -219,7 +298,7 @@ pub struct Fix {
 
 /// Chunked track recorder: fixes flushed every CHUNK fixes as one VSF document of columns (coordinates, times, heights in centimetres, accuracies, speeds, bearings), zstd-compressed, so a crash costs at most one chunk and a day's hike never rewrites more than a small object per flush.
 pub struct TrackRecorder {
-    store: Arc<FlatStorage>,
+    store: Arc<Store>,
     /// Eagle Time of the recording's start: the track's identity.
     start: i64,
     buf: Vec<Fix>,
@@ -232,7 +311,7 @@ const CHUNK_FIXES: usize = 64;
 const NONE16: u16 = u16::MAX;
 
 impl TrackRecorder {
-    pub fn new(store: Arc<FlatStorage>) -> TrackRecorder {
+    pub fn new(store: Arc<Store>) -> TrackRecorder {
         TrackRecorder { store, start: et_now(), buf: Vec::new(), chunk: 0 }
     }
 
@@ -266,10 +345,10 @@ impl TrackRecorder {
             .build();
         let Ok(doc) = doc else { return };
         let Ok(z) = zstd::encode_all(&doc[..], 3) else { return };
-        if self.store.write_device(&track_chunk_key(self.start, self.chunk), &z).is_ok() {
+        if self.store.write(&track_chunk_key(self.start, self.chunk), &z).is_ok() {
             self.chunk += 1;
             // VSF all the way down: the counter is a u, not naked LE bytes.
-            let _ = self.store.write_device(&track_count_key(self.start), &VsfType::u(self.chunk as usize, false).flatten());
+            let _ = self.store.write(&track_count_key(self.start), &VsfType::u(self.chunk as usize, false).flatten());
         }
     }
 
@@ -292,8 +371,8 @@ impl TrackRecorder {
 }
 
 /// One recorded chunk's fixes. A chunk from before (latitude, longitude, the map's elevation, unix seconds, as f64s) reads with the place and time only: its height was the map's, not the receiver's.
-pub fn track_chunk(store: &FlatStorage, start: i64, chunk: u32) -> Option<Vec<Fix>> {
-    let bytes = store.read_device(&track_chunk_key(start, chunk)).ok()??;
+pub fn track_chunk(store: &Store, start: i64, chunk: u32) -> Option<Vec<Fix>> {
+    let bytes = store.read(&track_chunk_key(start, chunk)).ok()??;
     if bytes.starts_with(&[0x28, 0xB5, 0x2F, 0xFD]) {
         let plain = zstd::decode_all(&bytes[..]).ok()?;
         let (header, end) = vsf::VsfHeader::decode(&plain).ok()?;
@@ -330,8 +409,8 @@ pub fn track_chunk(store: &FlatStorage, start: i64, chunk: u32) -> Option<Vec<Fi
 }
 
 /// Chunk count for a recorded track session (width-agnostic VSF read).
-pub fn track_chunks(store: &FlatStorage, start: i64) -> Option<u32> {
-    let bytes = store.read_device(&track_count_key(start)).ok()??;
+pub fn track_chunks(store: &Store, start: i64) -> Option<u32> {
+    let bytes = store.read(&track_count_key(start)).ok()??;
     let mut ptr = 0usize;
     let v = vsf::parse(&bytes, &mut ptr).ok()?;
     v.as_u64().and_then(|n| u32::try_from(n).ok())
@@ -340,6 +419,13 @@ pub fn track_chunks(store: &FlatStorage, start: i64) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A desktop-shaped store (the person's data waits for attestation) over a vault in `base`.
+    fn open(base: Option<&str>) -> Result<Arc<Store>, String> {
+        let b = base.unwrap();
+        kete::set_vault_dirs_override(format!("{b}/vault"), format!("{b}/vault-shadow"));
+        Ok(Store::new(FlatStorage::open_device_shared(APP, [3u8; 32]).map_err(|e| format!("{e:?}"))?))
+    }
 
     /// One serial test: set_vault_dirs_override is process-global, so parallel vault tests would race each other's directories.
     #[test]
@@ -362,7 +448,18 @@ mod tests {
             sun_az: 315.0,
             sun_alt: 40.0,
         };
+        // Before Photon attests anyone the session is held, not saved: it reads back, but a reopen finds nothing.
         save_session(&store, &s).unwrap();
+        assert_eq!(load_session(&store), Some(s));
+        assert!(!store.attested());
+        drop(store);
+        let store = open(Some(&base)).expect("reopen unattested");
+        assert_eq!(load_session(&store), None, "nothing was written before attestation");
+        save_session(&store, &s).unwrap();
+        // Attesting writes what the session held, under the person.
+        let person = [7u8; 32];
+        assert_eq!(store.attest(person).unwrap(), 1, "the held session is written");
+        assert!(store.attested());
         assert_eq!(load_session(&store), Some(s));
 
         // The settings keep the tool and the pen's colour, a fully transparent black pen included.
@@ -395,6 +492,8 @@ mod tests {
         drop(rec);
         drop(store);
         let store2 = open(Some(&base)).expect("reopen");
+        assert_eq!(load_session(&store2), None, "unattested, the person's data is not readable");
+        store2.attest(person).unwrap();
         assert_eq!(load_session(&store2), Some(s), "session must survive reopen");
         assert_eq!(track_chunks(&store2, key), Some(4), "track counter must survive reopen");
         let _ = std::fs::remove_dir_all(&dir);
@@ -405,11 +504,6 @@ mod tests {
 
 /// The vault as the on-device cell tier: every cell fetched from the bucket is written through here and served from here afterwards (offline included). Keyed by the VSF values (`d` cell, `u` depth, `wm` cell) through [`vault_key`], so cells, session and tracks share the vault with the type system as the namespace.
 ///
-/// The vault's index of the cells it kept before 0.223 (`d` cells, `d` index): what [`migrate_vault_cells`] moves out.
-fn cells_index_key() -> String {
-    vault_key(&[name("cells"), name("index")])
-}
-
 fn encode_cell_index(entries: &std::collections::HashMap<(u8, u64), (i64, u32)>) -> Option<Vec<u8>> {
     let mut depth = Vec::with_capacity(entries.len());
     let mut cell = Vec::with_capacity(entries.len());
@@ -477,7 +571,7 @@ fn layer_name(word: &str, layer: u8) -> VsfType {
     }
 }
 
-fn tag_key(key: mahere_tiles::CellKey, layer: u8) -> String {
+pub(crate) fn tag_key(key: mahere_tiles::CellKey, layer: u8) -> String {
     vault_key(&[
         layer_name("celltag", layer),
         VsfType::u(mahere_engine::residency::CELL_EPOCH as usize, false),
@@ -486,7 +580,7 @@ fn tag_key(key: mahere_tiles::CellKey, layer: u8) -> String {
     ])
 }
 
-fn cell_key(key: mahere_tiles::CellKey, layer: u8) -> String {
+pub(crate) fn cell_key(key: mahere_tiles::CellKey, layer: u8) -> String {
     vault_key(&[
         layer_name("cell", layer),
         VsfType::u(mahere_engine::residency::CELL_EPOCH as usize, false),
@@ -495,8 +589,8 @@ fn cell_key(key: mahere_tiles::CellKey, layer: u8) -> String {
     ])
 }
 
-/// Where a host's cells come from (the flag day's published layers): a local directory as it is, a published one by layer, or the bucket through the device's cell files ([`CellFiles`], under `cells`), each layer through a cache of its own. Returns the base store, the other layers' stores when cells come in layers, and the cell files for the budget and the areas' pins.
-pub fn cell_stores(local: Option<&std::path::Path>, cells: Option<&std::path::Path>) -> (Arc<dyn mahere_engine::residency::CellStore>, Option<mahere_engine::residency::LayerStores>, Option<Arc<CellFiles>>) {
+/// Where a host's cells come from (the flag day's published layers): a local directory as it is, a published one by layer, or the bucket through the vault's cell cache ([`VaultCells`]), each layer through a cache of its own. Returns the base store, the other layers' stores when cells come in layers, and the cell cache for the budget and the areas' pins.
+pub fn cell_stores(local: Option<&std::path::Path>, vault: Option<&Arc<FlatStorage>>) -> (Arc<dyn mahere_engine::residency::CellStore>, Option<mahere_engine::residency::LayerStores>, Option<Arc<VaultCells>>) {
     use mahere_engine::residency::{DEFAULT_CELLS_URL, DirStore, HttpStore, LayerDir, LayerStores, TieredStore};
     use mahere_tiles::publish::Layer;
     if let Some(dir) = local {
@@ -507,9 +601,9 @@ pub fn cell_stores(local: Option<&std::path::Path>, cells: Option<&std::path::Pa
         return (Arc::new(DirStore(dir.to_path_buf())), None, None);
     }
     let remote = |l: Layer| Arc::new(HttpStore::layer(DEFAULT_CELLS_URL, l));
-    match cells {
-        Some(dir) => {
-            let cache = CellFiles::open(dir);
+    match vault {
+        Some(v) => {
+            let cache = VaultCells::open(v.clone());
             let layers = LayerStores {
                 dem: Arc::new(TieredStore::new(cache.layer(Layer::Dem), remote(Layer::Dem))),
                 img: Arc::new(TieredStore::new(cache.layer(Layer::Img), remote(Layer::Img))),
@@ -532,50 +626,6 @@ pub fn cells_dir(base: Option<&str>) -> std::path::PathBuf {
         .or_else(|| std::env::var("APPDATA").ok())
         .unwrap_or_else(|| ".".into());
     std::path::Path::new(&data).join("mahere").join("cells")
-}
-
-/// The cells an older Mahere kept in the vault, moved into the cell files on a thread of its own (2026-10-18: the vault opened by walking every one of them). Each is copied unless the files have it already (it may have been fetched again meanwhile), then the vault's copies are deleted a thousand cells at a time under one commit each, and the vault's index of them last. Stopped part way, the next start goes on: what was moved is skipped, and a delete of a key already gone is nothing.
-pub fn migrate_vault_cells(vault: Arc<FlatStorage>, files: Arc<CellFiles>) {
-    if !matches!(vault.read_device(&cells_index_key()), Ok(Some(_))) {
-        return;
-    }
-    if let Err(e) = std::thread::Builder::new().name("cells out of the vault".into()).spawn(move || move_vault_cells(&vault, &files)) {
-        eprintln!("cells: the move out of the vault did not start: {e}");
-    }
-}
-
-/// [`migrate_vault_cells`]'s work, here and now: the number of cells moved, or None when the vault's deletes failed and the move stopped for this run.
-pub fn move_vault_cells(vault: &FlatStorage, files: &CellFiles) -> Option<usize> {
-    let Ok(Some(index)) = vault.read_device(&cells_index_key()) else { return Some(0) };
-    let entries: Vec<((u8, u64), (i64, u32))> = decode_cell_index(&index).into_iter().collect();
-    let t = std::time::Instant::now();
-    eprintln!("cells: moving {} out of the vault", entries.len());
-    let mut moved = 0usize;
-    for chunk in entries.chunks(1000) {
-        let mut gone = Vec::with_capacity(chunk.len() * 2);
-        for &((packed, raw), (seen, _)) in chunk {
-            let (depth, code) = (packed & 63, packed >> 6);
-            let key = mahere_tiles::CellKey { depth, prefix: raw >> (60 - 2 * depth as u32) };
-            if !files.has(key, code) {
-                if let Ok(Some(bytes)) = vault.read_device(&cell_key(key, code)) {
-                    let tag = vault.read_device(&tag_key(key, code)).ok().flatten().and_then(|b| String::from_utf8(b).ok());
-                    files.adopt(key, code, &bytes, tag.as_deref(), seen);
-                    moved += 1;
-                }
-            }
-            gone.push(cell_key(key, code));
-            gone.push(tag_key(key, code));
-        }
-        if let Err(e) = vault.delete_device_batch(&gone) {
-            eprintln!("cells: the vault's copies not deleted, the move stops for this run: {e:?}");
-            files.flush();
-            return None;
-        }
-    }
-    files.flush();
-    let _ = vault.delete_device(&cells_index_key());
-    eprintln!("cells: {moved} moved out of the vault, its {} entries deleted, in {:.0} s", entries.len(), t.elapsed().as_secs_f32());
-    Some(moved)
 }
 
 /// What the vault holds, by kind (2026-10-19: with the cells moved out it still held 26,457 entries): every live entry read and named by its VSF sections (sorted, joined by `+`), or `zstd` (a whole cell from before the flag day), `etag` (a short quoted string, a cell's tag), `raw` (anything else), `unreadable`; each kind with its count and bytes, the most numerous first.
@@ -619,7 +669,7 @@ fn signature(b: &[u8]) -> String {
 
 /// The user's own cells (ink and selection) in the vault, keyed `d` user, `u` depth, `wm` cell, with an index document (`d` user, `d` index) naming every one, so they all load at start.
 pub struct VaultUser {
-    store: Arc<FlatStorage>,
+    store: Arc<Store>,
     index: std::sync::Mutex<std::collections::HashMap<(u8, u64), (i64, u32)>>,
 }
 
@@ -632,29 +682,29 @@ fn user_index_key() -> String {
 }
 
 impl VaultUser {
-    pub fn new(store: Arc<FlatStorage>) -> VaultUser {
-        let index = store.read_device(&user_index_key()).ok().flatten().map(|b| decode_cell_index(&b)).unwrap_or_default();
+    pub fn new(store: Arc<Store>) -> VaultUser {
+        let index = store.read(&user_index_key()).ok().flatten().map(|b| decode_cell_index(&b)).unwrap_or_default();
         VaultUser { store, index: std::sync::Mutex::new(index) }
     }
 
     fn flush(&self) {
         let bytes = encode_cell_index(&self.index.lock().unwrap());
         if let Some(b) = bytes {
-            let _ = self.store.write_device(&user_index_key(), &b);
+            let _ = self.store.write(&user_index_key(), &b);
         }
     }
 }
 
 impl mahere_engine::ink::UserStore for VaultUser {
     fn put(&self, key: mahere_tiles::CellKey, bytes: &[u8]) {
-        if self.store.write_device(&user_key(key), bytes).is_ok() {
+        if self.store.write(&user_key(key), bytes).is_ok() {
             self.index.lock().unwrap().insert((key.depth, key.raw()), (et_now(), bytes.len() as u32));
             self.flush();
         }
     }
 
     fn delete(&self, key: mahere_tiles::CellKey) {
-        let _ = self.store.write_device(&user_key(key), &[]);
+        let _ = self.store.write(&user_key(key), &[]);
         self.index.lock().unwrap().remove(&(key.depth, key.raw()));
         self.flush();
     }
@@ -664,18 +714,51 @@ impl mahere_engine::ink::UserStore for VaultUser {
         keys.into_iter()
             .filter_map(|(depth, raw)| {
                 let key = mahere_tiles::CellKey { depth, prefix: raw >> (60 - 2 * depth as u32) };
-                let bytes = self.store.read_device(&user_key(key)).ok().flatten()?;
+                let bytes = self.store.read(&user_key(key)).ok().flatten()?;
                 (!bytes.is_empty()).then_some((key, bytes))
             })
             .collect()
     }
 }
 
+/// The desktop's ink, selections and areas from before they lived in the vault (plain files under `dir`: a `<cell>.vsf.zst` each, areas under `areas/`), brought into the store under the person and the files removed. Only once attested — before, the store holds in RAM and the files would be lost with the session. Returns how many came in.
+pub fn adopt_user_files(store: &Arc<Store>, dir: &std::path::Path) -> usize {
+    use mahere_engine::areas::AreaStore;
+    use mahere_engine::ink::UserStore;
+    if !store.attested() {
+        return 0;
+    }
+    let mut n = 0;
+    let user = VaultUser::new(store.clone());
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for e in entries.flatten() {
+            let path = e.path();
+            let Some(name) = path.file_name().and_then(|n| n.to_str()).and_then(|n| n.strip_suffix(".vsf.zst")) else { continue };
+            let (Some(key), Ok(bytes)) = (mahere_tiles::CellKey::from_name(name), std::fs::read(&path)) else { continue };
+            user.put(key, &bytes);
+            let _ = std::fs::remove_file(&path);
+            n += 1;
+        }
+    }
+    let areas = VaultAreas::new(store.clone());
+    if let Ok(entries) = std::fs::read_dir(dir.join("areas")) {
+        for e in entries.flatten() {
+            let path = e.path();
+            let Ok(bytes) = std::fs::read(&path) else { continue };
+            let Some(area) = mahere_tiles::area::Area::decode(&bytes) else { continue };
+            areas.put(&area.name, &bytes);
+            let _ = std::fs::remove_file(&path);
+            n += 1;
+        }
+    }
+    n
+}
+
 // ==================== AREAS ====================
 
 /// The user's areas in the vault: one document each under (`d` area, `x` name), an index document (`d` area, `d` index) naming them.
 pub struct VaultAreas {
-    store: Arc<FlatStorage>,
+    store: Arc<Store>,
     names: std::sync::Mutex<Vec<String>>,
 }
 
@@ -688,15 +771,15 @@ fn area_index_key() -> String {
 }
 
 impl VaultAreas {
-    pub fn new(store: Arc<FlatStorage>) -> VaultAreas {
-        let names = store.read_device(&area_index_key()).ok().flatten().map(|b| decode_names(&b)).unwrap_or_default();
+    pub fn new(store: Arc<Store>) -> VaultAreas {
+        let names = store.read(&area_index_key()).ok().flatten().map(|b| decode_names(&b)).unwrap_or_default();
         VaultAreas { store, names: std::sync::Mutex::new(names) }
     }
 
     fn flush(&self) {
         let names = self.names.lock().unwrap().clone();
         if let Some(b) = encode_names(&names) {
-            let _ = self.store.write_device(&area_index_key(), &b);
+            let _ = self.store.write(&area_index_key(), &b);
         }
     }
 }
@@ -724,7 +807,7 @@ fn decode_names(data: &[u8]) -> Vec<String> {
 
 impl mahere_engine::areas::AreaStore for VaultAreas {
     fn put(&self, area_name: &str, bytes: &[u8]) {
-        if self.store.write_device(&area_key(area_name), bytes).is_ok() {
+        if self.store.write(&area_key(area_name), bytes).is_ok() {
             let mut names = self.names.lock().unwrap();
             if !names.iter().any(|n| n == area_name) {
                 names.push(area_name.to_string());
@@ -735,14 +818,14 @@ impl mahere_engine::areas::AreaStore for VaultAreas {
     }
 
     fn delete(&self, area_name: &str) {
-        let _ = self.store.write_device(&area_key(area_name), &[]);
+        let _ = self.store.write(&area_key(area_name), &[]);
         self.names.lock().unwrap().retain(|n| n != area_name);
         self.flush();
     }
 
     fn load_all(&self) -> Vec<Vec<u8>> {
         let names = self.names.lock().unwrap().clone();
-        names.iter().filter_map(|n| self.store.read_device(&area_key(n)).ok().flatten()).filter(|b| !b.is_empty()).collect()
+        names.iter().filter_map(|n| self.store.read(&area_key(n)).ok().flatten()).filter(|b| !b.is_empty()).collect()
     }
 }
 
@@ -750,36 +833,42 @@ impl mahere_engine::areas::AreaStore for VaultAreas {
 mod index_tests {
     use super::*;
 
-    /// Cells an older Mahere kept in the vault move into the files with their tags and last use, and leave the vault, its index of them included; a cell the files have already is not copied over.
+    /// The cell cache in the vault: a cell kept reads back, a tag rides beside it, a layer is a store of its own; plain cell files from before are brought in and removed; a pinned cell survives being written again as the area's.
     #[test]
-    fn vault_cells_move_into_the_files() {
+    fn vault_cells_keep_cells_and_adopt_the_files() {
         let _one_at_a_time = crate::VAULT_TESTS.lock().unwrap_or_else(|e| e.into_inner());
-        let dir = std::env::temp_dir().join(format!("mahere-move-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("mahere-vcells-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         kete::set_vault_dirs_override(dir.join("vault").to_string_lossy().into(), dir.join("shadow").to_string_lossy().into());
         let vault = FlatStorage::open_device_shared(APP, [9u8; 32]).unwrap();
-        let (a, b) = (mahere_tiles::CellKey { depth: 14, prefix: 77 }, mahere_tiles::CellKey { depth: 9, prefix: 5 });
-        vault.write_device(&cell_key(a, 0), b"old base").unwrap();
-        vault.write_device(&tag_key(a, 0), b"\"t1\"").unwrap();
-        vault.write_device(&cell_key(a, 3), b"old terrain").unwrap();
-        vault.write_device(&cell_key(b, 0), b"old other").unwrap();
-        let mut ix = std::collections::HashMap::new();
-        ix.insert((a.depth, a.raw()), (1000, 8));
-        ix.insert((a.depth | 3 << 6, a.raw()), (1001, 11));
-        ix.insert((b.depth, b.raw()), (1002, 9));
-        vault.write_device(&cells_index_key(), &encode_cell_index(&ix).unwrap()).unwrap();
-        let files = CellFiles::open(&dir.join("cells"));
         use mahere_engine::residency::{CellCache, CellStore, Fetch};
-        files.put(b, b"fetched since");
-        assert_eq!(move_vault_cells(&vault, &files), Some(2));
-        assert!(matches!(files.get(a), Fetch::Bytes(x) if x == b"old base"));
-        assert_eq!(files.tag(a).as_deref(), Some("\"t1\""));
-        assert!(matches!(files.layer(mahere_tiles::publish::Layer::Dem).get(a), Fetch::Bytes(x) if x == b"old terrain"));
-        assert!(matches!(files.get(b), Fetch::Bytes(x) if x == b"fetched since"), "a cell the files had is not replaced");
-        assert!(vault.read_device(&cell_key(a, 0)).unwrap().is_none());
-        assert!(vault.read_device(&cell_key(b, 0)).unwrap().is_none());
-        assert!(vault.read_device(&cells_index_key()).unwrap().is_none());
-        assert_eq!(move_vault_cells(&vault, &files), Some(0), "a second start finds nothing to move");
+        let (a, b) = (mahere_tiles::CellKey { depth: 14, prefix: 77 }, mahere_tiles::CellKey { depth: 9, prefix: 5 });
+        // Files from before: one cell with a tag and a terrain layer.
+        let files = CellFiles::open(&dir.join("cells"));
+        files.put(b, b"from the files");
+        files.set_tag(b, "\"t0\"");
+        files.layer(mahere_tiles::publish::Layer::Dem).put(b, b"terrain from the files");
+        files.flush();
+        drop(files);
+        let cells = VaultCells::open(vault.clone());
+        cells.put(a, b"kept");
+        cells.set_tag(a, "\"t1\"");
+        assert!(matches!(cells.get(a), Fetch::Bytes(x) if x == b"kept"));
+        assert_eq!(cells.tag(a).as_deref(), Some("\"t1\""));
+        assert!(matches!(cells.layer(mahere_tiles::publish::Layer::Img).get(a), Fetch::Absent), "a layer is a store of its own");
+        cells.adopt_files(dir.join("cells"));
+        for _ in 0..200 {
+            if !dir.join("cells").exists() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(!dir.join("cells").exists(), "the files are removed once brought in");
+        assert!(matches!(cells.get(b), Fetch::Bytes(x) if x == b"from the files"));
+        assert_eq!(cells.tag(b).as_deref(), Some("\"t0\""));
+        assert!(matches!(cells.layer(mahere_tiles::publish::Layer::Dem).get(b), Fetch::Bytes(x) if x == b"terrain from the files"));
+        cells.set_pinned([a]);
+        assert!(matches!(cells.get(a), Fetch::Bytes(x) if x == b"kept"), "a pinned cell is rewritten durable, the same bytes");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -798,17 +887,17 @@ mod index_tests {
 /// Themes on disk: one VSF document per theme in the vault under (`d` theme, `x` name), colours authored in VSF RGB at gamma 2 as Photon authors its palette and kept that way: the renderers convert to the display at their one encode. The built-ins are written on first launch so a user can edit them in place; an index document (`d` theme, `d` index) lists the names.
 pub mod themes {
     use super::{name, vault_key};
-    use kete::FlatStorage;
+    use crate::Store;
     use mahere_engine::LayerMask;
     use mahere_engine::theme::Theme;
     use vsf::types::Tensor;
     use vsf::{VsfBuilder, VsfType};
 
-    fn theme_key(theme_name: &str) -> String {
+    pub(crate) fn theme_key(theme_name: &str) -> String {
         vault_key(&[name("theme"), VsfType::x(theme_name.to_string())])
     }
 
-    fn index_key() -> String {
+    pub(crate) fn index_key() -> String {
         vault_key(&[name("theme"), name("index")])
     }
 
@@ -977,17 +1066,23 @@ pub mod themes {
         })
     }
 
-    fn write_index(store: &FlatStorage, names: &[String]) {
+    fn write_index(store: &Store, names: &[String]) {
         let joined: Vec<VsfType> = names.iter().map(|n| VsfType::x(n.clone())).collect();
         let mut section = vsf::VsfSection::new("themes");
         section.add_field_multi("names", joined);
         if let Ok(b) = VsfBuilder::new().add_section_direct(section).build() {
-            let _ = store.write_device(&index_key(), &b);
+            let _ = store.write(&index_key(), &b);
         }
     }
 
-    pub fn names(store: &FlatStorage) -> Vec<String> {
-        let Ok(Some(bytes)) = store.read_device(&index_key()) else { return Vec::new() };
+    pub fn names(store: &Store) -> Vec<String> {
+        let Ok(Some(bytes)) = store.read(&index_key()) else { return Vec::new() };
+        decode_index(&bytes)
+    }
+
+    /// The theme names an index document lists.
+    pub(crate) fn decode_index(bytes: &[u8]) -> Vec<String> {
+        let bytes = bytes.to_vec();
         let Ok((header, end)) = vsf::VsfHeader::decode(&bytes) else { return Vec::new() };
         let Ok(sections) = header.sections(&bytes, end) else { return Vec::new() };
         let mut out = Vec::new();
@@ -1005,9 +1100,9 @@ pub mod themes {
         out
     }
 
-    pub fn save(store: &FlatStorage, t: &Theme) {
+    pub fn save(store: &Store, t: &Theme) {
         if let Some(b) = encode(t) {
-            let _ = store.write_device(&theme_key(&t.name), &b);
+            let _ = store.write(&theme_key(&t.name), &b);
             let mut list = names(store);
             if !list.iter().any(|n| *n == t.name) {
                 list.push(t.name.clone());
@@ -1016,13 +1111,13 @@ pub mod themes {
         }
     }
 
-    pub fn load(store: &FlatStorage, theme_name: &str) -> Option<Theme> {
-        let bytes = store.read_device(&theme_key(theme_name)).ok()??;
+    pub fn load(store: &Store, theme_name: &str) -> Option<Theme> {
+        let bytes = store.read(&theme_key(theme_name)).ok()??;
         decode(&bytes)
     }
 
     /// The built-ins into the vault where they are missing or an older revision, then every theme the vault holds, in index order, as authored (VSF RGB): the renderers convert to the display at their one encode.
-    pub fn load_all(store: &FlatStorage) -> Vec<Theme> {
+    pub fn load_all(store: &Store) -> Vec<Theme> {
         // Each theme read once (2026-10-21: themes took 2.9 s of a Pixel 3a's start, each read twice), a built-in written back only when a newer revision ships.
         let mut have: std::collections::HashMap<String, Theme> = names(store).into_iter().filter_map(|n| load(store, &n).map(|t| (n, t))).collect();
         let mut written = 0;
@@ -1041,8 +1136,8 @@ pub mod themes {
     }
 
     /// Remove a theme document and its index entry.
-    pub fn delete(store: &FlatStorage, theme_name: &str) {
-        let _ = store.delete_device(&theme_key(theme_name));
+    pub fn delete(store: &Store, theme_name: &str) {
+        let _ = store.delete(&theme_key(theme_name));
         let list: Vec<String> = names(store).into_iter().filter(|n| n != theme_name).collect();
         write_index(store, &list);
     }
@@ -1134,14 +1229,14 @@ impl mahere_panel::fonts::PackSource for VaultFonts {
         }
         let doc = self.fetch(id)?;
         if let Some(s) = &self.store {
-            let _ = s.write_device(&font_key(id), &doc);
+            let _ = s.write_device_cache(&font_key(id), &doc);
         }
         Ok(doc)
     }
 
     fn forget(&self, id: &str) {
         if let Some(s) = &self.store {
-            let _ = s.write_device(&font_key(id), &[]);
+            let _ = s.delete_device(&font_key(id));
         }
     }
 }

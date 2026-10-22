@@ -8,6 +8,8 @@ description = "mahere's on-device database: session, tracks (and soon tiles) on 
 
 [dependencies]
 kete = { version = "0.0.3" }
+# The machine's own device secret and the session Photon leaves for the stack's apps.
+tohu = { version = "0.0.3" }
 mahere-engine = { path = "../mahere-engine" }
 mahere-tiles = { path = "../mahere-tiles" }
 mahere-coord = { path = "../mahere-coord" }

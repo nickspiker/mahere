@@ -308,8 +308,8 @@ struct Laid {
     mark: Option<([f32; 2], u8)>,
 }
 
-/// The view a layout is for: the camera, the depth and the resident cells, the route, the labels layer and the theme. A different key is a stale layout.
-type ViewKey = (i64, i64, i64, i64, u8, usize, u64, bool, u64);
+/// The view a layout is for: the camera, the depth and the resident cells, the route, the labels layer, the theme and the font size. A different key is a stale layout.
+type ViewKey = (i64, i64, i64, i64, u8, usize, u64, bool, u64, u32);
 
 /// A finished layout, what each frame draws from: the labels as anchors and letters, the atlas their glyphs are in, where the view was, the theme's colours, and the route.
 #[derive(Clone)]
@@ -384,6 +384,8 @@ pub struct Labeller {
     /// The font packs, when the host gave them, and how many had arrived when the shown layout was asked for.
     fonts: Option<std::sync::Arc<crate::fonts::FontPacks>>,
     fonts_laid: usize,
+    /// The base font size the host last gave: a new one (the UI scaled, Ctrl or Cmd with the wheel) letters the view again.
+    font: f32,
 }
 
 impl Default for Labeller {
@@ -620,7 +622,7 @@ impl Labeller {
                 }
             })
             .expect("labels thread");
-        Labeller { tx, rx, shown: Lettering::default(), busy: false, asked: None, last: std::time::Instant::now(), fonts: None, fonts_laid: 0 }
+        Labeller { tx, rx, shown: Lettering::default(), busy: false, asked: None, last: std::time::Instant::now(), fonts: None, fonts_laid: 0, font: 0.0 }
     }
 
     /// The font packs to draw names in scripts the binary lacks (Nick 2026-10-16): a layout that needed one asks for it, and one arriving lays the view out again.
@@ -634,8 +636,13 @@ impl Labeller {
     }
 
     /// Whether the lettering shown is out of date for this view: the camera, the depth or the cells resident changed since it was laid out (a cell arriving, leaving or replaced by a newer copy).
+    /// The base font size to letter at, given before `pending` so a change is seen as a stale layout; `ask` and `update` take it too.
+    pub fn set_font(&mut self, font: f32) {
+        self.font = font;
+    }
+
     pub fn stale(&self, map: &mahere_engine::MapCore, w: usize, h: usize) -> bool {
-        self.shown.drawn_for != Some(Self::view_key(map, w, h))
+        self.shown.drawn_for != Some(self.view_key(map, w, h))
     }
 
     /// Whether a layout is running or due: a host keeps drawing frames until it lands.
@@ -647,20 +654,21 @@ impl Labeller {
     fn job(&self, map: &mut mahere_engine::MapCore, w: usize, h: usize, font: f32) -> LabelJob {
         let (palette, look, amount) = map.themes.get(map.theme).map_or((mahere_engine::theme::LABELS_LIGHT, mahere_engine::theme::LABEL_LOOK, mahere_engine::theme::LABEL_AMOUNT), |t| (t.label, t.label_look, t.label_amount));
         let family = map.themes.get(map.theme).and_then(|t| mahere_engine::theme::LABEL_FONTS.iter().position(|f| *f == t.label_font)).unwrap_or(0) as u8;
-        let key = Self::view_key(map, w, h);
+        let key = self.view_key(map, w, h);
         let names = map.layers().labels.then(|| map.name_job(w, h));
         LabelJob { names, cam: map.cam, w, h, font, palette, look, amount, family, route: map.route_points().map_or(Vec::new(), |p| p.to_vec()), key, fonts: self.fonts.clone() }
     }
 
     /// Ask the worker for a layout when one is due: the view rests, the lettering is stale, none is running, and every cell is in or a second has passed since the last ask (so cells still arriving never hold the labels back). Never waits.
     pub fn ask(&mut self, map: &mut mahere_engine::MapCore, w: usize, h: usize, font: f32, at_rest: bool) {
+        self.font = font;
         if !Self::wanted(map) {
             if !self.shown.kept.is_empty() || !self.shown.route.is_empty() {
                 self.shown = Lettering { atlas: self.shown.atlas.clone(), ..Lettering::default() };
             }
             return;
         }
-        let key = Self::view_key(map, w, h);
+        let key = self.view_key(map, w, h);
         let fonts_new = self.fonts_new();
         if self.busy || !at_rest || (!fonts_new && (self.shown.drawn_for == Some(key) || self.asked == Some(key))) {
             return;
@@ -692,6 +700,7 @@ impl Labeller {
 
     /// Lay out the view now and wait for it (a check or a test).
     pub fn update(&mut self, map: &mut mahere_engine::MapCore, w: usize, h: usize, font: f32) {
+        self.font = font;
         let job = self.job(map, w, h, font);
         let key = job.key;
         if self.tx.send(job).is_ok() {
@@ -726,9 +735,9 @@ impl Labeller {
         self.shown.hit(cam, w, h, x, y)
     }
 
-    fn view_key(map: &mahere_engine::MapCore, w: usize, h: usize) -> ViewKey {
+    fn view_key(&self, map: &mahere_engine::MapCore, w: usize, h: usize) -> ViewKey {
         let c = &map.cam;
-        ((c.lat() * 1e7) as i64, (c.lon() * 1e7) as i64, (c.ppd * 100.0) as i64, (c.bearing() * 1e5) as i64, map.vec_depth(), map.pool_version() as usize ^ (w << 20) ^ (h << 40), map.route_version, map.layers().labels, map.style_version())
+        ((c.lat() * 1e7) as i64, (c.lon() * 1e7) as i64, (c.ppd * 100.0) as i64, (c.bearing() * 1e5) as i64, map.vec_depth(), map.pool_version() as usize ^ (w << 20) ^ (h << 40), map.route_version, map.layers().labels, map.style_version(), self.font.to_bits())
     }
 
     /// Whether there is anything to draw: labels shown, or a route.

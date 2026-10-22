@@ -11,7 +11,7 @@ fn fresh_store(tag: &str) -> (Arc<mahere_store::FlatStorage>, std::path::PathBuf
     let dir = std::env::temp_dir().join(format!("kete-stress-{tag}-{nanos}"));
     std::fs::create_dir_all(&dir).unwrap();
     let store = mahere_store::open(Some(&dir.to_string_lossy())).expect("open");
-    (store, dir)
+    (store.vault().clone(), dir)
 }
 
 #[test]
@@ -88,17 +88,17 @@ fn overwrite_visibility_gauntlet() {
     drop(store);
     let store2 = mahere_store::open(Some(&dir.to_string_lossy())).expect("reopen");
     assert_eq!(
-        store2.read_device("persist").unwrap().as_deref(),
+        store2.vault().read_device("persist").unwrap().as_deref(),
         Some(b"final-form".as_slice()),
         "overwritten key must survive reopen"
     );
     assert_eq!(
-        store2.read_device("counter").unwrap().map(|v| u32::from_le_bytes(v.try_into().unwrap())),
+        store2.vault().read_device("counter").unwrap().map(|v| u32::from_le_bytes(v.try_into().unwrap())),
         Some(99),
         "interleaved counter must survive reopen"
     );
     assert_eq!(
-        store2.read_device("k").unwrap().as_deref(),
+        store2.vault().read_device("k").unwrap().as_deref(),
         Some(b"reborn".as_slice()),
         "post-delete rewrite must survive reopen"
     );

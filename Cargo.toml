@@ -21,3 +21,11 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/nickspiker/mahere"
 
 # vsf, fluor and kete (and kete's manifestus and tohu) come from crates.io since the v10 publish (2026-10-20). Until then mahere took them from GitHub at pinned commits, with [patch] blocks redirecting their sibling path dependencies, because a git checkout has no ../vsf next to it.
+
+# The stack builds from its sibling checkouts (2026-10-22): manifestus/kete carry the vault overhaul (group commit, the lazy second copy, the live map, the cache class) and fluor the busy-loop fix, none published yet. A release builds on a machine holding the siblings.
+[patch.crates-io]
+vsf = { path = "../vsf" }
+fluor = { path = "../fluor" }
+kete = { path = "../kete" }
+manifestus = { path = "../manifestus" }
+tohu = { path = "../tohu" }

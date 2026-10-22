@@ -1365,7 +1365,7 @@ struct SegOut {
     @builtin(position) pos: vec4<f32>,
     @location(0) at: vec2<f32>,
     @location(1) ends: vec4<f32>,
-    @location(2) half: f32,
+    @location(2) half_width: f32,
     @location(3) colour: vec4<f32>,
 };
 
@@ -1386,7 +1386,7 @@ fn vs_segment(@builtin(vertex_index) vi: u32, @location(0) ends: vec4<f32>, @loc
     out.pos = clip_of(p);
     out.at = p;
     out.ends = ends;
-    out.half = b.x;
+    out.half_width = b.x;
     out.colour = colour;
     return out;
 }
@@ -1397,6 +1397,6 @@ fn fs_segment(in: SegOut) -> @location(0) vec4<f32> {
     let t = clamp(dot(in.at - in.ends.xy, ab) / max(dot(ab, ab), 1e-6), 0.0, 1.0);
     let d = length(in.at - (in.ends.xy + ab * t));
     // Feathered over one pixel of the layer it is drawn into (a third of a screen pixel at 3×), the binning doing the rest, as for the map's own lines.
-    let cov = clamp((in.half - d) * U.scale + 0.5, 0.0, 1.0) * in.colour.a;
+    let cov = clamp((in.half_width - d) * U.scale + 0.5, 0.0, 1.0) * in.colour.a;
     return vec4<f32>(in.colour.rgb * cov, cov);
 }

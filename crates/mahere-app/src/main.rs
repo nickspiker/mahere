@@ -4,6 +4,7 @@
 //! Chrome, desktop input mapping, and the bg-layer blit live here; all map state and rendering live in the engine (shared with the Android shell).
 
 mod gpu;
+mod instance;
 
 use fluor::coord::Coord as Px;
 use fluor::event::{CursorIcon, ElementState, Event as FEvent, MouseButton, MouseScrollDelta};
@@ -31,8 +32,8 @@ struct MahereApp {
     /// Right-button drag: rotate about the screen centre.
     rotating: bool,
     last_cursor: (f64, f64),
-    store: Option<std::sync::Arc<mahere_store::FlatStorage>>,
-    cells: Option<std::sync::Arc<mahere_store::CellFiles>>,
+    store: Option<std::sync::Arc<mahere_store::Store>>,
+    cells: Option<std::sync::Arc<mahere_store::VaultCells>>,
     last_save: Instant,
     panel: Panel,
     /// The map's lettering, and when the camera last moved: labels are laid out once it has rested a quarter second, and hidden while it moves.
@@ -46,6 +47,13 @@ struct MahereApp {
     map_span: f64,
     /// The map on the GPU (the phone's compositor, read back into fluor's buffer); None draws it on the CPU.
     gpu: Option<gpu::Gpu>,
+    /// The one-copy lock, held for the process; its listener starts once the event loop can be woken.
+    instance: Option<instance::Instance>,
+    /// The settings as last written to the vault (or read from it): a tick that finds them changed writes them again.
+    settings_saved: Option<mahere_store::Settings>,
+    /// The UI scale the settings hold, handed to fluor once at start; and the scale fluor reports, kept for the next write.
+    zoom_request: Option<f32>,
+    ui_ru: f32,
 }
 
 impl MahereApp {
@@ -117,6 +125,10 @@ impl MahereApp {
             updater: mahere_update::Updater::new(mahere_store::user_dir()),
             map_span: 0.0,
             gpu: None,
+            instance: None,
+            settings_saved: None,
+            zoom_request: None,
+            ui_ru: 1.0,
         }
     }
 
@@ -235,13 +247,76 @@ impl MahereApp {
         }
     }
 
+    /// Photon's attestation, if it has one now: bind the store, and load the person's data over this session's (what they saved wins; what this session made where they had nothing is kept).
+    fn try_attest(&mut self) {
+        let Some(store) = self.store.clone() else { return };
+        if store.attested() || mahere_store::attest_from_photon(&store).is_none() {
+            return;
+        }
+        let n = mahere_store::adopt_user_files(&store, &mahere_store::user_dir());
+        eprintln!("store: attested; {n} ink cells and areas brought in from files");
+        if let Some(s) = mahere_store::load_settings(&store) {
+            self.restore(s);
+        }
+        self.map.set_themes(mahere_store::themes::load_all(&store));
+        self.areas.set_store(std::sync::Arc::new(mahere_store::VaultAreas::new(store.clone())));
+        self.map.set_user_store(std::sync::Arc::new(mahere_store::VaultUser::new(store.clone())));
+        self.chrome.invalidate_bg();
+    }
+
+    /// The notice while nobody is attested, and its button.
+    fn notice(&mut self) {
+        let unsaved = self.store.as_ref().is_some_and(|s| !s.attested());
+        self.panel.set_notice(unsaved.then_some(("Not signed in with Photon: this session isn't being saved", "Open Photon")));
+        if self.panel.take_notice_tap() {
+            launch_photon();
+        }
+    }
+
+    /// The settings as they stand, in the vault's shape. The desktop records no tracks.
+    fn settings(&self) -> mahere_store::Settings {
+        mahere_store::Settings { cache_budget: self.cache_budget, layer_bits: self.map.layers().bits() as u64, real_sun: self.map.real_sun, real_light: self.map.real_light, follow_heading: self.map.follow_heading, lock_to_fix: self.map.lock_to_fix, theme: self.map.theme as u64, compressed: self.map.compressed(), ui_ru: self.ui_ru, tool: self.map.tool as u8, pen_rgba: Some(self.map.pen_colour), travel: travel_code(self.map.travel), auto_update: self.updater.auto, record: false, ruler: self.map.ruler, contour_hold: self.map.contour_hold }
+    }
+
+    /// Settings read at start, applied as the phone applies them.
+    fn restore(&mut self, s: mahere_store::Settings) {
+        self.cache_budget = s.cache_budget;
+        self.map.set_theme(s.theme as usize);
+        self.map.set_layers(mahere_engine::LayerMask::from_bits(s.layer_bits as u32));
+        self.map.set_real_sun(s.real_sun);
+        self.map.set_real_light(s.real_light);
+        self.map.set_compressed(s.compressed);
+        self.map.set_follow_heading(s.follow_heading);
+        self.map.set_lock_to_fix(s.lock_to_fix);
+        self.map.ruler = s.ruler;
+        self.map.contour_hold = s.contour_hold;
+        self.map.set_tool(match s.tool {
+            1 => mahere_engine::ink::Tool::Pen,
+            3 => mahere_engine::ink::Tool::Erase,
+            2 => mahere_engine::ink::Tool::Select,
+            _ => mahere_engine::ink::Tool::None,
+        });
+        if let Some(c) = s.pen_rgba {
+            self.map.set_pen_colour(c);
+        }
+        self.map.set_travel(travel_of(s.travel));
+        self.updater.auto = s.auto_update;
+        self.ui_ru = s.ui_ru;
+        self.zoom_request = (s.ui_ru != 1.0).then_some(s.ui_ru);
+        self.settings_saved = Some(s);
+    }
+
     fn dims(ctx: &Context) -> (usize, usize) {
         (ctx.viewport.width_px as usize, ctx.viewport.height_px as usize)
     }
 }
 
+/// The one user event: bring the window forward.
+struct Show;
+
 impl FluorApp for MahereApp {
-    type UserEvent = ();
+    /// A later launch asked this one to come forward.
+    type UserEvent = Show;
 
     fn title(&self) -> &str {
         mahere_panel::APP_NAME
@@ -250,6 +325,36 @@ impl FluorApp for MahereApp {
     /// The OS window / taskbar icon: the same orb the chrome draws.
     fn window_icon(&self) -> Option<&fluor::host::icon::Icon> {
         self.chrome.app_icon.as_ref()
+    }
+
+    fn set_event_proxy(&mut self, proxy: std::sync::Arc<dyn fluor::host::WakeSender<Show>>) {
+        if let Some(i) = self.instance.as_mut() {
+            i.serve(move || {
+                let _ = proxy.send(Show);
+            });
+        }
+    }
+
+    /// Forward, where the user left it: a second launch never moves the window.
+    fn on_user_event(&mut self, _: Show, _: &mut Context) -> EventResponse {
+        EventResponse::Raise
+    }
+
+    /// Closing writes what the once-a-second beat may not have caught yet.
+    fn on_close_requested(&mut self) -> bool {
+        if let Some(store) = &self.store {
+            let s = self.settings();
+            if self.settings_saved != Some(s) {
+                let _ = mahere_store::save_settings(store, &s);
+            }
+            let c = &self.map.cam;
+            let _ = mahere_store::save_session(store, &mahere_store::Session { lat: c.lat(), lon: c.lon(), ppd: c.ppd, bearing: c.bearing(), sun_az: self.map.sun_az as f64, sun_alt: self.map.sun_alt as f64 });
+        }
+        false
+    }
+
+    fn take_zoom_request(&mut self) -> Option<f32> {
+        self.zoom_request.take()
     }
 
     fn init(&mut self, ctx: &mut Context) {
@@ -442,12 +547,27 @@ impl FluorApp for MahereApp {
                 EventResponse::Handled
             }
             FEvent::Focused(focused) => {
+                // Back from Photon (or anywhere): a person attested meanwhile is picked up on the edge, never polled.
+                if *focused {
+                    self.try_attest();
+                }
                 if self.chrome.set_focused(*focused) {
                     ctx.window.request_redraw();
                 }
                 EventResponse::Pass
             }
             FEvent::MouseWheel { delta } => {
+                // An open menu takes the wheel wherever the pointer is: it scrolls, the map stays put. A notch is three lines of the panel's text.
+                if self.panel.is_open() {
+                    let dy = match delta {
+                        MouseScrollDelta::Lines(_, y) => *y * self.panel.font_px() * 3.0,
+                        MouseScrollDelta::Pixels(_, y) => *y,
+                    };
+                    self.panel.scroll(dy);
+                    self.chrome.invalidate_bg();
+                    ctx.window.request_redraw();
+                    return EventResponse::Handled;
+                }
                 // Trackpads deliver Pixels with momentum; clamp per event.
                 let notches = (match delta {
                     MouseScrollDelta::Lines(_, y) => *y,
@@ -577,8 +697,15 @@ impl FluorApp for MahereApp {
                         sun_alt: self.map.sun_alt as f64,
                     },
                 );
+                // The settings ride the same beat, written only when something in them changed.
+                self.ui_ru = ctx.viewport.ru;
+                let s = self.settings();
+                if self.settings_saved != Some(s) && mahere_store::save_settings(store, &s).is_ok() {
+                    self.settings_saved = Some(s);
+                }
             }
         }
+        self.notice();
         // Updates: what the threads found, onto the page; a verified build swapped in and started in this one's place.
         let updates_changed = self.updater.poll();
         if updates_changed {
@@ -612,7 +739,8 @@ impl FluorApp for MahereApp {
         if areas_changed {
             self.chrome.invalidate_bg();
         }
-        // Labels waiting for the camera to rest keep the ticks coming until they are drawn.
+        // Labels waiting for the camera to rest keep the ticks coming until they are drawn; a new font size (the UI scaled) makes them stale.
+        self.labeller.set_font(self.panel.font_px());
         let labels_due = self.labeller.poll() || self.labeller.pending(&self.map, w, h);
         self.map.tick(w, h) || areas_changed || labels_due || self.gpu.as_ref().is_some_and(|g| g.wants_frame())
     }
@@ -713,18 +841,29 @@ fn main() {
         println!("OK");
         return;
     }
-    let vault = mahere_store::open(None).ok();
-    // A local bake (argv[1], or data/cells) serves directly; otherwise cells come from the bucket through the cell files, like the phone.
+    // One copy on the vault; a second launch brings the first forward and exits.
+    let instance = instance::claim();
+    // The vault, and the person Photon has attested on this machine, if any: their data loads from it, and is saved under them. Nobody attested, the session is held in RAM and the map says so.
+    let vault = mahere_store::open(None).map_err(|e| eprintln!("store: {e}")).ok();
+    if let Some(v) = &vault {
+        if mahere_store::attest_from_photon(v).is_some() {
+            let n = mahere_store::adopt_user_files(v, &mahere_store::user_dir());
+            if n > 0 {
+                eprintln!("store: {n} ink cells and areas brought in from the files");
+            }
+        }
+    }
+    // A local bake (argv[1], or data/cells) serves directly; otherwise cells come from the bucket through the vault's cell cache, like the phone.
     let local = std::env::args().nth(1).map(std::path::PathBuf::from).unwrap_or_else(|| "data/cells".into());
     if local.is_dir() {
         eprintln!("cells: {}", local.display());
     } else {
-        eprintln!("cells: {} (kept in {})", DEFAULT_CELLS_URL, mahere_store::cells_dir(None).display());
+        eprintln!("cells: {} (kept in the vault)", DEFAULT_CELLS_URL);
     }
-    let (store, layer_stores, cells) = mahere_store::cell_stores(local.is_dir().then_some(local.as_path()), Some(&mahere_store::cells_dir(None)));
-    // Cells an older Mahere kept in the vault move into the files on a thread of their own.
-    if let (Some(v), Some(c)) = (&vault, &cells) {
-        mahere_store::migrate_vault_cells(v.clone(), c.clone());
+    let (store, layer_stores, cells) = mahere_store::cell_stores(local.is_dir().then_some(local.as_path()), vault.as_ref().map(|v| v.vault()));
+    // The plain cell files of 0.223 come into the vault on a thread of their own.
+    if let Some(c) = &cells {
+        c.adopt_files(mahere_store::cells_dir(None));
     }
     let session = vault.as_ref().and_then(|s| mahere_store::load_session(s));
     let cam = match session {
@@ -736,11 +875,11 @@ fn main() {
         areas.set_layer_stores(vec![l.dem.clone(), l.img.clone()]);
     }
     let mut map = MapCore::layered(store, layer_stores, cam);
-    // The user's own cells, as files beside the data; the areas as files under them.
-    let user_dir = mahere_store::user_dir();
-    let _ = std::fs::create_dir_all(user_dir.join("areas"));
-    areas.set_store(std::sync::Arc::new(DirAreas(user_dir.join("areas"))));
-    map.set_user_store(std::sync::Arc::new(DirUser(user_dir)));
+    // The person's own cells (ink, selections) and areas, in the vault.
+    if let Some(v) = &vault {
+        areas.set_store(std::sync::Arc::new(mahere_store::VaultAreas::new(v.clone())));
+        map.set_user_store(std::sync::Arc::new(mahere_store::VaultUser::new(v.clone())));
+    }
     // MAHERE_AREA=<file>: a shared area document taken in at start.
     if let Some(bytes) = std::env::var("MAHERE_AREA").ok().and_then(|f| std::fs::read(f).ok()) {
         match areas.import(&bytes) {
@@ -757,60 +896,29 @@ fn main() {
     }
     let mut app = MahereApp::new(map, areas);
     // Font packs (Nick 2026-10-16): names in scripts the binary lacks draw in their own face once its pack, signed by the author, is fetched.
-    let fonts = mahere_panel::fonts::FontPacks::new(mahere_store::VaultFonts::new(vault.clone()), mahere_update::AUTHOR_PUBKEY);
+    let fonts = mahere_panel::fonts::FontPacks::new(mahere_store::VaultFonts::new(vault.as_ref().map(|v| v.vault().clone())), mahere_update::AUTHOR_PUBKEY);
     app.panel.set_fonts(fonts.clone());
     app.labeller.set_fonts(fonts);
+    if let Some(s) = vault.as_ref().and_then(|v| mahere_store::load_settings(v)) {
+        app.restore(s);
+    }
     app.store = vault;
     app.cells = cells;
+    app.instance = instance;
     run_app(app).expect("fluor event loop failed");
 }
 
-/// The user's areas as files in a directory, one per area by its name.
-struct DirAreas(std::path::PathBuf);
-
-impl DirAreas {
-    fn path(&self, name: &str) -> std::path::PathBuf {
-        self.0.join(format!("{}.vsf.zst", name.replace(' ', "-")))
-    }
-}
-
-impl mahere_engine::areas::AreaStore for DirAreas {
-    fn put(&self, name: &str, bytes: &[u8]) {
-        let _ = std::fs::write(self.path(name), bytes);
-    }
-
-    fn delete(&self, name: &str) {
-        let _ = std::fs::remove_file(self.path(name));
-    }
-
-    fn load_all(&self) -> Vec<Vec<u8>> {
-        let Ok(dir) = std::fs::read_dir(&self.0) else { return Vec::new() };
-        dir.flatten().filter_map(|e| std::fs::read(e.path()).ok()).collect()
-    }
-}
-
-/// The user's cells as files in a directory, one per cell by its name.
-struct DirUser(std::path::PathBuf);
-
-impl mahere_engine::ink::UserStore for DirUser {
-    fn put(&self, key: mahere_tiles::CellKey, bytes: &[u8]) {
-        let _ = std::fs::write(self.0.join(key.path()), bytes);
-    }
-
-    fn delete(&self, key: mahere_tiles::CellKey) {
-        let _ = std::fs::remove_file(self.0.join(key.path()));
-    }
-
-    fn load_all(&self) -> Vec<(mahere_tiles::CellKey, Vec<u8>)> {
-        let Ok(dir) = std::fs::read_dir(&self.0) else { return Vec::new() };
-        dir.flatten()
-            .filter_map(|e| {
-                let name = e.file_name().to_string_lossy().to_string();
-                let key = mahere_tiles::CellKey::from_name(&name)?;
-                let bytes = std::fs::read(e.path()).ok()?;
-                Some((key, bytes))
-            })
-            .collect()
+/// Open Photon, where the person signs in: it attests this machine for the stack's apps, and Mahere picks that up when its window is next focused. A Photon already running brings itself forward.
+fn launch_photon() {
+    #[cfg(target_os = "macos")]
+    let r = std::process::Command::new("open").args(["-a", "Photon Messenger"]).spawn();
+    #[cfg(not(target_os = "macos"))]
+    let r = std::process::Command::new("photon-messenger").spawn().or_else(|_| {
+        let home = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")).unwrap_or_default();
+        std::process::Command::new(std::path::Path::new(&home).join(".local/bin/photon-messenger")).spawn()
+    });
+    if let Err(e) = r {
+        eprintln!("Photon did not start: {e}");
     }
 }
 

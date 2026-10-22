@@ -35,7 +35,7 @@ fn main() {
         std::thread::sleep(std::time::Duration::from_millis(5));
         map.tick(w, h);
     }
-    let fonts = mahere_panel::fonts::FontPacks::new(mahere_store::VaultFonts::new(Some(vault.clone())), mahere_update::AUTHOR_PUBKEY);
+    let fonts = mahere_panel::fonts::FontPacks::new(mahere_store::VaultFonts::new(Some(vault.vault().clone())), mahere_update::AUTHOR_PUBKEY);
     let mut labels = mahere_panel::labels::Labeller::new();
     labels.set_fonts(fonts.clone());
     let shot = |labels: &mahere_panel::labels::Labeller, map: &mut MapCore, name: &str| {
