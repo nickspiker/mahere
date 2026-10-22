@@ -144,7 +144,8 @@ struct Slot { tag: u32, cu: u32, cv: u32, index: u32 };
 @group(0) @binding(10) var sel_tex: texture_2d_array<u32>;
 @group(0) @binding(11) var ov_tex: texture_2d_array<u32>;
 // The elevations this map pass draws, lowest and highest as quantised elevations: read back for the next frame's contour interval and raw elevation range (Nick 2026-10-10: the final gather, not a sampling).
-@group(0) @binding(12) var<storage, read_write> view_range: array<atomic<u32>, 2>;
+// Then each line class's largest magnitude drawn, at 2 + class: the next frame's line weights, the final gather (Nick 2026-10-21) rather than the cells' own largest, which counted roads off the screen.
+@group(0) @binding(12) var<storage, read_write> view_range: array<atomic<u32>, 34>;
 // The geoid's height above the ellipsoid per depth-0 texel, centimetres offset by 32768, a layer per diamond; 0 where that diamond's cell has not arrived.
 @group(0) @binding(13) var geoid_tex: texture_2d_array<u32>;
 // A vector cell's static layers composited once (Nick 2026-10-21, a Pixel 3a drawing every layer every pixel every frame): the base before the light and the fold after it, slots in its reference's c.z and c.w ([`fs_bake`]).
@@ -757,6 +758,14 @@ fn gather_range(elev: f32) {
     }
 }
 
+// A line drawn: its magnitude into its class's largest in view.
+fn gather_line(cls_id: u32, mag: u32) {
+    let c = 2u + min(cls_id, 31u);
+    if (mag > atomicLoad(&view_range[c])) {
+        atomicMax(&view_range[c], mag);
+    }
+}
+
 // The composite at a sample: ce, cf, cg the block's candidates for the terrain, the vector planes and the imagery, ch its user cells (NONE throughout when baking: the search finds them).
 fn compose(d: u32, u: u32, v: u32, pos: vec2<f32>, ce: vec4<u32>, cf: vec4<u32>, cg: vec4<u32>, ch: vec4<u32>) -> Composed {
     let mask = U.mask & LAYERS;
@@ -899,6 +908,9 @@ fn compose(d: u32, u: u32, v: u32, pos: vec2<f32>, ce: vec4<u32>, cf: vec4<u32>,
     if (vi != NONE) {
         let flags = vflags;
         let draw_line = (mask & M_LINE) != 0u && line.y != 0u && (line.x < BOUNDARY_FIRST || line.x > BOUNDARY_LAST || (mask & M_BOUND) != 0u) && U.depths.x >= line_min_depth(line.x, line.z);
+        if (draw_line && !baking()) {
+            gather_line(line.x, line.z);
+        }
         if ((mask & M_IMAGERY) != 0u && (im.x != 0u || im.y != 0u || im.z != 0u || im.w != 0u)) {
             // Imagery stands in for the ground: nothing lights it. True colour, or the near-infrared band as grey, unrolled to scene light.
             out.ground = false;
@@ -914,7 +926,12 @@ fn compose(d: u32, u: u32, v: u32, pos: vec2<f32>, ce: vec4<u32>, cf: vec4<u32>,
             // The water fill paints over imagery as it does over the ground, so a lake or a coast texel that is water in part matches the sea instead of showing the composite's own dark water: the composite's water taken out at the coverage, the theme's put in (the CPU's IMG_WATER).
             if ((mask & M_WATER) != 0u && lw.z != 0u) {
                 let t = f32(lw.z) / 255.0 * U.style_water.a * select(1.0, SEABED_GLAZE, seabed);
-                out.base = max(out.base - vec3<f32>(t * IMG_WATER), vec3<f32>(0.0)) + t * U.style_water.rgb;
+                if (baking()) {
+                    // Baked apart from the imagery, so the waterway lines drawn live go under it: the frame takes the composite's water out and puts the theme's in.
+                    out.water = t;
+                } else {
+                    out.base = max(out.base - vec3<f32>(t * IMG_WATER), vec3<f32>(0.0)) + t * U.style_water.rgb;
+                }
             }
             // Contours over the imagery and the water, under the other lines.
             if (contour_cov > 0.0) {
@@ -1079,7 +1096,7 @@ fn fs_map_g(in: VOut) -> GOut {
 
 // ==================== COMPOSITE: a vector cell's static layers, baked once ====================
 
-// What the light leaves alone, folded: the frame's colour is `x × A + B + W × water`, x being the base lit (on the ground), with the slope band and the contours over it, all live from the terrain. T0 the base at gamma 2 with 2.8 headroom and A; T1 B at gamma 2 and a byte of W (six bits), the ground (64) and whether the band applies (128).
+// What the light and the lines leave alone, folded: the frame's colour is `x × A + B + W × water`, x being the base lit (on the ground), with the slope band, the contours and the waterways over it, all live; then the other lines over everything (Nick 2026-10-21: lines baked in showed, and bought little). T0 the base at gamma 2 with 2.8 headroom and A; T1 B at gamma 2 and a byte of W (six bits), the ground (64) and whether the band applies (128, the ground's path; without it, imagery, whose water is laid on rather than mixed in).
 struct BakeOut {
     @location(0) t0: vec4<f32>,
     @location(1) t1: vec4<f32>,
@@ -1099,7 +1116,8 @@ fn fs_bake(@builtin(position) pos: vec4<f32>) -> BakeOut {
     let v = (u32(U.raw.y) << s) + (py << ts) + off;
     let none = vec4<u32>(NONE);
     let p = compose(u32(U.raw.z), u, v, pos.xy, none, none, none, none);
-    let keep = 1.0 - p.water;
+    // The ground's water covers what is under it; the imagery's is laid on (its own dark water taken out in the frame).
+    let keep = select(1.0, 1.0 - p.water, p.banded);
     let a = p.k1 * keep * p.k2;
     let b = p.c1 * keep * p.k2 + p.c2;
     let w = p.water * p.k2;
@@ -1161,7 +1179,24 @@ fn fs_fast(in: VOut) -> @location(0) vec4<f32> {
             }
         }
     }
-    var col = x * t0.a + t1.rgb * t1.rgb + w * U.style_water.rgb * (0.85 + 0.15 * diffuse);
+    // The lines, live: the waterways under the water, the rest over everything, weighted against the largest of each class the last frame drew.
+    var line = vec4<u32>(0u);
+    var draw_line = false;
+    if ((mask & M_LINE) != 0u && (r.c.x & FLAG_LINE) != 0u) {
+        line = textureLoad(line_tex, xy, i32(r.b.y), 0);
+        draw_line = line.y != 0u && (line.x < BOUNDARY_FIRST || line.x > BOUNDARY_LAST || (mask & M_BOUND) != 0u) && U.depths.x >= line_min_depth(line.x, line.z);
+    }
+    if (draw_line) {
+        gather_line(line.x, line.z);
+    }
+    if (draw_line && line.x == WATERWAY_CLASS) {
+        x = lerp3(x, line_colour(line.x, line.z), line_alpha(line.x, line.y, line.z));
+    }
+    let wr = U.style_water.rgb * (0.85 + 0.15 * diffuse) - vec3<f32>(select(IMG_WATER, 0.0, banded));
+    var col = x * t0.a + t1.rgb * t1.rgb + w * wr;
+    if (draw_line && line.x != WATERWAY_CLASS) {
+        col = lerp3(col, line_colour(line.x, line.z), line_alpha(line.x, line.y, line.z));
+    }
     var marks: Composed;
     marks.k2 = 1.0;
     marks.c2 = vec3<f32>(0.0);

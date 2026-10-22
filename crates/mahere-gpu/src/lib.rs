@@ -126,9 +126,12 @@ const KIND_G: u8 = 1;
 const KIND_FAST: u8 = 2;
 const KIND_BAKE: u8 = 3;
 
-/// The shader's layer bits the composite leaves to the frame (contours, slope bands: drawn live from the terrain) and those no composite is made under (raw elevation, the geoid, detail tinting).
-const LIVE_BITS: u32 = 64 | 128;
+/// The shader's layer bits the composite leaves to the frame (lines and boundaries, contours, slope bands: drawn live) and those no composite is made under (raw elevation, the geoid, detail tinting).
+const LIVE_BITS: u32 = 8 | 64 | 128 | 1024;
 const NO_COMPOSITE_BITS: u32 = 16 | 8192 | 32768;
+
+/// The gather buffer: lowest and highest elevation drawn, then each line class's largest magnitude drawn.
+const GATHER_WORDS: usize = 2 + 32;
 
 /// The reference's composite is baked and current (the shader's FLAG_COMP).
 const FLAG_COMP: u32 = 256;
@@ -322,8 +325,8 @@ pub struct GpuMap {
     comp0: Plane,
     comp1: Plane,
     baked: FxHashMap<CellKey, Baked>,
-    /// Each resident cell's largest line magnitude per class, kept from the pool for the bake's line weights.
-    line_max: FxHashMap<CellKey, [u8; 32]>,
+    /// Each line class's largest magnitude the last read-back map pass drew: the line weights (the plan's, from whole cells, until one is in).
+    line_drawn: Option<[u8; 32]>,
     bake_dummy: wgpu::Texture,
     bake_uniforms: Vec<wgpu::Buffer>,
     frame_no: u64,
@@ -521,8 +524,8 @@ impl GpuMap {
         let lut = storage_buffer(device, "lut", ((4096 + LUT_STYLE) * 4) as u64);
 
         // The elevations the map pass drew, lowest and highest as quantised elevations, and two buffers to read them back through without waiting on the GPU.
-        let view_range = device.create_buffer(&wgpu::BufferDescriptor { label: Some("view range"), size: 8, usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC, mapped_at_creation: false });
-        let range_read: [wgpu::Buffer; 2] = std::array::from_fn(|_| device.create_buffer(&wgpu::BufferDescriptor { label: Some("view range readback"), size: 8, usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false }));
+        let view_range = device.create_buffer(&wgpu::BufferDescriptor { label: Some("view range"), size: (GATHER_WORDS * 4) as u64, usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC, mapped_at_creation: false });
+        let range_read: [wgpu::Buffer; 2] = std::array::from_fn(|_| device.create_buffer(&wgpu::BufferDescriptor { label: Some("view range readback"), size: (GATHER_WORDS * 4) as u64, usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false }));
         let max_layers = device.limits().max_texture_array_layers.max(1);
         let dem = Plane::new(device, "dem", DEMQ_W as u32, DEMQ_H as u32, wgpu::TextureFormat::R16Uint, max_layers);
         let line = Plane::new(device, "line", 2 * TEX as u32, TEX as u32, wgpu::TextureFormat::Rgba8Uint, max_layers);
@@ -547,7 +550,7 @@ impl GpuMap {
             comp0,
             comp1,
             baked: FxHashMap::default(),
-            line_max: FxHashMap::default(),
+            line_drawn: None,
             bake_dummy: plane_texture(device, "composite stand-in", 1, 1, 1, wgpu::TextureFormat::Rgba8Unorm, wgpu::TextureUsages::empty()),
             bake_uniforms: Vec::new(),
             frame_no: 0,
@@ -766,10 +769,6 @@ impl GpuMap {
         self.comp0.evict_absent(pool);
         self.comp1.evict_absent(pool);
         self.baked.retain(|k, _| pool.map.contains_key(k));
-        self.line_max.retain(|k, _| pool.map.contains_key(k));
-        for (k, e) in pool.map.iter() {
-            self.line_max.entry(*k).or_insert(e.line_mag_max);
-        }
         let (w, h) = (2 * TEX as u32, TEX as u32);
         let mut scratch = vec![0u8; TRI * 4];
         // A plane full to the GPU's limit leaves a cell without a slot, and it draws as bare ground: said, not silent.
@@ -997,28 +996,6 @@ impl GpuMap {
                 None
             }
         }
-    }
-
-    /// The line weights a cell bakes under: each class's largest magnitude over the cell and its parent three depths up (a few kilometres about it at street zoom), so a lane beside a highway falls back as it does against the view's largest, and the same everywhere in that parent, with no seam where neighbouring cells meet.
-    fn bake_line_hi(&self, key: CellKey) -> [u8; 32] {
-        let mut hi = self.line_max.get(&key).copied().unwrap_or([0; 32]);
-        let mut k = key;
-        let mut wide = None;
-        for _ in 0..3 {
-            if k.depth == 0 {
-                break;
-            }
-            k = k.parent();
-            if let Some(m) = self.line_max.get(&k) {
-                wide = Some(*m);
-            }
-        }
-        if let Some(m) = wide {
-            for (h, v) in hi.iter_mut().zip(m) {
-                *h = (*h).max(v);
-            }
-        }
-        hi
     }
 
     /// Planes the last sync left for the next, its upload budget spent: the host keeps frames coming until they are in.
@@ -1308,7 +1285,7 @@ impl GpuMap {
         self.frame_no += 1;
         let layers = mask_bits(luts.mask) & !self.mask_off;
         let bake_mask = layers & !LIVE_BITS;
-        let mut bakes: Vec<(usize, u32, u32, [u8; 32])> = Vec::new();
+        let mut bakes: Vec<(usize, u32, u32)> = Vec::new();
         let mut fast_ready = false;
         self.bakes_left = false;
         if self.composite && mode == RenderMode::Full && layers & NO_COMPOSITE_BITS == 0 {
@@ -1324,16 +1301,15 @@ impl GpuMap {
             let mut wanted: Vec<usize> = plan.blocks.iter().flat_map(|b| b.cand[1]).filter(|&r| r != NONE && seen.insert(r)).map(|r| r as usize).collect();
             wanted.extend((0..plan.refs.len()).filter(|&i| plan.refs[i].wanted && plan.refs[i].key.depth == plan.vec_depth && plan.refs[i].flags & FLAG_INK == 0 && seen.insert(i as u32)));
             // Every current composite marked drawn first, so a bake making room never takes one this frame draws.
-            let mut stale: Vec<(usize, u64, [u8; 32])> = Vec::new();
+            let mut stale: Vec<(usize, u64)> = Vec::new();
             for i in wanted {
                 if refs[i].c[0] & FLAG_VEC == 0 {
                     continue;
                 }
                 let key = plan.refs[i].key;
-                let hi = self.bake_line_hi(key);
-                // Made from: the theme and layers, the cell's own planes, the terrain and imagery cells the bake's search can reach (this cell and its parents), the line weights.
+                // Made from: the theme and layers, the cell's own planes, the terrain and imagery cells the bake's search can reach (this cell and its parents).
                 let mut h = rustc_hash::FxHasher::default();
-                (shared, refs[i].c[0], hi).hash(&mut h);
+                (shared, refs[i].c[0]).hash(&mut h);
                 let mut k = key;
                 loop {
                     if let Some(&j) = by_key.get(&k) {
@@ -1353,9 +1329,9 @@ impl GpuMap {
                         continue;
                     }
                 }
-                stale.push((i, sig, hi));
+                stale.push((i, sig));
             }
-            for (i, sig, hi) in stale {
+            for (i, sig) in stale {
                 if !bake_ready || bakes.len() >= self.bake_budget {
                     self.bakes_left = true;
                     break;
@@ -1365,7 +1341,7 @@ impl GpuMap {
                 let Some((s0, s1)) = self.comp_alloc(device, queue, key) else { break };
                 self.baked.insert(key, Baked { sig, used: self.frame_no });
                 refs[i].c = [refs[i].c[0] | FLAG_COMP, refs[i].c[1], s0, s1];
-                bakes.push((i, s0, s1, hi));
+                bakes.push((i, s0, s1));
             }
         }
         // Blocks drawn from composites first, then the rest: two draws over one buffer.
@@ -1423,7 +1399,10 @@ impl GpuMap {
                 Some((x, y, r)) => [x, y, r, 1.0],
                 None => [0.0, 0.0, 0.0, 0.0],
             },
-            line_hi: std::array::from_fn(|i| std::array::from_fn(|j| plan.line_mag_hi[4 * i + j].max(1) as f32)),
+            line_hi: {
+                let hi = self.line_drawn.unwrap_or(plan.line_mag_hi);
+                std::array::from_fn(|i| std::array::from_fn(|j| hi[4 * i + j].max(1) as f32))
+            },
             measure: self.measure.map_or([0.0; 4], |(ox, oy, tx, ty)| [ox, oy, tx, ty]),
             style_water: rgba(luts.style.water),
             style_contour: rgba(luts.style.contour),
@@ -1443,7 +1422,7 @@ impl GpuMap {
         let u = Uniforms { depths: [plan.dem_depth as u32, plan.vec_depth as u32, plan.magnified as u32, measure_on as u32], ..u };
         queue.write_buffer(&self.uniforms, 0, bytemuck::bytes_of(&u));
         // The bakes, each a pass over its cell's texels with uniforms of its own: the cell's depth wanted throughout, its texel grid in `raw`, the live layers left out, nothing gathered.
-        for (j, &(i, s0, s1, hi)) in bakes.iter().enumerate() {
+        for (j, &(i, s0, s1)) in bakes.iter().enumerate() {
             if self.bake_uniforms.len() <= j {
                 self.bake_uniforms.push(device.create_buffer(&wgpu::BufferDescriptor { label: Some("bake uniforms"), size: std::mem::size_of::<Uniforms>() as u64, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false }));
             }
@@ -1454,7 +1433,6 @@ impl GpuMap {
                 scale: 1.0,
                 mask: bake_mask,
                 depths: [depth, depth, 0, 0],
-                line_hi: std::array::from_fn(|a| std::array::from_fn(|b| hi[4 * a + b].max(1) as f32)),
                 tone: [u.tone[0], 1.0, 0.0, 0.0],
                 globe: [0.0; 4],
                 raw: [r.cu as f32, r.cv as f32, r.diamond as f32, depth as f32],
@@ -1480,7 +1458,9 @@ impl GpuMap {
             self.map_variant(device, layers, KIND_FULL);
         }
         if draws_map {
-            queue.write_buffer(&self.view_range, 0, bytemuck::cast_slice(&[u32::MAX, 0u32]));
+            let mut reset = [0u32; GATHER_WORDS];
+            reset[0] = u32::MAX;
+            queue.write_buffer(&self.view_range, 0, bytemuck::cast_slice(&reset));
         }
         let scale = self.scale.max(1);
         let (_, _, map_view, _, _) = self.offscreen.iter().find(|(s, ..)| *s == scale).unwrap();
@@ -1537,7 +1517,7 @@ impl GpuMap {
         if draws_map {
             let idle = (0..2).find(|&i| self.range_state[i].load(std::sync::atomic::Ordering::Acquire) == RANGE_IDLE);
             if let Some(i) = idle {
-                encoder.copy_buffer_to_buffer(&self.view_range, 0, &self.range_read[i], 0, 8);
+                encoder.copy_buffer_to_buffer(&self.view_range, 0, &self.range_read[i], 0, (GATHER_WORDS * 4) as u64);
                 self.range_state[i].store(RANGE_COPIED, std::sync::atomic::Ordering::Release);
                 self.range_copied = Some(i);
             }
@@ -1634,6 +1614,7 @@ impl GpuMap {
                 let (lo, hi) = {
                     let view = self.range_read[i].slice(..).get_mapped_range();
                     let v: &[u32] = bytemuck::cast_slice(&view);
+                    self.line_drawn = Some(std::array::from_fn(|c| v[2 + c].min(255) as u8));
                     (v[0], v[1])
                 };
                 self.range_read[i].unmap();
