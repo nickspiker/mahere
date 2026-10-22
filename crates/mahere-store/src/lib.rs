@@ -16,6 +16,7 @@ pub use cells::{CellFileLayer, CellFiles};
 mod store;
 pub use store::Store;
 mod vault_cells;
+pub mod sync;
 pub use vault_cells::{VaultCellLayer, VaultCells};
 
 /// Tests that open a vault take this first: kete's vault directory is one setting for the process, and two tests pointing it at their own directories at once open each other's vaults.

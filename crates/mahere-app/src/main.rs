@@ -3,6 +3,7 @@
 //! mahere desktop app — a thin fluor frontend over mahere-engine's MapCore.
 //! Chrome, desktop input mapping, and the bg-layer blit live here; all map state and rendering live in the engine (shared with the Android shell).
 
+mod fleet;
 mod gpu;
 mod instance;
 
@@ -49,6 +50,10 @@ struct MahereApp {
     gpu: Option<gpu::Gpu>,
     /// The one-copy lock, held for the process; its listener starts once the event loop can be woken.
     instance: Option<instance::Instance>,
+    /// The person's fleet: their preferences and themes, the same on every device (MAHERE_SYNC while new).
+    fleet: Option<fleet::FleetSync>,
+    /// The preferences as last sent to or taken from the fleet.
+    synced_prefs: Option<mahere_store::sync::Prefs>,
     /// The settings as last written to the vault (or read from it): a tick that finds them changed writes them again.
     settings_saved: Option<mahere_store::Settings>,
     /// The UI scale the settings hold, handed to fluor once at start; and the scale fluor reports, kept for the next write.
@@ -72,6 +77,7 @@ impl MahereApp {
                     if let Some(store) = &self.store {
                         mahere_store::themes::save(store, self.map.current_theme());
                     }
+                    self.push_theme(&self.map.current_theme().name.clone(), false);
                 }
                 mahere_panel::ThemeEdit::CaptureLight | mahere_panel::ThemeEdit::ClearLight => {
                     if e == mahere_panel::ThemeEdit::ClearLight {
@@ -82,10 +88,12 @@ impl MahereApp {
                     if let Some(store) = &self.store {
                         mahere_store::themes::save(store, self.map.current_theme());
                     }
+                    self.push_theme(&self.map.current_theme().name.clone(), false);
                 }
                 mahere_panel::ThemeEdit::Delete => {
                     if let (Some(name), Some(store)) = (self.map.delete_theme(), &self.store) {
                         mahere_store::themes::delete(store, &name);
+                        self.push_theme(&name, true);
                     }
                 }
             }
@@ -126,6 +134,8 @@ impl MahereApp {
             map_span: 0.0,
             gpu: None,
             instance: None,
+            fleet: None,
+            synced_prefs: None,
             settings_saved: None,
             zoom_request: None,
             ui_ru: 1.0,
@@ -262,6 +272,109 @@ impl MahereApp {
         self.areas.set_store(std::sync::Arc::new(mahere_store::VaultAreas::new(store.clone())));
         self.map.set_user_store(std::sync::Arc::new(mahere_store::VaultUser::new(store.clone())));
         self.chrome.invalidate_bg();
+        if let Some(f) = self.fleet.as_mut() {
+            f.pull();
+        }
+    }
+
+    /// A theme to the fleet, edited or deleted — once the first pull has landed.
+    fn push_theme(&self, name: &str, deleted: bool) {
+        use mahere_store::sync;
+        let (Some(f), Some(store)) = (&self.fleet, &self.store) else { return };
+        if !f.pulled || !store.attested() {
+            return;
+        }
+        let key = format!("{}{name}", sync::THEME_PREFIX);
+        let bytes = if deleted { None } else { self.map.themes.iter().find(|t| t.name == name).and_then(mahere_store::themes::encode) };
+        if !deleted && bytes.is_none() {
+            return;
+        }
+        let t = sync::now();
+        sync::set_stamp(store, &key, t);
+        f.push(vec![sync::entry(&key, bytes.as_deref(), t)]);
+    }
+
+    /// What the fleet sent: each entry newer than this device's copy is taken in. After the first pull, what this device has and the fleet lacks goes out.
+    fn sync_in(&mut self) {
+        use mahere_store::sync;
+        let (Some(store), Some(f)) = (self.store.clone(), self.fleet.as_mut()) else { return };
+        let arrived = f.take();
+        if arrived.is_empty() {
+            return;
+        }
+        let first = !f.pulled;
+        f.pulled = true;
+        let mut themes_changed = false;
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for fleet::Arrived::Entries(entries) in arrived {
+            for e in entries {
+                seen.insert(e.key.clone());
+                if e.updated <= sync::stamp(&store, &e.key) {
+                    continue;
+                }
+                if e.key == sync::PREFS_KEY {
+                    if let Some(p) = sync::bytes_of(&e).and_then(|b| sync::Prefs::decode(&b)) {
+                        let mut s = self.settings();
+                        p.onto(&mut s);
+                        self.restore(s);
+                        self.synced_prefs = Some(p);
+                    }
+                } else if let Some(name) = e.key.strip_prefix(sync::THEME_PREFIX) {
+                    match sync::bytes_of(&e).and_then(|b| mahere_store::themes::decode(&b)) {
+                        Some(t) => mahere_store::themes::save(&store, &t),
+                        None if e.tombstone => mahere_store::themes::delete(&store, name),
+                        None => continue,
+                    }
+                    themes_changed = true;
+                }
+                sync::set_stamp(&store, &e.key, e.updated);
+            }
+        }
+        if themes_changed {
+            self.map.set_themes(mahere_store::themes::load_all(&store));
+            self.chrome.invalidate_bg();
+        }
+        if first {
+            // What this device holds that the fleet has never seen: its preferences, and every theme the person made or edited here.
+            let t = sync::now();
+            let mut out = Vec::new();
+            if !seen.contains(sync::PREFS_KEY) {
+                let p = sync::Prefs::of(&self.settings());
+                out.push(sync::entry(sync::PREFS_KEY, Some(&p.encode()), t));
+                self.synced_prefs = Some(p);
+            }
+            for th in self.map.themes.iter().filter(|th| th.edited) {
+                let key = format!("{}{}", sync::THEME_PREFIX, th.name);
+                if !seen.contains(&key) {
+                    if let Some(b) = mahere_store::themes::encode(th) {
+                        out.push(sync::entry(&key, Some(&b), t));
+                    }
+                }
+            }
+            for e in &out {
+                sync::set_stamp(&store, &e.key, t);
+            }
+            if let Some(f) = &self.fleet {
+                f.push(out);
+            }
+        }
+    }
+
+    /// The preferences, out to the fleet when they changed — after the first pull, so a fresh device's defaults never outrun the person's.
+    fn sync_out_prefs(&mut self) {
+        use mahere_store::sync;
+        let (Some(f), Some(store)) = (&self.fleet, &self.store) else { return };
+        if !f.pulled || !store.attested() {
+            return;
+        }
+        let p = sync::Prefs::of(&self.settings());
+        if self.synced_prefs == Some(p) {
+            return;
+        }
+        let t = sync::now();
+        sync::set_stamp(store, sync::PREFS_KEY, t);
+        f.push(vec![sync::entry(sync::PREFS_KEY, Some(&p.encode()), t)]);
+        self.synced_prefs = Some(p);
     }
 
     /// The notice while nobody is attested, and its button.
@@ -550,6 +663,11 @@ impl FluorApp for MahereApp {
                 // Back from Photon (or anywhere): a person attested meanwhile is picked up on the edge, never polled.
                 if *focused {
                     self.try_attest();
+                    if self.store.as_ref().is_some_and(|s| s.attested()) {
+                        if let Some(f) = self.fleet.as_mut() {
+                            f.pull();
+                        }
+                    }
                 }
                 if self.chrome.set_focused(*focused) {
                     ctx.window.request_redraw();
@@ -703,9 +821,11 @@ impl FluorApp for MahereApp {
                 if self.settings_saved != Some(s) && mahere_store::save_settings(store, &s).is_ok() {
                     self.settings_saved = Some(s);
                 }
+                self.sync_out_prefs();
             }
         }
         self.notice();
+        self.sync_in();
         // Updates: what the threads found, onto the page; a verified build swapped in and started in this one's place.
         let updates_changed = self.updater.poll();
         if updates_changed {
@@ -905,6 +1025,12 @@ fn main() {
     app.store = vault;
     app.cells = cells;
     app.instance = instance;
+    app.fleet = fleet::FleetSync::start();
+    if app.store.as_ref().is_some_and(|s| s.attested()) {
+        if let Some(f) = app.fleet.as_mut() {
+            f.pull();
+        }
+    }
     run_app(app).expect("fluor event loop failed");
 }
 
