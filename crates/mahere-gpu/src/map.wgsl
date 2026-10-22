@@ -212,7 +212,8 @@ fn pick(c: vec4<u32>, d: u32, u: u32, v: u32, want: u32, need: u32) -> u32 {
         }
         let a = refs[r].a;
         let s = 30u - a.y;
-        if (a.x == d && (u >> s) == a.z && (v >> s) == a.w) {
+        // Only a cell whose planes are on the GPU now: one still waiting for its upload has the flag cleared, and the search goes past it to a coarser cell, as before (2026-10-21: taken anyway, it drew as bare terrain, brown cells across the Pixel 3a's view).
+        if (a.x == d && (u >> s) == a.z && (v >> s) == a.w && (refs[r].c.x & need) != 0u) {
             return r;
         }
     }

@@ -185,7 +185,8 @@ impl GpuHost {
         }
         // A layout the label worker finished is a frame to draw.
         let lettered = self.labeller.poll();
-        let changed = map.tick(w as usize, h as usize) || fresh || panel_dirty || lettered;
+        // Planes still owed to the GPU are a change too: a view at rest goes on drawing until they are all in, or the cells waiting draw without them.
+        let changed = map.tick(w as usize, h as usize) || fresh || panel_dirty || lettered || self.map.uploads_pending();
         let quiet = std::time::Duration::from_millis(250);
         if !changed && (self.settled || self.last_low.elapsed() < quiet) {
             self.device.poll(wgpu::PollType::Poll).ok();
