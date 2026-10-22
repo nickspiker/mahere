@@ -38,6 +38,9 @@ pub struct GpuHost {
     cost_1x: Option<f32>,
     /// The passes' GPU times summed over the report's frames (map, labels, present) and how many frames gave them; the CPU's labels, overlay and encode times summed likewise.
     pass_ms: [f32; 3],
+    /// The profiling switches and when they were read.
+    debug: Debug,
+    debug_read: std::time::Instant,
     pass_n: u32,
     labels_ms: f32,
     overlay_ms: f32,
@@ -46,6 +49,29 @@ pub struct GpuHost {
     plan_ms: f32,
     sync_ms: f32,
     report: std::time::Instant,
+}
+
+/// A system property as text, read from adb's reach (`adb shell setprop debug.mahere.<name> <value>`), for profiling on a phone without touching it.
+fn debug_prop(name: &str) -> Option<String> {
+    let key = std::ffi::CString::new(format!("debug.mahere.{name}")).ok()?;
+    let mut buf = [0u8; 92];
+    let n = unsafe { libc::__system_property_get(key.as_ptr(), buf.as_mut_ptr() as *mut libc::c_char) };
+    (n > 0).then(|| String::from_utf8_lossy(&buf[..n as usize]).into_owned())
+}
+
+/// The profiling switches, read every two seconds: `mask_off` (layer bits the shader leaves out, decimal), `spin` (1: draw every frame, the view still), `overlay_off` (1: the panel's overlay not repainted).
+#[derive(Default, Clone, Copy)]
+struct Debug {
+    mask_off: u32,
+    spin: bool,
+    overlay_off: bool,
+}
+
+impl Debug {
+    fn read() -> Debug {
+        let num = |n: &str| debug_prop(n).and_then(|v| v.trim().parse::<u32>().ok()).unwrap_or(0);
+        Debug { mask_off: num("mask_off"), spin: num("spin") == 1, overlay_off: num("overlay_off") == 1 }
+    }
 }
 
 /// How long a still frame may take on the GPU, milliseconds: the scale is the largest whose measured cost fits (a still frame is drawn once, but far past this a mobile GPU's watchdog takes the device).
@@ -123,6 +149,8 @@ impl GpuHost {
             lost,
             cost_1x: None,
             pass_ms: [0.0; 3],
+            debug: Debug::default(),
+            debug_read: std::time::Instant::now() - std::time::Duration::from_secs(10),
             pass_n: 0,
             labels_ms: 0.0,
             overlay_ms: 0.0,
@@ -199,7 +227,12 @@ impl GpuHost {
         // A layout the label worker finished is a frame to draw.
         let lettered = self.labeller.poll();
         // Planes still owed to the GPU are a change too: a view at rest goes on drawing until they are all in, or the cells waiting draw without them.
-        let changed = map.tick(w as usize, h as usize) || fresh || panel_dirty || lettered || self.map.uploads_pending();
+        if self.debug_read.elapsed().as_secs() >= 2 {
+            self.debug = Debug::read();
+            self.debug_read = std::time::Instant::now();
+            self.map.mask_off = self.debug.mask_off;
+        }
+        let changed = map.tick(w as usize, h as usize) || fresh || panel_dirty || lettered || self.map.uploads_pending() || self.debug.spin;
         let quiet = std::time::Duration::from_millis(250);
         if !changed && (self.settled || self.last_low.elapsed() < quiet) {
             self.device.poll(wgpu::PollType::Poll).ok();
@@ -292,7 +325,7 @@ impl GpuHost {
         self.labels_ms += t_labels.elapsed().as_secs_f32() * 1000.0;
         let t_overlay = std::time::Instant::now();
         let structural = self.overlay_stamp.is_none_or(|s| (s.5, s.6, s.7, s.8, s.10, s.11) != (w, h, panel.is_open(), stamp.8, stamp.10, stamp.11));
-        if self.overlay_stamp != Some(stamp) && (structural || self.overlay_at.elapsed().as_millis() >= 150) {
+        if self.overlay_stamp != Some(stamp) && (structural || self.overlay_at.elapsed().as_millis() >= 150) && !(self.debug.overlay_off && self.overlay_stamp.is_some()) {
             self.overlay_at = std::time::Instant::now();
             let mut heading = c.bearing().to_degrees().rem_euclid(360.0);
             if heading > 180.0 {

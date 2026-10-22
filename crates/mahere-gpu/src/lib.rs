@@ -311,6 +311,8 @@ pub struct GpuMap {
     uploads_left: bool,
     /// The passes' GPU time, where the device can stamp it.
     timer: Option<PassTimer>,
+    /// Layer bits the shader is told are off whatever the view shows: a profiling switch (a host's debug property), 0 in use.
+    pub mask_off: u32,
     /// The geoid of the ten depth-0 cells, a layer per diamond (centimetres above the ellipsoid offset by 32768, 0 where none), and which diamonds are in.
     geoid_tex: wgpu::Texture,
     geoid_in: u16,
@@ -494,6 +496,7 @@ impl GpuMap {
             uploads: 0,
             upload_budget: usize::MAX,
             uploads_left: false,
+            mask_off: 0,
             timer: device.features().contains(wgpu::Features::TIMESTAMP_QUERY).then(|| PassTimer {
                 set: device.create_query_set(&wgpu::QuerySetDescriptor { label: Some("pass times"), ty: wgpu::QueryType::Timestamp, count: PASS_STAMPS }),
                 resolve: device.create_buffer(&wgpu::BufferDescriptor { label: Some("pass times"), size: PASS_STAMPS as u64 * 8, usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC, mapped_at_creation: false }),
@@ -1127,7 +1130,7 @@ impl GpuMap {
             raw: [luts.contours.lo_m, luts.contours.hi_m, 0.0, 0.0],
             size: [(w * self.scale.max(1)) as f32, (h * self.scale.max(1)) as f32],
             scale: self.scale.max(1) as f32,
-            mask: mask_bits(luts.mask),
+            mask: mask_bits(luts.mask) & !self.mask_off,
             light,
             sun: [luts.sun[0], luts.sun[1], luts.sun[2], 0.0],
             contour: [luts.contours.interval, luts.contours.index_every as f32, luts.contours.m_per_px, 0.0],
