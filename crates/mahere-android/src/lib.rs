@@ -879,6 +879,15 @@ pub extern "system" fn Java_nz_mahere_app_MahereActivity_nativeDraw(
         let AndroidApp { gpu: Some(g), map, panel, w, h, .. } = app else {
             return shell(ptr).draw(&window) as jboolean;
         };
+        if g.is_lost() {
+            app.gpu = None;
+            app.gpu_panics += 1;
+            if app.gpu_panics >= 3 {
+                app.gpu_failed = true;
+                eprintln!("gpu: giving up after {} failures, CPU present", app.gpu_panics);
+            }
+            return 1;
+        }
         if g.ensure_window(&window) {
             // A fatal error inside wgpu panics; across the JNI boundary that is an abort. Caught here, the GPU host is dropped and made again on the next frame (a lost device comes back that way); after a few in a row the CPU present takes over.
             let (w, h) = (*w as u32, *h as u32);

@@ -31,11 +31,21 @@ pub struct GpuHost {
     settled: bool,
     frames: u64,
     frame_ms: f32,
+    /// What a frame costs on the GPU (2026-10-21: the Pixel 3a's Adreno 615 lost its device on the first still frame at 3×, 21 million pixels): each submitted frame's time to done, with its scale, as the queue reports it; the cost of a 1× frame learnt from them; and the still scale that cost allows.
+    gpu_done: std::sync::Arc<std::sync::Mutex<Option<(u32, f32)>>>,
+    /// The device was lost: the host is made again.
+    lost: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    cost_1x: Option<f32>,
     work_ms: f32,
     plan_ms: f32,
     sync_ms: f32,
     report: std::time::Instant,
 }
+
+/// How long a still frame may take on the GPU, milliseconds: the scale is the largest whose measured cost fits (a still frame is drawn once, but far past this a mobile GPU's watchdog takes the device).
+const STILL_BUDGET_MS: f32 = 100.0;
+/// Plane uploads a frame makes at most: a burst of arriving cells spread over frames, never one long stall on the UI thread.
+const UPLOADS_PER_FRAME: usize = 24;
 
 /// Supersampling while the camera moves and once it has stopped.
 const MOVING_SCALE: u32 = 1;
@@ -66,12 +76,19 @@ impl GpuHost {
             .ok()?;
         // A validation error logs instead of killing the app: the map goes wrong on screen, the phone stays usable, logcat says why.
         device.on_uncaptured_error(std::sync::Arc::new(|e: wgpu::Error| eprintln!("gpu: {e}")));
-        device.set_device_lost_callback(|reason, msg| eprintln!("gpu: device lost ({reason:?}): {msg}"));
+        // A lost device answers nothing again: marked, so the host is dropped and made afresh on the next frame (2026-10-21: the Pixel 3a stayed black after its loss, every texture write refused).
+        let lost = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mark = lost.clone();
+        device.set_device_lost_callback(move |reason, msg| {
+            eprintln!("gpu: device lost ({reason:?}): {msg}");
+            mark.store(true, std::sync::atomic::Ordering::Relaxed);
+        });
         let caps = surface.get_capabilities(&adapter);
         // A linear 8-bit format: the shader writes display values, not scene-linear ones.
         let format = caps.formats.iter().copied().find(|f| !f.is_srgb()).unwrap_or(caps.formats[0]);
         let alpha = caps.alpha_modes.first().copied().unwrap_or(wgpu::CompositeAlphaMode::Auto);
-        let map = GpuMap::new(&device, &queue, format);
+        let mut map = GpuMap::new(&device, &queue, format);
+        map.upload_budget = UPLOADS_PER_FRAME;
         let info = adapter.get_info();
         eprintln!("gpu: {} ({:?}), surface {:?}", info.name, info.backend, format);
         Some(GpuHost {
@@ -94,6 +111,9 @@ impl GpuHost {
             settled: false,
             frames: 0,
             frame_ms: 0.0,
+            gpu_done: Default::default(),
+            lost,
+            cost_1x: None,
             work_ms: 0.0,
             plan_ms: 0.0,
             sync_ms: 0.0,
@@ -107,6 +127,11 @@ impl GpuHost {
         unsafe { instance.create_surface_unsafe(wgpu::SurfaceTargetUnsafe::RawHandle { raw_display_handle: rdh, raw_window_handle: rwh }) }
             .map_err(|e| eprintln!("gpu: surface: {e:?}"))
             .ok()
+    }
+
+    /// Whether the device was lost: the host must be made again.
+    pub fn is_lost(&self) -> bool {
+        self.lost.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// The Activity recreated its Surface: a new wgpu surface over the new window. False if that failed.
@@ -189,7 +214,13 @@ impl GpuHost {
         // The still frame's scale, at most what the GPU's largest texture holds for this screen: a scale it cannot hold fails to make its target, and the frame is lost.
         let fits = (self.device.limits().max_texture_dimension_2d / w.max(h).max(1)).max(1);
         let budget = ((STILL_PIXELS as f64 / (w as f64 * h as f64).max(1.0)).sqrt().floor() as u32).max(1);
-        self.map.scale = if in_motion { MOVING_SCALE } else { STILL_SCALE.min(fits).min(budget) };
+        // The GPU's own measure: a frame's cost goes as its pixels, the scale squared; until one is known a still frame is drawn at 1×.
+        if let Some((s, ms)) = self.gpu_done.lock().unwrap().take() {
+            let one = ms / (s * s) as f32;
+            self.cost_1x = Some(self.cost_1x.map_or(one, |c| c * 0.7 + one * 0.3));
+        }
+        let affordable = self.cost_1x.map_or(1, |c| (1..=STILL_SCALE).rev().find(|&s| c * (s * s) as f32 <= STILL_BUDGET_MS).unwrap_or(1));
+        self.map.scale = if in_motion { MOVING_SCALE } else { STILL_SCALE.min(fits).min(budget).min(affordable) };
         if in_motion {
             self.last_low = now;
         }
@@ -266,6 +297,13 @@ impl GpuHost {
         self.map.set_user(&self.device, &self.queue, &map.user, &map.preview, map.preview_version, w, h);
         self.map.render(&self.device, &self.queue, &mut enc, &view, &plan, map.luts(), w, h, mode);
         self.queue.submit([enc.finish()]);
+        {
+            // The frame's time to done on the GPU, reported when the queue is next polled.
+            let (scale, at, done) = (self.map.scale, std::time::Instant::now(), self.gpu_done.clone());
+            self.queue.on_submitted_work_done(move || {
+                *done.lock().unwrap() = Some((scale, at.elapsed().as_secs_f32() * 1000.0));
+            });
+        }
         self.map.after_submit();
         frame.present();
         // Reclaim what finished: staging buffers behind every upload and the arrays replaced by growth are only freed when the device is polled.
@@ -274,6 +312,7 @@ impl GpuHost {
         self.frame_ms += t0.elapsed().as_secs_f32() * 1000.0;
         if self.report.elapsed().as_secs() >= 10 {
             let n = self.frames.max(1) as f32;
+            eprintln!("gpu: a 1x frame costs {:.1} ms on the GPU, still frames at {}x", self.cost_1x.unwrap_or(f32::NAN), self.map.scale.max(1));
             eprintln!("gpu: {} frames, per frame {:.2} ms plan + {:.2} ms sync + {:.2} ms overlay and encode + {:.2} ms waiting for the swapchain, {} resident, {} pending, {} uploads, layers {:?}", self.frames, self.plan_ms / n, self.sync_ms / n, (self.work_ms - self.plan_ms - self.sync_ms) / n, (self.frame_ms - self.work_ms) / n, map.pool().map.len(), map.pending_cells(), self.map.uploads, self.map.layers());
             self.frames = 0;
             self.frame_ms = 0.0;
@@ -283,7 +322,7 @@ impl GpuHost {
             self.report = std::time::Instant::now();
         }
         // Lettering held back by cells still arriving needs another frame once its second is up.
-        !map.converged() || self.labeller.pending(map, w as usize, h as usize) || panel.fonts_due()
+        !map.converged() || self.labeller.pending(map, w as usize, h as usize) || panel.fonts_due() || self.map.uploads_pending()
     }
 }
 

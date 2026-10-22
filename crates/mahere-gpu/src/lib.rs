@@ -288,6 +288,9 @@ pub struct GpuMap {
     preview: Option<(wgpu::Texture, wgpu::TextureView, u32, u32)>,
     preview_version: u64,
     pub uploads: usize,
+    /// The most plane uploads one sync makes (unlimited by default): a host drawing on its UI thread spreads a burst of arrivals over frames, so no one frame stalls input (2026-10-21, the Pixel 3a's "not responding"); and whether planes were left for the next.
+    pub upload_budget: usize,
+    uploads_left: bool,
     /// The geoid of the ten depth-0 cells, a layer per diamond (centimetres above the ellipsoid offset by 32768, 0 where none), and which diamonds are in.
     geoid_tex: wgpu::Texture,
     geoid_in: u16,
@@ -469,6 +472,8 @@ impl GpuMap {
             present_binds: FxHashMap::default(),
             overlay: None,
             uploads: 0,
+            upload_budget: usize::MAX,
+            uploads_left: false,
             geoid_tex: plane_texture(device, "geoid", 2 * TEX as u32, TEX as u32, GEOID_DIAMONDS, wgpu::TextureFormat::R16Uint),
             geoid_in: 0,
             full_warned: std::time::Instant::now() - std::time::Duration::from_secs(60),
@@ -618,7 +623,14 @@ impl GpuMap {
             }
         };
         let mut no_slot = 0usize;
+        let uploads_before = self.uploads;
+        self.uploads_left = false;
         for (key, e) in pool.map.iter_mut() {
+            // The frame's share of uploads made: the rest wait for the next sync, the cells drawing from coarser ones meanwhile.
+            if self.uploads - uploads_before >= self.upload_budget {
+                self.uploads_left = true;
+                break;
+            }
             if let Some(d) = &e.dem_q {
                 let (slot, g) = self.dem.alloc(device, queue, *key);
                 grew |= g;
@@ -748,6 +760,11 @@ impl GpuMap {
         if grew {
             self.map_bind = None;
         }
+    }
+
+    /// Planes the last sync left for the next, its upload budget spent: the host keeps frames coming until they are in.
+    pub fn uploads_pending(&self) -> bool {
+        self.uploads_left
     }
 
     /// Layers allocated per plane: dem, line, land+water, imagery.
