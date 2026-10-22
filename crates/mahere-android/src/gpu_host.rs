@@ -311,6 +311,10 @@ impl GpuHost {
             map.view_depth().hash(&mut hs);
             map.zoom_depth().hash(&mut hs);
             map.past_data().hash(&mut hs);
+            // The ring round the globe while its base set loads: each cell's arrival, and the zoom it circles.
+            if let Some(done) = map.globe_loading() {
+                ((done * 10.0).round() as u32, c.ppd.to_bits()).hash(&mut hs);
+            }
             hs.finish()
         });
         // Labels: laid out again when the view rests; every frame each letter is a quad at its label's place on the map now.

@@ -708,20 +708,23 @@ pub extern "system" fn Java_nz_mahere_app_MahereActivity_nativeInit(
     let session = store.as_ref().and_then(|s| mahere_store::load_session(s));
     let settings = store.as_ref().and_then(|s| mahere_store::load_settings(s));
     lap("session and settings");
-    // Mt St Helens until the first GPS fix recenters us; a saved view only if it is a view (finite, on the globe, at a zoom the map has).
-    let home = Camera::new(46.2000, -122.1900, 12_000.0, 0.0);
-    let cam = match session {
+    // A saved view only if it is a view (finite, on the globe, at a zoom the map has); without one, a fresh install's whole globe ([`MapCore::fresh_globe`]), which the first GPS fix turns to face.
+    let restored = match session {
         Some(s) if s.lat.is_finite() && s.lon.is_finite() && s.ppd.is_finite() && s.bearing.is_finite() && s.lat.abs() <= 90.0 && s.lon.abs() <= 360.0 && (1.0..=4_000_000.0).contains(&s.ppd) => {
-            Camera::new(s.lat, s.lon, s.ppd, s.bearing)
+            Some(Camera::new(s.lat, s.lon, s.ppd, s.bearing))
         }
-        _ => home,
+        _ => None,
     };
+    let cam = restored.unwrap_or_else(|| Camera::new(0.0, 0.0, 1.0, 0.0));
     eprintln!("camera: {:.5} {:.5} ppd {:.1} bearing {:.3}", cam.lat(), cam.lon(), cam.ppd, cam.bearing());
     let mut areas = mahere_engine::areas::Areas::new(cell_store.clone());
     if let Some(l) = &layer_stores {
         areas.set_layer_stores(vec![l.dem.clone(), l.img.clone()]);
     }
     let mut map = MapCore::layered(cell_store, layer_stores, cam);
+    if restored.is_none() {
+        map.fresh_globe(None);
+    }
     if let Some(v) = &store {
         map.set_user_store(std::sync::Arc::new(mahere_store::VaultUser::new(v.clone())));
         areas.set_store(std::sync::Arc::new(mahere_store::VaultAreas::new(v.clone())));
@@ -775,8 +778,8 @@ pub extern "system" fn Java_nz_mahere_app_MahereActivity_nativeInit(
         last_cursor: (0., 0.),
         two: None,
         suppress_move: false,
-        // A restored session IS the view; don't let the first fix yank it.
-        centered_once: session.is_some(),
+        // A restored session IS the view; don't let the first fix yank it. A fresh globe turns to face the first fix, keeping its zoom.
+        centered_once: restored.is_some(),
         store,
         cells_cache,
         recorder,

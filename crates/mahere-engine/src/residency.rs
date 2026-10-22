@@ -382,8 +382,10 @@ impl Residency {
         // Everything still missing goes every time, pending or not: the loader keeps only the newest list, so a cell dropped from an older one would otherwise stay pending forever and never arrive (the holes Nick saw once the orientation sensor made every frame a new list). Nothing is sent while the missing set is unchanged.
         // Resident cells (there, base and all) without a layer the view now shows: asked for again with it, after every missing base.
         let want = self.want_layers;
+        // The globe's ten depth-0 cells take every layer, whatever the view shows (Nick 2026-10-22: the base set, then its terrain, imagery and near-infrared, then the screen).
+        let want_of = |k: &CellKey| if k.depth == 0 { WANT_DEM | WANT_IMG | WANT_NIR } else { want };
         let mut fill: Vec<CellKey> = if self.layers.is_some() {
-            list.iter().copied().filter(|k| !self.failed.contains_key(k) && self.pool.map.get(k).is_some_and(|e| e.exists && e.layers & want != want)).collect()
+            list.iter().copied().filter(|k| !self.failed.contains_key(k) && self.pool.map.get(k).is_some_and(|e| e.exists && e.layers & want_of(k) != want_of(k))).collect()
         } else {
             Vec::new()
         };
@@ -407,9 +409,17 @@ impl Residency {
         fill.sort_by_key(|k| near(k, center));
         self.fill_left = fill.len();
         self.bases_left = list.len();
-        // Cells baked whole carry everything in one read; cells in layers come base first, the layers after.
+        // Cells baked whole carry everything in one read; cells in layers come base first, the layers after. The globe's depth-0 set before all of it: its bases, then its layers, then the view's bases, then the view's layers.
         let first = if self.layers.is_some() { 0 } else { want };
-        let list: Vec<(CellKey, u8)> = list.into_iter().map(|k| (k, first)).chain(fill.into_iter().map(|k| (k, want))).collect();
+        let (globe_bases, bases): (Vec<CellKey>, Vec<CellKey>) = list.into_iter().partition(|k| k.depth == 0);
+        let (globe_fill, fill): (Vec<CellKey>, Vec<CellKey>) = fill.into_iter().partition(|k| k.depth == 0);
+        let list: Vec<(CellKey, u8)> = globe_bases
+            .into_iter()
+            .map(|k| (k, if self.layers.is_some() { 0 } else { want_of(&k) }))
+            .chain(globe_fill.into_iter().map(|k| (k, want_of(&k))))
+            .chain(bases.into_iter().map(|k| (k, first)))
+            .chain(fill.into_iter().map(|k| (k, want)))
+            .collect();
         let warm = if self.layers.is_some() { want } else { 0 };
         // Nothing missing: the cells around the view, into the store.
         let view = self.desired.iter().fold(self.desired.len() as u64, |h, k| h.wrapping_add((k.prefix ^ ((k.depth as u64) << 58)).wrapping_mul(0x9E37_79B9_7F4A_7C15)));
@@ -439,6 +449,11 @@ impl Residency {
         if !list.is_empty() {
             let _ = self.want_tx.send(WantList { list, warm, prefetch: Vec::new() });
         }
+    }
+
+    /// The globe's base set: how many of the ten depth-0 cells are in.
+    pub fn globe_bases(&self) -> usize {
+        self.pool.map.iter().filter(|(k, e)| k.depth == 0 && e.exists).count()
     }
 
     /// Whether a cell lies under one the loader confirmed absent, where nothing exists.
@@ -521,6 +536,15 @@ impl Residency {
 
 /// The newest want-list is the only one that matters: an older list's leftovers are cells the view no longer needs (the main side forgets them as pending too, so they're re-requested if they come back).
 /// Each loader takes the next cell as it finishes one and sends it on at once, so a slow cell holds up only itself (in batches, a whole batch waited on its slowest fetch); a newer list replaces what is queued.
+/// The loaders' work since start: bases loaded and their microseconds, cells loaded with their layers and theirs (2026-10-22: a relaunch with everything on the phone took ten seconds to fill the screen).
+static LOAD_STATS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+/// [`LOAD_STATS`] as (bases, base ms, with layers, their ms): the ms summed over the loaders, not wall time.
+pub fn load_stats() -> (u64, f64, u64, f64) {
+    let g = |i: usize| LOAD_STATS[i].load(std::sync::atomic::Ordering::Relaxed);
+    (g(0), g(1) as f64 / 1000.0, g(2), g(3) as f64 / 1000.0)
+}
+
 fn loader_thread(store: Arc<dyn CellStore>, layers: Option<LayerStores>, want_rx: Receiver<WantList>, done_tx: Sender<Loaded>, pack_cpu: Arc<std::sync::atomic::AtomicBool>) {
     // Fetching is waiting on the network far more than decoding (a cell is a round trip of a hundred milliseconds or more to the bucket, Nick 2026-10-15: tiles slow though small), so cells from the bucket load LOADERS at a time, in the list's order (every base, then the layers: Nick 2026-10-15, base first); from the device, as many as there are cores to decode them.
     let loaders = if layers.is_some() { LOADERS } else { (rayon::current_num_threads() / 2).clamp(2, 4) };
@@ -574,7 +598,11 @@ fn loader(store: &dyn CellStore, layers: Option<&LayerStores>, done_tx: &Sender<
         };
         match job {
             Work::Load(k, want) => {
+                let t = std::time::Instant::now();
                 let l = load_cell(store, layers, want, k, pack_cpu.load(std::sync::atomic::Ordering::Relaxed));
+                let i = if want == 0 { 0 } else { 2 };
+                LOAD_STATS[i].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                LOAD_STATS[i + 1].fetch_add(t.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
                 {
                     let mut q = lock.lock().unwrap();
                     q.busy.remove(&(k, want));

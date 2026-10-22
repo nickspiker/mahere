@@ -272,6 +272,10 @@ pub struct MapCore {
     pub contour_interval: f32,
     /// The contour interval held by hand, metres; None fits it to the view's elevation span (Nick 2026-10-21: an Auto row to lock it in).
     pub contour_hold: Option<f32>,
+    /// The next frame fits the whole globe to the screen (a fresh install's first view; the screen's size is known only then).
+    fit_globe: bool,
+    /// When the map was made, until its first view is complete (then logged).
+    started: Option<Instant>,
     /// Degrees the device is turned clockwise from north (0 when no sensor feeds it); the lighting turns against it.
     pub device_heading: f32,
     /// The device's rotation matrix from the orientation sensor, world (east, north, up) = R · device (x right, y up the screen, z out of it); identity without a sensor.
@@ -387,6 +391,8 @@ impl MapCore {
             contours_on_screen: 32.0,
             contour_interval: 0.0,
             contour_hold: None,
+            fit_globe: false,
+            started: Some(Instant::now()),
             device_heading: 0.0,
             device_rot: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
             real_sun: false,
@@ -441,6 +447,31 @@ impl MapCore {
         let (cx, cy) = (w as f64 * 0.5, h as f64 * 0.5);
         let (lat, lon) = self.cam.screen_to_geo(cx, cy, w, h);
         self.place_anchor(lat, lon, cx + dx, cy + dy, w, h);
+    }
+
+    /// A fresh install's first view (Nick 2026-10-22): the whole globe, centred on the GPS fix when there is one and anywhere at all when not, turned any way; the globe fits the screen at the first frame.
+    pub fn fresh_globe(&mut self, at: Option<(f64, f64)>) {
+        // A seed from the clock: nothing here needs more than a different place each install.
+        let mut x = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos() as u64) ^ 0x9E37_79B9_7F4A_7C15;
+        let mut next = move || {
+            x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = x;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            (z ^ (z >> 31)) as f64 / u64::MAX as f64
+        };
+        // Uniform over the sphere: the sine of the latitude even, not the latitude.
+        let (lat, lon) = at.unwrap_or_else(|| ((2.0 * next() - 1.0).asin().to_degrees(), next() * 360.0 - 180.0));
+        let bearing = next() * core::f64::consts::TAU;
+        self.cam = Camera::new(lat, lon, 1.0, bearing);
+        self.fit_globe = true;
+        self.dirty = true;
+    }
+
+    /// The globe's base set while it is coming in: the share of the ten depth-0 cells loaded, None once all are (or with nothing to wait for).
+    pub fn globe_loading(&self) -> Option<f32> {
+        let n = self.res.globe_bases();
+        (n < 10).then_some(n as f32 / 10.0)
     }
 
     /// The least pixels per degree a screen may show: the whole globe as a disk filling 94% of the shorter side.
@@ -805,14 +836,12 @@ impl MapCore {
         self.mark_dirty();
     }
 
-    /// A view's wanted cells, with the ten depth-0 cells while the geoid layer shows: it draws from their geoid at every zoom, and a map opened zoomed in has never loaded them (2026-10-19).
-    fn with_geoid(&self, mut want: Vec<mahere_tiles::CellKey>) -> Vec<mahere_tiles::CellKey> {
-        if self.layer_mask.geoid {
-            for d in 0..10u8 {
-                let k = mahere_tiles::CellKey::from_grid(d, 0, 0, 0);
-                if !want.contains(&k) {
-                    want.push(k);
-                }
+    /// A view's wanted cells, with the globe's ten depth-0 cells always: the base set every view falls back to, loaded first on a fresh install with the ring round the globe (Nick 2026-10-22), and the geoid's source at every zoom (2026-10-19).
+    fn with_globe(&self, mut want: Vec<mahere_tiles::CellKey>) -> Vec<mahere_tiles::CellKey> {
+        for d in 0..10u8 {
+            let k = mahere_tiles::CellKey::from_grid(d, 0, 0, 0);
+            if !want.contains(&k) {
+                want.push(k);
             }
         }
         want
@@ -1028,7 +1057,14 @@ impl MapCore {
     /// Integrate async-loaded cells. True if a redraw is due: cells arrived or the camera/sun/GPS changed since the last render.
     pub fn tick(&mut self, _w: usize, _h: usize) -> bool {
         let routed = self.poll_route();
-        self.res.drain() > 0 || self.dirty || routed
+        let changed = self.res.drain() > 0 || self.dirty || routed;
+        // When the first view and the globe's base set are complete, how long that took and the loaders' share (2026-10-22: ten seconds on a relaunch with every cell on the phone).
+        if let Some(t) = self.started.filter(|_| self.res.converged() && !self.res.pool.map.is_empty() && self.globe_loading().is_none()) {
+            self.started = None;
+            let (b, bms, f, fms) = residency::load_stats();
+            eprintln!("map: first view complete {:.2} s after start: {b} bases loaded in {bms:.0} ms, {f} with their layers in {fms:.0} ms (summed over the loaders), {} cells resident", t.elapsed().as_secs_f32(), self.res.pool.map.len());
+        }
+        changed
     }
 
     // ==================== NAVIGATION ====================
@@ -1163,7 +1199,7 @@ impl MapCore {
                 // Residency still hears the want: it re-sends an unchanged missing list once a second.
                 let center = Coord::from_lat_lon(self.cam.lat(), self.cam.lon());
                 let (cu, cv) = center.uv();
-                self.res.want(self.with_geoid(p.want.clone()), (cu, cv));
+                self.res.want(self.with_globe(p.want.clone()), (cu, cv));
                 self.last_frame_ms = t0.elapsed().as_secs_f32() * 1000.0;
                 return p;
             }
@@ -1172,7 +1208,7 @@ impl MapCore {
         self.last_straddle_blocks = p.straddle_blocks;
         let center = Coord::from_lat_lon(self.cam.lat(), self.cam.lon());
         let (cu, cv) = center.uv();
-        self.res.want(self.with_geoid(p.want.clone()), (cu, cv));
+        self.res.want(self.with_globe(p.want.clone()), (cu, cv));
         self.plan_cache = Some((key, p.clone()));
         self.last_frame_ms = t0.elapsed().as_secs_f32() * 1000.0;
         p
@@ -1324,7 +1360,29 @@ impl MapCore {
             self.draw_gps(w, h);
         }
         self.draw_compass(w, h);
+        self.draw_globe_ring(w, h);
         &self.canvas
+    }
+
+    /// The ring round the globe while its base set loads: from the top, clockwise, closing as the ten depth-0 cells arrive, gone when they are all in (Nick 2026-10-22).
+    fn draw_globe_ring(&mut self, w: usize, h: usize) {
+        let Some(done) = self.globe_loading() else { return };
+        if !self.cam.limb_visible(w, h) {
+            return;
+        }
+        const RING: [u8; 3] = [232, 232, 236];
+        let (cx, cy) = (w as f32 * 0.5, h as f32 * 0.5);
+        let r = self.cam.radius() as f32 + 0.015 * w.min(h) as f32;
+        let half_w = (0.004 * w.min(h) as f32).max(1.5);
+        let sweep = done.max(0.01) * core::f32::consts::TAU;
+        let steps = ((r * sweep) as usize / 3).clamp(8, 1440);
+        let at = |a: f32| (cx + r * a.sin(), cy - r * a.cos());
+        let mut prev = at(0.0);
+        for i in 1..=steps {
+            let p = at(i as f32 / steps as f32 * sweep);
+            draw_segment(&mut self.canvas, w, h, prev.0, prev.1, p.0, p.1, half_w, RING);
+            prev = p;
+        }
     }
 
     /// The GPS pin on screen: centre and accuracy radius in pixels, for a renderer that draws it itself.
@@ -1337,6 +1395,9 @@ impl MapCore {
 
     /// Everything a frame needs before any pixel: drain arrivals, lighting for the current sun and bearing, depth selection, the contour interval fit to the previous frame's range.
     fn prepare(&mut self, w: usize, h: usize) {
+        if std::mem::take(&mut self.fit_globe) && w > 0 && h > 0 {
+            self.cam.ppd = Self::ppd_floor(w, h);
+        }
         self.dirty = false;
         self.res.frame += 1;
         self.res.drain();
@@ -1482,7 +1543,7 @@ impl MapCore {
         // Residency: request what the lattice says we need, nearest-first.
         let center = Coord::from_lat_lon(self.cam.lat(), self.cam.lon());
         let (cu, cv) = center.uv();
-        self.res.want(self.with_geoid(want), (cu, cv));
+        self.res.want(self.with_globe(want), (cu, cv));
 
         self.draw_gps(w, h);
         self.draw_compass(w, h);

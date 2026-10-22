@@ -104,8 +104,12 @@ pub fn load_into(text: &mut TextRenderer, fonts: &FontPacks, cursor: &mut usize)
     *cursor += docs.len();
     let mut added = false;
     for (id, doc) in docs {
+        let t = Instant::now();
         match text.load_pack(&doc, fonts.author) {
-            Ok(_) => added = true,
+            Ok(_) => {
+                added = true;
+                eprintln!("font pack {id}: checked and loaded in {} ms on {}", t.elapsed().as_millis(), std::thread::current().name().unwrap_or("a thread"));
+            }
             Err(e) => {
                 eprintln!("font pack {id} refused: {e}");
                 fonts.refused(id);

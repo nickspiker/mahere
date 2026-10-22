@@ -1125,14 +1125,17 @@ impl VaultFonts {
 
 impl mahere_panel::fonts::PackSource for VaultFonts {
     fn get(&self, id: &str) -> Result<Vec<u8>, String> {
+        let t = std::time::Instant::now();
         if let Some(s) = &self.store {
             if let Ok(Some(b)) = s.read_device(&font_key(id)) {
                 if !b.is_empty() {
+                    eprintln!("font pack {id}: {} KB from the vault in {} ms", b.len() / 1024, t.elapsed().as_millis());
                     return Ok(b);
                 }
             }
         }
         let doc = self.fetch(id)?;
+        eprintln!("font pack {id}: {} KB from the bucket in {} ms", doc.len() / 1024, t.elapsed().as_millis());
         if let Some(s) = &self.store {
             let _ = s.write_device(&font_key(id), &doc);
         }

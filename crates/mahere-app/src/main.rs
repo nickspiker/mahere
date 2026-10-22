@@ -727,15 +727,20 @@ fn main() {
         mahere_store::migrate_vault_cells(v.clone(), c.clone());
     }
     let session = vault.as_ref().and_then(|s| mahere_store::load_session(s));
+    // Without a saved view, a fresh install's whole globe, anywhere and turned any way ([`MapCore::fresh_globe`]; the desktop has no GPS).
+    let fresh = session.is_none();
     let cam = match session {
         Some(s) => Camera::new(s.lat, s.lon, s.ppd, s.bearing),
-        None => Camera::new(46.2000, -122.1900, 12_000.0, 0.0),
+        None => Camera::new(0.0, 0.0, 1.0, 0.0),
     };
     let mut areas = mahere_engine::areas::Areas::new(store.clone());
     if let Some(l) = &layer_stores {
         areas.set_layer_stores(vec![l.dem.clone(), l.img.clone()]);
     }
     let mut map = MapCore::layered(store, layer_stores, cam);
+    if fresh {
+        map.fresh_globe(None);
+    }
     // The user's own cells, as files beside the data; the areas as files under them.
     let user_dir = mahere_store::user_dir();
     let _ = std::fs::create_dir_all(user_dir.join("areas"));
