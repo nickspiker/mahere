@@ -391,6 +391,10 @@ impl GpuHost {
             self.labels_ms = 0.0;
             self.overlay_ms = 0.0;
             self.encode_ms = 0.0;
+            // Memory: what the allocator has handed out, and what the resident cells hold of it.
+            let (cells, waiting, held) = map.pool().held();
+            let heap = unsafe { libc::mallinfo() }.uordblks as usize;
+            eprintln!("memory: heap {} MB allocated; {cells} cells hold {} MB, {waiting} of them planes not yet on the GPU", heap >> 20, held >> 20);
             eprintln!("gpu: {} frames, per frame {:.2} ms plan + {:.2} ms sync + {:.2} ms overlay and encode + {:.2} ms waiting for the swapchain, {} resident, {} pending, {} uploads, layers {:?}, {} of {} blocks from composites, {} cells baked so far", self.frames, self.plan_ms / n, self.sync_ms / n, (self.work_ms - self.plan_ms - self.sync_ms) / n, (self.frame_ms - self.work_ms) / n, map.pool().map.len(), map.pending_cells(), self.map.uploads, self.map.layers(), self.map.fast_blocks.0, self.map.fast_blocks.1, self.map.bakes);
             self.frames = 0;
             self.frame_ms = 0.0;

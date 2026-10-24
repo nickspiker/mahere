@@ -233,6 +233,20 @@ pub struct Pool {
     pub map: FxHashMap<CellKey, Entry>,
 }
 
+impl Pool {
+    /// What the resident cells hold in memory: cells, those still holding planes a GPU host has yet to take, and the bytes of every plane held (2026-10-23: a Pixel 3a killed for memory zoomed in at the south pole).
+    pub fn held(&self) -> (usize, usize, usize) {
+        let class = |c: &Option<mahere_tiles::ClassCell>| c.as_ref().map_or(0, |c| c.class.len() + c.cov.len() + c.mag.len() + c.uses.len());
+        let (mut waiting, mut bytes) = (0, 0);
+        for e in self.map.values() {
+            let planes = class(&e.line) + class(&e.land) + class(&e.own) + class(&e.mvum) + e.water.as_ref().map_or(0, |w| w.cov.len()) + e.img.as_ref().map_or(0, |i| i.red.len() + i.green.len() + i.blue.len() + i.nir.len());
+            waiting += (planes > 0) as usize;
+            bytes += planes + e.dem_q.as_ref().map_or(0, |d| d.tex.len() * 2) + e.dem.as_ref().map_or(0, |d| d.texel.len() * 8) + e.geoid.as_ref().map_or(0, |g| g.len() * 2);
+        }
+        (self.map.len(), waiting, bytes)
+    }
+}
+
 /// The layers a published cell comes in besides its base (Nick 2026-10-14: imagery and infrared only when a view shows them, and the terrain a layer of its own): each from a store of its own.
 #[derive(Clone)]
 pub struct LayerStores {
@@ -579,6 +593,37 @@ pub fn load_stats() -> (u64, f64, u64, f64) {
     (g(0), g(1) as f64 / 1000.0, g(2), g(3) as f64 / 1000.0)
 }
 
+/// Decodes under way at once, and their limit: half the cores, two at least. The loaders are many because a fetch is mostly waiting on the network; a decode is all memory and CPU, its temporaries megabytes, and twenty at once on a Pixel 3a took memory past what Android leaves an app and it was killed (2026-10-23: zoomed in at the south pole, where five diamonds meet and the view wants half again the cells).
+static DECODING: (std::sync::Mutex<usize>, std::sync::Condvar) = (std::sync::Mutex::new(0), std::sync::Condvar::new());
+
+fn decode_limit() -> usize {
+    static LIMIT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *LIMIT.get_or_init(|| (std::thread::available_parallelism().map_or(4, |n| n.get()) / 2).max(2))
+}
+
+/// A decode's turn: held while it runs, the next waiting one let in when it ends.
+struct DecodeTurn;
+
+impl DecodeTurn {
+    fn take() -> DecodeTurn {
+        let (lock, wake) = &DECODING;
+        let mut n = lock.lock().unwrap();
+        while *n >= decode_limit() {
+            n = wake.wait(n).unwrap();
+        }
+        *n += 1;
+        DecodeTurn
+    }
+}
+
+impl Drop for DecodeTurn {
+    fn drop(&mut self) {
+        let (lock, wake) = &DECODING;
+        *lock.lock().unwrap() -= 1;
+        wake.notify_one();
+    }
+}
+
 fn loader_thread(store: Arc<dyn CellStore>, layers: Option<LayerStores>, want_rx: Receiver<WantList>, done_tx: Sender<Loaded>, pack_cpu: Arc<std::sync::atomic::AtomicBool>) {
     // Fetching is waiting on the network far more than decoding (a cell is a round trip of a hundred milliseconds or more to the bucket, Nick 2026-10-15: tiles slow though small), so cells from the bucket load LOADERS at a time, in the list's order (every base, then the layers: Nick 2026-10-15, base first); from the device, as many as there are cores to decode them.
     let loaders = if layers.is_some() { LOADERS } else { (rayon::current_num_threads() / 2).clamp(2, 4) };
@@ -760,6 +805,8 @@ fn load_cell(store: &dyn CellStore, layers: Option<&LayerStores>, want: u8, key:
     if bytes.is_empty() && dem_bytes.is_empty() && img_bytes.0.is_empty() && img_bytes.1.is_empty() {
         return Loaded { key, merge, entry: Some(Entry { layers: layers_loaded, exists: true, ..Entry::default() }) };
     }
+    // Fetched: the decode waits its turn (the fetches above did not).
+    let _turn = DecodeTurn::take();
     let planes = match mahere_tiles::publish::decode_layers(if merge { None } else { non_empty(&bytes) }, non_empty(&dem_bytes), non_empty(&img_bytes.0), non_empty(&img_bytes.1)) {
         Ok(p) => p,
         Err(e) => {
