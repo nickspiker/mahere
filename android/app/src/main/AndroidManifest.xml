@@ -18,6 +18,8 @@
         android:roundIcon="@mipmap/ic_launcher_round"
         android:theme="@android:style/Theme.NoTitleBar.Fullscreen"
         android:extractNativeLibs="true">
+        <!-- Profileable from the shell (Android's heap and CPU profilers over adb), as Google recommends for release builds: no debugging, no data access (2026-10-23: finding where a Pixel 3a's memory went). -->
+        <profileable android:shell="true" />
         <activity
             android:name=".MahereActivity"
             android:exported="true"
