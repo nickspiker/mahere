@@ -697,10 +697,13 @@ fn compose(dem: &DemRef, vec: &VecRef, pool: &Pool, diamond: u8, uq: i64, vq: i6
 pub const DETAIL_FIRST: u8 = 8;
 pub const DETAIL_COLOURS: [[u8; 3]; 7] = [[40, 90, 230], [40, 160, 230], [40, 200, 160], [90, 210, 60], [220, 220, 40], [240, 140, 30], [230, 40, 40]];
 
+/// The least slope a contour is drawn on: dead flat ground (the sea, a lake, exactly level) has none and draws none; anything sloping at all does (Nick 2026-10-24: at 0.02, over a degree, Antarctica's plateau, a hundred metres over tens of kilometres, drew no contours at any interval and looked empty). The shader's `contour_at` holds the same.
+pub const CONTOUR_MIN_SLOPE: f32 = 1e-4;
+
 /// Contour coverage at a pixel: distance (in metres) to the nearest multiple of the interval, over the slope and the metres per pixel, gives the distance on screen; feather over one pixel. Flat ground (where the distance would be meaningless) draws nothing. Returns (coverage, is_index).
 #[inline(always)]
 fn contour_cov(elev_m: f32, slope: f32, c: &Contours) -> (f32, bool) {
-    if slope < 0.02 || c.interval <= 0.0 {
+    if slope < CONTOUR_MIN_SLOPE || c.interval <= 0.0 {
         return (0.0, false);
     }
     let level = (elev_m / c.interval).round();

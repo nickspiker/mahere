@@ -711,7 +711,8 @@ fn baking() -> bool {
 fn contour_at(s: Dem, u: u32, v: u32) -> vec2<f32> {
     let nzn = max(s.n.z, 1e-4);
     let slope = sqrt(max(1.0 - nzn * nzn, 0.0)) / nzn;
-    if (slope < 0.02 || U.contour.x <= 0.0) {
+    // Dead flat ground (the sea, a lake) has no slope and draws no contour; any slope does, Antarctica's plateau too (raster.rs CONTOUR_MIN_SLOPE).
+    if (slope < 1e-4 || U.contour.x <= 0.0) {
         return vec2<f32>(0.0);
     }
     let interval = U.contour.x;

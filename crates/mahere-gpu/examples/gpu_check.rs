@@ -248,11 +248,19 @@ fn main() {
         gpu.set_atlas(&device, &queue, a.side as u32, &a.rg, a.version);
         gpu.set_labels(&device, &queue, &labeller.glyphs(&map.cam, w, h), &labeller.segments(&map.cam, w, h));
     }
-    let luts = map.luts();
-    // Time the second frame: the first pays for pipeline warm-up.
+    // Time the second frame: the first pays for pipeline warm-up. Between them the elevations the first drew go back to the map, as a host's do, so the second fits its contour interval to them (without it no contours draw at all).
     let mut frame_ms = 0.0;
     gpu.set_user(&device, &queue, &map.user, &map.preview, map.preview_version, w as u32, h as u32);
     for i in 0..2 {
+        if i == 1 {
+            device.poll(wgpu::PollType::wait_indefinitely()).ok();
+            if let Some(r) = gpu.take_range() {
+                map.set_drawn_range(r);
+                plan = map.plan(w, h);
+                map.render(w, h);
+            }
+        }
+        let luts = map.luts();
         let t = std::time::Instant::now();
         let mut enc = device.create_command_encoder(&Default::default());
         gpu.render(&device, &queue, &mut enc, &view, &plan, luts, w as u32, h as u32, mahere_gpu::RenderMode::Full);
@@ -263,6 +271,7 @@ fn main() {
             frame_ms = t.elapsed().as_secs_f32() * 1000.0;
         }
     }
+    let luts = map.luts();
     // The elevations the map pass drew, read back as the phone reads them, against the CPU frame's own range.
     device.poll(wgpu::PollType::wait_indefinitely()).ok();
     let q = |e: u16| e as f32 * 0.5 - 11000.0;
