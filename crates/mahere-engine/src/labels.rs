@@ -24,7 +24,7 @@ const RIVER: u8 = mahere_tiles::osm::RoadClass::Waterway as u8 + 1;
 const LAKE: u8 = mahere_tiles::names::AREA + mahere_tiles::osm::AreaClass::Water as u8;
 const _: () = assert!(RIVER == 12 && LAKE == mahere_tiles::names::AREA + 12, "the panel letters waterways as 12 and lakes as AREA + 12");
 
-/// The most cells' names kept between gathers; past it the cache starts again.
+/// The most cells' names kept between gathers; past it the cache starts again (a backstop: the cache keeps only resident cells anyway).
 const NAMES_KEPT: usize = 4096;
 
 /// How far past the screen's edge a texel still counts, so a label running off the edge is laid out whole.
@@ -93,6 +93,8 @@ pub fn gather(job: &NameJob, cache: &mut NamesCache) -> NamedTexels {
     for k in &job.reloaded {
         cache.remove(k);
     }
+    // Only cells still resident keep their names: a cell's two name planes are half a megabyte, and every cell a session passed through stayed until the 4096th (2026-10-23: a Pixel 3a killed for memory zoomed in at the south pole, the names of every cell seen on the way held).
+    cache.retain(|k, _| job.resident.contains(k));
     let (w, h, depth) = (job.w, job.h, job.depth);
     let mut keys: Vec<CellKey> = Vec::new();
     let step = 32usize;

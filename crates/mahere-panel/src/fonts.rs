@@ -22,8 +22,12 @@ const RETRY: Duration = Duration::from_secs(30);
 
 #[derive(Default)]
 struct State {
-    /// Every document fetched, in arrival order: each renderer keeps how far through it has loaded.
-    docs: Vec<(&'static str, Arc<Vec<u8>>)>,
+    /// Every document fetched, in arrival order: each renderer keeps how far through it has loaded. A document's bytes go once every renderer has loaded it (each keeps its own face), the place in the list staying.
+    docs: Vec<(&'static str, Option<Arc<Vec<u8>>>)>,
+    /// How many renderers have loaded each document.
+    loads: Vec<usize>,
+    /// The renderers the host draws with, 0 for unknown (then nothing is let go).
+    renderers: usize,
     /// Packs being fetched, or fetched already.
     asked: HashSet<&'static str>,
     /// Packs whose fetch failed, and when.
@@ -65,7 +69,10 @@ impl FontPacks {
                     let got = me.source.get(id);
                     let mut st = me.state.lock().unwrap();
                     match got {
-                        Ok(doc) => st.docs.push((id, Arc::new(doc))),
+                        Ok(doc) => {
+                            st.docs.push((id, Some(Arc::new(doc))));
+                            st.loads.push(0);
+                        }
                         Err(e) => {
                             eprintln!("font pack {id}: {e}");
                             st.failed.insert(id, Instant::now());
@@ -87,8 +94,30 @@ impl FontPacks {
         self.state.lock().unwrap().docs.len()
     }
 
-    fn since(&self, from: usize) -> Vec<(&'static str, Arc<Vec<u8>>)> {
-        self.state.lock().unwrap().docs.get(from..).map(<[_]>::to_vec).unwrap_or_default()
+    /// How many renderers load every pack (the panel's and the lettering's, say): a document they have all loaded is let go, each keeping its own face (2026-10-23: 57 MB of packs at a whole-globe view were held three times on a Pixel 3a, killed for memory).
+    pub fn set_renderers(&self, n: usize) {
+        self.state.lock().unwrap().renderers = n;
+    }
+
+    /// The bytes of what arrived since `from`, each with its place in the list, and where the list ended; a document already let go is read from the source again (a renderer made since, after a lost GPU device).
+    fn since(&self, from: usize) -> (usize, Vec<(usize, &'static str, Arc<Vec<u8>>)>) {
+        let (end, ids): (usize, Vec<(usize, &'static str, Option<Arc<Vec<u8>>>)>) = {
+            let st = self.state.lock().unwrap();
+            (st.docs.len().max(from), st.docs.iter().enumerate().skip(from).map(|(i, (id, d))| (i, *id, d.clone())).collect())
+        };
+        (end, ids.into_iter().filter_map(|(i, id, d)| d.or_else(|| self.source.get(id).ok().map(Arc::new)).map(|d| (i, id, d))).collect())
+    }
+
+    /// A renderer has loaded the document at `i`: once every renderer has, its bytes go.
+    fn loaded(&self, i: usize) {
+        let mut st = self.state.lock().unwrap();
+        let n = st.renderers;
+        if let Some(c) = st.loads.get_mut(i) {
+            *c += 1;
+            if n > 0 && *c >= n {
+                st.docs[i].1 = None;
+            }
+        }
     }
 
     /// A document a renderer refused: forgotten at the source and fetched again after [`RETRY`]. The list of arrivals only grows, so every renderer's place in it holds.
@@ -100,10 +129,11 @@ impl FontPacks {
 
 /// What arrived since `cursor` loaded into a renderer, each checked against the author's key; true when a face was added (whatever measured text before measures again).
 pub fn load_into(text: &mut TextRenderer, fonts: &FontPacks, cursor: &mut usize) -> bool {
-    let docs = fonts.since(*cursor);
-    *cursor += docs.len();
+    let (end, docs) = fonts.since(*cursor);
+    *cursor = end;
     let mut added = false;
-    for (id, doc) in docs {
+    for (i, id, doc) in docs {
+        fonts.loaded(i);
         let t = Instant::now();
         match text.load_pack(&doc, fonts.author) {
             Ok(_) => {

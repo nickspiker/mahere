@@ -764,6 +764,8 @@ pub extern "system" fn Java_nz_mahere_app_MahereActivity_nativeInit(
     }
     let recorder = store.clone().map(|s| std::sync::Arc::new(std::sync::Mutex::new(mahere_store::TrackRecorder::new(s))));
     let fonts = mahere_panel::fonts::FontPacks::new(mahere_store::VaultFonts::new(store.clone()), mahere_update::AUTHOR_PUBKEY);
+    // The panel's renderer and the lettering's load every pack; a document both have loaded is let go.
+    fonts.set_renderers(2);
     let mut app = AndroidApp {
         map,
         w: width as usize,
