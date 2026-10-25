@@ -213,7 +213,8 @@ impl Plane {
             if self.cap >= self.max {
                 return (None, false);
             }
-            let new_cap = (self.cap * 2).min(self.max);
+            // Half again, not double: growing holds the old array and the new at once, and on a phone the GPU's memory is the app's (2026-10-24: arrays doubling to 512 layers at the south pole took a Pixel 3a past what Android allows).
+            let new_cap = (self.cap + (self.cap / 2).max(8)).min(self.max);
             let new_tex = plane_texture(device, self.label, self.w, self.h, new_cap, self.format, self.extra);
             let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("grow plane") });
             enc.copy_texture_to_texture(

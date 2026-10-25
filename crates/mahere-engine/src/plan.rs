@@ -157,7 +157,7 @@ pub fn plan_frame(w: usize, h: usize, cam: &Camera, pool: &Pool, dem_depth: u8, 
         })
         .collect();
 
-    // Desired set and the elevation range, from the lattice. The corners dedupe to their finest cells first (a few hundred from a few thousand corners), then each walks its parents; at the coarse depths the ring of neighbours comes too, so a zoom out lands on cells already resident instead of a blank screen (Nick 2026-10-06), and they are small.
+    // Desired set and the elevation range, from the lattice. The corners dedupe to their finest cells first (a few hundred from a few thousand corners), then each walks its parents; at the coarse depths below the view's the ring of neighbours comes too, so a zoom out lands on cells already resident instead of a blank screen (Nick 2026-10-06), and they are small.
     let fine = dem_depth.max(vec_depth);
     let mut fine_cells: rustc_hash::FxHashSet<u64> = rustc_hash::FxHashSet::default();
     for c in &corners {
@@ -169,7 +169,8 @@ pub fn plan_frame(w: usize, h: usize, cam: &Camera, pool: &Pool, dem_depth: u8, 
         for d in MIN_DEPTH..=fine {
             let key = CellKey { depth: d, prefix: fp >> (2 * (fine - d) as u32) };
             desired.insert(key);
-            if d <= PREFETCH_DEPTH {
+            // Not at the view's own depth, the most cells by far: a zoom out lands on the coarser rings, and a pan's next cells are prefetched into the store (2026-10-24: at the south pole, where five diamonds meet, the ring at the view's depth doubled the resident cells and a Pixel 3a's GPU arrays with them, and it was killed for memory).
+            if d <= PREFETCH_DEPTH && d < fine {
                 let (cu, cv) = key.grid();
                 let n = 1u64 << d;
                 for (du, dv) in [(-1i64, -1i64), (0, -1), (1, -1), (-1, 0), (1, 0), (-1, 1), (0, 1), (1, 1)] {
