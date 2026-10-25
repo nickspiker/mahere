@@ -56,7 +56,7 @@ impl Gpu {
         let mut limits = wgpu::Limits::default();
         limits.max_texture_array_layers = adapter.limits().max_texture_array_layers.min(2048);
         limits.max_texture_dimension_2d = adapter.limits().max_texture_dimension_2d.max(limits.max_texture_dimension_2d);
-        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor { label: Some("mahere"), required_limits: limits, required_features: adapter.features() & wgpu::Features::TIMESTAMP_QUERY, ..Default::default() }))
+        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor { label: Some("mahere"), required_limits: limits, required_features: mahere_gpu::wanted_features(&adapter), ..Default::default() }))
             .map_err(|e| eprintln!("gpu: no device, the CPU draws the map: {e:?}"))
             .ok()?;
         device.on_uncaptured_error(std::sync::Arc::new(|e: wgpu::Error| eprintln!("gpu: {e}")));

@@ -434,9 +434,28 @@ const RANGE_COPIED: u8 = 1;
 const RANGE_MAPPING: u8 = 2;
 const RANGE_READY: u8 = 3;
 
+/// The map shader for a device: its colour arithmetic in 16-bit floats where the device has them (half the registers a fragment holds, twice the rate on Apple, Adreno and Mali; Nick 2026-10-25, a full optimise), in 32-bit where not, through the `hf`/`hv3` aliases the source writes them in.
+pub fn shader_source(f16: bool) -> String {
+    let prelude = if f16 { "enable f16;\nalias hf = f16;\nalias hv3 = vec3<f16>;\n" } else { "alias hf = f32;\nalias hv3 = vec3<f32>;\n" };
+    format!("{prelude}{}", include_str!("map.wgsl"))
+}
+
+/// The device features the map asks for when the adapter has them: 16-bit floats for the shader, the GPU's own clock for the passes.
+pub fn wanted_features(adapter: &wgpu::Adapter) -> wgpu::Features {
+    adapter.features() & (wgpu::Features::SHADER_F16 | wgpu::Features::TIMESTAMP_QUERY)
+}
+
 impl GpuMap {
-    pub fn new(device: &wgpu::Device, _queue: &wgpu::Queue, present_format: wgpu::TextureFormat) -> GpuMap {
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("mahere map"), source: wgpu::ShaderSource::Wgsl(include_str!("map.wgsl").into()) });
+    pub fn new(device: &wgpu::Device, queue: &wgpu::Queue, present_format: wgpu::TextureFormat) -> GpuMap {
+        // MAHERE_F32=1 keeps 32-bit colour on a device that has 16 (comparing the two).
+        Self::new_with(device, queue, present_format, std::env::var("MAHERE_F32").as_deref() == Ok("1"))
+    }
+
+    /// [`GpuMap::new`], with 32-bit colour kept on a device that has 16 when `force_f32`.
+    pub fn new_with(device: &wgpu::Device, _queue: &wgpu::Queue, present_format: wgpu::TextureFormat, force_f32: bool) -> GpuMap {
+        let f16 = device.features().contains(wgpu::Features::SHADER_F16) && !force_f32;
+        eprintln!("gpu: the map's colour in {}-bit floats", if f16 { 16 } else { 32 });
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("mahere map"), source: wgpu::ShaderSource::Wgsl(shader_source(f16).into()) });
         let uint_array = wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Uint, view_dimension: wgpu::TextureViewDimension::D2Array, multisampled: false };
         let storage = wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: true }, has_dynamic_offset: false, min_binding_size: None };
         let float_array = wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: false }, view_dimension: wgpu::TextureViewDimension::D2Array, multisampled: false };
@@ -1660,10 +1679,13 @@ fn rgba(c: [u8; 4]) -> [f32; 4] {
 
 #[cfg(test)]
 mod shader_tests {
-    /// The map shader parses and validates (a WGSL mistake otherwise shows only on a phone, as a black map).
+    /// The map shader parses and validates in both its builds, 16-bit colour and 32 (a WGSL mistake otherwise shows only on a phone, as a black map).
     #[test]
     fn the_map_shader_validates() {
-        let module = naga::front::wgsl::parse_str(include_str!("map.wgsl")).unwrap_or_else(|e| panic!("{}", e.emit_to_string(include_str!("map.wgsl"))));
-        naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::all()).validate(&module).expect("valid");
+        for f16 in [true, false] {
+            let src = super::shader_source(f16);
+            let module = naga::front::wgsl::parse_str(&src).unwrap_or_else(|e| panic!("f16 {f16}: {}", e.emit_to_string(&src)));
+            naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::all()).validate(&module).unwrap_or_else(|e| panic!("f16 {f16}: {e:?}"));
+        }
     }
 }

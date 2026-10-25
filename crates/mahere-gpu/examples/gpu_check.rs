@@ -102,7 +102,7 @@ fn main() {
     // Texture arrays hold one cell per layer: ask for the adapter.s real layer limit, not WebGPU.s 256.
     let mut limits = wgpu::Limits::default();
     limits.max_texture_array_layers = adapter.limits().max_texture_array_layers.min(2048);
-    let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor { label: Some("mahere"), required_limits: limits, required_features: adapter.features() & wgpu::Features::TIMESTAMP_QUERY, ..Default::default() })).expect("device");
+    let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor { label: Some("mahere"), required_limits: limits, required_features: mahere_gpu::wanted_features(&adapter), ..Default::default() })).expect("device");
     let format = wgpu::TextureFormat::Rgba8Unorm;
     let mut gpu = GpuMap::new(&device, &queue, format);
     // MAHERE_SS=1 samples exactly where the CPU does (top-left of each pixel, no supersampling): the exactness check. The default is the anti-aliased frame.

@@ -107,7 +107,7 @@ impl GpuHost {
         // The still frame is drawn at three times the screen, larger than WebGPU's 8192 on a tall screen (a 1440 by 3040 Note 10+ needs 9120): ask for the GPU's own limit (Nick 2026-10-15: the screen flicked to black whenever the map came to rest).
         limits.max_texture_dimension_2d = adapter.limits().max_texture_dimension_2d.max(limits.max_texture_dimension_2d);
         // The GPU's own clock around the passes where it has one: what a frame costs it, apart from the CPU's share.
-        let required_features = adapter.features() & wgpu::Features::TIMESTAMP_QUERY;
+        let required_features = mahere_gpu::wanted_features(&adapter);
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor { label: Some("mahere"), required_limits: limits, required_features, ..Default::default() }))
             .map_err(|e| eprintln!("gpu: no device: {e:?}"))
             .ok()?;
@@ -124,7 +124,8 @@ impl GpuHost {
         // A linear 8-bit format: the shader writes display values, not scene-linear ones.
         let format = caps.formats.iter().copied().find(|f| !f.is_srgb()).unwrap_or(caps.formats[0]);
         let alpha = caps.alpha_modes.first().copied().unwrap_or(wgpu::CompositeAlphaMode::Auto);
-        let mut map = GpuMap::new(&device, &queue, format);
+        // debug.mahere.f32=1: 32-bit colour on a device that has 16, for comparing the two (read at start).
+        let mut map = GpuMap::new_with(&device, &queue, format, debug_prop("f32").as_deref() == Some("1"));
         map.upload_budget = UPLOADS_PER_FRAME;
         map.bake_budget = BAKES_PER_FRAME;
         let info = adapter.get_info();

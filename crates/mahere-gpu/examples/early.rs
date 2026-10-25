@@ -19,7 +19,7 @@ fn main() {
     let adapter = pollster::block_on(instance.request_adapter(&Default::default())).expect("adapter");
     let mut limits = wgpu::Limits::default();
     limits.max_texture_array_layers = adapter.limits().max_texture_array_layers.min(2048);
-    let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor { required_limits: limits, ..Default::default() })).expect("device");
+    let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor { required_limits: limits, required_features: mahere_gpu::wanted_features(&adapter), ..Default::default() })).expect("device");
     let format = wgpu::TextureFormat::Rgba8Unorm;
     let mut gpu = GpuMap::new(&device, &queue, format);
     gpu.scale = 1;

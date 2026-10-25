@@ -463,22 +463,22 @@ fn light_eval(n: vec3<f32>) -> vec3<f32> {
 }
 
 // Every authored colour is VSF RGB at gamma 2, quantised ×256: a byte is the light (b/256)². The style uniforms arrive already linear; the tables and constants are decoded here.
-fn dec(c: vec3<f32>) -> vec3<f32> {
-    let x = c / 256.0;
+fn dec(c: vec3<f32>) -> hv3 {
+    let x = hv3(c / 256.0);
     return x * x;
 }
 
-fn unpack_rgb(p: u32) -> vec3<f32> {
+fn unpack_rgb(p: u32) -> hv3 {
     return dec(vec3<f32>(f32((p >> 16u) & 255u), f32((p >> 8u) & 255u), f32(p & 255u)));
 }
 
 // A styled table entry's opacity, its top byte as a fraction.
-fn unpack_a(p: u32) -> f32 {
-    return f32(p >> 24u) / 255.0;
+fn unpack_a(p: u32) -> hf {
+    return hf(f32(p >> 24u) / 255.0);
 }
 
-fn img_light(b: u32) -> f32 {
-    return U.img_table[b >> 2u][b & 3u];
+fn img_light(b: u32) -> hf {
+    return hf(U.img_table[b >> 2u][b & 3u]);
 }
 
 // Opsin's highlight rail, (3x − x³)/2, clamped first because past 1 the cubic folds back.
@@ -488,7 +488,8 @@ fn rail(x: vec3<f32>) -> vec3<f32> {
 }
 
 // The one display encode: linear VSF RGB to the display's gamma-2 code values 0..255, truncated. Compressed: exposure 2/3 into the rail. Linear: exposure 1/2.8 straight, so the widest stored range (imagery's tone ceiling, 2.8 times paper white) reaches white unclipped. Then the square root.
-fn to_display(x: vec3<f32>) -> vec3<f32> {
+fn to_display(xh: hv3) -> vec3<f32> {
+    let x = vec3<f32>(xh);
     let d = vec3<f32>(dot(U.display[0].xyz, x), dot(U.display[1].xyz, x), dot(U.display[2].xyz, x));
     let t = select(clamp(d * (1.0 / 2.8), vec3<f32>(0.0), vec3<f32>(1.0)), rail(d * (2.0 / 3.0)), U.tone.x > 0.5);
     return min(floor(sqrt(t) * 256.0), vec3<f32>(255.0));
@@ -499,12 +500,12 @@ fn line_scale(cls: u32, mag: u32) -> f32 {
     return clamp(f32(mag) / U.line_hi[cls >> 2u][cls & 3u], 0.0, 1.0);
 }
 
-fn line_colour(cls_id: u32, mag: u32) -> vec3<f32> {
+fn line_colour(cls_id: u32, mag: u32) -> hv3 {
     let cls = min(cls_id, CLASS_MAX);
     let c = unpack_rgb(lut[CLASS_BASE + cls]);
     if (cls == WATERWAY_CLASS) {
         // Water on a linear scale up to the largest magnitude in view: the biggest river on screen is full, a trickle a third.
-        return c * (0.35 + 0.65 * line_scale(cls, mag));
+        return c * hf(0.35 + 0.65 * line_scale(cls, mag));
     }
     return c;
 }
@@ -537,10 +538,14 @@ fn line_min_depth(cls: u32, mag: u32) -> u32 {
 }
 
 // Coverage of a line as drawn: every class but water fades against the boldest of its class in view, so a lane next to a highway falls back and the same lane alone is full.
-fn line_alpha(cls_id: u32, cov: u32, mag: u32) -> f32 {
+fn line_alpha(cls_id: u32, cov: u32, mag: u32) -> hf {
+    return hf(line_alpha32(cls_id, cov, mag));
+}
+
+fn line_alpha32(cls_id: u32, cov: u32, mag: u32) -> f32 {
     let cls = min(cls_id, CLASS_MAX);
     // The theme's opacity for the class, then the magnitude's.
-    let a = unpack_a(lut[CLASS_BASE + cls]);
+    let a = f32(unpack_a(lut[CLASS_BASE + cls]));
     if (cls == WATERWAY_CLASS) {
         return f32(cov) / 255.0 * a;
     }
@@ -551,28 +556,28 @@ fn line_alpha(cls_id: u32, cov: u32, mag: u32) -> f32 {
     return f32(cov) / 255.0 * (0.5 + 0.5 * line_scale(cls, mag)) * a;
 }
 
-fn lerp3(a: vec3<f32>, b: vec3<f32>, t: f32) -> vec3<f32> {
+fn lerp3(a: hv3, b: hv3, t: hf) -> hv3 {
     return a + (b - a) * t;
 }
 
 // What a sample is before the light touches it, and how what comes after folds: the final colour is `(base × light) × k + c`, every post-light layer (slope band, contour, lines, the debug tint) being an affine step that composes into one `k` and one `c`. Water sits between, with its own alpha, because its shade follows the sun. A G-buffer of these relights a frame without touching the page table.
 struct Composed {
-    base: vec3<f32>,
+    base: hv3,
     ground: bool,
     n: vec3<f32>,
-    k1: f32,
-    c1: vec3<f32>,
-    water: f32,
-    k2: f32,
-    c2: vec3<f32>,
+    k1: hf,
+    c1: hv3,
+    water: hf,
+    k2: hf,
+    c2: hv3,
     // The sample took the ground's path (not the imagery's, not a bare cell): the slope band applies.
     banded: bool,
 };
 
 // A lerp toward `col` by `a` after the light, folded into (k, c).
-struct Fold { k: f32, c: vec3<f32> };
+struct Fold { k: hf, c: hv3 };
 
-fn fold(f: Fold, col: vec3<f32>, a: f32) -> Fold {
+fn fold(f: Fold, col: hv3, a: hf) -> Fold {
     return Fold(f.k * (1.0 - a), f.c * (1.0 - a) + col * a);
 }
 
@@ -625,10 +630,10 @@ fn overlays(composed: Composed, ov: vec4<u32>, layer: i32, t: vec3<u32>) -> Comp
         let m = own_mgr(ov.x);
         let col = lut[OWN_BASE + min(m, 12u)];
         let wild = lut[WILD_AT];
-        let cov = f32(ov.y) / 255.0;
-        { let f = fold(Fold(out.k2, out.c2), unpack_rgb(col), unpack_a(col) * OWN_FILL * cov); out.k2 = f.k; out.c2 = f.c; }
+        let cov = hf(f32(ov.y) / 255.0 * OWN_FILL);
+        { let f = fold(Fold(out.k2, out.c2), unpack_rgb(col), unpack_a(col) * cov); out.k2 = f.k; out.c2 = f.c; }
         if (ov.x >= OWN_WILD) {
-            { let f = fold(Fold(out.k2, out.c2), unpack_rgb(wild), unpack_a(wild) * OWN_FILL * cov); out.k2 = f.k; out.c2 = f.c; }
+            { let f = fold(Fold(out.k2, out.c2), unpack_rgb(wild), unpack_a(wild) * cov); out.k2 = f.k; out.c2 = f.c; }
         }
         var edge = false;
         var wild_edge = false;
@@ -646,7 +651,7 @@ fn overlays(composed: Composed, ov: vec4<u32>, layer: i32, t: vec3<u32>) -> Comp
     }
     if ((mask & M_MVUM) != 0u && ov.z != 0u && ov.w != 0u) {
         let col = lut[MVUM_BASE + min(ov.z, 14u)];
-        { let f = fold(Fold(out.k2, out.c2), unpack_rgb(col), f32(ov.w) / 255.0 * unpack_a(col)); out.k2 = f.k; out.c2 = f.c; }
+        { let f = fold(Fold(out.k2, out.c2), unpack_rgb(col), hf(f32(ov.w) / 255.0) * unpack_a(col)); out.k2 = f.k; out.c2 = f.c; }
     }
     return out;
 }
@@ -686,17 +691,17 @@ fn user_marks(composed: Composed, d: u32, u: u32, v: u32, cand: vec4<u32>) -> Co
             let px = textureLoad(ink_tex, xy, i32(r.b.x), 0);
             if (px.w != 0u) {
                 // Premultiplied over, after the light: the ground kept by what the ink leaves, plus the ink's own light.
-                let a = f32(px.w) / 255.0;
+                let a = hf(f32(px.w) / 255.0);
                 let ink = dec(vec3<f32>(f32(px.x), f32(px.y), f32(px.z)));
                 out.k2 = out.k2 * (1.0 - a);
                 out.c2 = out.c2 * (1.0 - a) + ink;
             }
             let sp = textureLoad(sel_tex, xy, i32(r.b.y), 0);
             if (sp.x != 0u) {
-                { let f = fold(Fold(out.k2, out.c2), SEL_TINT, f32(sp.x) / 255.0 * SEL_ALPHA); out.k2 = f.k; out.c2 = f.c; }
+                { let f = fold(Fold(out.k2, out.c2), hv3(SEL_TINT), hf(f32(sp.x) / 255.0 * SEL_ALPHA)); out.k2 = f.k; out.c2 = f.c; }
             }
             if (sel_edge(i32(r.b.y), t, sp.x)) {
-                { let f = fold(Fold(out.k2, out.c2), SEL_TINT, SEL_EDGE_ALPHA); out.k2 = f.k; out.c2 = f.c; }
+                { let f = fold(Fold(out.k2, out.c2), hv3(SEL_TINT), hf(SEL_EDGE_ALPHA)); out.k2 = f.k; out.c2 = f.c; }
             }
             break;
         }
@@ -739,16 +744,16 @@ fn slope_band(s: Dem) -> vec4<f32> {
     let nzn = max(s.n.z, 1e-4);
     let deg = degrees(atan(sqrt(max(1.0 - nzn * nzn, 0.0)) / nzn));
     if (deg >= 45.0) {
-        return vec4<f32>(dec(vec3<f32>(150.0, 40.0, 200.0)), 1.0);
+        return vec4<f32>(vec3<f32>(dec(vec3<f32>(150.0, 40.0, 200.0))), 1.0);
     }
     if (deg >= 35.0) {
-        return vec4<f32>(dec(vec3<f32>(230.0, 50.0, 40.0)), 1.0);
+        return vec4<f32>(vec3<f32>(dec(vec3<f32>(230.0, 50.0, 40.0))), 1.0);
     }
     if (deg >= 30.0) {
-        return vec4<f32>(dec(vec3<f32>(250.0, 150.0, 40.0)), 1.0);
+        return vec4<f32>(vec3<f32>(dec(vec3<f32>(250.0, 150.0, 40.0))), 1.0);
     }
     if (deg >= 25.0) {
-        return vec4<f32>(dec(vec3<f32>(250.0, 220.0, 60.0)), 1.0);
+        return vec4<f32>(vec3<f32>(dec(vec3<f32>(250.0, 220.0, 60.0))), 1.0);
     }
     return vec4<f32>(0.0);
 }
@@ -777,21 +782,21 @@ fn gather_line(cls_id: u32, mag: u32) {
 fn compose(d: u32, u: u32, v: u32, pos: vec2<f32>, ce: vec4<u32>, cf: vec4<u32>, cg: vec4<u32>, ch: vec4<u32>) -> Composed {
     let mask = U.mask & LAYERS;
     var out: Composed;
-    out.base = U.style_no_dem.rgb;
+    out.base = hv3(U.style_no_dem.rgb);
     out.ground = false;
     out.n = vec3<f32>(0.0, 0.0, 1.0);
     out.k1 = 1.0;
-    out.c1 = vec3<f32>(0.0);
+    out.c1 = hv3(0.0);
     out.water = 0.0;
     out.k2 = 1.0;
-    out.c2 = vec3<f32>(0.0);
+    out.c2 = hv3(0.0);
     out.banded = false;
     var contour_cov = 0.0;
     var contour_index = false;
     // The theme's contour inks; the geoid's own, darker, over its pale wash.
     var contour_ink = U.style_contour;
     var contour_ink_index = U.style_contour_index;
-    var band = vec3<f32>(0.0);
+    var band = hv3(0.0);
     var have_band = false;
     var found_depth = NONE;
     var is_sea = false;
@@ -803,10 +808,10 @@ fn compose(d: u32, u: u32, v: u32, pos: vec2<f32>, ce: vec4<u32>, cf: vec4<u32>,
         if (g.z > 0.0) {
             let t = clamp(g.x / 100.0, -1.0, 1.0);
             let neutral = dec(vec3<f32>(236.0, 236.0, 232.0));
-            out.base = select(lerp3(neutral, dec(vec3<f32>(40.0, 110.0, 230.0)), -t), lerp3(neutral, dec(vec3<f32>(236.0, 110.0, 40.0)), t), t >= 0.0);
+            out.base = select(lerp3(neutral, dec(vec3<f32>(40.0, 110.0, 230.0)), hf(-t)), lerp3(neutral, dec(vec3<f32>(236.0, 110.0, 40.0)), hf(t)), t >= 0.0);
             if ((mask & M_CONTOURS) != 0u) {
-                contour_ink = vec4<f32>(dec(vec3<f32>(28.0, 28.0, 32.0)), 0.6);
-                contour_ink_index = vec4<f32>(dec(vec3<f32>(28.0, 28.0, 32.0)), 0.9);
+                contour_ink = vec4<f32>(vec3<f32>(dec(vec3<f32>(28.0, 28.0, 32.0))), 0.6);
+                contour_ink_index = vec4<f32>(vec3<f32>(dec(vec3<f32>(28.0, 28.0, 32.0))), 0.9);
                 let interval = geoid_interval(U.contour.z);
                 let level = round(g.x / interval);
                 let d_px = abs(g.x - level * interval) / max(g.y / GEOID_TEXEL_M * U.contour.z, 1e-6);
@@ -839,11 +844,11 @@ fn compose(d: u32, u: u32, v: u32, pos: vec2<f32>, ce: vec4<u32>, cf: vec4<u32>,
                 // The open sea: exactly zero and dead flat, which is how a global DEM writes the ocean (below-sea-level land keeps its colour).
                 if (abs(s.elev) < 0.75 && s.n.z > 0.9995) {
                     is_sea = true;
-                    out.base = U.style_sea.rgb;
+                    out.base = hv3(U.style_sea.rgb);
                 } else if ((mask & M_HYPSO) != 0u) {
                     out.base = unpack_rgb(lut[eq >> 4u]);
                 } else {
-                    out.base = U.style_flat.rgb;
+                    out.base = hv3(U.style_flat.rgb);
                 }
                 out.ground = true;
             }
@@ -854,11 +859,11 @@ fn compose(d: u32, u: u32, v: u32, pos: vec2<f32>, ce: vec4<u32>, cf: vec4<u32>,
             }
             if ((mask & M_SLOPE) != 0u) {
                 let b = slope_band(s);
-                band = b.rgb;
+                band = hv3(b.rgb);
                 have_band = b.a > 0.5;
             }
         } else if ((mask & (M_DEM | M_RAW)) != 0u) {
-            out.base = U.style_bg.rgb;
+            out.base = hv3(U.style_bg.rgb);
         }
     }
     // The vector cell first, for its water: a wet texel below sea level is seabed, tinted by depth, which the imagery leaves alone as it does the sea.
@@ -893,7 +898,7 @@ fn compose(d: u32, u: u32, v: u32, pos: vec2<f32>, ce: vec4<u32>, cf: vec4<u32>,
     if (out.ground && !is_sea && elev_m < 0.0 && lw.z != 0u) {
         seabed = true;
         let t = clamp(-elev_m / SEABED_FULL_DEPTH, 0.0, 1.0);
-        out.base = U.style_sea.rgb * (1.0 - SEABED_DARK * t);
+        out.base = hv3(U.style_sea.rgb * (1.0 - SEABED_DARK * t));
     }
     // Imagery has its own depth (a global 10 m layer sits several levels above the vector cells), so it is found on its own: the finest cell at or above the vector depth that carries any.
     // Imagery stands in for the lit ground where it has data and the terrain is not sea: the composite's own ocean pixels and the tiles' edges never show, the terrain's coastline does.
@@ -908,10 +913,10 @@ fn compose(d: u32, u: u32, v: u32, pos: vec2<f32>, ce: vec4<u32>, cf: vec4<u32>,
     }
     if (vi == NONE && (mask & M_IMAGERY) != 0u && (im.x != 0u || im.y != 0u || im.z != 0u || im.w != 0u)) {
         out.ground = false;
-        out.base = select(vec3<f32>(img_light(im.x), img_light(im.y), img_light(im.z)), vec3<f32>(img_light(im.w)), (mask & M_INFRARED) != 0u);
+        out.base = select(hv3(img_light(im.x), img_light(im.y), img_light(im.z)), hv3(img_light(im.w)), (mask & M_INFRARED) != 0u);
         if (contour_cov > 0.0) {
             let ink = select(contour_ink, contour_ink_index, contour_index);
-            { let f = fold(Fold(out.k2, out.c2), ink.rgb, contour_cov * ink.a); out.k2 = f.k; out.c2 = f.c; }
+            { let f = fold(Fold(out.k2, out.c2), hv3(ink.rgb), hf(contour_cov * ink.a)); out.k2 = f.k; out.c2 = f.c; }
         }
         return user_marks(out, d, u, v, ch);
     }
@@ -925,9 +930,9 @@ fn compose(d: u32, u: u32, v: u32, pos: vec2<f32>, ce: vec4<u32>, cf: vec4<u32>,
             // Imagery stands in for the ground: nothing lights it. True colour, or the near-infrared band as grey, unrolled to scene light.
             out.ground = false;
             if ((mask & M_INFRARED) != 0u) {
-                out.base = vec3<f32>(img_light(im.w));
+                out.base = hv3(img_light(im.w));
             } else {
-                out.base = vec3<f32>(img_light(im.x), img_light(im.y), img_light(im.z));
+                out.base = hv3(img_light(im.x), img_light(im.y), img_light(im.z));
             }
             // Under the water, as over the ground: the waterway lines, into the base itself, so a lake covers the river running into it.
             if (draw_line && line.x == WATERWAY_CLASS) {
@@ -938,15 +943,15 @@ fn compose(d: u32, u: u32, v: u32, pos: vec2<f32>, ce: vec4<u32>, cf: vec4<u32>,
                 let t = f32(lw.z) / 255.0 * U.style_water.a * select(1.0, SEABED_GLAZE, seabed);
                 if (baking()) {
                     // Baked apart from the imagery, so the waterway lines drawn live go under it: the frame takes the composite's water out and puts the theme's in.
-                    out.water = t;
+                    out.water = hf(t);
                 } else {
-                    out.base = max(out.base - vec3<f32>(t * IMG_WATER), vec3<f32>(0.0)) + t * U.style_water.rgb;
+                    out.base = max(out.base - hv3(t * IMG_WATER), hv3(0.0)) + hv3(t * U.style_water.rgb);
                 }
             }
             // Contours over the imagery and the water, under the other lines.
             if (contour_cov > 0.0) {
                 let ink = select(contour_ink, contour_ink_index, contour_index);
-                { let f = fold(Fold(out.k2, out.c2), ink.rgb, contour_cov * ink.a); out.k2 = f.k; out.c2 = f.c; }
+                { let f = fold(Fold(out.k2, out.c2), hv3(ink.rgb), hf(contour_cov * ink.a)); out.k2 = f.k; out.c2 = f.c; }
             }
             out = overlays(out, ov, ov_layer, ov_t);
             if (draw_line && line.x != WATERWAY_CLASS) {
@@ -957,7 +962,7 @@ fn compose(d: u32, u: u32, v: u32, pos: vec2<f32>, ce: vec4<u32>, cf: vec4<u32>,
         // The slope band and the contours come under everything that follows, so a baked composite leaves them to the frame.
         out.banded = true;
         if ((mask & M_LAND) != 0u && lw.y != 0u) {
-            out.base = lerp3(out.base, unpack_rgb(lut[LAND_BASE + min(lw.x, 13u)]), f32(lw.y) / 255.0 * unpack_a(lut[LAND_BASE + min(lw.x, 13u)]));
+            out.base = lerp3(out.base, unpack_rgb(lut[LAND_BASE + min(lw.x, 13u)]), hf(f32(lw.y) / 255.0) * unpack_a(lut[LAND_BASE + min(lw.x, 13u)]));
         }
         if (have_band) {
             { let f = fold(Fold(out.k1, out.c1), band, 0.45); out.k1 = f.k; out.c1 = f.c; }
@@ -965,13 +970,13 @@ fn compose(d: u32, u: u32, v: u32, pos: vec2<f32>, ce: vec4<u32>, cf: vec4<u32>,
         // Under the water: the contours and the waterway lines, so a lake covers the river running into it. Over it: every other line.
         if (contour_cov > 0.0) {
             let ink = select(contour_ink, contour_ink_index, contour_index);
-            { let f = fold(Fold(out.k1, out.c1), ink.rgb, contour_cov * ink.a); out.k1 = f.k; out.c1 = f.c; }
+            { let f = fold(Fold(out.k1, out.c1), hv3(ink.rgb), hf(contour_cov * ink.a)); out.k1 = f.k; out.c1 = f.c; }
         }
         if (draw_line && line.x == WATERWAY_CLASS) {
             { let f = fold(Fold(out.k1, out.c1), line_colour(line.x, line.z), line_alpha(line.x, line.y, line.z)); out.k1 = f.k; out.c1 = f.c; }
         }
         if ((mask & M_WATER) != 0u && lw.z != 0u) {
-            out.water = f32(lw.z) / 255.0 * U.style_water.a * select(1.0, SEABED_GLAZE, seabed);
+            out.water = hf(f32(lw.z) / 255.0 * U.style_water.a * select(1.0, SEABED_GLAZE, seabed));
         }
         out = overlays(out, ov, ov_layer, ov_t);
         if (draw_line && line.x != WATERWAY_CLASS) {
@@ -983,7 +988,7 @@ fn compose(d: u32, u: u32, v: u32, pos: vec2<f32>, ce: vec4<u32>, cf: vec4<u32>,
         }
         if (contour_cov > 0.0) {
             let ink = select(contour_ink, contour_ink_index, contour_index);
-            { let f = fold(Fold(out.k2, out.c2), ink.rgb, contour_cov * ink.a); out.k2 = f.k; out.c2 = f.c; }
+            { let f = fold(Fold(out.k2, out.c2), hv3(ink.rgb), hf(contour_cov * ink.a)); out.k2 = f.k; out.c2 = f.c; }
         }
     }
     // Where the wanted terrain cell has not arrived at all (no reference and no absent marker), the cell's two triangles each take a random dark colour of their own, the CPU's loading_noise, where nothing at any depth stands in; a coarser stand-in draws as it is.
@@ -1000,10 +1005,10 @@ fn compose(d: u32, u: u32, v: u32, pos: vec2<f32>, ce: vec4<u32>, cf: vec4<u32>,
             out.base = noise;
             out.ground = false;
             out.k1 = 1.0;
-            out.c1 = vec3<f32>(0.0);
+            out.c1 = hv3(0.0);
             out.water = 0.0;
             out.k2 = 1.0;
-            out.c2 = vec3<f32>(0.0);
+            out.c2 = hv3(0.0);
         }
     }
     out = user_marks(out, d, u, v, ch);
@@ -1030,17 +1035,17 @@ fn compose(d: u32, u: u32, v: u32, pos: vec2<f32>, ce: vec4<u32>, cf: vec4<u32>,
 }
 
 // The light applied, all linear: the same arithmetic whether the pieces come from the page table or from the G-buffer.
-fn shade(base: vec3<f32>, ground: bool, n: vec3<f32>, k1: f32, c1: vec3<f32>, water: f32, k2: f32, c2: vec3<f32>) -> vec3<f32> {
+fn shade(base: hv3, ground: bool, n: vec3<f32>, k1: hf, c1: hv3, water: hf, k2: hf, c2: hv3) -> hv3 {
     var rgb = base;
     var diffuse = 1.0;
     if (ground) {
         diffuse = max(dot(n, U.sun.xyz), 0.0);
         // No cap: the display's highlight curve is the only place light meets white. The floor is physics (the sky's harmonics ring a little below zero facing away), not a clip.
-        rgb = rgb * max(light_eval(n), vec3<f32>(0.0));
+        rgb = rgb * hv3(max(light_eval(n), vec3<f32>(0.0)));
     }
     rgb = rgb * k1 + c1;
     if (water > 0.0) {
-        let wr = U.style_water.rgb * (0.85 + 0.15 * diffuse);
+        let wr = hv3(U.style_water.rgb * (0.85 + 0.15 * diffuse));
         rgb = lerp3(rgb, wr, water);
     }
     return rgb * k2 + c2;
@@ -1064,7 +1069,7 @@ fn off_globe(pos: vec2<f32>) -> bool {
 @fragment
 fn fs_map(in: VOut) -> @location(0) vec4<f32> {
     if (off_globe(in.pos.xy)) {
-        return vec4<f32>(to_display(U.style_bg.rgb) / 255.0, 1.0);
+        return vec4<f32>(to_display(hv3(U.style_bg.rgb)) / 255.0, 1.0);
     }
     let s = sample_uv(in);
     let blk = blocks[in.block];
@@ -1086,21 +1091,21 @@ fn fs_map_g(in: VOut) -> GOut {
     let blk = blocks[in.block];
     var p = compose(s.x, s.y, s.z, in.pos.xy, blk.e, blk.f, blk.g, blk.h);
     if (off_globe(in.pos.xy)) {
-        p.base = U.style_bg.rgb;
+        p.base = hv3(U.style_bg.rgb);
         p.ground = false;
         p.n = vec3<f32>(0.0, 0.0, 1.0);
         p.k1 = 1.0;
-        p.c1 = vec3<f32>(0.0);
+        p.c1 = hv3(0.0);
         p.water = 0.0;
         p.k2 = 1.0;
-        p.c2 = vec3<f32>(0.0);
+        p.c2 = hv3(0.0);
     }
     var g: GOut;
     // Linear light kept at gamma 2 so 8 bits hold the shadows; the base with 2.8 times headroom, the most unrolled imagery carries.
-    g.base = vec4<f32>(sqrt(p.base / 2.8), select(0.0, 1.0, p.ground));
-    g.normal = vec4<f32>(p.n * 0.5 + 0.5, p.water);
-    g.post1 = vec4<f32>(sqrt(p.c1), p.k1);
-    g.post2 = vec4<f32>(sqrt(p.c2), p.k2);
+    g.base = vec4<f32>(sqrt(vec3<f32>(p.base) / 2.8), select(0.0, 1.0, p.ground));
+    g.normal = vec4<f32>(p.n * 0.5 + 0.5, f32(p.water));
+    g.post1 = vec4<f32>(sqrt(vec3<f32>(p.c1)), f32(p.k1));
+    g.post2 = vec4<f32>(sqrt(vec3<f32>(p.c2)), f32(p.k2));
     return g;
 }
 
@@ -1127,12 +1132,12 @@ fn fs_bake(@builtin(position) pos: vec4<f32>) -> BakeOut {
     let none = vec4<u32>(NONE);
     let p = compose(u32(U.raw.z), u, v, pos.xy, none, none, none, none);
     // The ground's water covers what is under it; the imagery's is laid on (its own dark water taken out in the frame).
-    let keep = select(1.0, 1.0 - p.water, p.banded);
-    let a = p.k1 * keep * p.k2;
-    let b = p.c1 * keep * p.k2 + p.c2;
-    let w = p.water * p.k2;
+    let keep = select(1.0, 1.0 - f32(p.water), p.banded);
+    let a = f32(p.k1) * keep * f32(p.k2);
+    let b = vec3<f32>(p.c1) * keep * f32(p.k2) + vec3<f32>(p.c2);
+    let w = f32(p.water) * f32(p.k2);
     var o: BakeOut;
-    o.t0 = vec4<f32>(sqrt(clamp(p.base / 2.8, vec3<f32>(0.0), vec3<f32>(1.0))), a);
+    o.t0 = vec4<f32>(sqrt(clamp(vec3<f32>(p.base) / 2.8, vec3<f32>(0.0), vec3<f32>(1.0))), a);
     let bits = round(clamp(w, 0.0, 1.0) * 63.0) + select(0.0, 64.0, p.ground) + select(0.0, 128.0, p.banded);
     o.t1 = vec4<f32>(sqrt(clamp(b, vec3<f32>(0.0), vec3<f32>(1.0))), bits / 255.0);
     return o;
@@ -1142,7 +1147,7 @@ fn fs_bake(@builtin(position) pos: vec4<f32>) -> BakeOut {
 @fragment
 fn fs_fast(in: VOut) -> @location(0) vec4<f32> {
     if (off_globe(in.pos.xy)) {
-        return vec4<f32>(to_display(U.style_bg.rgb) / 255.0, 1.0);
+        return vec4<f32>(to_display(hv3(U.style_bg.rgb)) / 255.0, 1.0);
     }
     let s = sample_uv(in);
     let d = s.x;
@@ -1152,7 +1157,7 @@ fn fs_fast(in: VOut) -> @location(0) vec4<f32> {
     let mask = U.mask & LAYERS;
     let ci = pick(blk.f, d, u, v, U.depths.y, FLAG_COMP);
     if (ci == NONE) {
-        return vec4<f32>(to_display(U.style_bg.rgb) / 255.0, 1.0);
+        return vec4<f32>(to_display(hv3(U.style_bg.rgb)) / 255.0, 1.0);
     }
     let r = refs[ci];
     let t = tri(u, v, r.a.y);
@@ -1163,7 +1168,7 @@ fn fs_fast(in: VOut) -> @location(0) vec4<f32> {
     let ground = (bits & 64u) != 0u;
     let banded = (bits & 128u) != 0u;
     let w = f32(bits & 63u) / 63.0;
-    var x = t0.rgb * t0.rgb * 2.8;
+    var x = hv3(t0.rgb * t0.rgb * 2.8);
     var diffuse = 1.0;
     if ((mask & (M_DEM | M_CONTOURS | M_SLOPE)) != 0u) {
         let dem = sample_dem(d, u, v, blk.e);
@@ -1172,19 +1177,19 @@ fn fs_fast(in: VOut) -> @location(0) vec4<f32> {
             if (ground && (mask & M_DEM) != 0u) {
                 let n = view_normal(dem.n, in.pos.xy);
                 diffuse = max(dot(n, U.sun.xyz), 0.0);
-                x = x * max(light_eval(n), vec3<f32>(0.0));
+                x = x * hv3(max(light_eval(n), vec3<f32>(0.0)));
             }
             if (banded && (mask & M_SLOPE) != 0u) {
                 let b = slope_band(dem);
                 if (b.a > 0.5) {
-                    x = lerp3(x, b.rgb, 0.45);
+                    x = lerp3(x, hv3(b.rgb), 0.45);
                 }
             }
             if ((mask & M_CONTOURS) != 0u) {
                 let c = contour_at(dem, u, v);
                 if (c.x > 0.0) {
                     let ink = select(U.style_contour, U.style_contour_index, c.y > 0.5);
-                    x = lerp3(x, ink.rgb, c.x * ink.a);
+                    x = lerp3(x, hv3(ink.rgb), hf(c.x * ink.a));
                 }
             }
         }
@@ -1202,14 +1207,14 @@ fn fs_fast(in: VOut) -> @location(0) vec4<f32> {
     if (draw_line && line.x == WATERWAY_CLASS) {
         x = lerp3(x, line_colour(line.x, line.z), line_alpha(line.x, line.y, line.z));
     }
-    let wr = U.style_water.rgb * (0.85 + 0.15 * diffuse) - vec3<f32>(select(IMG_WATER, 0.0, banded));
-    var col = x * t0.a + t1.rgb * t1.rgb + w * wr;
+    let wr = hv3(U.style_water.rgb * (0.85 + 0.15 * diffuse) - vec3<f32>(select(IMG_WATER, 0.0, banded)));
+    var col = x * hf(t0.a) + hv3(t1.rgb * t1.rgb) + hf(w) * wr;
     if (draw_line && line.x != WATERWAY_CLASS) {
         col = lerp3(col, line_colour(line.x, line.z), line_alpha(line.x, line.y, line.z));
     }
     var marks: Composed;
     marks.k2 = 1.0;
-    marks.c2 = vec3<f32>(0.0);
+    marks.c2 = hv3(0.0);
     marks = user_marks(marks, d, u, v, blk.h);
     col = col * marks.k2 + marks.c2;
     return vec4<f32>(to_display(col) / 255.0, 1.0);
@@ -1229,7 +1234,7 @@ fn fs_relight(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     let nw = textureLoad(g_normal, xy, 0);
     let p1 = textureLoad(g_post1, xy, 0);
     let p2 = textureLoad(g_post2, xy, 0);
-    let rgb = shade(b.rgb * b.rgb * 2.8, b.a > 0.5, normalize(nw.xyz * 2.0 - 1.0), p1.a, p1.rgb * p1.rgb, nw.w, p2.a, p2.rgb * p2.rgb);
+    let rgb = shade(hv3(b.rgb * b.rgb * 2.8), b.a > 0.5, normalize(nw.xyz * 2.0 - 1.0), hf(p1.a), hv3(p1.rgb * p1.rgb), hf(nw.w), hf(p2.a), hv3(p2.rgb * p2.rgb));
     return vec4<f32>(to_display(rgb) / 255.0, 1.0);
 }
 
