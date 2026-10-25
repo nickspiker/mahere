@@ -311,6 +311,8 @@ impl GpuHost {
             map.view_depth().hash(&mut hs);
             map.zoom_depth().hash(&mut hs);
             map.past_data().hash(&mut hs);
+            // The contours' spacing over the scale bar.
+            map.contour_major().map(f32::to_bits).hash(&mut hs);
             // The ring round the globe while its base set loads: each cell's arrival, and the zoom it circles.
             if let Some(done) = map.globe_loading() {
                 ((done * 10.0).round() as u32, c.ppd.to_bits()).hash(&mut hs);
@@ -340,7 +342,7 @@ impl GpuHost {
             if heading > 180.0 {
                 heading -= 360.0;
             }
-            let readouts = Readouts { lat: c.lat(), lon: c.lon(), gps_height: map.gps_sea_level(), elev: map.elevation_at(c.lat(), c.lon()), heading_deg: heading, m_per_px: 111_320.0 / c.ppd, frame_ms: map.last_frame_ms, resident: map.pool().map.len(), phone_heading: map.have_rotation.then(|| map.true_heading()), cache_used: cache.0, cache_max: cache.1, has_fix: map.gps.is_some() };
+            let readouts = Readouts { lat: c.lat(), lon: c.lon(), gps_height: map.gps_sea_level(), elev: map.elevation_at(c.lat(), c.lon()), heading_deg: heading, m_per_px: 111_320.0 / c.ppd, frame_ms: map.last_frame_ms, resident: map.pool().map.len(), phone_heading: map.have_rotation.then(|| map.true_heading()), cache_used: cache.0, cache_max: cache.1, has_fix: map.gps.is_some(), contour_major_m: map.contour_major() };
             let measure = map.measure_view(w as usize, h as usize, Panel::strip_samples(w as usize));
             let orb = |n: usize| map.orb(n);
             panel.paint(w as usize, h as usize, mask, ctl, &readouts, measure.as_ref(), &map.themes, areas, Some(&orb));

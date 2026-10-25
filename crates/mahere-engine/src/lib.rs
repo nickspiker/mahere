@@ -468,6 +468,12 @@ impl MapCore {
         self.dirty = true;
     }
 
+    /// The heavier (index) contours' spacing in metres, while the terrain's contours draw (not the geoid's, whose interval is its own).
+    pub fn contour_major(&self) -> Option<f32> {
+        let m = self.luts.mask;
+        (m.contours && !m.geoid && self.luts.contours.interval > 0.0).then(|| self.luts.contours.interval * self.luts.contours.index_every as f32)
+    }
+
     /// The globe's base set while it is coming in: the share of the ten depth-0 cells loaded, None once all are (or with nothing to wait for).
     pub fn globe_loading(&self) -> Option<f32> {
         let n = self.res.globe_bases();

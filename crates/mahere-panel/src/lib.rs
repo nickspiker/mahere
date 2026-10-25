@@ -117,6 +117,23 @@ impl Pick {
     }
 }
 
+/// A length as a person reads it: centimetres under a metre, metres with a decimal under ten, whole metres, kilometres from a thousand, no trailing zero.
+pub fn length_text(m: f64) -> String {
+    let trim = |x: f64, places: usize| {
+        let t = format!("{x:.places$}");
+        if t.contains('.') { t.trim_end_matches('0').trim_end_matches('.').to_string() } else { t }
+    };
+    if m < 1.0 {
+        format!("{} cm", trim(m * 100.0, 0))
+    } else if m < 10.0 {
+        format!("{} m", trim(m, 1))
+    } else if m < 1000.0 {
+        format!("{} m", trim(m, 0))
+    } else {
+        format!("{} km", trim(m / 1000.0, 1))
+    }
+}
+
 /// What the readouts show.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Readouts {
@@ -137,6 +154,8 @@ pub struct Readouts {
     pub cache_max: u64,
     /// There is a GPS fix to go to.
     pub has_fix: bool,
+    /// The heavier (index) contours' spacing in metres, while contours draw.
+    pub contour_major_m: Option<f32>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1448,7 +1467,7 @@ impl Panel {
         Self::paint_pill(&mut canvas, &mut self.text, btn, current.word(), current != Pick::Info, font);
         if !self.open {
             // The scale bar, bottom left; the open panel shows the scale itself.
-            Self::paint_scale(&mut canvas, &mut self.text, font, font * 0.8, bottom - font * 0.8, r.m_per_px, (w as f32 * 0.3).min(font * 10.0));
+            Self::paint_scale(&mut canvas, &mut self.text, font, font * 0.8, bottom - font * 0.8, r.m_per_px, (w as f32 * 0.3).min(font * 10.0), r.contour_major_m);
             return &self.buf;
         }
         if page != Page::Layers {
@@ -1709,7 +1728,7 @@ impl Panel {
 
     /// The scale bar: the longest round distance (1, 2 or 5 of a power of ten metres) that fits in `max_px`, its length in metres or kilometres over it; text first, then the bar on a dark edge, as everything here paints top first.
     #[allow(clippy::too_many_arguments)]
-    fn paint_scale(canvas: &mut Canvas, text: &mut TextRenderer, font: f32, x0: f32, y: f32, m_per_px: f64, max_px: f32) {
+    fn paint_scale(canvas: &mut Canvas, text: &mut TextRenderer, font: f32, x0: f32, y: f32, m_per_px: f64, max_px: f32, contour_major_m: Option<f32>) {
         if !(m_per_px > 0.0) {
             return;
         }
@@ -1727,9 +1746,14 @@ impl Panel {
         let style = TextStyle::new(font * 0.75, theme::TEXTBOX_TEXT);
         let shade = TextStyle::new(font * 0.75, GEAR_BG);
         let ty = y - font * 0.55;
-        text.draw_text_left(canvas, &label, x0, ty, &style, None, None);
-        for (ox, oy) in [(-1.0, 0.0), (1.0, 0.0), (0.0, -1.0), (0.0, 1.0)] {
-            text.draw_text_left(canvas, &label, x0 + ox, ty + oy, &shade, None, None);
+        // Above it, the heavier contours' spacing while contours draw (Nick 2026-10-24: so we know what's going on).
+        let major = contour_major_m.filter(|m| m.is_finite() && *m > 0.0).map(|m| format!("Contours {}", length_text(m as f64)));
+        let lines: Vec<(String, f32)> = std::iter::once((label, ty)).chain(major.map(|m| (m, ty - font * 0.85))).collect();
+        for (line, ly) in &lines {
+            text.draw_text_left(canvas, line, x0, *ly, &style, None, None);
+            for (ox, oy) in [(-1.0, 0.0), (1.0, 0.0), (0.0, -1.0), (0.0, 1.0)] {
+                text.draw_text_left(canvas, line, x0 + ox, ly + oy, &shade, None, None);
+            }
         }
         // The bar and its end ticks, then the dark edge under them.
         let (xi, yi, pi, ti) = (x0 as isize, y as isize, px as isize, t as isize);
