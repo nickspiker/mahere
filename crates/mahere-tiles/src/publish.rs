@@ -114,6 +114,52 @@ pub fn split_keeping(bytes: &[u8], kept: impl Fn(Layer) -> Option<Vec<u8>>) -> R
     Ok(out)
 }
 
+/// A published terrain document with its apron (the texels one step past each edge) replaced, every other field as it was: the apron quantised on the document's own base and step, coded as a publish codes it (2026-10-24: aprons filled from the seabed grid where a bake had no neighbour drew Antarctica's tile edges as contours).
+pub fn with_apron(dem_doc: &[u8], apron: &[f32]) -> Result<Vec<u8>, String> {
+    if apron.len() != crate::APRON {
+        return Err(format!("an apron of {} texels, not {}", apron.len(), crate::APRON));
+    }
+    let fields = crate::section_fields(dem_doc, "dem").ok_or("no terrain section")?;
+    let num = |n: &str| fields.get(n).and_then(|v| v.first()).and_then(crate::scalar_f32).ok_or_else(|| format!("the terrain without its {n}"));
+    let (base, step) = (num("base")?, num("step")?);
+    let q: Vec<u16> = apron.iter().map(|&e| if e.is_nan() { u16::MAX } else { (((e - base) / step).round() as i32).clamp(0, 65534) as u16 }).collect();
+    let coded = VsfType::t_u4(vsf::types::Tensor::new(vec![4, 2, crate::TEX], q));
+    let coded = ac::code_field(std::slice::from_ref(&coded), None).unwrap_or_else(|| vec![coded]);
+    rebuild(dem_doc, |section, field| (section == "dem" && field == "apron").then(|| coded.clone()))
+}
+
+/// A base naming `doc` as its `layer`, every other field as it was.
+pub fn relinked(base_doc: &[u8], layer: Layer, doc: &[u8]) -> Result<Vec<u8>, String> {
+    let hp = provenance(doc).ok_or("a layer without its provenance hash")?;
+    rebuild(base_doc, |section, field| (section == "layers" && field == layer.dir()).then(|| vec![hp.clone()]))
+}
+
+/// A document built again from its sections, a field's values replaced where `replace` gives them.
+fn rebuild(doc: &[u8], replace: impl Fn(&str, &str) -> Option<Vec<VsfType>>) -> Result<Vec<u8>, String> {
+    let (header, end) = vsf::VsfHeader::decode(doc).map_err(|e| format!("{e:?}"))?;
+    let sections = header.sections(doc, end).map_err(|e| format!("{e:?}"))?;
+    let mut b = VsfBuilder::new();
+    let mut replaced = false;
+    for s in sections {
+        let mut out = VsfSection::new(s.name.clone());
+        for f in s.fields {
+            let v = match replace(&s.name, &f.name) {
+                Some(v) => {
+                    replaced = true;
+                    v
+                }
+                None => f.values,
+            };
+            out.add_field_multi(f.name, v);
+        }
+        b = b.add_section_direct(out);
+    }
+    if !replaced {
+        return Err("nothing to replace".into());
+    }
+    b.build().map_err(|e| format!("{e:?}"))
+}
+
 /// Whether two documents hold the same sections, byte for byte past their headers (which differ in their time and hashes alone).
 pub fn same_contents(a: &[u8], b: &[u8]) -> bool {
     let body = |d: &[u8]| vsf::VsfHeader::decode(d).ok().map(|(_, end)| end);

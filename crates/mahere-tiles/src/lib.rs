@@ -2067,7 +2067,7 @@ pub fn decode_route(data: &[u8]) -> Option<route::RouteCell> {
     route::RouteCell::decode(&section_alone(data, "route")?)
 }
 
-fn scalar_f32(v: &VsfType) -> Option<f32> {
+pub(crate) fn scalar_f32(v: &VsfType) -> Option<f32> {
     match v {
         VsfType::f5(x) => Some(*x),
         VsfType::f6(x) => Some(*x as f32),
