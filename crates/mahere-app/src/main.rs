@@ -41,6 +41,12 @@ struct MahereApp {
     /// The map's lettering, and when the camera last moved: labels are laid out once it has rested a quarter second, and hidden while it moves.
     labeller: mahere_panel::labels::Labeller,
     label_cam: ((u64, u64, u64, u64), Instant),
+    /// Profiling (MAHERE_SPIN=move pans a pixel a frame, =still redraws in place): each frame part's milliseconds summed, frames counted, when last reported.
+    spin: Option<bool>,
+    prof: [f32; 6],
+    prof_n: u32,
+    prof_at: Instant,
+    prof_flat: f32,
     cache_budget: u64,
     areas: mahere_engine::areas::Areas,
     /// Updates (after Photon's): a verified build is swapped in for this one, which then starts again as it.
@@ -52,6 +58,58 @@ struct MahereApp {
 }
 
 impl MahereApp {
+    /// The window's perimeter and chrome over the background, flattened into `target`; with profiling on, the frame's parts reported every three seconds.
+    fn finish_frame(&mut self, target: &mut [u32], ctx: &mut Context, w: usize, h: usize, t: [Instant; 4]) {
+        let [t0, t1, t2, t3] = t;
+        let t4 = Instant::now();
+        self.chrome.rasterize_perimeter(target, w, h, ctx.clip_mask);
+        self.chrome.rasterize_chrome(ctx.damage, ctx.text, ctx.clip_mask);
+        let t4b = Instant::now();
+        let clip = ctx.damage_clip;
+        match &self.gpu {
+            // The chrome alone, then the map's frame under it straight from the readback, one pass over the damage (2026-10-25: the chrome group's background layer cost a copy into it, and the group a composite and a blit, every frame).
+            Some(g) if g.frame.len() == w * h => {
+                self.chrome.flatten_chrome_into(target, w, h, Some(Clip::new(clip.x0, clip.y0, clip.x1, clip.y1)));
+                let (x0, x1) = (clip.x0.max(0) as usize, (clip.x1.max(0) as usize).min(w));
+                // Where nothing of the chrome is, the map's pixel as it is; where the chrome is opaque, the chrome; only its anti-aliased edges take fluor's under kernel.
+                for y in (clip.y0.max(0) as usize)..(clip.y1.max(0) as usize).min(h) {
+                    let r = y * w + x0..y * w + x1;
+                    let (dst, src) = (&mut target[r.clone()], &g.frame[r]);
+                    for i in 0..dst.len() {
+                        match dst[i] >> 24 {
+                            0 => dst[i] = src[i],
+                            255 => {}
+                            _ => fluor::paint::flatten_premult(&mut dst[i..i + 1], &src[i..i + 1]),
+                        }
+                    }
+                }
+            }
+            _ => self.chrome.flatten_into(target, w, h, Some(Clip::new(clip.x0, clip.y0, clip.x1, clip.y1))),
+        }
+        if self.spin.is_some() {
+            let t5 = Instant::now();
+            let ms = |a: Instant, b: Instant| (b - a).as_secs_f32() * 1000.0;
+            for (k, v) in [ms(t0, t1), ms(t1, t2), ms(t2, t3), ms(t3, t4), ms(t4, t5), ms(t0, t5)].into_iter().enumerate() {
+                self.prof[k] += v;
+            }
+            self.prof_n += 1;
+            self.prof_flat += t4b.elapsed().as_secs_f32() * 1000.0;
+            if self.prof_at.elapsed().as_secs() >= 3 {
+                eprintln!("  flatten alone {:.1} ms", self.prof_flat / self.prof_n.max(1) as f32);
+                self.prof_flat = 0.0;
+                let n = self.prof_n.max(1) as f32;
+                let p = self.prof.map(|v| v / n);
+                if let Some(g) = &self.gpu {
+                    eprintln!("  map parts (last frame): plan + sync {:.1} ms, overlay {:.1}, submit and poll {:.1}, landing a frame {:.1}; GPU passes {:.1}", g.parts[0], g.parts[1], g.parts[2], g.parts[3], g.parts[4]);
+                }
+                eprintln!("desktop {w}x{h}: {} frames, per frame before the panel {:.1} ms, panel paint {:.1}, map (gpu frame) {:.1}, into fluor's layer {:.1}, chrome + flatten {:.1}, render total {:.1}", self.prof_n, p[0], p[1], p[2], p[3], p[4], p[5]);
+                self.prof = [0.0; 6];
+                self.prof_n = 0;
+                self.prof_at = Instant::now();
+            }
+        }
+    }
+
     /// The editor's requests: a built-in is copied before it is edited, a field change is live, and closing the editor writes the theme to the vault.
     fn apply_theme_edits(&mut self) {
         for e in self.panel.take_theme_edits() {
@@ -117,6 +175,11 @@ impl MahereApp {
             panel: Panel::new(),
             labeller: mahere_panel::labels::Labeller::new(),
             label_cam: ((0, 0, 0, 0), Instant::now()),
+            spin: std::env::var("MAHERE_SPIN").ok().map(|v| v == "move"),
+            prof: [0.0; 6],
+            prof_n: 0,
+            prof_at: Instant::now(),
+            prof_flat: 0.0,
             cache_budget: 2 << 30,
             areas,
             updater: mahere_update::Updater::new(mahere_store::user_dir()),
@@ -582,6 +645,14 @@ impl FluorApp for MahereApp {
     }
 
     fn tick(&mut self, ctx: &mut Context) -> bool {
+        if let Some(moving) = self.spin {
+            let (w, h) = Self::dims(ctx);
+            if moving {
+                self.map.pan(1.0, 0.0, w, h);
+            }
+            self.map.mark_dirty();
+            ctx.window.request_redraw();
+        }
         let (w, h) = Self::dims(ctx);
         // The UI scale kept whenever it changes (fluor's Cmd/Ctrl keys and scroll).
         if (ctx.viewport.ru - self.kept_ru).abs() > 1e-3 {
@@ -652,9 +723,9 @@ impl FluorApp for MahereApp {
 
     fn render(&mut self, target: &mut [u32], ctx: &mut Context) {
         let (w, h) = Self::dims(ctx);
-        if let Some(g) = self.gpu.as_mut() {
-            g.render(&mut self.map, &mut self.labeller, self.panel.label_font_px(), w, h);
-            self.chrome.invalidate_bg();
+        let t0 = Instant::now();
+        if self.gpu.is_some() {
+            // Drawn below, once the panel is painted: it goes over the map on the GPU.
         } else if self.map.needs_render(w, h) {
             self.map.render(w, h);
             self.chrome.invalidate_bg();
@@ -687,12 +758,18 @@ impl FluorApp for MahereApp {
             };
             self.chrome.invalidate_chrome();
         }
+        let t1 = Instant::now();
         let areas = self.areas.view(self.map.user.has_selection());
         self.panel.paint(w, h, self.map.layers(), Controls { real_sun: self.map.real_sun, real_light: self.map.real_light, follow_heading: self.map.follow_heading, lock_to_fix: self.map.lock_to_fix, cache_budget: self.cache_budget, theme: self.map.theme, compressed: self.map.compressed(), tool: self.map.tool as u8, pen_rgba: self.map.pen_colour, travel: travel_code(self.map.travel), record: false, clear_ink: false, clear_sel: false, locate: false, ruler: self.map.ruler, contour_auto: self.map.contour_hold.is_none(), contour_interval: self.map.contour_hold.unwrap_or(self.map.contour_interval) }, &readouts, measure.as_ref(), &themes, &areas, None);
-        let mut map = match &self.gpu {
-            Some(g) => g.frame.clone(),
-            None => self.map.canvas.clone(),
-        };
+        let t2 = Instant::now();
+        // On the GPU: the map, its labels, the marks and the panel drawn together, the newest frame landed in fluor's own pixels, copied into the chrome's background layer as it is.
+        if let Some(g) = self.gpu.as_mut() {
+            g.render(&mut self.map, &mut self.labeller, self.panel.label_font_px(), &self.panel, self.panel.pixels(), w, h);
+            let t3 = Instant::now();
+            self.finish_frame(target, ctx, w, h, [t0, t1, t2, t3]);
+            return;
+        }
+        let mut map = self.map.canvas.clone();
         // The labels, laid out a quarter second after the camera stops, drawn every frame letter by letter over the map and under the panel.
         let c = self.map.cam;
         let cam_key = (c.lat().to_bits(), c.lon().to_bits(), c.ppd.to_bits(), c.bearing().to_bits());
@@ -706,17 +783,14 @@ impl FluorApp for MahereApp {
             self.labeller.draw_cpu(&mut map, &self.map.cam, w, h);
         }
         self.panel.composite_rgb(&mut map, w, h);
+        let t3 = Instant::now();
         self.chrome.rasterize_bg(ctx.damage, |c| {
             let n = c.pixels.len().min(map.len());
             for (out, &rgb) in c.pixels[..n].iter_mut().zip(&map[..n]) {
                 *out = pack_argb((rgb >> 16) as u8, (rgb >> 8) as u8, rgb as u8, 255);
             }
         });
-        self.chrome.rasterize_perimeter(target, w, h, ctx.clip_mask);
-        self.chrome.rasterize_chrome(ctx.damage, ctx.text, ctx.clip_mask);
-        let clip = ctx.damage_clip;
-        self.chrome
-            .flatten_into(target, w, h, Some(Clip::new(clip.x0, clip.y0, clip.x1, clip.y1)));
+        self.finish_frame(target, ctx, w, h, [t0, t1, t2, t3]);
     }
 
     fn cursor_for(&self, x: Px, y: Px, ctx: &Context) -> CursorIcon {

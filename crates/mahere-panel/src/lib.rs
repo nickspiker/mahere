@@ -1777,19 +1777,35 @@ impl Panel {
     }
 
     /// The screen overlay for the GPU as premultiplied RGBA bytes: the engine's marks (0xRRGGBB ink over black, the ink's brightness its coverage) under the panel.
+    /// The panel as last painted, fluor's pixels.
+    pub fn pixels(&self) -> &[u32] {
+        &self.buf
+    }
+
     pub fn overlay_rgba(&self, marks: &[u32], w: usize, h: usize) -> Vec<u8> {
+        self.overlay_rows(marks, w, h, 0, h)
+    }
+
+    /// [`Self::overlay_rgba`] for rows `y0..y1` alone: what a host uploads when only they changed.
+    pub fn overlay_rows(&self, marks: &[u32], w: usize, h: usize, y0: usize, y1: usize) -> Vec<u8> {
+        let (y0, y1) = (y0.min(h), y1.min(h).max(y0.min(h)));
         let n = w * h;
-        let mut out = vec![0u8; n * 4];
-        for i in 0..n {
+        let mut out = vec![0u8; (y1 - y0) * w * 4];
+        let panel = self.buf.len() == n;
+        for (k, i) in (y0 * w..y1 * w).enumerate() {
             let m = marks.get(i).copied().unwrap_or(0);
+            // Nothing here, the most of the screen: it stays clear (2026-10-25: the desktop built this every frame while the panel's readouts moved).
+            if m == 0 && (!panel || self.buf[i] >> 24 == 0) {
+                continue;
+            }
             let (mr, mg, mb) = ((m >> 16) as u8, (m >> 8) as u8, m as u8);
             let ma = mr.max(mg).max(mb);
-            let (r, g, b, a) = if self.buf.len() == n { Self::premul(self.buf[i]) } else { (0, 0, 0, 0) };
+            let (r, g, b, a) = if panel { Self::premul(self.buf[i]) } else { (0, 0, 0, 0) };
             let keep = 255 - a as u32;
-            out[4 * i] = r + ((mr as u32 * keep) / 255) as u8;
-            out[4 * i + 1] = g + ((mg as u32 * keep) / 255) as u8;
-            out[4 * i + 2] = b + ((mb as u32 * keep) / 255) as u8;
-            out[4 * i + 3] = a + ((ma as u32 * keep) / 255) as u8;
+            out[4 * k] = r + ((mr as u32 * keep) / 255) as u8;
+            out[4 * k + 1] = g + ((mg as u32 * keep) / 255) as u8;
+            out[4 * k + 2] = b + ((mb as u32 * keep) / 255) as u8;
+            out[4 * k + 3] = a + ((ma as u32 * keep) / 255) as u8;
         }
         out
     }

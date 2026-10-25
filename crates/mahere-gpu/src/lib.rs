@@ -1024,6 +1024,21 @@ impl GpuMap {
         }
     }
 
+    /// Rows `y0..` of the screen overlay replaced, `rgba` holding whole rows: only what changed is uploaded.
+    pub fn set_overlay_rows(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, w: u32, h: u32, y0: u32, rgba: &[u8]) {
+        self.ensure_overlay(device, w, h);
+        let rows = (rgba.len() / (w as usize * 4)) as u32;
+        if rows == 0 || y0 + rows > h {
+            return;
+        }
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo { texture: &self.overlay.as_ref().unwrap().0, mip_level: 0, origin: wgpu::Origin3d { x: 0, y: y0, z: 0 }, aspect: wgpu::TextureAspect::All },
+            &rgba[..(rows * w * 4) as usize],
+            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(w * 4), rows_per_image: Some(rows) },
+            wgpu::Extent3d { width: w, height: rows, depth_or_array_layers: 1 },
+        );
+    }
+
     /// The glyph atlas (two bytes a texel: a letter's coverage, its halo's), uploaded when its version changed.
     pub fn set_atlas(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, side: u32, rg: &[u8], version: u64) {
         if self.atlas.as_ref().is_some_and(|(t, v, _)| *v == version && t.width() == side) {
