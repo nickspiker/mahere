@@ -228,15 +228,19 @@ const GROUPS: [(&str, &[Layer]); 8] = [
     ("Land and water", &[Layer::Land, Layer::Water, Layer::Own, Layer::Mvum]),
     ("Light", &[Layer::RealSun, Layer::RealLight, Layer::Linear]),
     ("Location", &[Layer::FollowHeading, Layer::LockToFix, Layer::Record]),
-    // The text size alone, a slider (Nick 2026-10-25: on the Mac it was not easy to scale the overall font size).
+    // The interface's size, a slider, on a computer (Nick 2026-10-25); on a phone the pinch on the panel sets it and the group is not shown.
     ("Display", &[]),
     ("Diagnostics", &[Layer::Debug]),
 ];
 
-/// The Display group, whose row is the text size.
+/// The Display group, whose row is the interface size.
 const DISPLAY_GROUP: usize = 6;
 
-/// The text sizes the slider steps through: the panel's text and the map's lettering, over whatever the UI scale is (the RU, which fluor's Cmd/Ctrl keys and the phone's pinch set); the orb, the buttons and the window's chrome stay as the UI scale has them.
+/// The map's lettering's size over the UI scale, at most and at least.
+pub const LABEL_MIN: f32 = 0.5;
+pub const LABEL_MAX: f32 = 3.0;
+
+/// The interface sizes the slider steps through (the UI scale, fluor's RU: the panel, the orb, the buttons and the map's lettering with them; Cmd/Ctrl with + - 0 or scroll set the same).
 const TEXT_SCALES: [f32; 13] = [0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.1, 1.25, 1.4, 1.6, 1.8, 2.0, 2.5];
 
 fn text_pos(ru: f32) -> f32 {
@@ -601,11 +605,14 @@ pub struct Panel {
     /// The contour interval's slider under Contours, and whether a finger is on it.
     interval: Slider,
     interval_held: bool,
-    /// The text size slider; the size it is being moved to (applied when it is let go, so the row stays under the finger); the text size in use; one for the host to keep, once.
+    /// The interface size slider; the size it is being moved to (applied when it is let go, so the row stays under the finger); one for the host to apply and keep, once.
     text_slider: Slider,
     text_pending: Option<f32>,
-    text_scale: f32,
-    text_request: Option<f32>,
+    ru_request: Option<f32>,
+    /// The map's lettering over the UI scale (Nick 2026-10-25: scroll on the map with the panel open, Shift and scroll with it closed, a pinch begun on the map with it open); the panel's own text follows the UI scale alone.
+    label_scale: f32,
+    /// A touch screen: the interface size is the pinch on the panel, and the slider is not shown.
+    touch: bool,
     text: TextRenderer,
     /// The font packs, when the host gave them, and how far through their arrivals this renderer has loaded.
     fonts: Option<std::sync::Arc<fonts::FontPacks>>,
@@ -672,7 +679,7 @@ impl Panel {
         let checks = LAYERS.iter().map(|&(l, label)| (l, Checkbox::new(&mut hits, label, 0.0, 0.0, 10.0, 10.0, 10.0, false))).collect();
         let interval = Slider::new(&mut hits, 0.0, 0.0, 10.0, 10.0, 0.0);
         let text_slider = Slider::new(&mut hits, 0.0, 0.0, 10.0, 10.0, text_pos(1.0));
-        Panel { fonts: None, font_cursor: Default::default(), open: false, dirty: true, ru: 1.0, stack: vec![Page::Layers], theme_rows: Vec::new(), edit_rows: Vec::new(), edit_scroll: 0.0, edit_extent: 0.0, press: None, sliders: Vec::new(), field_vals: [0.0; 4], held: None, edits: Vec::new(), hits, shown: vec![true; LAYERS.len()], group_open: GROUPS_OPEN, group_rows: Vec::new(), tree: Vec::new(), layer_open: None, field_open: None, theme_now: None, interval, interval_held: false, text_slider, text_pending: None, text_scale: 1.0, text_request: None, checks, text: TextRenderer::new(), buf: Vec::new(), w: 0, h: 0, font: 16.0, gear: (0.0, 0.0, 0.0), panel_w: 0.0, theme_row: (0.0, 0.0, 0.0), slider: (0.0, 0.0, 0.0), slider_held: false, cache_max: CACHE_MIN + 1, strip_close: None, clear_measure: false, area_rows: Vec::new(), area_acts: Vec::new(), areas: AreasView::default(), update_rows: Vec::new(), update_acts: Vec::new(), updates: UpdatesView::default(), host_orb: None, layers_scroll: 0.0, layers_extent: 0.0, layers_press: None, layers_band: (0.0, 0.0), orb_icon: fluor::host::icon::Icon::from_vsf_bytes(APP_ORB_VSF).ok(), orb_scaled: (0, Vec::new()), locate_btn: None, tool_btn: None, toolbox_open: false, tool_rows: Vec::new() }
+        Panel { fonts: None, font_cursor: Default::default(), open: false, dirty: true, ru: 1.0, stack: vec![Page::Layers], theme_rows: Vec::new(), edit_rows: Vec::new(), edit_scroll: 0.0, edit_extent: 0.0, press: None, sliders: Vec::new(), field_vals: [0.0; 4], held: None, edits: Vec::new(), hits, shown: vec![true; LAYERS.len()], group_open: GROUPS_OPEN, group_rows: Vec::new(), tree: Vec::new(), layer_open: None, field_open: None, theme_now: None, interval, interval_held: false, text_slider, text_pending: None, ru_request: None, label_scale: 1.0, touch: false, checks, text: TextRenderer::new(), buf: Vec::new(), w: 0, h: 0, font: 16.0, gear: (0.0, 0.0, 0.0), panel_w: 0.0, theme_row: (0.0, 0.0, 0.0), slider: (0.0, 0.0, 0.0), slider_held: false, cache_max: CACHE_MIN + 1, strip_close: None, clear_measure: false, area_rows: Vec::new(), area_acts: Vec::new(), areas: AreasView::default(), update_rows: Vec::new(), update_acts: Vec::new(), updates: UpdatesView::default(), host_orb: None, layers_scroll: 0.0, layers_extent: 0.0, layers_press: None, layers_band: (0.0, 0.0), orb_icon: fluor::host::icon::Icon::from_vsf_bytes(APP_ORB_VSF).ok(), orb_scaled: (0, Vec::new()), locate_btn: None, tool_btn: None, toolbox_open: false, tool_rows: Vec::new() }
     }
 
     pub fn is_open(&self) -> bool {
@@ -954,17 +961,56 @@ impl Panel {
     }
 
     /// The UI's scale (fluor's RU multiplier), clamped as fluor clamps it. Relayout follows on the next paint.
-    /// A text size the slider set, once, for the host to keep.
-    pub fn take_text_request(&mut self) -> Option<f32> {
-        self.text_request.take()
+    /// An interface size the slider set, once, for the host to apply as its UI scale and keep.
+    pub fn take_ru_request(&mut self) -> Option<f32> {
+        self.ru_request.take()
     }
 
-    /// The text size over the UI scale (a kept one restored at start).
-    pub fn set_text_scale(&mut self, t: f32) {
-        let t = t.clamp(TEXT_SCALES[0], TEXT_SCALES[TEXT_SCALES.len() - 1]);
-        if (t - self.text_scale).abs() > 1e-4 {
-            self.text_scale = t;
-            self.dirty = true;
+    /// The map's lettering over the UI scale.
+    pub fn set_label_scale(&mut self, t: f32) {
+        self.label_scale = t.clamp(LABEL_MIN, LABEL_MAX);
+    }
+
+    pub fn label_scale(&self) -> f32 {
+        self.label_scale
+    }
+
+    /// The map's lettering's size: the panel's text at the UI scale, times its own.
+    pub fn label_font_px(&self) -> f32 {
+        self.font * self.label_scale
+    }
+
+    /// A touch screen: the interface size is the pinch, the slider not shown.
+    pub fn set_touch(&mut self, touch: bool) {
+        self.touch = touch;
+    }
+
+    /// Whether a point is on the open panel's column (not the map beside it).
+    pub fn covers(&self, x: f32, _y: f32) -> bool {
+        self.open && x < self.panel_w
+    }
+
+    /// A scroll over the open panel: its list moves, `dy` pixels (down positive). True when it moved.
+    pub fn wheel(&mut self, dy: f32) -> bool {
+        if !self.open {
+            return false;
+        }
+        match self.page() {
+            Page::Layers => {
+                let to = (self.layers_scroll + dy).clamp(0.0, self.layers_extent);
+                let moved = (to - self.layers_scroll).abs() > 0.0;
+                self.layers_scroll = to;
+                self.dirty |= moved;
+                moved
+            }
+            Page::Edit => {
+                let to = (self.edit_scroll + dy).clamp(0.0, self.edit_extent);
+                let moved = (to - self.edit_scroll).abs() > 0.0;
+                self.edit_scroll = to;
+                self.dirty |= moved;
+                moved
+            }
+            _ => false,
         }
     }
 
@@ -994,11 +1040,9 @@ impl Panel {
         let (wf, hf) = (w as f32, h as f32);
         let span = if w + h > 0 { 2.0 * wf * hf / (wf + hf) } else { 0.0 };
         let unit = hm(span / 32.0 * self.ru, hf / 13.0);
-        // The orb and its margin from the UI scale alone; the text, and the rows holding it, at the text size over it.
-        let base = (unit * 0.5).max(6.0);
-        self.font = base * self.text_scale;
-        let r = base * 1.15;
-        let pad = base * 0.6;
+        self.font = (unit * 0.5).max(6.0);
+        let r = self.font * 1.15;
+        let pad = self.font * 0.6;
         self.gear = self.host_orb.unwrap_or((pad + r, pad + r, r));
         let r = self.gear.2;
         self.panel_w = (self.font * 13.0).min(w as f32 * 0.7);
@@ -1025,13 +1069,18 @@ impl Panel {
         let setting = row * 0.85;
         let slider_row = self.font * 2.4;
         for (gi, (_, layers)) in GROUPS.iter().enumerate() {
+            // On a touch screen the Display group holds nothing (the pinch is its slider): parked off the page, its place kept.
+            if gi == DISPLAY_GROUP && self.touch {
+                self.group_rows.push((-1.0e6, 0.0));
+                continue;
+            }
             self.group_rows.push((y + row * 0.5, row * 0.5));
             self.tree.push((y + row * 0.5, row * 0.5, TreeRow::Group(gi)));
             y += row;
             if !self.group_open[gi] {
                 continue;
             }
-            if gi == DISPLAY_GROUP {
+            if gi == DISPLAY_GROUP && !self.touch {
                 self.text_slider.set_rect(x0 + indent + (full - indent) * 0.5, y + slider_row * 0.72, full - indent, self.font * 1.1);
                 self.tree.push((y + slider_row * 0.5, slider_row * 0.5, TreeRow::TextSize));
                 y += slider_row;
@@ -1656,11 +1705,11 @@ impl Panel {
                     }
                 }
                 TreeRow::TextSize => {
-                    let shown = self.text_pending.unwrap_or(self.text_scale);
-                    self.text.draw_text_left(&mut canvas, "Text size", tx, cy - font * 0.55, &dim, clip, None);
+                    let shown = self.text_pending.unwrap_or(self.ru);
+                    self.text.draw_text_left(&mut canvas, "Interface size", tx, cy - font * 0.55, &dim, clip, None);
                     self.text.draw_text_left(&mut canvas, &format!("{}%", (shown * 100.0).round() as i64), tx + font * 4.5, cy - font * 0.55, &small, clip, None);
                     if self.text_pending.is_none() {
-                        self.text_slider.set_value(text_pos(self.text_scale));
+                        self.text_slider.set_value(text_pos(self.ru));
                     }
                     if cy - hh >= band_top && cy + hh <= footer_top {
                         self.text_slider.render_content_into(&mut canvas, None, HIT_NONE);
@@ -2032,10 +2081,10 @@ impl Panel {
         self.slider_held = false;
         self.held = None;
         self.interval_held = false;
-        // The text size let go: the panel takes it, and the host keeps it.
-        if let Some(t) = self.text_pending.take() {
-            self.set_text_scale(t);
-            self.text_request = Some(t);
+        // The interface size let go: the panel takes it, and the host applies it as its UI scale and keeps it.
+        if let Some(ru) = self.text_pending.take() {
+            self.set_ru(ru);
+            self.ru_request = Some(ru);
         }
         let mut changed = false;
         if let Some((x, y, moved)) = self.layers_press.take() {

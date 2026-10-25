@@ -246,9 +246,9 @@ impl MahereApp {
 }
 
 impl FluorApp for MahereApp {
-    /// The UI scale kept from the last launch, once: fluor applies it as its own zoom.
+    /// The UI scale kept from the last launch, once, then the panel's interface size when the slider sets it: fluor applies either as its own zoom, as its Cmd/Ctrl keys and scroll do.
     fn take_zoom_request(&mut self) -> Option<f32> {
-        self.zoom_restore.take()
+        self.zoom_restore.take().or_else(|| self.panel.take_ru_request())
     }
 
     type UserEvent = ();
@@ -458,12 +458,28 @@ impl FluorApp for MahereApp {
                 EventResponse::Pass
             }
             FEvent::MouseWheel { delta } => {
-                // Trackpads deliver Pixels with momentum; clamp per event.
-                let notches = (match delta {
-                    MouseScrollDelta::Lines(_, y) => *y,
-                    MouseScrollDelta::Pixels(_, y) => *y / 120.,
-                } as f64)
-                    .clamp(-3.0, 3.0);
+                // Trackpads deliver Pixels with momentum; clamp per event. A Mac turns Shift and scroll sideways: either axis counts.
+                let (dx, dy) = match delta {
+                    MouseScrollDelta::Lines(x, y) => (*x, *y),
+                    MouseScrollDelta::Pixels(x, y) => (*x / 120., *y / 120.),
+                };
+                let notches = (if dy != 0.0 { dy } else { dx } as f64).clamp(-3.0, 3.0);
+                // Nick 2026-10-25: over the open panel the scroll moves its list; on the map with the panel open, or with Shift, it sizes the map's lettering; otherwise it zooms the map (Cmd/Ctrl and scroll, the interface size, is fluor's own and never arrives here).
+                if self.panel.covers(ctx.cursor_x, ctx.cursor_y) {
+                    if self.panel.wheel(-(notches as f32) * self.panel.font_px() * 2.0) {
+                        ctx.window.request_redraw();
+                    }
+                    return EventResponse::Handled;
+                }
+                if self.panel.is_open() || ctx.modifiers.shift_key() {
+                    let t = self.panel.label_scale() * fluor::geom::zoom_step_factor(notches as f32 * 2.0);
+                    self.panel.set_label_scale(t);
+                    if let Some(store) = &self.store {
+                        let _ = mahere_store::save_label_scale(store, self.panel.label_scale());
+                    }
+                    ctx.window.request_redraw();
+                    return EventResponse::Handled;
+                }
                 self.map.zoom_about(
                     1.18_f64.powf(notches),
                     ctx.cursor_x as f64,
@@ -567,12 +583,6 @@ impl FluorApp for MahereApp {
 
     fn tick(&mut self, ctx: &mut Context) -> bool {
         let (w, h) = Self::dims(ctx);
-        // The text size the panel's slider set, kept.
-        if let Some(t) = self.panel.take_text_request() {
-            if let Some(store) = &self.store {
-                let _ = mahere_store::save_text_scale(store, t);
-            }
-        }
         // The UI scale kept whenever it changes (fluor's Cmd/Ctrl keys and scroll).
         if (ctx.viewport.ru - self.kept_ru).abs() > 1e-3 {
             self.kept_ru = ctx.viewport.ru;
@@ -643,7 +653,7 @@ impl FluorApp for MahereApp {
     fn render(&mut self, target: &mut [u32], ctx: &mut Context) {
         let (w, h) = Self::dims(ctx);
         if let Some(g) = self.gpu.as_mut() {
-            g.render(&mut self.map, &mut self.labeller, self.panel.font_px(), w, h);
+            g.render(&mut self.map, &mut self.labeller, self.panel.label_font_px(), w, h);
             self.chrome.invalidate_bg();
         } else if self.map.needs_render(w, h) {
             self.map.render(w, h);
@@ -692,7 +702,7 @@ impl FluorApp for MahereApp {
         // On the GPU the labels are in the frame already.
         if self.gpu.is_none() && mahere_panel::labels::Labeller::wanted(&self.map) {
             let at_rest = self.label_cam.1.elapsed().as_millis() >= 250;
-            self.labeller.ask(&mut self.map, w, h, self.panel.font_px(), at_rest);
+            self.labeller.ask(&mut self.map, w, h, self.panel.label_font_px(), at_rest);
             self.labeller.draw_cpu(&mut map, &self.map.cam, w, h);
         }
         self.panel.composite_rgb(&mut map, w, h);
@@ -795,8 +805,8 @@ fn main() {
         app.zoom_restore = Some(ru);
         app.kept_ru = ru;
     }
-    if let Some(t) = vault.as_ref().and_then(|v| mahere_store::load_text_scale(v)) {
-        app.panel.set_text_scale(t);
+    if let Some(t) = vault.as_ref().and_then(|v| mahere_store::load_label_scale(v)) {
+        app.panel.set_label_scale(t);
     }
     app.store = vault;
     app.cells = cells;

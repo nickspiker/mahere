@@ -74,6 +74,9 @@ pub struct AndroidApp {
     /// The UI's scale, pinched while the panel is open; the last finger distance of such a pinch.
     ui_ru: f32,
     ui_pinch: Option<f64>,
+    /// Where the first finger came down, and whether a pinch with the panel open began there on the panel (the interface size) or on the map (the map's lettering).
+    first_down: (f64, f64),
+    pinch_on_panel: bool,
     panel: Panel,
     /// Font packs (Nick 2026-10-16), shared by the panel and the GPU host's labels.
     fonts: std::sync::Arc<mahere_panel::fonts::FontPacks>,
@@ -147,12 +150,19 @@ impl AndroidApp {
         Controls { real_sun: self.map.real_sun, real_light: self.map.real_light, follow_heading: self.map.follow_heading, lock_to_fix: self.map.lock_to_fix, cache_budget: self.cache_budget, theme: self.map.theme, compressed: self.map.compressed(), tool: self.map.tool as u8, pen_rgba: self.map.pen_colour, travel: travel_code(self.map.travel), record: self.recording, clear_ink: false, clear_sel: false, locate: false, ruler: self.map.ruler, contour_auto: self.map.contour_hold.is_none(), contour_interval: self.map.contour_hold.unwrap_or(self.map.contour_interval) }
     }
 
-    /// A pinch with the panel open: the finger distance's ratio to the last event's scales the UI.
+    /// A pinch with the panel open: the finger distance's ratio to the last event's scales the interface when it began on the panel, the map's lettering when it began on the map (Nick 2026-10-25: by where the first finger came down).
     fn ui_pinch(&mut self, x0: f64, y0: f64, x1: f64, y1: f64) {
         let d = ((x1 - x0).powi(2) + (y1 - y0).powi(2)).sqrt().max(1.0);
-        if let Some(prev) = self.ui_pinch {
-            self.ui_ru = (self.ui_ru * (d / prev) as f32).clamp(mahere_panel::RU_MIN, mahere_panel::RU_MAX);
-            self.panel.set_ru(self.ui_ru);
+        match self.ui_pinch {
+            None => self.pinch_on_panel = self.panel.covers(self.first_down.0 as f32, self.first_down.1 as f32),
+            Some(prev) if self.pinch_on_panel => {
+                self.ui_ru = (self.ui_ru * (d / prev) as f32).clamp(mahere_panel::RU_MIN, mahere_panel::RU_MAX);
+                self.panel.set_ru(self.ui_ru);
+            }
+            Some(prev) => {
+                let t = self.panel.label_scale() * (d / prev) as f32;
+                self.panel.set_label_scale(t);
+            }
         }
         self.ui_pinch = Some(d);
     }
@@ -520,12 +530,6 @@ impl FluorApp for AndroidApp {
                 if self.panel.release(&mut mask, &mut ctl) {
                     self.apply_controls(ctl, mask);
                 }
-                // The text size set on the panel, kept.
-                if let Some(t) = self.panel.take_text_request() {
-                    if let Some(store) = &self.store {
-                        let _ = mahere_store::save_text_scale(store, t);
-                    }
-                }
                 self.apply_area_acts();
                 self.apply_update_acts();
                 if self.drawing {
@@ -612,6 +616,7 @@ fn shell<'a>(ptr: jlong) -> &'a mut Shell {
 }
 
 /// Android MotionEvent action codes (masked).
+const ACTION_DOWN: jint = 0;
 const ACTION_MOVE: jint = 2;
 const ACTION_POINTER_UP: jint = 6;
 
@@ -802,6 +807,8 @@ pub extern "system" fn Java_nz_mahere_app_MahereActivity_nativeInit(
             probe_short: None,
             ui_ru,
             ui_pinch: None,
+            first_down: (0.0, 0.0),
+            pinch_on_panel: true,
         panel: Panel::new(),
         fonts,
         cache_budget: settings.map_or(DEFAULT_CACHE_BUDGET, |s| if s.cache_budget == 0 { DEFAULT_CACHE_BUDGET } else { s.cache_budget }),
@@ -817,8 +824,10 @@ pub extern "system" fn Java_nz_mahere_app_MahereActivity_nativeInit(
         install: None,
     };
     app.panel.set_ru(ui_ru);
-    if let Some(t) = app.store.as_ref().and_then(|v| mahere_store::load_text_scale(v)) {
-        app.panel.set_text_scale(t);
+    // A touch screen: the interface size is the pinch on the panel.
+    app.panel.set_touch(true);
+    if let Some(t) = app.store.as_ref().and_then(|v| mahere_store::load_label_scale(v)) {
+        app.panel.set_label_scale(t);
     }
     app.panel.set_fonts(app.fonts.clone());
     Box::into_raw(Box::new(AndroidShell::new(app, width as u32, height as u32))) as jlong
@@ -954,7 +963,10 @@ pub extern "system" fn Java_nz_mahere_app_MahereActivity_nativeOnTouch(
     if stylus {
         s.app().stylus_seen = Some(Instant::now());
     }
-    // With the panel open, two fingers scale the UI (fluor's RU), not the map.
+    if action == ACTION_DOWN {
+        s.app().first_down = (x0 as f64, y0 as f64);
+    }
+    // With the panel open, two fingers scale the interface or the map's lettering, by where the first came down; never the map.
     if s.app().panel.is_open() {
         if count >= 2 && action != ACTION_POINTER_UP {
             s.app().ui_pinch(x0 as f64, y0 as f64, x1 as f64, y1 as f64);
@@ -962,7 +974,14 @@ pub extern "system" fn Java_nz_mahere_app_MahereActivity_nativeOnTouch(
         }
         if count >= 2 || s.app().ui_pinch.is_some() {
             s.app().ui_pinch = None;
-            s.app().save_settings();
+            if s.app().pinch_on_panel {
+                s.app().save_settings();
+            } else {
+                let app = s.app();
+                if let Some(store) = &app.store {
+                    let _ = mahere_store::save_label_scale(store, app.panel.label_scale());
+                }
+            }
             return 0;
         }
         let r = s.on_touch(action, x0, y0);
