@@ -32,6 +32,9 @@ struct MahereApp {
     rotating: bool,
     last_cursor: (f64, f64),
     store: Option<std::sync::Arc<mahere_store::FlatStorage>>,
+    /// The UI scale kept from the last launch, handed to fluor once; the scale last kept.
+    zoom_restore: Option<f32>,
+    kept_ru: f32,
     cells: Option<std::sync::Arc<mahere_store::CellFiles>>,
     last_save: Instant,
     panel: Panel,
@@ -107,6 +110,8 @@ impl MahereApp {
             rotating: false,
             last_cursor: (0., 0.),
             store: None,
+            zoom_restore: None,
+            kept_ru: 1.0,
             cells: None,
             last_save: Instant::now(),
             panel: Panel::new(),
@@ -241,6 +246,11 @@ impl MahereApp {
 }
 
 impl FluorApp for MahereApp {
+    /// The kept UI scale at start, then the panel's text size when it is set: fluor applies either as its own zoom.
+    fn take_zoom_request(&mut self) -> Option<f32> {
+        self.zoom_restore.take().or_else(|| self.panel.take_ru_request())
+    }
+
     type UserEvent = ();
 
     fn title(&self) -> &str {
@@ -557,6 +567,13 @@ impl FluorApp for MahereApp {
 
     fn tick(&mut self, ctx: &mut Context) -> bool {
         let (w, h) = Self::dims(ctx);
+        // The UI scale kept whenever it changes (fluor's keys and scroll, or the panel's text size).
+        if (ctx.viewport.ru - self.kept_ru).abs() > 1e-3 {
+            self.kept_ru = ctx.viewport.ru;
+            if let Some(store) = &self.store {
+                let _ = mahere_store::save_ui_scale(store, self.kept_ru);
+            }
+        }
         // Session persistence rides the refinement ticks: at most one vault write per few seconds, only while the view is actually changing.
         if self.last_save.elapsed().as_secs() >= 1 {
             self.last_save = Instant::now();
@@ -767,6 +784,11 @@ fn main() {
     fonts.set_renderers(1);
     app.panel.set_fonts(fonts.clone());
     app.labeller.set_fonts(fonts);
+    // The UI scale from the last launch, through fluor's own zoom so its keys, scroll and the panel's slider move one setting.
+    if let Some(ru) = vault.as_ref().and_then(|v| mahere_store::load_ui_scale(v)) {
+        app.zoom_restore = Some(ru);
+        app.kept_ru = ru;
+    }
     app.store = vault;
     app.cells = cells;
     run_app(app).expect("fluor event loop failed");

@@ -221,18 +221,35 @@ const LAYERS: [(Layer, &str); 25] = [
 ];
 
 /// The Layers page as a tree (Nick 2026-10-21: "a checkbox monolith"): each group a row that opens and closes over its rows; the pages (areas, updates) stay at the foot, always shown.
-const GROUPS: [(&str, &[Layer]); 7] = [
+const GROUPS: [(&str, &[Layer]); 8] = [
     ("Ground", &[Layer::Dem, Layer::Hypso, Layer::Raw, Layer::Geoid, Layer::Contours, Layer::Slope]),
     ("Imagery", &[Layer::Imagery, Layer::Infrared]),
     ("Lines and names", &[Layer::Line, Layer::Labels, Layer::Boundaries]),
     ("Land and water", &[Layer::Land, Layer::Water, Layer::Own, Layer::Mvum]),
     ("Light", &[Layer::RealSun, Layer::RealLight, Layer::Linear]),
     ("Location", &[Layer::FollowHeading, Layer::LockToFix, Layer::Record]),
+    // The text size alone, a slider (Nick 2026-10-25: on the Mac it was not easy to scale the overall font size).
+    ("Display", &[]),
     ("Diagnostics", &[Layer::Debug]),
 ];
 
+/// The Display group, whose row is the text size.
+const DISPLAY_GROUP: usize = 6;
+
+/// The UI scales the text size slider steps through (the panel's whole layout and the map's lettering with it).
+const TEXT_SCALES: [f32; 13] = [0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.1, 1.25, 1.4, 1.6, 1.8, 2.0, 2.5];
+
+fn text_pos(ru: f32) -> f32 {
+    let i = TEXT_SCALES.iter().enumerate().min_by(|a, b| (a.1.ln() - ru.ln()).abs().total_cmp(&(b.1.ln() - ru.ln()).abs())).map_or(5, |(i, _)| i);
+    i as f32 / (TEXT_SCALES.len() - 1) as f32
+}
+
+fn text_at(pos: f32) -> f32 {
+    TEXT_SCALES[(pos.clamp(0.0, 1.0) * (TEXT_SCALES.len() - 1) as f32).round() as usize]
+}
+
 /// Which groups start open: the ground's, the rest folded.
-const GROUPS_OPEN: [bool; 7] = [true, false, false, false, false, false, false];
+const GROUPS_OPEN: [bool; 8] = [true, false, false, false, false, false, false, false];
 
 /// A row nested under another row of its group (Auto interval under Contours): set in one step further.
 fn nested(l: Layer) -> bool {
@@ -247,6 +264,8 @@ enum TreeRow {
     Field(Field),
     Interval,
     Slider(usize),
+    /// The text size slider, the Display group's row.
+    TextSize,
 }
 
 /// A layer's own settings, opened under its row (Nick 2026-10-21: "sliders under each element so we don't have to open separate pages"): the theme's fields that layer draws with, and for the contours their interval.
@@ -572,7 +591,7 @@ pub struct Panel {
     checks: Vec<(Layer, Checkbox)>,
     /// Which rows of `checks` the tree shows now (their groups open), and each group's state and header row (centre y, half height) from the last layout.
     shown: Vec<bool>,
-    group_open: [bool; 7],
+    group_open: [bool; 8],
     group_rows: Vec<(f32, f32)>,
     /// The tree as laid out: each row's centre y, half height and kind; the layer whose settings are open, the field whose sliders are, and the current theme as last painted (its values for a field opened by a tap).
     tree: Vec<(f32, f32, TreeRow)>,
@@ -582,6 +601,10 @@ pub struct Panel {
     /// The contour interval's slider under Contours, and whether a finger is on it.
     interval: Slider,
     interval_held: bool,
+    /// The text size slider; the scale it is being moved to (applied when it is let go, so the row stays under the finger); a scale for the host to apply, once.
+    text_slider: Slider,
+    text_pending: Option<f32>,
+    ru_request: Option<f32>,
     text: TextRenderer,
     /// The font packs, when the host gave them, and how far through their arrivals this renderer has loaded.
     fonts: Option<std::sync::Arc<fonts::FontPacks>>,
@@ -647,7 +670,8 @@ impl Panel {
         let mut hits: HitId = HIT_NONE;
         let checks = LAYERS.iter().map(|&(l, label)| (l, Checkbox::new(&mut hits, label, 0.0, 0.0, 10.0, 10.0, 10.0, false))).collect();
         let interval = Slider::new(&mut hits, 0.0, 0.0, 10.0, 10.0, 0.0);
-        Panel { fonts: None, font_cursor: Default::default(), open: false, dirty: true, ru: 1.0, stack: vec![Page::Layers], theme_rows: Vec::new(), edit_rows: Vec::new(), edit_scroll: 0.0, edit_extent: 0.0, press: None, sliders: Vec::new(), field_vals: [0.0; 4], held: None, edits: Vec::new(), hits, shown: vec![true; LAYERS.len()], group_open: GROUPS_OPEN, group_rows: Vec::new(), tree: Vec::new(), layer_open: None, field_open: None, theme_now: None, interval, interval_held: false, checks, text: TextRenderer::new(), buf: Vec::new(), w: 0, h: 0, font: 16.0, gear: (0.0, 0.0, 0.0), panel_w: 0.0, theme_row: (0.0, 0.0, 0.0), slider: (0.0, 0.0, 0.0), slider_held: false, cache_max: CACHE_MIN + 1, strip_close: None, clear_measure: false, area_rows: Vec::new(), area_acts: Vec::new(), areas: AreasView::default(), update_rows: Vec::new(), update_acts: Vec::new(), updates: UpdatesView::default(), host_orb: None, layers_scroll: 0.0, layers_extent: 0.0, layers_press: None, layers_band: (0.0, 0.0), orb_icon: fluor::host::icon::Icon::from_vsf_bytes(APP_ORB_VSF).ok(), orb_scaled: (0, Vec::new()), locate_btn: None, tool_btn: None, toolbox_open: false, tool_rows: Vec::new() }
+        let text_slider = Slider::new(&mut hits, 0.0, 0.0, 10.0, 10.0, text_pos(1.0));
+        Panel { fonts: None, font_cursor: Default::default(), open: false, dirty: true, ru: 1.0, stack: vec![Page::Layers], theme_rows: Vec::new(), edit_rows: Vec::new(), edit_scroll: 0.0, edit_extent: 0.0, press: None, sliders: Vec::new(), field_vals: [0.0; 4], held: None, edits: Vec::new(), hits, shown: vec![true; LAYERS.len()], group_open: GROUPS_OPEN, group_rows: Vec::new(), tree: Vec::new(), layer_open: None, field_open: None, theme_now: None, interval, interval_held: false, text_slider, text_pending: None, ru_request: None, checks, text: TextRenderer::new(), buf: Vec::new(), w: 0, h: 0, font: 16.0, gear: (0.0, 0.0, 0.0), panel_w: 0.0, theme_row: (0.0, 0.0, 0.0), slider: (0.0, 0.0, 0.0), slider_held: false, cache_max: CACHE_MIN + 1, strip_close: None, clear_measure: false, area_rows: Vec::new(), area_acts: Vec::new(), areas: AreasView::default(), update_rows: Vec::new(), update_acts: Vec::new(), updates: UpdatesView::default(), host_orb: None, layers_scroll: 0.0, layers_extent: 0.0, layers_press: None, layers_band: (0.0, 0.0), orb_icon: fluor::host::icon::Icon::from_vsf_bytes(APP_ORB_VSF).ok(), orb_scaled: (0, Vec::new()), locate_btn: None, tool_btn: None, toolbox_open: false, tool_rows: Vec::new() }
     }
 
     pub fn is_open(&self) -> bool {
@@ -929,6 +953,11 @@ impl Panel {
     }
 
     /// The UI's scale (fluor's RU multiplier), clamped as fluor clamps it. Relayout follows on the next paint.
+    /// A text size the slider set, once: the host applies it as its UI scale and keeps it.
+    pub fn take_ru_request(&mut self) -> Option<f32> {
+        self.ru_request.take()
+    }
+
     pub fn set_ru(&mut self, ru: f32) {
         let ru = ru.clamp(RU_MIN, RU_MAX);
         if (ru - self.ru).abs() > 1e-4 {
@@ -989,6 +1018,11 @@ impl Panel {
             y += row;
             if !self.group_open[gi] {
                 continue;
+            }
+            if gi == DISPLAY_GROUP {
+                self.text_slider.set_rect(x0 + indent + (full - indent) * 0.5, y + slider_row * 0.72, full - indent, self.font * 1.1);
+                self.tree.push((y + slider_row * 0.5, slider_row * 0.5, TreeRow::TextSize));
+                y += slider_row;
             }
             for l in layers.iter() {
                 let Some(i) = self.checks.iter().position(|(c, _)| c == l) else { continue };
@@ -1107,7 +1141,7 @@ impl Panel {
                 self.dirty = true;
                 return false;
             }
-            Some(TreeRow::Interval | TreeRow::Slider(_)) => return false,
+            Some(TreeRow::Interval | TreeRow::Slider(_) | TreeRow::TextSize) => return false,
             _ => {}
         }
         for (i, (l, cb)) in self.checks.iter_mut().enumerate() {
@@ -1340,6 +1374,12 @@ impl Panel {
                     self.dirty = true;
                     return true;
                 }
+            }
+            if self.group_open[DISPLAY_GROUP] && self.tree.iter().any(|t| t.2 == TreeRow::TextSize) && grab(self.text_slider.bbox()) {
+                self.text_slider.set_value_from_x(x);
+                self.text_pending = Some(text_at(self.text_slider.value()));
+                self.dirty = true;
+                return true;
             }
             if self.layer_open == Some(Layer::Contours) && grab(self.interval.bbox()) {
                 self.interval.set_value_from_x(x);
@@ -1601,6 +1641,17 @@ impl Panel {
                     // Sliders take no clip: one only part in the band is left out.
                     if cy - hh >= band_top && cy + hh <= footer_top {
                         self.interval.render_content_into(&mut canvas, None, HIT_NONE);
+                    }
+                }
+                TreeRow::TextSize => {
+                    let shown = self.text_pending.unwrap_or(self.ru);
+                    self.text.draw_text_left(&mut canvas, "Text size", tx, cy - font * 0.55, &dim, clip, None);
+                    self.text.draw_text_left(&mut canvas, &format!("{}%", (shown * 100.0).round() as i64), tx + font * 4.5, cy - font * 0.55, &small, clip, None);
+                    if self.text_pending.is_none() {
+                        self.text_slider.set_value(text_pos(self.ru));
+                    }
+                    if cy - hh >= band_top && cy + hh <= footer_top {
+                        self.text_slider.render_content_into(&mut canvas, None, HIT_NONE);
                     }
                 }
                 TreeRow::Slider(k) => {
@@ -1894,6 +1945,12 @@ impl Panel {
                 }
                 return true;
             }
+            if self.text_pending.is_some() {
+                self.text_slider.set_value_from_x(x);
+                self.text_pending = Some(text_at(self.text_slider.value()));
+                self.dirty = true;
+                return true;
+            }
             if self.interval_held {
                 self.interval.set_value_from_x(x);
                 ctl.contour_auto = false;
@@ -1963,6 +2020,12 @@ impl Panel {
         self.slider_held = false;
         self.held = None;
         self.interval_held = false;
+        // The text size let go: the panel takes it, and the host applies and keeps it.
+        if let Some(ru) = self.text_pending.take() {
+            self.set_ru(ru);
+            self.ru_request = Some(ru);
+            self.dirty = true;
+        }
         let mut changed = false;
         if let Some((x, y, moved)) = self.layers_press.take() {
             if !moved && self.page() == Page::Layers {

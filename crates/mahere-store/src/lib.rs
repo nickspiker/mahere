@@ -167,6 +167,24 @@ pub struct Settings {
     pub contour_hold: Option<f32>,
 }
 
+fn ui_scale_key() -> String {
+    vault_key(&[name("ui scale")])
+}
+
+/// The desktop's UI scale (fluor's RU multiplier: its Cmd/Ctrl keys and scroll, and the panel's text size), kept between launches (Nick 2026-10-25). The phone keeps its own in its settings.
+pub fn save_ui_scale(store: &FlatStorage, ru: f32) -> Result<(), StorageError> {
+    store.write_device(&ui_scale_key(), &VsfType::f5(ru).flatten())
+}
+
+pub fn load_ui_scale(store: &FlatStorage) -> Option<f32> {
+    let bytes = store.read_device(&ui_scale_key()).ok()??;
+    let mut ptr = 0usize;
+    match vsf::parse(&bytes, &mut ptr).ok()? {
+        VsfType::f5(v) if v.is_finite() && v > 0.0 => Some(v),
+        _ => None,
+    }
+}
+
 fn settings_key() -> String {
     vault_key(&[name("settings")])
 }

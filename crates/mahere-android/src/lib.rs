@@ -520,6 +520,11 @@ impl FluorApp for AndroidApp {
                 if self.panel.release(&mut mask, &mut ctl) {
                     self.apply_controls(ctl, mask);
                 }
+                // The text size set on the panel: the phone's UI scale, kept with the settings.
+                if let Some(ru) = self.panel.take_ru_request() {
+                    self.ui_ru = ru;
+                    self.save_settings();
+                }
                 self.apply_area_acts();
                 self.apply_update_acts();
                 if self.drawing {
