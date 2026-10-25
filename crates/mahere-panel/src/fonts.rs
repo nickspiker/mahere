@@ -94,18 +94,25 @@ impl FontPacks {
         self.state.lock().unwrap().docs.len()
     }
 
-    /// How many renderers load every pack (the panel's and the lettering's, say): a document they have all loaded is let go, each keeping its own face (2026-10-23: 57 MB of packs at a whole-globe view were held three times on a Pixel 3a, killed for memory).
+    /// How many renderers must load a document before it is let go, each keeping its own face; one that wants it later reads it from the source again (2026-10-23: 57 MB of packs at a whole-globe view were held three times on a Pixel 3a, killed for memory).
     pub fn set_renderers(&self, n: usize) {
         self.state.lock().unwrap().renderers = n;
     }
 
-    /// The bytes of what arrived since `from`, each with its place in the list, and where the list ended; a document already let go is read from the source again (a renderer made since, after a lost GPU device).
-    fn since(&self, from: usize) -> (usize, Vec<(usize, &'static str, Arc<Vec<u8>>)>) {
-        let (end, ids): (usize, Vec<(usize, &'static str, Option<Arc<Vec<u8>>>)>) = {
+    /// The packs arrived since `from`, each with its place in the list, and where the list ended.
+    fn ids_since(&self, from: usize) -> (usize, Vec<(usize, &'static str)>) {
+        let st = self.state.lock().unwrap();
+        (st.docs.len().max(from), st.docs.iter().enumerate().skip(from).map(|(i, (id, _))| (i, *id)).collect())
+    }
+
+    /// The document at `i`, read from the source again if it was let go (a renderer that wants it after another loaded it).
+    fn bytes(&self, i: usize) -> Option<(&'static str, Arc<Vec<u8>>)> {
+        let (id, d) = {
             let st = self.state.lock().unwrap();
-            (st.docs.len().max(from), st.docs.iter().enumerate().skip(from).map(|(i, (id, d))| (i, *id, d.clone())).collect())
+            let (id, d) = st.docs.get(i)?;
+            (*id, d.clone())
         };
-        (end, ids.into_iter().filter_map(|(i, id, d)| d.or_else(|| self.source.get(id).ok().map(Arc::new)).map(|d| (i, id, d))).collect())
+        d.or_else(|| self.source.get(id).ok().map(Arc::new)).map(|d| (id, d))
     }
 
     /// A renderer has loaded the document at `i`: once every renderer has, its bytes go.
@@ -127,12 +134,38 @@ impl FontPacks {
     }
 }
 
-/// What arrived since `cursor` loaded into a renderer, each checked against the author's key; true when a face was added (whatever measured text before measures again).
-pub fn load_into(text: &mut TextRenderer, fonts: &FontPacks, cursor: &mut usize) -> bool {
-    let (end, docs) = fonts.since(*cursor);
-    *cursor = end;
+/// Where a renderer is in the packs that arrived: how far it has looked, and the packs it passed over because its own text did not need them, loaded when it does.
+#[derive(Default)]
+pub struct FontCursor {
+    at: usize,
+    waiting: Vec<usize>,
+}
+
+impl FontCursor {
+    /// Packs arrived that this renderer has not looked at yet.
+    pub fn behind(&self, fonts: &FontPacks) -> bool {
+        fonts.arrived() > self.at
+    }
+}
+
+/// The packs this renderer's own text wants, of those arrived (each checked against the author's key), loaded; the rest wait until its text needs them (2026-10-25: the panel loaded every script the map's lettering fetched, Arabic, Tibetan and 17 MB of Han included, a parsed copy each, and a Pixel 3a's fresh install was killed for memory). True when a face was added (whatever measured text before measures again).
+pub fn load_into(text: &mut TextRenderer, fonts: &FontPacks, cursor: &mut FontCursor) -> bool {
+    let (end, fresh) = fonts.ids_since(cursor.at);
+    cursor.at = end;
+    cursor.waiting.extend(fresh.into_iter().map(|(i, _)| i));
+    if cursor.waiting.is_empty() {
+        return false;
+    }
+    let wanted: HashSet<&'static str> = text.wanted_packs().iter().map(|p| p.id).collect();
     let mut added = false;
-    for (i, id, doc) in docs {
+    let waiting = std::mem::take(&mut cursor.waiting);
+    for i in waiting {
+        let Some(id) = fonts.ids_since(i).1.first().map(|(_, id)| *id) else { continue };
+        if !wanted.contains(id) {
+            cursor.waiting.push(i);
+            continue;
+        }
+        let Some((id, doc)) = fonts.bytes(i) else { continue };
         fonts.loaded(i);
         let t = Instant::now();
         match text.load_pack(&doc, fonts.author) {

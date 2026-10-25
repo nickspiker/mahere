@@ -368,7 +368,7 @@ struct Letterer {
     previous: HashSet<(u8, String, String)>,
     names: mahere_engine::labels::NamesCache,
     /// How far through the font packs' arrivals this renderer has loaded.
-    font_cursor: usize,
+    font_cursor: crate::fonts::FontCursor,
     /// The regional face the view's Han draws in (its names' kana or Hangul decide).
     han: fluor::packs::Han,
 }
@@ -608,7 +608,7 @@ impl Labeller {
                 for data in LABEL_FONT_FILES {
                     text.load_font_data_named(data.to_vec());
                 }
-                let mut l = Letterer { text, family: 0, w: 0, h: 0, atlas: Atlas::new(), sent: 0, shared: std::sync::Arc::new(Atlas::new()), advance: HashMap::new(), look: mahere_engine::theme::LABEL_LOOK, amount: mahere_engine::theme::LABEL_AMOUNT, previous: HashSet::new(), names: Default::default() , font_cursor: 0, han: fluor::packs::Han::Simplified };
+                let mut l = Letterer { text, family: 0, w: 0, h: 0, atlas: Atlas::new(), sent: 0, shared: std::sync::Arc::new(Atlas::new()), advance: HashMap::new(), look: mahere_engine::theme::LABEL_LOOK, amount: mahere_engine::theme::LABEL_AMOUNT, previous: HashSet::new(), names: Default::default() , font_cursor: Default::default(), han: fluor::packs::Han::Simplified };
                 while let Ok(mut job) = jobs.recv() {
                     // Only the newest job matters: a camera that moved on has made the others stale.
                     while let Ok(newer) = jobs.try_recv() {

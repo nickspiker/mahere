@@ -763,8 +763,8 @@ fn main() {
     let mut app = MahereApp::new(map, areas);
     // Font packs (Nick 2026-10-16): names in scripts the binary lacks draw in their own face once its pack, signed by the author, is fetched.
     let fonts = mahere_panel::fonts::FontPacks::new(mahere_store::VaultFonts::new(vault.clone()), mahere_update::AUTHOR_PUBKEY);
-    // The panel's renderer and the lettering's load every pack; a document both have loaded is let go.
-    fonts.set_renderers(2);
+    // Each renderer loads only the packs its own text wants; a document is let go once one has loaded it, read again from the vault for another that wants it later.
+    fonts.set_renderers(1);
     app.panel.set_fonts(fonts.clone());
     app.labeller.set_fonts(fonts);
     app.store = vault;
