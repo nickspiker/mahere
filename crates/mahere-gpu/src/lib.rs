@@ -219,12 +219,15 @@ impl Plane {
             // Half again, not double: growing holds the old array and the new at once, and on a phone the GPU's memory is the app's (2026-10-24: arrays doubling to 512 layers at the south pole took a Pixel 3a past what Android allows).
             let new_cap = (self.cap + (self.cap / 2).max(8)).min(self.max);
             let new_tex = plane_texture(device, self.label, self.w, self.h, new_cap, self.format, self.extra);
+            // A layer at a time: Metal copies one slice of an array per copy, and wgpu 28 hands it the whole layer count as the depth, so only layer 0 arrived and the rest showed whatever the new memory held, another tile's (Nick 2026-10-25: on the Mac, \"a totally different tile\" while tiles load).
             let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("grow plane") });
-            enc.copy_texture_to_texture(
-                wgpu::TexelCopyTextureInfo { texture: &self.tex, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
-                wgpu::TexelCopyTextureInfo { texture: &new_tex, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
-                wgpu::Extent3d { width: self.w, height: self.h, depth_or_array_layers: self.cap },
-            );
+            for layer in 0..self.cap {
+                enc.copy_texture_to_texture(
+                    wgpu::TexelCopyTextureInfo { texture: &self.tex, mip_level: 0, origin: wgpu::Origin3d { x: 0, y: 0, z: layer }, aspect: wgpu::TextureAspect::All },
+                    wgpu::TexelCopyTextureInfo { texture: &new_tex, mip_level: 0, origin: wgpu::Origin3d { x: 0, y: 0, z: layer }, aspect: wgpu::TextureAspect::All },
+                    wgpu::Extent3d { width: self.w, height: self.h, depth_or_array_layers: 1 },
+                );
+            }
             queue.submit([enc.finish()]);
             self.free.extend((self.cap..new_cap).rev());
             self.tex = new_tex;
