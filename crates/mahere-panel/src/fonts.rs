@@ -139,6 +139,8 @@ impl FontPacks {
 pub struct FontCursor {
     at: usize,
     waiting: Vec<usize>,
+    /// The packs this renderer's text has asked for (a renderer offers each want once, so it is kept here).
+    asked: HashSet<&'static str>,
 }
 
 impl FontCursor {
@@ -146,6 +148,13 @@ impl FontCursor {
     pub fn behind(&self, fonts: &FontPacks) -> bool {
         fonts.arrived() > self.at
     }
+}
+
+/// What this renderer's text lacked, asked for and remembered as this renderer's own.
+pub fn ask(text: &mut TextRenderer, fonts: &Arc<FontPacks>, cursor: &mut FontCursor) {
+    let packs = text.wanted_packs();
+    cursor.asked.extend(packs.iter().map(|p| p.id));
+    fonts.want(packs);
 }
 
 /// The packs this renderer's own text wants, of those arrived (each checked against the author's key), loaded; the rest wait until its text needs them (2026-10-25: the panel loaded every script the map's lettering fetched, Arabic, Tibetan and 17 MB of Han included, a parsed copy each, and a Pixel 3a's fresh install was killed for memory). True when a face was added (whatever measured text before measures again).
@@ -156,12 +165,11 @@ pub fn load_into(text: &mut TextRenderer, fonts: &FontPacks, cursor: &mut FontCu
     if cursor.waiting.is_empty() {
         return false;
     }
-    let wanted: HashSet<&'static str> = text.wanted_packs().iter().map(|p| p.id).collect();
     let mut added = false;
     let waiting = std::mem::take(&mut cursor.waiting);
     for i in waiting {
         let Some(id) = fonts.ids_since(i).1.first().map(|(_, id)| *id) else { continue };
-        if !wanted.contains(id) {
+        if !cursor.asked.contains(id) {
             cursor.waiting.push(i);
             continue;
         }

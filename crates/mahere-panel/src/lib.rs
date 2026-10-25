@@ -1372,7 +1372,7 @@ impl Panel {
             if fonts::load_into(&mut self.text, &f, &mut self.font_cursor) {
                 self.dirty = true;
             }
-            f.want(self.text.wanted_packs());
+            fonts::ask(&mut self.text, &f, &mut self.font_cursor);
         }
         if self.areas != *areas {
             self.areas = areas.clone();

@@ -811,7 +811,7 @@ impl Letterer {
         }
         // The packs this layout's names needed and lacked, fetched for the next.
         if let Some(f) = &job.fonts {
-            f.want(self.text.wanted_packs());
+            crate::fonts::ask(&mut self.text, f, &mut self.font_cursor);
         }
         let route_width = (font * 0.32).max(3.0);
         let (a, b) = ([w as f64 * 0.25, h as f64 * 0.5], [w as f64 * 0.75, h as f64 * 0.5]);
