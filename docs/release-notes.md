@@ -1,5 +1,24 @@
 # Mahere release notes
 
+## 0.1.0 · October 2026
+
+### First launch
+- A fresh install opens on the whole globe, centred on you when there is a GPS fix and anywhere at all when not, turned any way.
+- A ring round the globe closes as the base map arrives; then terrain, imagery and infrared fill in while you are already free to move.
+
+### Contours
+- The spacing of the heavier contours shows above the scale bar.
+- Contours draw on gentle ground too: Antarctica's ice sheet and other near-flat country no longer look empty.
+- The straight lines along tile edges in contour maps, worst over Antarctica and along coasts, are gone: the map data itself was repaired.
+
+### Text size
+- A Text size slider under Display in the menu, kept between launches.
+- On a computer, Cmd or Ctrl with + and − (or with scroll) does the same, and is remembered too.
+
+### Lighter and quicker on older phones
+- Reopening reads each piece of the map once instead of twice.
+- Phones like the Pixel 3a are no longer closed for running out of memory near the poles or on a first launch: fewer map pieces are kept around, the lettering keeps only what is in view, each font is loaded only where it is needed, and place names take a fraction of the memory they did.
+
 ## 0.0.0 · October 2026
 
 ### Version numbers start over
