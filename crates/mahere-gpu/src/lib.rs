@@ -133,6 +133,9 @@ const NO_COMPOSITE_BITS: u32 = 16 | 8192 | 32768;
 /// The gather buffer: lowest and highest elevation drawn, then each line class's largest magnitude drawn.
 const GATHER_WORDS: usize = 2 + 32;
 
+/// The shader's STAND_IN_DEPTHS: a vector cell coarser than the view's by more draws no lines or overlays.
+const STAND_IN_DEPTHS: u8 = 2;
+
 /// The reference's composite is baked and current (the shader's FLAG_COMP).
 const FLAG_COMP: u32 = 256;
 
@@ -1346,7 +1349,8 @@ impl GpuMap {
             }
         }
         // Blocks drawn from composites first, then the rest: two draws over one buffer.
-        let fast = |b: &PlanBlock| fast_ready && b.cand[1][0] != NONE && b.cand[1].iter().all(|&r| r == NONE || refs[r as usize].c[0] & FLAG_COMP != 0);
+        // Not a block standing in from a cell more than STAND_IN_DEPTHS coarser (its composite has the overlays the full pass leaves out there).
+        let fast = |b: &PlanBlock| fast_ready && b.cand[1][0] != NONE && b.cand[1].iter().all(|&r| r == NONE || (refs[r as usize].c[0] & FLAG_COMP != 0 && plan.refs[r as usize].key.depth + STAND_IN_DEPTHS >= plan.vec_depth));
         let gpu_block = |b: &PlanBlock| GpuBlock { a: [b.x, b.y, b.size, b.diamond], b: [b.u0, b.v0, 0, 0], c: [b.du_dx, b.dv_dx, b.du_dy, b.dv_dy], d: [b.twist_u, b.twist_v, 0.0, 0.0], e: b.cand[0], f: b.cand[1], g: b.cand[2], h: b.ink };
         let mut blocks: Vec<GpuBlock> = plan.blocks.iter().filter(|b| fast(b)).map(gpu_block).collect();
         let n_fast = blocks.len();

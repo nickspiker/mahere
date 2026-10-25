@@ -56,6 +56,12 @@ const FLAG_MVUM: u32 = 128u;
 const FLAG_VEC: u32 = 206u;
 // The reference's composite is baked and current: c.z and c.w are its slots.
 const FLAG_COMP: u32 = 256u;
+// A vector cell this many depths coarser than the view's, standing in while the view's own arrive, draws no lines or overlays: at its texel size they are blocks of solid colour (2026-10-25: "before all the tiles are loaded it looks super scattered"). Its water and land still fill under the terrain.
+const STAND_IN_DEPTHS: u32 = 2u;
+
+fn stand_in(depth: u32) -> bool {
+    return depth + STAND_IN_DEPTHS < U.depths.y;
+}
 
 const M_DEM: u32 = 1u;
 const M_LAND: u32 = 2u;
@@ -866,6 +872,9 @@ fn compose(d: u32, u: u32, v: u32, pos: vec2<f32>, ce: vec4<u32>, cf: vec4<u32>,
     if (vi != NONE) {
         let r = refs[vi];
         vflags = r.c.x;
+        if (stand_in(r.a.y)) {
+            vflags = vflags & ~(FLAG_LINE | FLAG_OWN | FLAG_MVUM);
+        }
         let t = tri(u, v, r.a.y);
         let xy = vec2<i32>(i32(2u * t.x + t.z), i32(t.y));
         if ((vflags & FLAG_LINE) != 0u) {
@@ -1183,7 +1192,7 @@ fn fs_fast(in: VOut) -> @location(0) vec4<f32> {
     // The lines, live: the waterways under the water, the rest over everything, weighted against the largest of each class the last frame drew.
     var line = vec4<u32>(0u);
     var draw_line = false;
-    if ((mask & M_LINE) != 0u && (r.c.x & FLAG_LINE) != 0u) {
+    if ((mask & M_LINE) != 0u && (r.c.x & FLAG_LINE) != 0u && !stand_in(r.a.y)) {
         line = textureLoad(line_tex, xy, i32(r.b.y), 0);
         draw_line = line.y != 0u && (line.x < BOUNDARY_FIRST || line.x > BOUNDARY_LAST || (mask & M_BOUND) != 0u) && U.depths.x >= line_min_depth(line.x, line.z);
     }
