@@ -959,25 +959,40 @@ impl mahere_engine::areas::AreaStore for DirAreas {
     }
 }
 
-/// The user's cells as files in a directory, one per cell by its name.
+/// The user's cells as files in a directory, one per cell by its case-free name ([`mahere_tiles::CellKey::file_name`]).
 struct DirUser(std::path::PathBuf);
+
+impl DirUser {
+    fn path(&self, key: mahere_tiles::CellKey) -> std::path::PathBuf {
+        self.0.join(format!("{}.vsf.zst", key.file_name()))
+    }
+}
 
 impl mahere_engine::ink::UserStore for DirUser {
     fn put(&self, key: mahere_tiles::CellKey, bytes: &[u8]) {
-        let _ = std::fs::write(self.0.join(key.path()), bytes);
+        let _ = std::fs::write(self.path(key), bytes);
     }
 
     fn delete(&self, key: mahere_tiles::CellKey) {
-        let _ = std::fs::remove_file(self.0.join(key.path()));
+        let _ = std::fs::remove_file(self.path(key));
     }
 
+    /// Every cell here; one still under its bucket name (before 2026-10-25) is renamed to the case-free one as it is read.
     fn load_all(&self) -> Vec<(mahere_tiles::CellKey, Vec<u8>)> {
         let Ok(dir) = std::fs::read_dir(&self.0) else { return Vec::new() };
         dir.flatten()
+            .filter(|e| e.path().is_file())
             .filter_map(|e| {
                 let name = e.file_name().to_string_lossy().to_string();
-                let key = mahere_tiles::CellKey::from_name(&name)?;
-                let bytes = std::fs::read(e.path()).ok()?;
+                let key = match mahere_tiles::CellKey::from_file_name(&name) {
+                    Some(k) => k,
+                    None => {
+                        let k = mahere_tiles::CellKey::from_name(&name)?;
+                        let _ = std::fs::rename(e.path(), self.path(k));
+                        k
+                    }
+                };
+                let bytes = std::fs::read(self.path(key)).ok()?;
                 Some((key, bytes))
             })
             .collect()

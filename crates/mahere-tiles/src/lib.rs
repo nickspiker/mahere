@@ -139,6 +139,22 @@ impl CellKey {
         format!("{}.vsf.zst", self.name())
     }
 
+    /// The key as a file name on the device: the depth and the world cell in lowercase hex. The bucket's name tells cells apart by letter case, which a Mac's or a Windows file system does not: two cells named alike but for case were one file there, and each showed the other's roads, water and names (Nick 2026-10-25, a second Point Southworth inland).
+    pub fn file_name(self) -> String {
+        format!("{:02}{:016x}", self.depth, self.raw())
+    }
+
+    /// The key back from [`Self::file_name`] (any extension after it ignored).
+    pub fn from_file_name(name: &str) -> Option<CellKey> {
+        let name = name.get(..18)?;
+        let depth: u8 = name[..2].parse().ok()?;
+        if depth > 30 {
+            return None;
+        }
+        let raw = u64::from_str_radix(&name[2..], 16).ok()?;
+        Some(CellKey { depth, prefix: raw >> (60 - 2 * depth as u32) })
+    }
+
     /// The key back from its file name (with or without the extension): the base64url undone, the depth and world cell parsed.
     pub fn from_name(name: &str) -> Option<CellKey> {
         let name = name.trim_end_matches(".vsf.zst");

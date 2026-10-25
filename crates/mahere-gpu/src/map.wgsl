@@ -995,8 +995,8 @@ fn compose(d: u32, u: u32, v: u32, pos: vec2<f32>, ce: vec4<u32>, cf: vec4<u32>,
     if (want_dem && !baking() && found_depth != U.depths.x && lookup(d, U.depths.x, u, v) == NONE) {
         let s = 30u - U.depths.x;
         let m = (1u << s) - 1u;
-        let half = (((u & m) + (v & m)) >> s) & 1u;
-        var h = (d * 0x27D4EB2Fu) ^ (U.depths.x * 0xC2B2AE3Du) ^ ((u >> s) * 0x9E3779B1u) ^ ((v >> s) * 0x85EBCA77u) ^ (half * 0x165667B1u);
+        let side = (((u & m) + (v & m)) >> s) & 1u;
+        var h = (d * 0x27D4EB2Fu) ^ (U.depths.x * 0xC2B2AE3Du) ^ ((u >> s) * 0x9E3779B1u) ^ ((v >> s) * 0x85EBCA77u) ^ (side * 0x165667B1u);
         h = h ^ (h >> 15u);
         h = h * 0x2C1B3C6Du;
         h = h ^ (h >> 12u);
@@ -1380,7 +1380,7 @@ struct SegOut {
     @builtin(position) pos: vec4<f32>,
     @location(0) at: vec2<f32>,
     @location(1) ends: vec4<f32>,
-    @location(2) half: f32,
+    @location(2) half_w: f32,
     @location(3) colour: vec4<f32>,
 };
 
@@ -1401,7 +1401,7 @@ fn vs_segment(@builtin(vertex_index) vi: u32, @location(0) ends: vec4<f32>, @loc
     out.pos = clip_of(p);
     out.at = p;
     out.ends = ends;
-    out.half = b.x;
+    out.half_w = b.x;
     out.colour = colour;
     return out;
 }
@@ -1412,6 +1412,6 @@ fn fs_segment(in: SegOut) -> @location(0) vec4<f32> {
     let t = clamp(dot(in.at - in.ends.xy, ab) / max(dot(ab, ab), 1e-6), 0.0, 1.0);
     let d = length(in.at - (in.ends.xy + ab * t));
     // Feathered over one pixel of the layer it is drawn into (a third of a screen pixel at 3×), the binning doing the rest, as for the map's own lines.
-    let cov = clamp((in.half - d) * U.scale + 0.5, 0.0, 1.0) * in.colour.a;
+    let cov = clamp((in.half_w - d) * U.scale + 0.5, 0.0, 1.0) * in.colour.a;
     return vec4<f32>(in.colour.rgb * cov, cov);
 }

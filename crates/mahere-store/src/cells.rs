@@ -67,8 +67,9 @@ fn write_whole(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 impl CellFiles {
     /// The cache under `dir`, its index read; with no index (a first start, or one lost), made again from the files there.
     pub fn open(dir: &Path) -> Arc<CellFiles> {
-        let root = dir.join(format!("e{CELL_EPOCH}"));
+        let root = files_root(dir);
         let _ = std::fs::create_dir_all(&root);
+        take_old_files(&dir.join(format!("e{CELL_EPOCH}")), &root);
         let mut index = Index::default();
         match std::fs::read(root.join("index.vsf")) {
             Ok(bytes) => index.entries = decode_cell_index(&bytes),
@@ -83,7 +84,7 @@ impl CellFiles {
 
     fn path(&self, key: CellKey, code: u8) -> PathBuf {
         let group = key.ancestor(key.depth.saturating_sub(4));
-        self.root.join(layer_dir(code)).join(format!("{:02}", key.depth)).join(group.name()).join(format!("{}.vsf", key.name()))
+        self.root.join(layer_dir(code)).join(format!("{:02}", key.depth)).join(group.file_name()).join(format!("{}.vsf", key.file_name()))
     }
 
     fn touch(&self, key: CellKey, code: u8, bytes: usize, seen: i64) {
@@ -212,6 +213,57 @@ impl CellFiles {
 }
 
 /// The index made again from the files themselves, each dated now: a first start finds nothing, one whose index was lost keeps what it had.
+/// The cell files under a cache directory: named by [`CellKey::file_name`], which no file system confuses.
+fn files_root(dir: &Path) -> PathBuf {
+    dir.join(format!("e{CELL_EPOCH}-hex"))
+}
+
+/// The cells kept under their bucket names (before 2026-10-25), taken into `root` once: renamed where the file system tells letter case apart (Linux, Android), so nothing is fetched again and the areas' cells stay; dropped on a Mac or Windows, where two cells named alike but for case had shared one file and no copy there can be trusted. The index goes along: it is keyed by the cells, not their names.
+fn take_old_files(old: &Path, root: &Path) {
+    if !old.is_dir() {
+        return;
+    }
+    if cfg!(any(target_os = "macos", target_os = "windows")) {
+        eprintln!("cells: the cache kept under case-blind names is dropped and fetched again as it is needed");
+        // Away from the path first, so a large cache is deleted beside the start and never taken for the old layout again.
+        let gone = old.with_extension("dropped");
+        if std::fs::rename(old, &gone).is_ok() {
+            std::thread::spawn(move || {
+                let _ = std::fs::remove_dir_all(&gone);
+            });
+        }
+        return;
+    }
+    let mut moved = 0usize;
+    for code in 0..4u8 {
+        let Ok(depths) = std::fs::read_dir(old.join(layer_dir(code))) else { continue };
+        for d in depths.flatten() {
+            let Ok(groups) = std::fs::read_dir(d.path()) else { continue };
+            for g in groups.flatten() {
+                let Ok(files) = std::fs::read_dir(g.path()) else { continue };
+                for f in files.flatten() {
+                    let name = f.file_name();
+                    let Some(name) = name.to_str() else { continue };
+                    // The cell's file and its tag beside it.
+                    let Some((stem, ext)) = name.split_once('.') else { continue };
+                    if ext != "vsf" && ext != "tag" {
+                        continue;
+                    }
+                    let Some(key) = CellKey::from_name(stem) else { continue };
+                    let group = key.ancestor(key.depth.saturating_sub(4));
+                    let dir = root.join(layer_dir(code)).join(format!("{:02}", key.depth)).join(group.file_name());
+                    if std::fs::create_dir_all(&dir).is_ok() && std::fs::rename(f.path(), dir.join(format!("{}.{ext}", key.file_name()))).is_ok() {
+                        moved += 1;
+                    }
+                }
+            }
+        }
+    }
+    let _ = std::fs::rename(old.join("index.vsf"), root.join("index.vsf"));
+    let _ = std::fs::remove_dir_all(old);
+    eprintln!("cells: {moved} files renamed to case-free names");
+}
+
 fn scan(root: &Path) -> HashMap<(u8, u64), (i64, u32)> {
     let mut out = HashMap::new();
     let now = et_now();
@@ -224,7 +276,7 @@ fn scan(root: &Path) -> HashMap<(u8, u64), (i64, u32)> {
                 for f in files.flatten() {
                     let name = f.file_name();
                     let Some(name) = name.to_str().and_then(|n| n.strip_suffix(".vsf")) else { continue };
-                    if let (Some(key), Ok(meta)) = (CellKey::from_name(name), f.metadata()) {
+                    if let (Some(key), Ok(meta)) = (CellKey::from_file_name(name), f.metadata()) {
                         out.insert(CellFiles::ix(key, code), (now, meta.len() as u32));
                     }
                 }
@@ -310,9 +362,37 @@ mod tests {
         assert_eq!(c.cached_bytes(), 12, "the index read back");
         assert!(matches!(c.layer(Layer::Dem).get(key), Fetch::Bytes(b) if b == b"terrain!"));
         drop(c);
-        std::fs::remove_file(dir.join(format!("e{CELL_EPOCH}")).join("index.vsf")).unwrap();
+        std::fs::remove_file(files_root(&dir).join("index.vsf")).unwrap();
         let c = CellFiles::open(&dir);
         assert_eq!(c.cached_bytes(), 12, "the index made again from the files");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Cells kept under their bucket names are found under the case-free ones after an open, their index with them; two names alike but for case are two files.
+    #[test]
+    fn old_names_are_taken_in() {
+        let dir = scratch("names");
+        let (a, b) = (CellKey { depth: 14, prefix: 0x0aa5 }, CellKey { depth: 14, prefix: 0x0aa5 + 1 });
+        let old = dir.join(format!("e{CELL_EPOCH}"));
+        for (key, bytes) in [(a, b"a".as_slice()), (b, b"bb")] {
+            let group = key.ancestor(key.depth - 4);
+            let d = old.join("base").join("14").join(group.name());
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(d.join(format!("{}.vsf", key.name())), bytes).unwrap();
+        }
+        let c = CellFiles::open(&dir);
+        if cfg!(any(target_os = "macos", target_os = "windows")) {
+            assert!(matches!(c.get(a), Fetch::Absent), "a case-blind file system's old cache is dropped");
+        } else {
+            assert!(matches!(c.get(a), Fetch::Bytes(x) if x == b"a"));
+            assert!(matches!(c.get(b), Fetch::Bytes(x) if x == b"bb"));
+            assert_eq!(c.cached_bytes(), 3, "the index made from the renamed files");
+        }
+        assert!(!old.exists());
+        for k in [a, b] {
+            assert_eq!(CellKey::from_file_name(&k.file_name()), Some(k));
+            assert_eq!(k.file_name(), k.file_name().to_lowercase());
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 

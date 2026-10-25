@@ -180,6 +180,8 @@ struct Plane {
     w: u32,
     h: u32,
     format: wgpu::TextureFormat,
+    /// Usage beyond sampling and copying (a composite plane is rendered into).
+    extra: wgpu::TextureUsages,
     tex: wgpu::Texture,
     cap: u32,
     max: u32,
@@ -191,8 +193,17 @@ struct Plane {
 
 impl Plane {
     fn new(device: &wgpu::Device, label: &'static str, w: u32, h: u32, format: wgpu::TextureFormat, max: u32) -> Plane {
+        Plane::with_usage(device, label, w, h, format, max, wgpu::TextureUsages::empty())
+    }
+
+    fn with_usage(device: &wgpu::Device, label: &'static str, w: u32, h: u32, format: wgpu::TextureFormat, max: u32, extra: wgpu::TextureUsages) -> Plane {
         let cap = INITIAL_LAYERS.min(max);
-        Plane { label, w, h, format, tex: plane_texture(device, label, w, h, cap, format, wgpu::TextureUsages::empty()), cap, max, map: FxHashMap::default(), free: (0..cap).rev().collect(), sparse_since: None }
+        Plane { label, w, h, format, extra, tex: plane_texture(device, label, w, h, cap, format, extra), cap, max, map: FxHashMap::default(), free: (0..cap).rev().collect(), sparse_since: None }
+    }
+
+    /// A view of one layer, to render into.
+    fn layer_view(&self, slot: u32) -> wgpu::TextureView {
+        self.tex.create_view(&wgpu::TextureViewDescriptor { dimension: Some(wgpu::TextureViewDimension::D2), base_array_layer: slot, array_layer_count: Some(1), ..Default::default() })
     }
 
     /// The cell's slot, allocating one if it has none and growing the array when it is full: `Some((slot, fresh))`, or None at the device's limit. True when the array was reallocated (bind groups must be rebuilt).
@@ -207,7 +218,7 @@ impl Plane {
             }
             // Half again, not double: growing holds the old array and the new at once, and on a phone the GPU's memory is the app's (2026-10-24: arrays doubling to 512 layers at the south pole took a Pixel 3a past what Android allows).
             let new_cap = (self.cap + (self.cap / 2).max(8)).min(self.max);
-            let new_tex = plane_texture(device, self.label, self.w, self.h, new_cap, self.format, wgpu::TextureUsages::empty());
+            let new_tex = plane_texture(device, self.label, self.w, self.h, new_cap, self.format, self.extra);
             // A layer at a time: Metal copies one slice of an array per copy, and wgpu 28 hands it the whole layer count as the depth, so only layer 0 arrived and the rest showed whatever the new memory held, another tile's (Nick 2026-10-25: on the Mac, \"a totally different tile\" while tiles load).
             let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("grow plane") });
             for layer in 0..self.cap {
@@ -257,7 +268,7 @@ impl Plane {
             _ => {}
         }
         let new_cap = (used * 2).max(INITIAL_LAYERS).next_power_of_two().min(self.cap / 2);
-        let new_tex = plane_texture(device, self.label, self.w, self.h, new_cap, self.format, wgpu::TextureUsages::empty());
+        let new_tex = plane_texture(device, self.label, self.w, self.h, new_cap, self.format, self.extra);
         let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("shrink plane") });
         let mut new_map = FxHashMap::default();
         for (i, (k, old_slot)) in self.map.iter().enumerate() {
@@ -324,8 +335,6 @@ pub struct GpuMap {
     /// Each line class's largest magnitude the last read-back map pass drew: the line weights (the plan's, from whole cells, until one is in).
     line_drawn: Option<[u8; 32]>,
     bake_dummy: wgpu::Texture,
-    /// The pair each bake draws into before it is copied into the composites' layers.
-    bake_targets: [wgpu::Texture; 2],
     bake_uniforms: Vec<wgpu::Buffer>,
     frame_no: u64,
     /// Bumped by every theme upload, so composites made under the last theme are made again.
@@ -553,11 +562,8 @@ impl GpuMap {
         // The overlays: ownership class and coverage, motor vehicle use class and coverage.
         let ov = Plane::new(device, "overlays", 2 * TEX as u32, TEX as u32, wgpu::TextureFormat::Rgba8Uint, max_layers);
         let comp_max = COMP_LAYERS.min(max_layers);
-        let comp0 = Plane::new(device, "composite base", 2 * TEX as u32, TEX as u32, wgpu::TextureFormat::Rgba8Unorm, comp_max);
-        let comp1 = Plane::new(device, "composite fold", 2 * TEX as u32, TEX as u32, wgpu::TextureFormat::Rgba8Unorm, comp_max);
-        // Each bake draws into this pair and is copied into its layers: drawing straight into a layer of an array (a view aliasing one slice) left the Mac's composites holding other cells' bakes (Nick 2026-10-25, water and parks in the wrong triangles), where a copy into a layer is one slice exactly.
-        let bake_target = |label| device.create_texture(&wgpu::TextureDescriptor { label: Some(label), size: wgpu::Extent3d { width: 2 * TEX as u32, height: TEX as u32, depth_or_array_layers: 1 }, mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2, format: wgpu::TextureFormat::Rgba8Unorm, usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC, view_formats: &[] });
-        let bake_targets = [bake_target("bake base"), bake_target("bake fold")];
+        let comp0 = Plane::with_usage(device, "composite base", 2 * TEX as u32, TEX as u32, wgpu::TextureFormat::Rgba8Unorm, comp_max, wgpu::TextureUsages::RENDER_ATTACHMENT);
+        let comp1 = Plane::with_usage(device, "composite fold", 2 * TEX as u32, TEX as u32, wgpu::TextureFormat::Rgba8Unorm, comp_max, wgpu::TextureUsages::RENDER_ATTACHMENT);
         let (built_tx, built_rx) = std::sync::mpsc::channel();
 
         GpuMap {
@@ -571,7 +577,6 @@ impl GpuMap {
             comp1,
             baked: FxHashMap::default(),
             line_drawn: None,
-            bake_targets,
             bake_dummy: plane_texture(device, "composite stand-in", 1, 1, 1, wgpu::TextureFormat::Rgba8Unorm, wgpu::TextureUsages::empty()),
             bake_uniforms: Vec::new(),
             frame_no: 0,
@@ -1477,21 +1482,12 @@ impl GpuMap {
             };
             queue.write_buffer(&self.bake_uniforms[j], 0, bytemuck::bytes_of(&bu));
             let bind = self.bind_with(device, &self.bake_uniforms[j], true);
-            let (v0, v1) = (self.bake_targets[0].create_view(&Default::default()), self.bake_targets[1].create_view(&Default::default()));
+            let (v0, v1) = (self.comp0.layer_view(s0), self.comp1.layer_view(s1));
             let attach = |v| Some(wgpu::RenderPassColorAttachment { view: v, depth_slice: None, resolve_target: None, ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT), store: wgpu::StoreOp::Store } });
-            {
-                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor { label: Some("bake"), color_attachments: &[attach(&v0), attach(&v1)], depth_stencil_attachment: None, timestamp_writes: None, occlusion_query_set: None, multiview_mask: None });
-                pass.set_pipeline(&self.map_variants[&(u32::MAX, KIND_BAKE)]);
-                pass.set_bind_group(0, &bind, &[]);
-                pass.draw(0..3, 0..1);
-            }
-            for (src, dst, slot) in [(&self.bake_targets[0], &self.comp0.tex, s0), (&self.bake_targets[1], &self.comp1.tex, s1)] {
-                encoder.copy_texture_to_texture(
-                    wgpu::TexelCopyTextureInfo { texture: src, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
-                    wgpu::TexelCopyTextureInfo { texture: dst, mip_level: 0, origin: wgpu::Origin3d { x: 0, y: 0, z: slot }, aspect: wgpu::TextureAspect::All },
-                    wgpu::Extent3d { width: 2 * TEX as u32, height: TEX as u32, depth_or_array_layers: 1 },
-                );
-            }
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor { label: Some("bake"), color_attachments: &[attach(&v0), attach(&v1)], depth_stencil_attachment: None, timestamp_writes: None, occlusion_query_set: None, multiview_mask: None });
+            pass.set_pipeline(&self.map_variants[&(u32::MAX, KIND_BAKE)]);
+            pass.set_bind_group(0, &bind, &[]);
+            pass.draw(0..3, 0..1);
         }
 
         // The map pass gathers the elevations it draws: reset, then copied out after the pass into a free readback buffer (none free: this frame's range is skipped, the next one's read).
@@ -1690,6 +1686,19 @@ mod shader_tests {
             let src = super::shader_source(f16);
             let module = naga::front::wgsl::parse_str(&src).unwrap_or_else(|e| panic!("f16 {f16}: {}", e.emit_to_string(&src)));
             naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::all()).validate(&module).unwrap_or_else(|e| panic!("f16 {f16}: {e:?}"));
+        }
+    }
+
+    /// No name in the shader is one of Metal's own type names, which naga passes thru unrenamed: a varying called `half` failed the route pipeline on the Mac (2026-10-25, "cannot combine with previous 'float' declaration specifier"), where Vulkan never minded.
+    #[test]
+    fn no_shader_name_is_a_metal_type() {
+        const METAL: [&str; 12] = ["half", "half2", "half3", "half4", "char", "uchar", "short", "ushort", "uint8_t", "int8_t", "size_t", "ptrdiff_t"];
+        let src = super::shader_source(false);
+        for (n, line) in src.lines().enumerate() {
+            let code = line.split("//").next().unwrap_or("");
+            for word in code.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')) {
+                assert!(!METAL.contains(&word), "line {}: `{word}` is a Metal type name: {line}", n + 1);
+            }
         }
     }
 }
