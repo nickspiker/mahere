@@ -185,6 +185,24 @@ pub fn load_ui_scale(store: &FlatStorage) -> Option<f32> {
     }
 }
 
+fn text_scale_key() -> String {
+    vault_key(&[name("text scale")])
+}
+
+/// The text size over the UI scale (the panel's slider: the panel's text and the map's lettering), kept between launches on every platform.
+pub fn save_text_scale(store: &FlatStorage, t: f32) -> Result<(), StorageError> {
+    store.write_device(&text_scale_key(), &VsfType::f5(t).flatten())
+}
+
+pub fn load_text_scale(store: &FlatStorage) -> Option<f32> {
+    let bytes = store.read_device(&text_scale_key()).ok()??;
+    let mut ptr = 0usize;
+    match vsf::parse(&bytes, &mut ptr).ok()? {
+        VsfType::f5(v) if v.is_finite() && v > 0.0 => Some(v),
+        _ => None,
+    }
+}
+
 fn settings_key() -> String {
     vault_key(&[name("settings")])
 }

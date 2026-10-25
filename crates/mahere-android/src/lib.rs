@@ -520,10 +520,11 @@ impl FluorApp for AndroidApp {
                 if self.panel.release(&mut mask, &mut ctl) {
                     self.apply_controls(ctl, mask);
                 }
-                // The text size set on the panel: the phone's UI scale, kept with the settings.
-                if let Some(ru) = self.panel.take_ru_request() {
-                    self.ui_ru = ru;
-                    self.save_settings();
+                // The text size set on the panel, kept.
+                if let Some(t) = self.panel.take_text_request() {
+                    if let Some(store) = &self.store {
+                        let _ = mahere_store::save_text_scale(store, t);
+                    }
                 }
                 self.apply_area_acts();
                 self.apply_update_acts();
@@ -816,6 +817,9 @@ pub extern "system" fn Java_nz_mahere_app_MahereActivity_nativeInit(
         install: None,
     };
     app.panel.set_ru(ui_ru);
+    if let Some(t) = app.store.as_ref().and_then(|v| mahere_store::load_text_scale(v)) {
+        app.panel.set_text_scale(t);
+    }
     app.panel.set_fonts(app.fonts.clone());
     Box::into_raw(Box::new(AndroidShell::new(app, width as u32, height as u32))) as jlong
 }

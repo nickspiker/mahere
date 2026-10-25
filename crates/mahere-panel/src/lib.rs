@@ -236,7 +236,7 @@ const GROUPS: [(&str, &[Layer]); 8] = [
 /// The Display group, whose row is the text size.
 const DISPLAY_GROUP: usize = 6;
 
-/// The UI scales the text size slider steps through (the panel's whole layout and the map's lettering with it).
+/// The text sizes the slider steps through: the panel's text and the map's lettering, over whatever the UI scale is (the RU, which fluor's Cmd/Ctrl keys and the phone's pinch set); the orb, the buttons and the window's chrome stay as the UI scale has them.
 const TEXT_SCALES: [f32; 13] = [0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.1, 1.25, 1.4, 1.6, 1.8, 2.0, 2.5];
 
 fn text_pos(ru: f32) -> f32 {
@@ -601,10 +601,11 @@ pub struct Panel {
     /// The contour interval's slider under Contours, and whether a finger is on it.
     interval: Slider,
     interval_held: bool,
-    /// The text size slider; the scale it is being moved to (applied when it is let go, so the row stays under the finger); a scale for the host to apply, once.
+    /// The text size slider; the size it is being moved to (applied when it is let go, so the row stays under the finger); the text size in use; one for the host to keep, once.
     text_slider: Slider,
     text_pending: Option<f32>,
-    ru_request: Option<f32>,
+    text_scale: f32,
+    text_request: Option<f32>,
     text: TextRenderer,
     /// The font packs, when the host gave them, and how far through their arrivals this renderer has loaded.
     fonts: Option<std::sync::Arc<fonts::FontPacks>>,
@@ -671,7 +672,7 @@ impl Panel {
         let checks = LAYERS.iter().map(|&(l, label)| (l, Checkbox::new(&mut hits, label, 0.0, 0.0, 10.0, 10.0, 10.0, false))).collect();
         let interval = Slider::new(&mut hits, 0.0, 0.0, 10.0, 10.0, 0.0);
         let text_slider = Slider::new(&mut hits, 0.0, 0.0, 10.0, 10.0, text_pos(1.0));
-        Panel { fonts: None, font_cursor: Default::default(), open: false, dirty: true, ru: 1.0, stack: vec![Page::Layers], theme_rows: Vec::new(), edit_rows: Vec::new(), edit_scroll: 0.0, edit_extent: 0.0, press: None, sliders: Vec::new(), field_vals: [0.0; 4], held: None, edits: Vec::new(), hits, shown: vec![true; LAYERS.len()], group_open: GROUPS_OPEN, group_rows: Vec::new(), tree: Vec::new(), layer_open: None, field_open: None, theme_now: None, interval, interval_held: false, text_slider, text_pending: None, ru_request: None, checks, text: TextRenderer::new(), buf: Vec::new(), w: 0, h: 0, font: 16.0, gear: (0.0, 0.0, 0.0), panel_w: 0.0, theme_row: (0.0, 0.0, 0.0), slider: (0.0, 0.0, 0.0), slider_held: false, cache_max: CACHE_MIN + 1, strip_close: None, clear_measure: false, area_rows: Vec::new(), area_acts: Vec::new(), areas: AreasView::default(), update_rows: Vec::new(), update_acts: Vec::new(), updates: UpdatesView::default(), host_orb: None, layers_scroll: 0.0, layers_extent: 0.0, layers_press: None, layers_band: (0.0, 0.0), orb_icon: fluor::host::icon::Icon::from_vsf_bytes(APP_ORB_VSF).ok(), orb_scaled: (0, Vec::new()), locate_btn: None, tool_btn: None, toolbox_open: false, tool_rows: Vec::new() }
+        Panel { fonts: None, font_cursor: Default::default(), open: false, dirty: true, ru: 1.0, stack: vec![Page::Layers], theme_rows: Vec::new(), edit_rows: Vec::new(), edit_scroll: 0.0, edit_extent: 0.0, press: None, sliders: Vec::new(), field_vals: [0.0; 4], held: None, edits: Vec::new(), hits, shown: vec![true; LAYERS.len()], group_open: GROUPS_OPEN, group_rows: Vec::new(), tree: Vec::new(), layer_open: None, field_open: None, theme_now: None, interval, interval_held: false, text_slider, text_pending: None, text_scale: 1.0, text_request: None, checks, text: TextRenderer::new(), buf: Vec::new(), w: 0, h: 0, font: 16.0, gear: (0.0, 0.0, 0.0), panel_w: 0.0, theme_row: (0.0, 0.0, 0.0), slider: (0.0, 0.0, 0.0), slider_held: false, cache_max: CACHE_MIN + 1, strip_close: None, clear_measure: false, area_rows: Vec::new(), area_acts: Vec::new(), areas: AreasView::default(), update_rows: Vec::new(), update_acts: Vec::new(), updates: UpdatesView::default(), host_orb: None, layers_scroll: 0.0, layers_extent: 0.0, layers_press: None, layers_band: (0.0, 0.0), orb_icon: fluor::host::icon::Icon::from_vsf_bytes(APP_ORB_VSF).ok(), orb_scaled: (0, Vec::new()), locate_btn: None, tool_btn: None, toolbox_open: false, tool_rows: Vec::new() }
     }
 
     pub fn is_open(&self) -> bool {
@@ -953,9 +954,18 @@ impl Panel {
     }
 
     /// The UI's scale (fluor's RU multiplier), clamped as fluor clamps it. Relayout follows on the next paint.
-    /// A text size the slider set, once: the host applies it as its UI scale and keeps it.
-    pub fn take_ru_request(&mut self) -> Option<f32> {
-        self.ru_request.take()
+    /// A text size the slider set, once, for the host to keep.
+    pub fn take_text_request(&mut self) -> Option<f32> {
+        self.text_request.take()
+    }
+
+    /// The text size over the UI scale (a kept one restored at start).
+    pub fn set_text_scale(&mut self, t: f32) {
+        let t = t.clamp(TEXT_SCALES[0], TEXT_SCALES[TEXT_SCALES.len() - 1]);
+        if (t - self.text_scale).abs() > 1e-4 {
+            self.text_scale = t;
+            self.dirty = true;
+        }
     }
 
     pub fn set_ru(&mut self, ru: f32) {
@@ -984,9 +994,11 @@ impl Panel {
         let (wf, hf) = (w as f32, h as f32);
         let span = if w + h > 0 { 2.0 * wf * hf / (wf + hf) } else { 0.0 };
         let unit = hm(span / 32.0 * self.ru, hf / 13.0);
-        self.font = (unit * 0.5).max(6.0);
-        let r = self.font * 1.15;
-        let pad = self.font * 0.6;
+        // The orb and its margin from the UI scale alone; the text, and the rows holding it, at the text size over it.
+        let base = (unit * 0.5).max(6.0);
+        self.font = base * self.text_scale;
+        let r = base * 1.15;
+        let pad = base * 0.6;
         self.gear = self.host_orb.unwrap_or((pad + r, pad + r, r));
         let r = self.gear.2;
         self.panel_w = (self.font * 13.0).min(w as f32 * 0.7);
@@ -1644,11 +1656,11 @@ impl Panel {
                     }
                 }
                 TreeRow::TextSize => {
-                    let shown = self.text_pending.unwrap_or(self.ru);
+                    let shown = self.text_pending.unwrap_or(self.text_scale);
                     self.text.draw_text_left(&mut canvas, "Text size", tx, cy - font * 0.55, &dim, clip, None);
                     self.text.draw_text_left(&mut canvas, &format!("{}%", (shown * 100.0).round() as i64), tx + font * 4.5, cy - font * 0.55, &small, clip, None);
                     if self.text_pending.is_none() {
-                        self.text_slider.set_value(text_pos(self.ru));
+                        self.text_slider.set_value(text_pos(self.text_scale));
                     }
                     if cy - hh >= band_top && cy + hh <= footer_top {
                         self.text_slider.render_content_into(&mut canvas, None, HIT_NONE);
@@ -2020,11 +2032,10 @@ impl Panel {
         self.slider_held = false;
         self.held = None;
         self.interval_held = false;
-        // The text size let go: the panel takes it, and the host applies and keeps it.
-        if let Some(ru) = self.text_pending.take() {
-            self.set_ru(ru);
-            self.ru_request = Some(ru);
-            self.dirty = true;
+        // The text size let go: the panel takes it, and the host keeps it.
+        if let Some(t) = self.text_pending.take() {
+            self.set_text_scale(t);
+            self.text_request = Some(t);
         }
         let mut changed = false;
         if let Some((x, y, moved)) = self.layers_press.take() {

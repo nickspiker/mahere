@@ -246,9 +246,9 @@ impl MahereApp {
 }
 
 impl FluorApp for MahereApp {
-    /// The kept UI scale at start, then the panel's text size when it is set: fluor applies either as its own zoom.
+    /// The UI scale kept from the last launch, once: fluor applies it as its own zoom.
     fn take_zoom_request(&mut self) -> Option<f32> {
-        self.zoom_restore.take().or_else(|| self.panel.take_ru_request())
+        self.zoom_restore.take()
     }
 
     type UserEvent = ();
@@ -567,7 +567,13 @@ impl FluorApp for MahereApp {
 
     fn tick(&mut self, ctx: &mut Context) -> bool {
         let (w, h) = Self::dims(ctx);
-        // The UI scale kept whenever it changes (fluor's keys and scroll, or the panel's text size).
+        // The text size the panel's slider set, kept.
+        if let Some(t) = self.panel.take_text_request() {
+            if let Some(store) = &self.store {
+                let _ = mahere_store::save_text_scale(store, t);
+            }
+        }
+        // The UI scale kept whenever it changes (fluor's Cmd/Ctrl keys and scroll).
         if (ctx.viewport.ru - self.kept_ru).abs() > 1e-3 {
             self.kept_ru = ctx.viewport.ru;
             if let Some(store) = &self.store {
@@ -784,10 +790,13 @@ fn main() {
     fonts.set_renderers(1);
     app.panel.set_fonts(fonts.clone());
     app.labeller.set_fonts(fonts);
-    // The UI scale from the last launch, through fluor's own zoom so its keys, scroll and the panel's slider move one setting.
+    // The UI scale from the last launch, through fluor's own zoom (its Cmd/Ctrl keys and scroll); the text size over it.
     if let Some(ru) = vault.as_ref().and_then(|v| mahere_store::load_ui_scale(v)) {
         app.zoom_restore = Some(ru);
         app.kept_ru = ru;
+    }
+    if let Some(t) = vault.as_ref().and_then(|v| mahere_store::load_text_scale(v)) {
+        app.panel.set_text_scale(t);
     }
     app.store = vault;
     app.cells = cells;

@@ -384,6 +384,8 @@ pub struct Labeller {
     /// The font packs, when the host gave them, and how many had arrived when the shown layout was asked for.
     fonts: Option<std::sync::Arc<crate::fonts::FontPacks>>,
     fonts_laid: usize,
+    /// The text size the last layout was asked at: a new one lays the view out again (2026-10-25: the UI scale changed and the map's lettering stayed at the old size until the camera moved).
+    font_asked: f32,
 }
 
 impl Default for Labeller {
@@ -620,7 +622,7 @@ impl Labeller {
                 }
             })
             .expect("labels thread");
-        Labeller { tx, rx, shown: Lettering::default(), busy: false, asked: None, last: std::time::Instant::now(), fonts: None, fonts_laid: 0 }
+        Labeller { tx, rx, shown: Lettering::default(), busy: false, asked: None, last: std::time::Instant::now(), fonts: None, fonts_laid: 0, font_asked: 0.0 }
     }
 
     /// The font packs to draw names in scripts the binary lacks (Nick 2026-10-16): a layout that needed one asks for it, and one arriving lays the view out again.
@@ -661,7 +663,7 @@ impl Labeller {
             return;
         }
         let key = Self::view_key(map, w, h);
-        let fonts_new = self.fonts_new();
+        let fonts_new = self.fonts_new() || (font - self.font_asked).abs() > 0.01;
         if self.busy || !at_rest || (!fonts_new && (self.shown.drawn_for == Some(key) || self.asked == Some(key))) {
             return;
         }
@@ -674,6 +676,7 @@ impl Labeller {
             self.asked = Some(key);
             self.last = std::time::Instant::now();
             self.fonts_laid = self.fonts.as_ref().map_or(0, |f| f.arrived());
+            self.font_asked = font;
         }
     }
 
