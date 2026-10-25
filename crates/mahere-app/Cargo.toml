@@ -19,6 +19,10 @@ wgpu = { version = "28", default-features = false, features = ["wgsl"] }
 pollster = "0.4"
 fluor = { version = "0.0.5", features = ["host-winit"] }
 
+# Linux presents on fluor's GPU (Vulkan): the map goes under the chrome on the device it is drawn on (the Mac always presents thru wgpu).
+[target.'cfg(target_os = "linux")'.dependencies]
+fluor = { version = "0.0.5", features = ["host-winit", "gpu"] }
+
 [dev-dependencies]
 mahere-coord = { path = "../mahere-coord" }
 png = "0.17"

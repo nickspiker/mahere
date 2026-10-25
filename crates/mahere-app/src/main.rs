@@ -67,6 +67,8 @@ impl MahereApp {
         let t4b = Instant::now();
         let clip = ctx.damage_clip;
         match &self.gpu {
+            // On fluor's device the map is its layer under the chrome: the scratch is the chrome alone.
+            Some(g) if g.layer => self.chrome.flatten_chrome_into(target, w, h, Some(Clip::new(clip.x0, clip.y0, clip.x1, clip.y1))),
             // The chrome alone, then the map's frame under it straight from the readback, one pass over the damage (2026-10-25: the chrome group's background layer cost a copy into it, and the group a composite and a blit, every frame).
             Some(g) if g.frame.len() == w * h => {
                 self.chrome.flatten_chrome_into(target, w, h, Some(Clip::new(clip.x0, clip.y0, clip.x1, clip.y1)));
@@ -303,6 +305,12 @@ impl MahereApp {
         }
     }
 
+    /// The map keeps a device of its own (or the CPU): MAHERE_CPU=1 or MAHERE_READBACK=1.
+    #[cfg(not(target_os = "windows"))]
+    fn own_device() -> bool {
+        std::env::var("MAHERE_CPU").as_deref() == Ok("1") || std::env::var("MAHERE_READBACK").as_deref() == Ok("1")
+    }
+
     fn dims(ctx: &Context) -> (usize, usize) {
         (ctx.viewport.width_px as usize, ctx.viewport.height_px as usize)
     }
@@ -328,12 +336,45 @@ impl FluorApp for MahereApp {
     fn init(&mut self, ctx: &mut Context) {
         self.chrome.resize(ctx.viewport);
         self.map.marks_top = chrome::strip_height(ctx.viewport) as f32;
-        self.gpu = gpu::Gpu::new();
+        // fluor's device came first (gpu_ready) where it presents on the GPU; otherwise a headless one of the map's own.
+        if self.gpu.is_none() {
+            self.gpu = gpu::Gpu::new();
+        }
         if self.gpu.is_some() {
             // The cells go to the GPU as they are; the CPU's own unpacked copies are not kept.
             self.map.set_gpu_only();
         }
         self.map_span = ctx.viewport.span as f64;
+    }
+
+    /// The map on fluor's device: the features and limits it needs (MAHERE_CPU=1 the CPU raster, MAHERE_READBACK=1 the headless device and its readback).
+    #[cfg(not(target_os = "windows"))]
+    fn gpu_request(&self, adapter: &wgpu::Adapter) -> Option<fluor::host::gpu::GpuRequest> {
+        if Self::own_device() {
+            return None;
+        }
+        Some(fluor::host::gpu::GpuRequest { features: mahere_gpu::wanted_features(adapter), limits: gpu::Gpu::limits(adapter) })
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    fn gpu_ready(&mut self, g: &fluor::host::gpu::Gpu) {
+        // The Mac always makes fluor's device: a plain one when the map asked for nothing, which the map can't draw on.
+        if !Self::own_device() {
+            self.gpu = Some(gpu::Gpu::on(g.device.clone(), g.queue.clone(), &g.adapter));
+        }
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    fn under_layer(&mut self) -> Option<fluor::host::gpu::UnderLayer> {
+        self.gpu.as_ref()?.under_layer()
+    }
+
+    /// With the map under fluor's chrome on the GPU, the scratch holds the chrome alone: only its own changes are damage. Otherwise the map changes every pixel.
+    fn damage_rect(&mut self, viewport: fluor::Viewport) -> Option<fluor::canvas::PixelRect> {
+        if self.gpu.as_ref().is_some_and(|g| g.layer) {
+            return self.chrome.chrome_damage_rect();
+        }
+        Some(fluor::canvas::PixelRect::new(0, 0, viewport.width_px as usize, viewport.height_px as usize))
     }
 
     fn on_resize(&mut self, width: u32, height: u32, ctx: &mut Context) {

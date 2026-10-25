@@ -1125,8 +1125,6 @@ dependencies = [
 [[package]]
 name = "fluor"
 version = "0.0.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d2a663b9e4d51c7fd90ee090b6f241f73755f042ff7b7f0173364f7864f4c300"
 dependencies = [
  "block2 0.6.2",
  "cosmic-text",
@@ -4034,8 +4032,6 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 [[package]]
 name = "vsf"
 version = "0.10.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ee202daf22bcd6b1e9bf99b2884c9f093a25c5eb1770e1b07bc2b098e0f00f44"
 dependencies = [
  "aes-gcm",
  "bitvec",

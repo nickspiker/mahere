@@ -1,4 +1,5 @@
-//! The map on the GPU for the desktop (Nick 2026-10-17: the desktop was slow and its contours sparkled, the CPU raster stepping along texel edges where the phone's shader interpolates): the phone's compositor ([`GpuMap`]) on a headless device, its frame read back into the buffer fluor already presents, so the chrome, the panel and fluor's own present are as they were.
+//! The map on the GPU for the desktop (Nick 2026-10-17: the desktop was slow and its contours sparkled, the CPU raster stepping along texel edges where the phone's shader interpolates): the phone's compositor ([`GpuMap`]).
+//! On Linux and the Mac it draws on fluor's own device and its frame is fluor's layer under the chrome, composited on the GPU straight onto the window (2026-10-25); on Windows, or with MAHERE_READBACK=1, on a headless device of its own, read back into the buffer fluor presents.
 //! Vulkan on Linux and Windows, Metal on the Mac; with no adapter (or MAHERE_CPU=1) the app keeps the CPU raster.
 
 use mahere_engine::MapCore;
@@ -23,6 +24,8 @@ pub struct Gpu {
     device: wgpu::Device,
     queue: wgpu::Queue,
     map: GpuMap,
+    /// On fluor's device: the target is fluor's layer under the chrome, never read back.
+    pub layer: bool,
     /// The frame's target (BGRA, so a row read back is fluor's pixel order once its colour is turned to darkness) and its size.
     target: Option<(wgpu::Texture, wgpu::TextureView, u32, u32)>,
     /// The readback ring: each buffer, its state, and the frame it holds.
@@ -44,6 +47,35 @@ pub struct Gpu {
 }
 
 impl Gpu {
+    /// What the map needs of a device on `adapter`: texture arrays hold one cell per layer, so the adapter's real layer limit, not WebGPU's 256; and its own largest texture, for the still frame at three times a large window.
+    pub fn limits(adapter: &wgpu::Adapter) -> wgpu::Limits {
+        let mut limits = wgpu::Limits::default();
+        limits.max_texture_array_layers = adapter.limits().max_texture_array_layers.min(2048);
+        limits.max_texture_dimension_2d = adapter.limits().max_texture_dimension_2d.max(limits.max_texture_dimension_2d);
+        limits
+    }
+
+    /// The map on fluor's device (asked for with [`Self::limits`] and the map's features): its frame goes under the chrome as it is.
+    pub fn on(device: wgpu::Device, queue: wgpu::Queue, adapter: &wgpu::Adapter) -> Gpu {
+        let info = adapter.get_info();
+        eprintln!("gpu: {} ({:?}), the map under fluor's chrome", info.name, info.backend);
+        Self::with(device, queue, true)
+    }
+
+    fn with(device: wgpu::Device, queue: wgpu::Queue, layer: bool) -> Gpu {
+        device.on_uncaptured_error(std::sync::Arc::new(|e: wgpu::Error| eprintln!("gpu: {e}")));
+        let map = GpuMap::new(&device, &queue, wgpu::TextureFormat::Bgra8Unorm);
+        Gpu { device, queue, map, layer, target: None, ring: Vec::new(), drawn: 0, shown: 0, style_version: None, last_cam: None, last_move: Instant::now(), settled: false, last_marks: Vec::new(), last_panel: Vec::new(), frame: Vec::new(), parts: [0.0; 5] }
+    }
+
+    /// The frame as fluor's layer under the chrome (on fluor's device only).
+    #[cfg(not(target_os = "windows"))]
+    pub fn under_layer(&self) -> Option<fluor::host::gpu::UnderLayer> {
+        let (_, view, w, h) = self.target.as_ref().filter(|_| self.layer)?;
+        Some(fluor::host::gpu::UnderLayer { view: view.clone(), width: *w, height: *h })
+    }
+
+    /// The map on a headless device of its own, its frames read back.
     pub fn new() -> Option<Gpu> {
         if std::env::var("MAHERE_CPU").as_deref() == Ok("1") {
             return None;
@@ -52,18 +84,12 @@ impl Gpu {
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions { power_preference: wgpu::PowerPreference::HighPerformance, compatible_surface: None, force_fallback_adapter: false }))
             .map_err(|e| eprintln!("gpu: no adapter, the CPU draws the map: {e:?}"))
             .ok()?;
-        // Texture arrays hold one cell per layer: the adapter's real layer limit, not WebGPU's 256; and its own largest texture, for the still frame at three times a large window.
-        let mut limits = wgpu::Limits::default();
-        limits.max_texture_array_layers = adapter.limits().max_texture_array_layers.min(2048);
-        limits.max_texture_dimension_2d = adapter.limits().max_texture_dimension_2d.max(limits.max_texture_dimension_2d);
-        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor { label: Some("mahere"), required_limits: limits, required_features: mahere_gpu::wanted_features(&adapter), ..Default::default() }))
+        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor { label: Some("mahere"), required_limits: Self::limits(&adapter), required_features: mahere_gpu::wanted_features(&adapter), ..Default::default() }))
             .map_err(|e| eprintln!("gpu: no device, the CPU draws the map: {e:?}"))
             .ok()?;
-        device.on_uncaptured_error(std::sync::Arc::new(|e: wgpu::Error| eprintln!("gpu: {e}")));
         let info = adapter.get_info();
-        eprintln!("gpu: {} ({:?})", info.name, info.backend);
-        let map = GpuMap::new(&device, &queue, wgpu::TextureFormat::Bgra8Unorm);
-        Some(Gpu { device, queue, map, target: None, ring: Vec::new(), drawn: 0, shown: 0, style_version: None, last_cam: None, last_move: Instant::now(), settled: false, last_marks: Vec::new(), last_panel: Vec::new(), frame: Vec::new(), parts: [0.0; 5] })
+        eprintln!("gpu: {} ({:?}), read back", info.name, info.backend);
+        Some(Self::with(device, queue, false))
     }
 
     /// The still frame is still to come, or composites to bake: the host keeps ticking until they are done.
@@ -82,10 +108,14 @@ impl Gpu {
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: wgpu::TextureFormat::Bgra8Unorm,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | if self.layer { wgpu::TextureUsages::TEXTURE_BINDING } else { wgpu::TextureUsages::COPY_SRC },
             view_formats: &[],
         });
         let view = texture.create_view(&Default::default());
+        if self.layer {
+            self.target = Some((texture, view, w, h));
+            return;
+        }
         let bpr = (w * 4).div_ceil(256) * 256;
         // A new size: the ring made again (a frame of the old size in flight is dropped with it).
         self.ring = (0..RING)
@@ -191,6 +221,20 @@ impl Gpu {
         }
         let ov_ms = t_ov.elapsed().as_secs_f32() * 1000.0;
         self.map.set_user(&self.device, &self.queue, &map.user, &map.preview, map.preview_version, wu, hu);
+        if self.layer {
+            // fluor's layer: drawn and submitted, and fluor's present on the same queue lays it under the chrome; the GPU's own readbacks (the drawn range, the pass times) land as the device is polled.
+            let (_, view, _, _) = self.target.as_ref().unwrap();
+            let mut enc = self.device.create_command_encoder(&Default::default());
+            self.map.render(&self.device, &self.queue, &mut enc, view, &plan, map.luts(), wu, hu, RenderMode::Full);
+            let t_sub = Instant::now();
+            self.queue.submit([enc.finish()]);
+            self.map.after_submit();
+            self.device.poll(wgpu::PollType::Poll).ok();
+            let gpu_ms = self.map.take_pass_times().map_or(0.0, |p| p[0] + p[1] + p[2]);
+            self.parts = [(t_sync - t0).as_secs_f32() * 1000.0, ov_ms, t_sub.elapsed().as_secs_f32() * 1000.0, 0.0, gpu_ms];
+            map.last_frame_ms = t0.elapsed().as_secs_f32() * 1000.0;
+            return;
+        }
         // A free readback buffer; when every one is still in flight, the oldest is waited for.
         self.device.poll(wgpu::PollType::Poll).ok();
         self.take_landed(w, h);
