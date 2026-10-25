@@ -64,7 +64,9 @@ impl Gpu {
 
     fn with(device: wgpu::Device, queue: wgpu::Queue, layer: bool) -> Gpu {
         device.on_uncaptured_error(std::sync::Arc::new(|e: wgpu::Error| eprintln!("gpu: {e}")));
-        let map = GpuMap::new(&device, &queue, wgpu::TextureFormat::Bgra8Unorm);
+        let mut map = GpuMap::new(&device, &queue, wgpu::TextureFormat::Bgra8Unorm);
+        // MAHERE_COMP=0: every pixel drawn whole, no baked composites (to tell a composite's fault from the map's).
+        map.composite = std::env::var("MAHERE_COMP").as_deref() != Ok("0");
         Gpu { device, queue, map, layer, target: None, ring: Vec::new(), drawn: 0, shown: 0, style_version: None, last_cam: None, last_move: Instant::now(), settled: false, last_marks: Vec::new(), last_panel: Vec::new(), frame: Vec::new(), parts: [0.0; 5] }
     }
 

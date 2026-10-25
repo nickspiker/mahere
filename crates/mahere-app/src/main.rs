@@ -874,7 +874,14 @@ fn main() {
     if let (Some(v), Some(c)) = (&vault, &cells) {
         mahere_store::migrate_vault_cells(v.clone(), c.clone());
     }
-    let session = vault.as_ref().and_then(|s| mahere_store::load_session(s));
+    let mut session = vault.as_ref().and_then(|s| mahere_store::load_session(s));
+    // MAHERE_AT=lat,lon,ppd[,bearing°]: open there instead of the saved view (a place to look at again, a report to reproduce).
+    if let Some(at) = std::env::var("MAHERE_AT").ok() {
+        let v: Vec<f64> = at.split(',').filter_map(|x| x.trim().parse().ok()).collect();
+        if v.len() >= 3 {
+            session = Some(mahere_store::Session { lat: v[0], lon: v[1], ppd: v[2], bearing: v.get(3).copied().unwrap_or(0.0).to_radians(), sun_az: 315.0, sun_alt: 40.0 });
+        }
+    }
     // Without a saved view, a fresh install's whole globe, anywhere and turned any way ([`MapCore::fresh_globe`]; the desktop has no GPS).
     let fresh = session.is_none();
     let cam = match session {
