@@ -1081,7 +1081,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1124,7 +1124,9 @@ dependencies = [
 
 [[package]]
 name = "fluor"
-version = "0.0.5"
+version = "0.0.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b17f1dee58b15354f7fb63b9d286dc76c93c2ec33d399377dcd9b8734f063e93"
 dependencies = [
  "block2 0.6.2",
  "cosmic-text",
@@ -1482,7 +1484,7 @@ dependencies = [
  "js-sys",
  "log",
  "wasm-bindgen",
- "windows-core 0.58.0",
+ "windows-core 0.62.2",
 ]
 
 [[package]]
@@ -1601,6 +1603,8 @@ dependencies = [
 [[package]]
 name = "ihi"
 version = "0.0.48"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e820ef1c51d912e9c78a84cf71319ee3b758c66a264c96bdd2c8d6f2ab4c6969"
 dependencies = [
  "blake3",
  "i256",
@@ -1754,7 +1758,9 @@ dependencies = [
 
 [[package]]
 name = "kete"
-version = "0.0.4"
+version = "0.0.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "44bf405ec9a30889a85b9b090eaafbcc9b14f58e0c92f510984a42860b6a13b6"
 dependencies = [
  "blake3",
  "chacha20poly1305 0.11.0",
@@ -2035,7 +2041,9 @@ dependencies = [
 
 [[package]]
 name = "manifestus"
-version = "0.0.4"
+version = "0.0.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3845f3d551546608aa83b4ab90269ee3a894edab081cd3c6ccf7413563055d5d"
 dependencies = [
  "blake3",
  "hashbrown 0.15.5",
@@ -3222,7 +3230,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3675,10 +3683,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix 1.1.5",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3814,6 +3822,8 @@ checksum = "c7c4ceeeca15c8384bbc3e011dbd8fccb7f068a440b752b7d9b32ceb0ca0e2e8"
 [[package]]
 name = "tohu"
 version = "0.0.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3d50206f52e870b9b5303bbe1836efafcab7ee90566112531a1e9cfb659a51d7"
 dependencies = [
  "base64",
  "blake3",
@@ -4024,6 +4034,8 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 [[package]]
 name = "vsf"
 version = "0.10.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ee202daf22bcd6b1e9bf99b2884c9f093a25c5eb1770e1b07bc2b098e0f00f44"
 dependencies = [
  "aes-gcm",
  "bitvec",
@@ -4427,7 +4439,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

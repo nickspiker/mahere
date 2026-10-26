@@ -1,5 +1,27 @@
 # Mahere release notes
 
+## 0.2.0 · October 2026
+
+### Faster on computers
+- On Mac and Linux the map is drawn by the graphics card straight onto the window, with nothing copied back and forth: about twice as fast while you pan and zoom.
+- Graphics cards that can work in half precision draw the map's colours that way, which is quicker on phones and Macs.
+
+### Two text sizes
+- The map's lettering and the menus size separately.
+- On a computer: scroll over the map to zoom; scroll over the open menu to move through it; Shift and scroll, or scroll on the map while the menu is open, sizes the map's lettering; Cmd or Ctrl with scroll, + or −, or the Interface size slider, sizes the menus. Both are remembered.
+- On a phone: pinch on the map to move it; with the menu open, a pinch that starts on the menu sizes the menus and one that starts on the map sizes the lettering.
+
+### Map storage
+- Downloaded map pieces are kept in Mahere's own store with your notes and settings, and it opens in a moment however much it holds.
+- The first start after the update moves the pieces already downloaded into it.
+- On a Mac, the map is downloaded again as you look at it: the old copy can't be trusted (see below).
+
+### Fixes
+- On a Mac, triangles of the map no longer show another place's roads, water, parks and names (a second Point Southworth inland): the Mac's file system treated two pieces' names as one.
+- On a Mac, the map no longer shows scattered pieces from elsewhere while it loads.
+- On a Mac, directions draw their route line.
+- Coarse stand-in pieces no longer draw roads and outlines in the wrong places while the sharper ones arrive.
+
 ## 0.1.0 · October 2026
 
 ### First launch

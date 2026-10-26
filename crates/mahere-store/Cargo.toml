@@ -7,7 +7,7 @@ repository.workspace = true
 description = "mahere's on-device database: session, tracks (and soon tiles) on the kete/manifestus crash-proof vault"
 
 [dependencies]
-kete = { version = "0.0.4" }
+kete = { version = "0.0.5" }
 mahere-engine = { path = "../mahere-engine" }
 mahere-tiles = { path = "../mahere-tiles" }
 mahere-coord = { path = "../mahere-coord" }
