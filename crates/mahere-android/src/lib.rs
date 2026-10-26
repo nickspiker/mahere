@@ -50,6 +50,9 @@ pub struct AndroidApp {
     travel: f64,
     /// A second finger touched during this press.
     had_two: bool,
+    /// A finger down on the map with the panel open: the panel closes when it lifts, unless a second finger came (a pinch sizes the interface or the lettering, Nick 2026-10-26) or it travelled.
+    close_on_lift: bool,
+    pinched: bool,
     /// A stroke of the pen or a selection in progress; the touch that is drawing is a stylus; its pressure; when a stylus last touched, since while the pen is out fingers only navigate.
     drawing: bool,
     stylus: bool,
@@ -575,10 +578,12 @@ impl FluorApp for AndroidApp {
                     self.dragging = false;
                     return EventResponse::Handled;
                 }
-                // With the panel open the map takes no gesture: a tap on it closes the panel and nothing else.
+                // With the panel open the map takes no gesture: a tap on it closes the panel and nothing else, decided when the finger lifts.
                 if was_open {
-                    self.panel.close();
-                    self.save_settings();
+                    self.close_on_lift = true;
+                    self.pinched = false;
+                    self.travel = 0.0;
+                    self.last_cursor = (ctx.cursor_x as f64, ctx.cursor_y as f64);
                     self.dragging = false;
                     return EventResponse::Handled;
                 }
@@ -622,6 +627,14 @@ impl FluorApp for AndroidApp {
                 }
                 self.apply_area_acts();
                 self.apply_update_acts();
+                if std::mem::take(&mut self.close_on_lift) {
+                    if !self.pinched && self.travel < 12.0 {
+                        self.panel.close();
+                        self.save_settings();
+                    }
+                    self.pinched = false;
+                    return EventResponse::Handled;
+                }
                 if self.drawing {
                     self.map.end_stroke(self.w, self.h);
                     self.drawing = false;
@@ -657,7 +670,9 @@ impl FluorApp for AndroidApp {
                     self.last_cursor = (x, y);
                     return EventResponse::Handled;
                 }
-                if let Some(pin) = self.pin_drag {
+                if self.close_on_lift {
+                    self.travel += (x - self.last_cursor.0).abs() + (y - self.last_cursor.1).abs();
+                } else if let Some(pin) = self.pin_drag {
                     self.map.move_pin(pin, x, y, self.w, self.h);
                     ctx.window.request_redraw();
                 } else if self.suppress_move {
@@ -911,6 +926,8 @@ pub extern "system" fn Java_nz_mahere_app_MahereActivity_nativeInit(
         dragging: false,
         travel: 0.0,
         had_two: false,
+        close_on_lift: false,
+        pinched: false,
         drawing: false,
         stylus: false,
         erasing: false,
@@ -1096,6 +1113,7 @@ pub extern "system" fn Java_nz_mahere_app_MahereActivity_nativeOnTouch(
     // With the panel open, two fingers scale the interface or the map's lettering, by where the first came down; never the map.
     if s.app().panel.is_open() {
         if count >= 2 && action != ACTION_POINTER_UP {
+            s.app().pinched = true;
             s.app().ui_pinch(x0 as f64, y0 as f64, x1 as f64, y1 as f64);
             return 0;
         }

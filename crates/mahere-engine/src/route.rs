@@ -734,7 +734,7 @@ pub fn find_cached(store: Arc<dyn CellStore>, dem: Arc<dyn CellStore>, from: (f6
         let walk = within(reach(depth)) && (depth == ROUTE_DEPTH || !within(reach(depth + 1)));
         let trixels = cell.node_trixels(n.name, w);
         // To the same place at another depth: a node there, or a point along a corridor there, whose two ends cost their way along it (the way is on every parent and child trixel of its own, the pyramid being a union).
-        let mut level = |cells: &mut Cells, states: &mut Vec<(Node, f64, usize, Via)>, open: &mut BinaryHeap<Reverse<(u64, usize)>>, index: &mut HashMap<Node, usize>, node_ll: &mut HashMap<Node, (f64, f64)>, t: T| -> bool {
+        let level = |cells: &mut Cells, states: &mut Vec<(Node, f64, usize, Via)>, open: &mut BinaryHeap<Reverse<(u64, usize)>>, index: &mut HashMap<Node, usize>, node_ll: &mut HashMap<Node, (f64, f64)>, t: T| -> bool {
             let Some((st, c, cw)) = stand(cells, t, n.osm) else { return false };
             let sp = travel.speed(&c.ways[cw as usize - 1]).unwrap_or(speed);
             let tm = mahere_tiles::texel_m(t.depth);
