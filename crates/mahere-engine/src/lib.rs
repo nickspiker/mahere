@@ -1211,6 +1211,39 @@ impl MapCore {
         self.route_rx.is_some()
     }
 
+    /// The route as a session keeps it: the mode (0 off, 1 directions, 2 navigation), the way of travel's code (1 car, 2 bike, 3 foot), and the pins.
+    pub fn route_state(&self) -> (u8, u8, Option<(f64, f64)>, Option<(f64, f64)>, Option<(f64, f64)>) {
+        let travel = match self.travel {
+            Some(route::Travel::Car) => 1,
+            Some(route::Travel::Bike) => 2,
+            Some(route::Travel::Foot) => 3,
+            None => 0,
+        };
+        (self.route_mode as u8, travel, self.pin_a, self.pin_b, self.nav_to)
+    }
+
+    /// A session's route back (Nick 2026-10-26): its mode, way of travel and pins as they stood, and the route found again.
+    pub fn restore_route(&mut self, mode: u8, travel: u8, pin_a: Option<(f64, f64)>, pin_b: Option<(f64, f64)>, nav_to: Option<(f64, f64)>) {
+        let mode = match mode {
+            1 => RouteMode::Directions,
+            2 => RouteMode::Navigate,
+            _ => return,
+        };
+        self.set_route_mode(mode);
+        self.travel = match travel {
+            1 => Some(route::Travel::Car),
+            2 => Some(route::Travel::Bike),
+            3 => Some(route::Travel::Foot),
+            _ => None,
+        };
+        let on_globe = |p: Option<(f64, f64)>| p.filter(|(a, b)| a.is_finite() && b.is_finite() && a.abs() <= 90.0 && b.abs() <= 180.0);
+        self.pin_a = on_globe(pin_a);
+        self.pin_b = on_globe(pin_b);
+        self.nav_to = on_globe(nav_to);
+        self.reroute();
+        self.dirty = true;
+    }
+
     /// Directions or navigation, or neither (which clears the pins and the route).
     pub fn set_route_mode(&mut self, mode: RouteMode) {
         if mode != self.route_mode {
@@ -2503,8 +2536,25 @@ impl MapCore {
             // The route's own profile, resampled to the strip's width; the ends' elevations are its first and last known points.
             let (profile, distance_m, elev_origin, elev_target) = match &self.route {
                 Some(r) if !r.profile.is_empty() => {
+                    // Smoothed (Nick 2026-10-26): each sample the mean of its neighbours over a fiftieth of the route, then a line between samples for every column of the strip.
                     let n = samples.max(2);
-                    let p: Vec<f32> = (0..n).map(|i| r.profile[i * (r.profile.len() - 1) / (n - 1)]).collect();
+                    let m = r.profile.len();
+                    let half = (m / 100).max(1);
+                    let smooth: Vec<f32> = (0..m)
+                        .map(|k| {
+                            let (lo, hi) = (k.saturating_sub(half), (k + half).min(m - 1));
+                            let known: Vec<f32> = r.profile[lo..=hi].iter().copied().filter(|e| !e.is_nan()).collect();
+                            if known.is_empty() { f32::NAN } else { known.iter().sum::<f32>() / known.len() as f32 }
+                        })
+                        .collect();
+                    let p: Vec<f32> = (0..n)
+                        .map(|i| {
+                            let x = i as f64 * (m - 1) as f64 / (n - 1) as f64;
+                            let (k, f) = (x.floor() as usize, (x - x.floor()) as f32);
+                            let (a, b) = (smooth[k], smooth[(k + 1).min(m - 1)]);
+                            if a.is_nan() || b.is_nan() { a } else { a + (b - a) * f }
+                        })
+                        .collect();
                     (p, r.metres, r.profile.iter().find(|e| !e.is_nan()).copied(), r.profile.iter().rev().find(|e| !e.is_nan()).copied())
                 }
                 _ => (Vec::new(), 0.0, None, None),

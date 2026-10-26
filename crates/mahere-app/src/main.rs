@@ -34,6 +34,9 @@ struct MahereApp {
     store: Option<std::sync::Arc<mahere_store::FlatStorage>>,
     /// The UI scale kept from the last launch, handed to fluor once; the scale last kept.
     zoom_restore: Option<f32>,
+    /// The window's place and size: the last the user settled it at (saved with the session), and the saved one to restore once at launch.
+    window_rect: Option<(i32, i32, u32, u32)>,
+    window_restore: Option<(i32, i32, u32, u32)>,
     kept_ru: f32,
     cells: Option<std::sync::Arc<mahere_store::VaultCells>>,
     last_save: Instant,
@@ -179,6 +182,8 @@ impl MahereApp {
             last_cursor: (0., 0.),
             store: None,
             zoom_restore: None,
+            window_rect: None,
+            window_restore: None,
             kept_ru: 1.0,
             cells: None,
             last_save: Instant::now(),
@@ -416,6 +421,17 @@ impl FluorApp for MahereApp {
     /// The UI scale kept from the last launch, once, then the panel's interface size when the slider sets it: fluor applies either as its own zoom, as its Cmd/Ctrl keys and scroll do.
     fn take_zoom_request(&mut self) -> Option<f32> {
         self.zoom_restore.take().or_else(|| self.panel.take_ru_request())
+    }
+
+    /// The window where it was last session, once (fluor keeps the size always and the position only on a live monitor).
+    fn take_window_geometry_request(&mut self) -> Option<(i32, i32, u32, u32)> {
+        self.window_restore.take()
+    }
+
+    /// The window settled somewhere by the user: kept for the session.
+    fn on_window_rect_changed(&mut self, x: i32, y: i32, w: u32, h: u32) {
+        eprintln!("window: settled at {x},{y} {w}\u{d7}{h}");
+        self.window_rect = Some((x, y, w, h));
     }
 
     type UserEvent = ();
@@ -883,17 +899,8 @@ impl FluorApp for MahereApp {
             )));
             if let Some(store) = &self.store {
                 let c = &self.map.cam;
-                let _ = mahere_store::save_session(
-                    store,
-                    &mahere_store::Session {
-                        lat: c.lat(),
-                        lon: c.lon(),
-                        ppd: c.ppd,
-                        bearing: c.bearing(),
-                        sun_az: self.map.sun_az as f64,
-                        sun_alt: self.map.sun_alt as f64,
-                    },
-                );
+                let (route_mode, travel, pin_a, pin_b, nav_to) = self.map.route_state();
+                let _ = mahere_store::save_session(store, &mahere_store::Session { lat: c.lat(), lon: c.lon(), ppd: c.ppd, bearing: c.bearing(), sun_az: self.map.sun_az as f64, sun_alt: self.map.sun_alt as f64, route_mode, travel, pin_a, pin_b, nav_to, window: self.window_rect });
             }
         }
         // Updates: what the threads found, onto the page; a verified build swapped in and started in this one's place.
@@ -1047,11 +1054,11 @@ fn main() {
         c.take_files(&mahere_store::cells_dir(None));
     }
     let mut session = vault.as_ref().and_then(|s| mahere_store::load_session(s));
-    // MAHERE_AT=lat,lon,ppd[,bearing°]: open there instead of the saved view (a place to look at again, a report to reproduce).
+    // MAHERE_AT=lat,lon,ppd[,bearing°]: open there instead of the saved view (a place to look at again, a report to reproduce); the session's route and window stay.
     if let Some(at) = std::env::var("MAHERE_AT").ok() {
         let v: Vec<f64> = at.split(',').filter_map(|x| x.trim().parse().ok()).collect();
         if v.len() >= 3 {
-            session = Some(mahere_store::Session { lat: v[0], lon: v[1], ppd: v[2], bearing: v.get(3).copied().unwrap_or(0.0).to_radians(), sun_az: 315.0, sun_alt: 40.0 });
+            session = Some(mahere_store::Session { lat: v[0], lon: v[1], ppd: v[2], bearing: v.get(3).copied().unwrap_or(0.0).to_radians(), sun_az: 315.0, sun_alt: 40.0, ..session.unwrap_or_default() });
         }
     }
     // Without a saved view, a fresh install's whole globe, anywhere and turned any way ([`MapCore::fresh_globe`]; the desktop has no GPS).
@@ -1067,6 +1074,10 @@ fn main() {
     let mut map = MapCore::layered(store, layer_stores, cam);
     if fresh {
         map.fresh_globe(None);
+    }
+    // The route as it stood last session.
+    if let Some(s) = session {
+        map.restore_route(s.route_mode, s.travel, s.pin_a, s.pin_b, s.nav_to);
     }
     // The user's own cells, as files beside the data; the areas as files under them.
     let user_dir = mahere_store::user_dir();
@@ -1098,6 +1109,12 @@ fn main() {
     if let Some(ru) = vault.as_ref().and_then(|v| mahere_store::load_ui_scale(v)) {
         app.zoom_restore = Some(ru);
         app.kept_ru = ru;
+    }
+    // The window where it was.
+    app.window_restore = session.and_then(|s| s.window);
+    app.window_rect = app.window_restore;
+    if let Some((x, y, w, h)) = app.window_restore {
+        eprintln!("window: restoring {x},{y} {w}\u{d7}{h}");
     }
     if let Some(t) = vault.as_ref().and_then(|v| mahere_store::load_label_scale(v)) {
         app.panel.set_label_scale(t);

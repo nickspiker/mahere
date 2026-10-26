@@ -1114,6 +1114,9 @@ fn finish(cells: &mut Cells, dem: &Arc<dyn CellStore>, travel: Travel, from: (f6
         _ => 4.0 / 3.6,
     };
     let names: HashMap<i64, String> = chain.iter().filter_map(|s| cells.ways(s.0).into_iter().find(|w| w.0 == s.1).map(|w| (s.1, w.1.name))).collect();
+    // A ferry rides at sea level: its stretch of the profile is the water, not the seabed under it (Nick 2026-10-26: Puget Sound's floor showed under the Southworth ferry).
+    let ferries: Vec<i64> = chain.iter().map(|s| s.1).filter(|&osm| cells.ways(chain.iter().find(|s| s.1 == osm).unwrap().0).into_iter().any(|w| w.0 == osm && w.1.class == FERRY)).collect();
+    let afloat: Vec<bool> = chain.iter().map(|s| ferries.contains(&s.1)).collect();
     let mut route = Route { travel, pts: Vec::with_capacity(chain.len()), metres: 0.0, seconds, climb_m: 0.0, steps: Vec::new(), profile: Vec::new(), again: None };
     route.pts.push(from);
     let mut last_way = None;
@@ -1155,11 +1158,11 @@ fn finish(cells: &mut Cells, dem: &Arc<dyn CellStore>, travel: Travel, from: (f6
                 k += 1;
                 along += chain[k].2;
             }
-            ground.elev(chain[k].0).unwrap_or(f32::NAN)
+            if afloat[k] { 0.0 } else { ground.elev(chain[k].0).unwrap_or(f32::NAN) }
         })
         .collect();
     if travel != Travel::Car {
-        let (time, climb) = ground_time(&mut ground, &chain.iter().map(|s| s.0).collect::<Vec<_>>(), travel);
+        let (time, climb) = ground_time(&mut ground, &chain.iter().map(|s| s.0).collect::<Vec<_>>(), &afloat, travel);
         route.climb_m = climb;
         if let Some(t) = time {
             route.seconds = t + crow(a.lat_lon(), chain[0].0.lat_lon()) / off_way + crow(chain.last().unwrap().0.lat_lon(), b.lat_lon()) / off_way;
@@ -1217,14 +1220,14 @@ impl Ground {
 }
 
 /// The time along a path on foot or a bike from the ground's own elevation, every few metres: Tobler's hiking function walking, and on a bike its pace plus a minute for every ten metres climbed. With the metres climbed. None when the elevation is not there.
-fn ground_time(ground: &mut Ground, path: &[T], travel: Travel) -> (Option<f64>, f64) {
-    let mut elev = |t: T| ground.elev(t);
+fn ground_time(ground: &mut Ground, path: &[T], afloat: &[bool], travel: Travel) -> (Option<f64>, f64) {
+    let mut elev = |k: usize| if afloat[k] { Some(0.0) } else { ground.elev(path[k]) };
     let (mut time, mut climb) = (0.0, 0.0);
     let step = 6usize;
     let mut prev: Option<(T, f32)> = None;
     for k in (0..path.len()).step_by(step).chain(std::iter::once(path.len().saturating_sub(1))) {
         let t = path[k];
-        let Some(e) = elev(t) else { return (None, climb) };
+        let Some(e) = elev(k) else { return (None, climb) };
         if let Some((pt, pe)) = prev {
             let len = crow(pt.lat_lon(), t.lat_lon());
             if len < 0.01 {

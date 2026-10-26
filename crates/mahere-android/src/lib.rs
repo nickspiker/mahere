@@ -534,7 +534,8 @@ impl AndroidApp {
     fn save_session(&self) {
         if let Some(store) = &self.store {
             let c = &self.map.cam;
-            let s = mahere_store::Session { lat: c.lat(), lon: c.lon(), ppd: c.ppd, bearing: c.bearing(), sun_az: self.map.sun_az as f64, sun_alt: self.map.sun_alt as f64 };
+            let (route_mode, travel, pin_a, pin_b, nav_to) = self.map.route_state();
+            let s = mahere_store::Session { lat: c.lat(), lon: c.lon(), ppd: c.ppd, bearing: c.bearing(), sun_az: self.map.sun_az as f64, sun_alt: self.map.sun_alt as f64, route_mode, travel, pin_a, pin_b, nav_to, window: None };
             let store = store.clone();
             self.persist.run(move || {
                 let _ = mahere_store::save_session(&store, &s);
@@ -880,6 +881,10 @@ pub extern "system" fn Java_nz_mahere_app_MahereActivity_nativeInit(
     let mut map = MapCore::layered(cell_store, layer_stores, cam);
     if restored.is_none() {
         map.fresh_globe(None);
+    }
+    // The route as it stood last session.
+    if let Some(s) = session {
+        map.restore_route(s.route_mode, s.travel, s.pin_a, s.pin_b, s.nav_to);
     }
     if let Some(v) = &store {
         map.set_user_store(std::sync::Arc::new(mahere_store::VaultUser::new(v.clone())));

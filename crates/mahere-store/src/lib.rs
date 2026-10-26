@@ -74,7 +74,7 @@ fn load_or_mint_secret(path: &str) -> Result<[u8; 32], String> {
 
 // ==================== SESSION ====================
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Session {
     pub lat: f64,
     pub lon: f64,
@@ -82,6 +82,14 @@ pub struct Session {
     pub bearing: f64,
     pub sun_az: f64,
     pub sun_alt: f64,
+    /// The route as it stood (Nick 2026-10-26: what was going on last session, back on launch): 0 none, 1 directions, 2 navigation; the way of travel (1 car, 2 bike, 3 foot); the pins.
+    pub route_mode: u8,
+    pub travel: u8,
+    pub pin_a: Option<(f64, f64)>,
+    pub pin_b: Option<(f64, f64)>,
+    pub nav_to: Option<(f64, f64)>,
+    /// The desktop window's outer position and inner size, physical pixels, as fluor reports and restores them.
+    pub window: Option<(i32, i32, u32, u32)>,
 }
 
 // ==================== KEYS ====================
@@ -118,10 +126,15 @@ fn track_count_key(start: i64) -> String {
 }
 
 pub fn save_session(store: &FlatStorage, s: &Session) -> Result<(), StorageError> {
-    let t = VsfType::t_f6(Tensor::new(
-        vec![6],
-        vec![s.lat, s.lon, s.ppd, s.bearing, s.sun_az, s.sun_alt],
-    ));
+    // One tensor of floats: the view and sun, then the route and the window, a place or a rect that is not there as NaN (a session from before them is six long).
+    let pt = |p: Option<(f64, f64)>| p.map_or([f64::NAN; 2], |(a, b)| [a, b]);
+    let win = s.window.map_or([f64::NAN; 4], |(x, y, w, h)| [x as f64, y as f64, w as f64, h as f64]);
+    let mut v = vec![s.lat, s.lon, s.ppd, s.bearing, s.sun_az, s.sun_alt, s.route_mode as f64, s.travel as f64];
+    v.extend(pt(s.pin_a));
+    v.extend(pt(s.pin_b));
+    v.extend(pt(s.nav_to));
+    v.extend(win);
+    let t = VsfType::t_f6(Tensor::new(vec![v.len()], v));
     store.write_device(&session_key(), &t.flatten())
 }
 
@@ -130,10 +143,20 @@ pub fn load_session(store: &FlatStorage) -> Option<Session> {
     let mut ptr = 0usize;
     let v = vsf::parse(&bytes, &mut ptr).ok()?;
     let d = tensor_f64(v)?;
-    if d.len() != 6 {
+    if d.len() < 6 {
         return None;
     }
-    Some(Session { lat: d[0], lon: d[1], ppd: d[2], bearing: d[3], sun_az: d[4], sun_alt: d[5] })
+    let pt = |k: usize| -> Option<(f64, f64)> {
+        match (d.get(k), d.get(k + 1)) {
+            (Some(&a), Some(&b)) if a.is_finite() && b.is_finite() => Some((a, b)),
+            _ => None,
+        }
+    };
+    let window = match (d.get(14), d.get(15), d.get(16), d.get(17)) {
+        (Some(&x), Some(&y), Some(&w), Some(&h)) if x.is_finite() && y.is_finite() && w >= 1.0 && h >= 1.0 => Some((x as i32, y as i32, w as u32, h as u32)),
+        _ => None,
+    };
+    Some(Session { lat: d[0], lon: d[1], ppd: d[2], bearing: d[3], sun_az: d[4], sun_alt: d[5], route_mode: d.get(6).map_or(0, |&m| m as u8).min(2), travel: d.get(7).map_or(0, |&t| t as u8).min(3), pin_a: pt(8), pin_b: pt(10), nav_to: pt(12), window })
 }
 
 /// The app's settings: the cache budget in bytes, the layer mask as bits, and the mode flags, as one tensor of integers in the vault under `d` settings.
