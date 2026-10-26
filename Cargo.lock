@@ -1884,7 +1884,7 @@ checksum = "f9f8bd3e56ce4dfc153cf470fffbfa98c7620958b312ca5c3a4b8d5181fd13c6"
 
 [[package]]
 name = "mahere-android"
-version = "0.1.22"
+version = "0.1.23"
 dependencies = [
  "fluor",
  "jni 0.21.1",
@@ -1906,7 +1906,7 @@ dependencies = [
 
 [[package]]
 name = "mahere-app"
-version = "0.1.22"
+version = "0.1.23"
 dependencies = [
  "bytemuck",
  "fluor",
@@ -1924,11 +1924,11 @@ dependencies = [
 
 [[package]]
 name = "mahere-coord"
-version = "0.1.22"
+version = "0.1.23"
 
 [[package]]
 name = "mahere-dem"
-version = "0.1.22"
+version = "0.1.23"
 dependencies = [
  "flate2",
  "las",
@@ -1939,7 +1939,7 @@ dependencies = [
 
 [[package]]
 name = "mahere-engine"
-version = "0.1.22"
+version = "0.1.23"
 dependencies = [
  "mahere-coord",
  "mahere-tiles",
@@ -1951,7 +1951,7 @@ dependencies = [
 
 [[package]]
 name = "mahere-gpu"
-version = "0.1.22"
+version = "0.1.23"
 dependencies = [
  "bytemuck",
  "mahere-engine",
@@ -1966,7 +1966,7 @@ dependencies = [
 
 [[package]]
 name = "mahere-osm"
-version = "0.1.22"
+version = "0.1.23"
 dependencies = [
  "mahere-coord",
  "osmpbf",
@@ -1976,7 +1976,7 @@ dependencies = [
 
 [[package]]
 name = "mahere-panel"
-version = "0.1.22"
+version = "0.1.23"
 dependencies = [
  "fluor",
  "mahere-engine",
@@ -1986,7 +1986,7 @@ dependencies = [
 
 [[package]]
 name = "mahere-store"
-version = "0.1.22"
+version = "0.1.23"
 dependencies = [
  "blake3",
  "kete",
@@ -2002,7 +2002,7 @@ dependencies = [
 
 [[package]]
 name = "mahere-tiles"
-version = "0.1.22"
+version = "0.1.23"
 dependencies = [
  "mahere-coord",
  "mahere-dem",
@@ -2016,7 +2016,7 @@ dependencies = [
 
 [[package]]
 name = "mahere-update"
-version = "0.1.22"
+version = "0.1.23"
 dependencies = [
  "blake3",
  "ed25519-dalek",
