@@ -1,5 +1,12 @@
 # Mahere release notes
 
+## 5.0 · October 2026
+
+### One set of controls
+- Every button, list and choice in Mahere is now drawn by the same toolkit as Photon: the toolbox, Car / Bike / Foot, Go / From here / To here, the copy buttons, the themes, the areas, the places found and the Updates page all share one look and one feel.
+- The search page's buttons size to their words and wrap where the panel is narrow.
+- Copy works the same way on every platform.
+
 ## 4.0 · October 2026
 
 ### Directions
