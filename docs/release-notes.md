@@ -1,5 +1,27 @@
 # Mahere release notes
 
+## 0.3.0 · October 2026
+
+### Search
+- Search has a page of its own in the menu: type at the top, the places found appear below with what they are and how far away, and one tapped shows on the map with Go, From here and To here.
+- It searches the names in view from the map already on your device, at every zoom, so it works offline and never waits on a download.
+
+### Directions and navigation
+- Directions: pick Directions in the toolbox, tap the start, then the end. The green and red pins can be dragged, and Swap turns the trip round. Car, Bike and Foot sit on the card.
+- Navigate: pick Navigate and tap where you are going. The route starts from your GPS fix and is worked out again as you move.
+- Routes are found from the map itself, with no separate road database: the junctions and the runs between them are read off the drawn roads and trails, and the major roads carry the middle of a long trip at coarser zooms, so a drive between towns climbs onto the highways and comes back down to the streets at each end.
+- Directions work across Washington and Montana on the major roads, and in the 1 m areas on every road and trail.
+- Distances along a road are the road's own length, not the grid's, and the route line follows every switchback at full detail, so the length and the climb are right.
+- Routes come back about ten times faster.
+
+### Phone
+- Two fingers on the map with the menu open size the map's lettering; two fingers on the menu size the menu.
+- A tap on the map with the menu open closes it when the finger lifts, not when it lands, so a pinch is never taken for a tap.
+- The green, red and blue pins show on the phone.
+
+### Versions
+- Version numbers are digits only, and a build wears the same number on every platform. The Updates page shows the build number beside it.
+
 ## 0.2.0 · October 2026
 
 ### Faster on computers
