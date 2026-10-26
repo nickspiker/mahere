@@ -30,15 +30,25 @@ stamp() {
     MINOR=$(echo "$V" | cut -d. -f2)
     PATCH=$(echo "$V" | cut -d. -f3)
     export MAHERE_VERSION_CODE=$(git rev-list --count HEAD)
-    export MAHERE_VERSION_NAME="$V+$(git rev-parse --short HEAD)"
+    # The name people read is the version alone, digits only (Nick 2026-10-26: letters in a version); the build number is the manifest's own field.
+    export MAHERE_VERSION_NAME="$V"
 }
 
-# begin_dev: a dev build never wears a release's patch 0 (right after a release the tree is moved to patch 1 first).
+# begin_dev: the version a dev build wears. A dev build never wears a release's patch 0 (right after a release the tree is moved to patch 1 first). One version per tree, whatever the platform: the published commit is tagged dev-<version>, and the patch moves on only when the code has changed since (Nick 2026-10-26: each platform's publish moved the patch, so one commit wore three numbers).
 begin_dev() {
     stamp
     if [ "$PATCH" = 0 ]; then
         set_version "$MAJOR.$MINOR.1" "Version $MAJOR.$MINOR.1, the dev line after release $MAJOR.$MINOR.0"
         stamp
+    fi
+    if git rev-parse -q --verify "refs/tags/dev-$V" > /dev/null; then
+        if [ "$(git rev-parse "dev-$V")" != "$(git rev-parse HEAD)" ]; then
+            set_version "$MAJOR.$MINOR.$((PATCH + 1))" "Version $MAJOR.$MINOR.$((PATCH + 1)), the code changed since dev $V was published"
+            stamp
+            git tag "dev-$V"
+        fi
+    else
+        git tag "dev-$V"
     fi
 }
 
