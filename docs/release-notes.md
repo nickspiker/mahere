@@ -1,6 +1,27 @@
 # Mahere release notes
 
-## 0.3.0 · October 2026
+## 4.0 · October 2026
+
+### Directions
+- The route line follows every switchback. Where two legs of a trail ran close enough to merge at a coarser zoom, the line used to jump straight between them and the trip measured short; the Snow Lake walk went from 8.0 km to 10.8 km.
+- The line is drawn through the finest map pieces on your device, and redrawn as finer ones arrive, so zooming in on a stretch sharpens its route.
+- An elevation profile on the route card, for car, bike and foot, with the start and end heights and the rise. A ferry crossing rides at sea level, not along the seabed.
+
+### Places
+- Copy buttons next to the place in degrees, in degrees-minutes-seconds and as its seven-word world code, on the tap card and in the menu's footer.
+- Type a world code into the search, in any case, and if it checks out it is the first result, with Go, From here and To here.
+- Type a latitude and longitude any way you like: N23.6, W48.14; 47.4455, -121.4235; 47°26′43.8″ N 121°25′24.6″ W; 47 26.73 N 121 25.41 W; with or without the symbols.
+- A searched place lands where the map letters it, not hundreds of metres off.
+- A start chosen from one search waits for the end from the next.
+
+### Remembered
+- Mahere opens where you left it: the view, the route and its pins, and on a computer the window's place and size.
+
+### Tidier
+- Version numbers read as 4.0, 4.1 and so on, with no build numbers.
+- Areas and Updates in the menu are plain rows to open, not boxes to tick.
+
+## 3.0 · October 2026
 
 ### Search
 - Search has a page of its own in the menu: type at the top, the places found appear below with what they are and how far away, and one tapped shows on the map with Go, From here and To here.
@@ -20,9 +41,9 @@
 - The green, red and blue pins show on the phone.
 
 ### Versions
-- Version numbers are digits only, and a build wears the same number on every platform. The Updates page shows the build number beside it.
+- Version numbers are digits only, and a build wears the same number on every platform.
 
-## 0.2.0 · October 2026
+## 2.0 · October 2026
 
 ### Faster on computers
 - On Mac and Linux the map is drawn by the graphics card straight onto the window, with nothing copied back and forth: about twice as fast while you pan and zoom.
@@ -44,7 +65,7 @@
 - On a Mac, directions draw their route line.
 - Coarse stand-in pieces no longer draw roads and outlines in the wrong places while the sharper ones arrive.
 
-## 0.1.0 · October 2026
+## 1.0 · October 2026
 
 ### First launch
 - A fresh install opens on the whole globe, centred on you when there is a GPS fix and anywhere at all when not, turned any way.
@@ -63,7 +84,7 @@
 - Reopening reads each piece of the map once instead of twice.
 - Phones like the Pixel 3a are no longer closed for running out of memory near the poles or on a first launch: fewer map pieces are kept around, the lettering keeps only what is in view, each font is loaded only where it is needed, and place names take a fraction of the memory they did.
 
-## 0.0.0 · October 2026
+## 0.0 · October 2026
 
 ### Version numbers start over
 - Mahere is numbered from 0.0.0 again: the old numbers had run up to 0.225 after only a dozen releases.
