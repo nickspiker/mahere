@@ -7,6 +7,7 @@ repository.workspace = true
 description = "mahere desktop app: offline trail map on the fluor compositor"
 
 [dependencies]
+arboard = "3"
 bytemuck = "1"
 mahere-tiles = { path = "../mahere-tiles" }
 mahere-engine = { path = "../mahere-engine" }

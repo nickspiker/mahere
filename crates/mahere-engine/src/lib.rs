@@ -358,6 +358,10 @@ pub struct MapCore {
     route: Option<Arc<route::Route>>,
     pub route_version: u64,
     route_rx: Option<std::sync::mpsc::Receiver<Result<route::Route, String>>>,
+    /// The route being drawn again through finer cells, and whether cells arrived since it last was (Nick 2026-10-26: zooming in on a stretch fixes its line).
+    refine_rx: Option<std::sync::mpsc::Receiver<Option<route::Route>>>,
+    refine_due: bool,
+    refine_at: Option<Instant>,
 }
 
 type PlanKey = (u64, u64, u64, u64, usize, usize, u64, u8, u8);
@@ -456,6 +460,9 @@ impl MapCore {
             route: None,
             route_version: 0,
             route_rx: None,
+            refine_rx: None,
+            refine_due: false,
+            refine_at: None,
         }
     }
 
@@ -1086,9 +1093,14 @@ impl MapCore {
 
     /// Integrate async-loaded cells. True if a redraw is due: cells arrived or the camera/sun/GPS changed since the last render.
     pub fn tick(&mut self, _w: usize, _h: usize) -> bool {
-        let routed = self.poll_route();
+        let routed = self.poll_route() | self.poll_refine();
         self.follow_fix();
-        let changed = self.res.drain() > 0 || self.dirty || routed;
+        let arrived = self.res.drain();
+        if arrived > 0 {
+            self.refine_due = true;
+        }
+        self.refine_route();
+        let changed = arrived > 0 || self.dirty || routed;
         // When the first view and the globe's base set are complete, how long that took and the loaders' share (2026-10-22: ten seconds on a relaunch with every cell on the phone).
         if let Some(t) = self.started.filter(|_| self.res.converged() && !self.res.pool.map.is_empty() && self.globe_loading().is_none()) {
             self.started = None;
@@ -1142,6 +1154,39 @@ impl MapCore {
         self.route_asked = Some(Instant::now());
         self.route_error = None;
         self.dirty = true;
+    }
+
+    /// The route drawn again through the finer cells that arrived (a second after they did, one pass at a time, while any run is coarse).
+    fn refine_route(&mut self) {
+        let Some(r) = &self.route else { return };
+        if !self.refine_due || self.refine_rx.is_some() || self.route_rx.is_some() || r.coarse_runs() == 0 || self.refine_at.is_some_and(|t| t.elapsed() < std::time::Duration::from_secs(1)) {
+            return;
+        }
+        self.refine_due = false;
+        self.refine_at = Some(Instant::now());
+        let (store, cache, route) = (self.res.store(), self.route_cache.clone(), r.clone());
+        let dem = self.res.layer_stores().map_or(store.clone(), |l| l.dem);
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(route::refine_route(store, dem, &route, Some(cache)));
+        });
+        self.refine_rx = Some(rx);
+    }
+
+    /// A route drawn again: kept in the old one's place when a run got finer.
+    fn poll_refine(&mut self) -> bool {
+        let Some(rx) = &self.refine_rx else { return false };
+        let Ok(finer) = rx.try_recv() else { return false };
+        self.refine_rx = None;
+        let Some(r) = finer else { return false };
+        // Only while it is still the route it was drawn from.
+        if self.route_rx.is_some() {
+            return false;
+        }
+        self.route = Some(Arc::new(r));
+        self.route_version += 1;
+        self.dirty = true;
+        true
     }
 
     /// A finished search: the route kept, or why there is none.
@@ -1991,7 +2036,7 @@ mod tests {
         assert_eq!(map.route_card(), vec!["Tap where to go".to_string()]);
         map.nav_to = Some(pts[2]);
         assert_eq!(map.route_card(), vec!["Waiting for a GPS fix".to_string()]);
-        map.route = Some(Arc::new(route::Route { travel: route::Travel::Foot, pts: pts.clone(), metres: 3000.0, seconds: 3000.0, climb_m: 0.0, steps: vec![route::Step { name: "North Road".into(), turn: "Start", at_m: 0.0 }, route::Step { name: "East Road".into(), turn: "Turn right onto", at_m: 2000.0 }] }));
+        map.route = Some(Arc::new(route::Route { travel: route::Travel::Foot, pts: pts.clone(), metres: 3000.0, seconds: 3000.0, climb_m: 0.0, steps: vec![route::Step { name: "North Road".into(), turn: "Start", at_m: 0.0 }, route::Step { name: "East Road".into(), turn: "Turn right onto", at_m: 2000.0 }], profile: Vec::new(), again: None }));
         map.gps = Some(GpsFix { lat: lat0 + deg(1500.0), lon: lon0, accuracy_m: 5.0, height_m: None, v_accuracy_m: None });
         assert_eq!(map.route_card(), vec!["In 500 m: Turn right onto East Road".to_string(), "1.5 km \u{b7} 25 min left".to_string()]);
 
@@ -2455,7 +2500,16 @@ impl MapCore {
         // Directions and navigation: the route card, no line or mark of the ruler's (the pins are drawn in the overlay).
         if self.route_mode != RouteMode::Off {
             let at = self.pin_b.or(self.pin_a).or(self.nav_to).unwrap_or((self.cam.lat(), self.cam.lon()));
-            return Some(MeasureView { origin_px: (0.0, 0.0), target_px: (0.0, 0.0), distance_m: 0.0, bearing_deg: 0.0, elev_origin: None, elev_target: None, profile: Vec::new(), info: self.route_card(), ruler: false, target: at, route: true });
+            // The route's own profile, resampled to the strip's width; the ends' elevations are its first and last known points.
+            let (profile, distance_m, elev_origin, elev_target) = match &self.route {
+                Some(r) if !r.profile.is_empty() => {
+                    let n = samples.max(2);
+                    let p: Vec<f32> = (0..n).map(|i| r.profile[i * (r.profile.len() - 1) / (n - 1)]).collect();
+                    (p, r.metres, r.profile.iter().find(|e| !e.is_nan()).copied(), r.profile.iter().rev().find(|e| !e.is_nan()).copied())
+                }
+                _ => (Vec::new(), 0.0, None, None),
+            };
+            return Some(MeasureView { origin_px: (0.0, 0.0), target_px: (0.0, 0.0), distance_m, bearing_deg: 0.0, elev_origin, elev_target, profile, info: self.route_card(), ruler: false, target: at, route: true });
         }
         let m = self.measure?;
         let (olat, olon) = self.measure_origin(w, h)?;

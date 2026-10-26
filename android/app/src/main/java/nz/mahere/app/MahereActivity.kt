@@ -69,6 +69,7 @@ class MahereActivity : Activity(), SurfaceHolder.Callback, Choreographer.FrameCa
     private external fun nativeOnKey(ptr: Long, code: Int): Boolean
     private external fun nativePollKeyboard(ptr: Long): Int
     private external fun nativeTakeInstall(ptr: Long): String?
+    private external fun nativeTakeCopy(ptr: Long): String?
     private external fun nativeWantsRecording(ptr: Long): Boolean
     private external fun nativeSetUnmetered(ptr: Long, unmetered: Boolean)
     private external fun nativeOnDeclination(ptr: Long, declinationDeg: Float)
@@ -321,6 +322,7 @@ class MahereActivity : Activity(), SurfaceHolder.Callback, Choreographer.FrameCa
             keyboard(nativePollKeyboard(nativePtr))
             syncProbe()
             nativeTakeInstall(nativePtr)?.let { installApk(it) }
+            nativeTakeCopy(nativePtr)?.let { copyToClipboard(it) }
             syncRecording()
             Choreographer.getInstance().postFrameCallback(this)
         }
@@ -329,6 +331,12 @@ class MahereActivity : Activity(), SurfaceHolder.Callback, Choreographer.FrameCa
     // ---- Updates (after Photon's): a downloaded, verified build installed through a package installer session ----
 
     /// Install an update the engine downloaded and checked against the signed manifest: a PackageInstaller session, off the main thread (it copies the whole APK). Once Mahere is its own installer of record, Android 12 and later install without asking; the first time, the system's confirm comes up through MahereInstallReceiver.
+    // A copy button's text onto the clipboard (Nick 2026-10-26).
+    private fun copyToClipboard(text: String) {
+        val cm = getSystemService(Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
+        cm.setPrimaryClip(android.content.ClipData.newPlainText("Mahere", text))
+    }
+
     private fun installApk(path: String) {
         Thread({
             try {

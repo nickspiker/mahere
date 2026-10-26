@@ -462,8 +462,8 @@ const GEAR_BG: u32 = ink(0x14_18_22, 230);
 const PANEL_DIM: u32 = ink(0x0E_12_1A, 170);
 /// The footer's ground: a shade apart from the column's, so the readouts read as their own panel.
 const FOOTER_BG: u32 = ink(0x18_1E_2A, 236);
-/// The footer's height in font sizes: the slider and its label, six readouts and the world code's label and three lines.
-const FOOTER_LINES: f32 = 15.0;
+/// The footer's height in font sizes: the slider and its label, the place two ways (a label with its copy button, then the value), five readouts, and the world code's label and three lines.
+const FOOTER_LINES: f32 = 18.0;
 const STRIP_FILL: u32 = ink(0x3A_5A_7A, 200);
 const SLIDER_TRACK: u32 = ink(0x2A_30_3C, 255);
 const SLIDER_FILL: u32 = ink(0x1A_22_4E, 255);
@@ -661,6 +661,9 @@ pub struct Panel {
     tool_btn: Option<(f32, f32, f32, f32)>,
     toolbox_open: bool,
     tool_rows: Vec<((f32, f32, f32, f32), Pick)>,
+    /// Copy buttons (Nick 2026-10-26: one next to the degrees, the degrees-minutes-seconds and the world code): each with the text it copies, and the text of the one tapped, for the host's clipboard.
+    copy_btns: Vec<((f32, f32, f32, f32), String)>,
+    copied: Option<String>,
     /// Search (Nick 2026-10-25): what is typed, whether the host has the latest, the places found (and whether the latest typing has been searched), the one picked, and what to do with it. The field is a fluor textbox on the search page.
     query: String,
     search_box: Option<Textbox>,
@@ -677,6 +680,23 @@ pub struct Panel {
     swap: bool,
     /// The bottom card's top edge as last painted: a tap below it is the card's, never the map's.
     card_top: Option<f32>,
+}
+
+/// A place in decimal degrees with its hemispheres.
+pub fn degrees_text(lat: f64, lon: f64) -> String {
+    format!("{:.5}\u{b0} {}  {:.5}\u{b0} {}", lat.abs(), if lat >= 0.0 { "N" } else { "S" }, lon.abs(), if lon >= 0.0 { "E" } else { "W" })
+}
+
+/// A place in degrees, minutes and seconds with its hemispheres.
+pub fn dms_text(lat: f64, lon: f64) -> String {
+    let part = |v: f64, pos: &str, neg: &str| {
+        let a = v.abs();
+        let d = a.floor();
+        let m = ((a - d) * 60.0).floor();
+        let sec = ((a - d) * 60.0 - m) * 60.0;
+        format!("{}\u{b0}{:02}\u{2032}{:04.1}\u{2033} {}", d as i64, m as i64, sec, if v >= 0.0 { pos } else { neg })
+    };
+    format!("{}  {}", part(lat, "N", "S"), part(lon, "E", "W"))
 }
 
 /// The search page as painted: its field and the rects that take taps.
@@ -733,7 +753,7 @@ impl Panel {
         let checks = LAYERS.iter().map(|&(l, label)| (l, Checkbox::new(&mut hits, label, 0.0, 0.0, 10.0, 10.0, 10.0, false))).collect();
         let interval = Slider::new(&mut hits, 0.0, 0.0, 10.0, 10.0, 0.0);
         let text_slider = Slider::new(&mut hits, 0.0, 0.0, 10.0, 10.0, text_pos(1.0));
-        Panel { fonts: None, font_cursor: Default::default(), open: false, dirty: true, ru: 1.0, stack: vec![Page::Layers], theme_rows: Vec::new(), edit_rows: Vec::new(), edit_scroll: 0.0, edit_extent: 0.0, press: None, sliders: Vec::new(), field_vals: [0.0; 4], held: None, edits: Vec::new(), hits, shown: vec![true; LAYERS.len()], group_open: GROUPS_OPEN, group_rows: Vec::new(), tree: Vec::new(), layer_open: None, field_open: None, theme_now: None, interval, interval_held: false, text_slider, text_pending: None, ru_request: None, label_scale: 1.0, touch: false, checks, text: TextRenderer::new(), buf: Vec::new(), w: 0, h: 0, font: 16.0, gear: (0.0, 0.0, 0.0), panel_w: 0.0, theme_row: (0.0, 0.0, 0.0), slider: (0.0, 0.0, 0.0), slider_held: false, cache_max: CACHE_MIN + 1, strip_close: None, clear_measure: false, area_rows: Vec::new(), area_acts: Vec::new(), areas: AreasView::default(), update_rows: Vec::new(), update_acts: Vec::new(), updates: UpdatesView::default(), host_orb: None, layers_scroll: 0.0, layers_extent: 0.0, layers_press: None, layers_band: (0.0, 0.0), orb_icon: fluor::host::icon::Icon::from_vsf_bytes(APP_ORB_VSF).ok(), orb_scaled: (0, Vec::new()), locate_btn: None, tool_btn: None, toolbox_open: false, tool_rows: Vec::new(), query: String::new(), search_box: None, query_dirty: false, search_pending: false, found: Vec::new(), picked: None, search_act: None, search_rows: Vec::new(), search_acts: Vec::new(), search_field: None, route_pills: Vec::new(), swap: false, card_top: None }
+        Panel { fonts: None, font_cursor: Default::default(), open: false, dirty: true, ru: 1.0, stack: vec![Page::Layers], theme_rows: Vec::new(), edit_rows: Vec::new(), edit_scroll: 0.0, edit_extent: 0.0, press: None, sliders: Vec::new(), field_vals: [0.0; 4], held: None, edits: Vec::new(), hits, shown: vec![true; LAYERS.len()], group_open: GROUPS_OPEN, group_rows: Vec::new(), tree: Vec::new(), layer_open: None, field_open: None, theme_now: None, interval, interval_held: false, text_slider, text_pending: None, ru_request: None, label_scale: 1.0, touch: false, checks, text: TextRenderer::new(), buf: Vec::new(), w: 0, h: 0, font: 16.0, gear: (0.0, 0.0, 0.0), panel_w: 0.0, theme_row: (0.0, 0.0, 0.0), slider: (0.0, 0.0, 0.0), slider_held: false, cache_max: CACHE_MIN + 1, strip_close: None, clear_measure: false, area_rows: Vec::new(), area_acts: Vec::new(), areas: AreasView::default(), update_rows: Vec::new(), update_acts: Vec::new(), updates: UpdatesView::default(), host_orb: None, layers_scroll: 0.0, layers_extent: 0.0, layers_press: None, layers_band: (0.0, 0.0), orb_icon: fluor::host::icon::Icon::from_vsf_bytes(APP_ORB_VSF).ok(), orb_scaled: (0, Vec::new()), locate_btn: None, tool_btn: None, toolbox_open: false, tool_rows: Vec::new(), copy_btns: Vec::new(), copied: None, query: String::new(), search_box: None, query_dirty: false, search_pending: false, found: Vec::new(), picked: None, search_act: None, search_rows: Vec::new(), search_acts: Vec::new(), search_field: None, route_pills: Vec::new(), swap: false, card_top: None }
     }
 
     pub fn is_open(&self) -> bool {
@@ -888,6 +908,33 @@ impl Panel {
         *self.stack.last().unwrap_or(&Page::Layers)
     }
 
+    /// The text a copy button put on the clipboard's way, once.
+    pub fn take_copy(&mut self) -> Option<String> {
+        self.copied.take()
+    }
+
+    /// Words wrapped to a width, none cut.
+    fn wrap_words(text: &mut TextRenderer, words: &str, style: &TextStyle, max_w: f32) -> Vec<String> {
+        let mut lines: Vec<String> = Vec::new();
+        for word in words.split_whitespace() {
+            match lines.last_mut() {
+                Some(l) if text.measure_text(&format!("{l} {word}"), style) <= max_w => {
+                    l.push(' ');
+                    l.push_str(word);
+                }
+                _ => lines.push(word.to_string()),
+            }
+        }
+        lines
+    }
+
+    /// A copy button after a label: a small pill reading "copy", kept with the text it copies.
+    fn paint_copy(canvas: &mut Canvas, text: &mut TextRenderer, copies: &mut Vec<((f32, f32, f32, f32), String)>, x: f32, y_mid: f32, font: f32, what: String) {
+        let r = (x, y_mid - font * 0.5, font * 2.3, font * 1.0);
+        Self::paint_pill(canvas, text, r, "copy", false, font * 0.85);
+        copies.push((r, what));
+    }
+
     /// Whether the search page is up (the hosts route typing to it and raise the keyboard).
     pub fn is_searching(&self) -> bool {
         self.open && self.page() == Page::Search
@@ -957,7 +1004,10 @@ impl Panel {
             Pick::Info => tool(ctl, 0, 0, false, false),
             Pick::Ruler => tool(ctl, 0, 0, true, false),
             Pick::Search => {
-                tool(ctl, 0, 0, false, true);
+                // The route stays as it is: a start set from one search waits for the end from the next.
+                ctl.tool = 0;
+                ctl.ruler = false;
+                ctl.search = true;
                 self.open = true;
                 if self.page() != Page::Search {
                     self.stack.push(Page::Search);
@@ -1340,6 +1390,10 @@ impl Panel {
             self.dirty = true;
             return true;
         }
+        if let Some((_, what)) = self.copy_btns.iter().find(|(r, _)| inside((r.0 - self.font * 0.3, r.1 - self.font * 0.3, r.2 + self.font * 0.6, r.3 + self.font * 0.6))) {
+            self.copied = Some(what.clone());
+            return true;
+        }
         if let Some((cx, cy, cr)) = self.strip_close {
             if (x - cx).powi(2) + (y - cy).powi(2) <= (cr * 1.4).powi(2) {
                 self.clear_measure = true;
@@ -1677,6 +1731,7 @@ impl Panel {
         let mut damage = Damage::new();
         let mut canvas = Canvas::new(&mut self.buf, w, h, &mut damage);
         self.strip_close = None;
+        self.copy_btns.clear();
         self.route_pills.clear();
         self.search_rows.clear();
         self.search_acts.clear();
@@ -1686,7 +1741,7 @@ impl Panel {
         if let Some(m) = measure {
             if m.route {
                 // The way of travel and, for directions, the swap: above the card's lines, so painted before its background.
-                let top = h as f32 - Self::strip_band(font, m) + font * 0.3;
+                let top = h as f32 - Self::strip_band(&mut self.text, w, font, m) + font * 0.3;
                 let (pw, ph) = (font * 3.4, font * 1.25);
                 let mut px = font;
                 for (b, word) in [(1u8, "Car"), (2, "Bike"), (3, "Foot")] {
@@ -1701,8 +1756,8 @@ impl Panel {
                     self.route_pills.push((r, 4));
                 }
             }
-            self.strip_close = Some(Self::paint_strip(&mut canvas, &mut self.text, w, h, font, m));
-            bottom -= Self::strip_band(font, m);
+            self.strip_close = Some(Self::paint_strip(&mut canvas, &mut self.text, w, h, font, m, &mut self.copy_btns));
+            bottom -= Self::strip_band(&mut self.text, w, font, m);
             self.card_top = Some(bottom);
         }
         // The locate button, bottom right above any strip; dim without a fix.
@@ -1795,9 +1850,21 @@ impl Panel {
             ("frame", format!("{:.1} ms  \u{b7}  {} cells", r.frame_ms, r.resident)),
         ];
         let line = font * 1.15;
-        for (label, value) in rows.iter() {
+        for (k, (label, value)) in rows.iter().enumerate() {
             if y > h as f32 {
                 break;
+            }
+            if k == 0 {
+                // The place: its label with a copy button, the degrees under it; then the same in degrees, minutes and seconds (Nick 2026-10-26). The copies: the degrees signed and plain, the rest as shown.
+                let dms = dms_text(r.lat, r.lon);
+                for (label, shown, what) in [("position", value.clone(), format!("{:.6}, {:.6}", r.lat, r.lon)), ("d\u{b0} m\u{2032} s\u{2033}", dms.clone(), dms)] {
+                    let lw = self.text.draw_text_left(&mut canvas, label, x, y, &dim, None, None);
+                    Self::paint_copy(&mut canvas, &mut self.text, &mut self.copy_btns, x + lw + font * 0.4, y, font * 0.85, what);
+                    y += font * 0.95;
+                    self.text.draw_text_right(&mut canvas, &shown, right, y, &small, None, None);
+                    y += line;
+                }
+                continue;
             }
             self.text.draw_text_left(&mut canvas, label, x, y, &dim, None, None);
             self.text.draw_text_right(&mut canvas, value, right, y, &small, None, None);
@@ -1816,7 +1883,8 @@ impl Panel {
                 _ => world_lines.push(word.to_string()),
             }
         }
-        self.text.draw_text_left(&mut canvas, "world", x, y, &dim, None, None);
+        let lw = self.text.draw_text_left(&mut canvas, "world", x, y, &dim, None, None);
+        Self::paint_copy(&mut canvas, &mut self.text, &mut self.copy_btns, x + lw + font * 0.4, y, font * 0.85, words.clone());
         y += font * 0.9;
         for l in &world_lines {
             if y > h as f32 {
@@ -2025,14 +2093,18 @@ impl Panel {
     /// The measurement strip along the bottom: the elevation profile from origin to target as a filled area, with distance and bearing on the left and the elevations on the right.
     /// Returns the close button's centre and radius.
     /// The measurement strip's height: what is at the point, a line each, above the distance and the profile.
-    fn strip_band(font: f32, m: &MeasureView) -> f32 {
+    fn strip_band(text: &mut TextRenderer, w: usize, font: f32, m: &MeasureView) -> f32 {
         if m.route {
-            // The way-of-travel row, then the card's lines (the first few turns).
-            return font * 2.0 + font * 0.9 + m.info.len().min(ROUTE_LINES) as f32 * font * 1.05;
+            // The way-of-travel row, then the card's lines (the first few turns), then the ground along the way when the route has one (Nick 2026-10-26: an elevation profile for the route).
+            let profile = if m.profile.is_empty() { 0.0 } else { font * 3.8 };
+            return font * 2.0 + font * 0.9 + m.info.len().min(ROUTE_LINES) as f32 * font * 1.05 + profile;
         }
         if !m.ruler {
-            // The card: what is there, a line each, and where.
-            return font * 2.2 + (m.info.len() + 1) as f32 * font * 1.05;
+            // The card: what is there, a line each, and where three ways (degrees, degrees-minutes-seconds, the world code on as many lines as its words take), each with its copy button.
+            let (lat, lon) = m.target;
+            let words = vsf::types::WorldCoord::from_lat_lon(lat, lon).to_words();
+            let lines = Self::wrap_words(text, &words, &TextStyle::new(font * 0.8, READOUT), w as f32 - font * 2.0 - font * 3.2).len();
+            return font * 2.2 + (m.info.len() + 2 + lines) as f32 * font * 1.05;
         }
         font * 6.5 + m.info.len() as f32 * font * 1.05
     }
@@ -2101,10 +2173,11 @@ impl Panel {
         paint::circle_filled(canvas, xi, yi, r as isize, GEAR_BG, None, None);
     }
 
-    fn paint_strip(canvas: &mut Canvas, text: &mut TextRenderer, w: usize, h: usize, font: f32, m: &MeasureView) -> (f32, f32, f32) {
+    #[allow(clippy::too_many_arguments)]
+    fn paint_strip(canvas: &mut Canvas, text: &mut TextRenderer, w: usize, h: usize, font: f32, m: &MeasureView, copies: &mut Vec<((f32, f32, f32, f32), String)>) -> (f32, f32, f32) {
         // What is at the point, a line each, above the distance and the profile; the strip grows to hold them.
         let info_h = m.info.len() as f32 * font * 1.05;
-        let band = Self::strip_band(font, m);
+        let band = Self::strip_band(text, w, font, m);
         let strip_top = h as f32 - band;
         let margin = font;
         // The close button, top right of the strip: a cross in a disc.
@@ -2118,6 +2191,17 @@ impl Panel {
                 let style = if k == 0 { point.clone() } else { TextStyle::new(font * 0.8, READOUT) };
                 text.draw_text_left(canvas, line, margin, strip_top + font * 2.0 + font * 0.5 + k as f32 * font * 1.05, &style, None, None);
             }
+            if !m.profile.is_empty() {
+                // The ground along the route under the lines, the start and end elevations on the right.
+                let ceil_y = h as f32 - font * 3.3;
+                let e = |v: Option<f32>| v.map_or("\u{2014}".to_string(), |e| format!("{} m", e.round() as i64));
+                let rise = match (m.elev_origin, m.elev_target) {
+                    (Some(a), Some(b)) => format!("   {:+} m", (b - a).round() as i64),
+                    _ => String::new(),
+                };
+                text.draw_text_right(canvas, &format!("{} \u{2192} {}{rise}", e(m.elev_origin), e(m.elev_target)), w as f32 - margin, ceil_y - font * 0.25, &TextStyle::new(font * 0.75, READOUT_DIM), None, None);
+                Self::paint_profile(canvas, text, w, font, ceil_y, h as f32 - font * 0.5, &m.profile);
+            }
             paint::fill_rect(canvas, 0, strip_top as isize, w as isize, band as isize, PANEL_BG, None, None);
             return (cx, cy, cr);
         }
@@ -2125,20 +2209,31 @@ impl Panel {
             text.draw_text_left(canvas, line, margin, strip_top + font * 0.9 + k as f32 * font * 1.05, &point, None, None);
         }
         if !m.ruler {
-            // A tap's card (Nick 2026-10-14: a little info at the bottom per tap): the lines, then the place in degrees.
+            // A tap's card (Nick 2026-10-14: a little info at the bottom per tap): the lines, then the place in degrees, in degrees, minutes and seconds, and as its seven words, a copy button by each (Nick 2026-10-26).
             let (lat, lon) = m.target;
-            let at = format!("{:.5}\u{b0} {}  {:.5}\u{b0} {}", lat.abs(), if lat >= 0.0 { "N" } else { "S" }, lon.abs(), if lon >= 0.0 { "E" } else { "W" });
-            text.draw_text_left(canvas, &at, margin, strip_top + font * 0.9 + m.info.len() as f32 * font * 1.05, &TextStyle::new(font * 0.8, READOUT), None, None);
+            let style = TextStyle::new(font * 0.8, READOUT);
+            let mut y = strip_top + font * 0.9 + m.info.len() as f32 * font * 1.05;
+            let words = vsf::types::WorldCoord::from_lat_lon(lat, lon).to_words();
+            for (shown, copy) in [(degrees_text(lat, lon), format!("{lat:.6}, {lon:.6}")), (dms_text(lat, lon), dms_text(lat, lon))] {
+                let tw = text.draw_text_left(canvas, &shown, margin, y, &style, None, None);
+                Self::paint_copy(canvas, text, copies, margin + tw + font * 0.6, y, font, copy);
+                y += font * 1.05;
+            }
+            // The words wrapped to the width left of the copy button.
+            let lines = Self::wrap_words(text, &words, &style, w as f32 - margin * 2.0 - font * 3.2);
+            for (k, l) in lines.iter().enumerate() {
+                let tw = text.draw_text_left(canvas, l, margin, y, &style, None, None);
+                if k == 0 {
+                    Self::paint_copy(canvas, text, copies, margin + tw + font * 0.6, y, font, words.clone());
+                }
+                y += font * 1.05;
+            }
             paint::fill_rect(canvas, 0, strip_top as isize, w as isize, band as isize, PANEL_BG, None, None);
             return (cx, cy, cr);
         }
         let top = strip_top + info_h;
-        let (lo, hi) = m.profile.iter().filter(|e| !e.is_nan()).fold((f32::MAX, f32::MIN), |(a, b), &e| (a.min(e), b.max(e)));
-        let have = lo <= hi;
-        let span = (hi - lo).max(1.0);
         // Text first (topmost), then the profile, then the band under both.
         let small = TextStyle::new(font * 0.9, READOUT);
-        let dim = TextStyle::new(font * 0.75, READOUT_DIM);
         let dist = if m.distance_m < 1000.0 { format!("{} m", m.distance_m.round() as i64) } else { format!("{:.2} km", m.distance_m / 1000.0) };
         text.draw_text_left(canvas, &format!("{dist}   {}°", m.bearing_deg.round() as i64), margin, top + font * 0.9, &small, None, None);
         let e = |v: Option<f32>| v.map_or("—".to_string(), |e| format!("{} m", e.round() as i64));
@@ -2147,26 +2242,32 @@ impl Panel {
             _ => String::new(),
         };
         text.draw_text_right(canvas, &format!("{} → {}{rise}", e(m.elev_origin), e(m.elev_target)), w as f32 - margin - font * 1.6, top + font * 0.9, &small, None, None);
-        if have {
-            text.draw_text_left(canvas, &format!("{} m", hi.round() as i64), margin, top + font * 1.9, &dim, None, None);
-            text.draw_text_left(canvas, &format!("{} m", lo.round() as i64), margin, h as f32 - font * 0.6, &dim, None, None);
+        Self::paint_profile(canvas, text, w, font, top + font * 1.8, h as f32 - font * 0.5, &m.profile);
+        paint::fill_rect(canvas, 0, strip_top as isize, w as isize, band as isize, PANEL_BG, None, None);
+        (cx, cy, cr)
+    }
+
+    /// An elevation profile between `ceil_y` and `floor_y`: one column per sample from the floor up to the elevation, the high and the low lettered at the left; nothing where no sample is known.
+    fn paint_profile(canvas: &mut Canvas, text: &mut TextRenderer, w: usize, font: f32, ceil_y: f32, floor_y: f32, profile: &[f32]) {
+        let (lo, hi) = profile.iter().filter(|e| !e.is_nan()).fold((f32::MAX, f32::MIN), |(a, b), &e| (a.min(e), b.max(e)));
+        if lo > hi {
+            return;
         }
-        // The profile: one column per sample, from the band's floor up to the elevation.
-        let floor_y = h as f32 - font * 0.5;
-        let ceil_y = top + font * 1.8;
-        let x0 = margin;
-        let n = m.profile.len().max(1);
-        for (i, &el) in m.profile.iter().enumerate() {
+        let span = (hi - lo).max(1.0);
+        let margin = font;
+        let dim = TextStyle::new(font * 0.75, READOUT_DIM);
+        text.draw_text_left(canvas, &format!("{} m", hi.round() as i64), margin, ceil_y + font * 0.1, &dim, None, None);
+        text.draw_text_left(canvas, &format!("{} m", lo.round() as i64), margin, floor_y - font * 0.1, &dim, None, None);
+        let n = profile.len().max(1);
+        for (i, &el) in profile.iter().enumerate() {
             if el.is_nan() {
                 continue;
             }
-            let x = x0 + i as f32 * (w as f32 - 2.0 * margin) / n as f32;
+            let x = margin + i as f32 * (w as f32 - 2.0 * margin) / n as f32;
             let y = floor_y - (el - lo) / span * (floor_y - ceil_y);
             paint::fill_rect(canvas, x as isize, y as isize, 1, (floor_y - y).max(1.0) as isize, STRIP_FILL, None, None);
             paint::fill_rect(canvas, x as isize, y as isize - 1, 1, 2, STRIP_EDGE, None, None);
         }
-        paint::fill_rect(canvas, 0, strip_top as isize, w as isize, band as isize, PANEL_BG, None, None);
-        (cx, cy, cr)
     }
 
     /// The search page: the title, the field (the textbox, drawn by fluor), then the places found a row each (what it is and how far, small), or the one picked with Go, From here and To here. Returns the rects that take taps.

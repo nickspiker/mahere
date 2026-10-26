@@ -99,7 +99,7 @@ pub fn run(job: &SearchJob, cache: &mut NamesCache, tier: &dyn Fn(&Named) -> Opt
     }
     let (w, h) = (job.w as f64, job.h as f64);
     let (cx, cy) = (w / 2.0, h / 2.0);
-    // Merged by (kind, name, reference): the best fit, the position nearest the centre, the size at the finest depth seen.
+    // Merged by (kind, name, reference): the best fit, the position and size at the finest depth seen (a coarse texel is hundreds of metres wide: a trailhead placed from a depth-5 cell stood a kilometre from where the map letters it), nearest the centre among that depth's.
     let mut found: Vec<(Found, u8, f64)> = Vec::new();
     for &key in &job.cached {
         if !meets(&job.cam, job.w, job.h, key) {
@@ -154,11 +154,10 @@ pub fn run(job: &SearchJob, cache: &mut NamesCache, tier: &dyn Fn(&Named) -> Opt
                 Some(e) => {
                     e.0.fit = e.0.fit.min(f);
                     e.0.rank = e.0.rank.max(n.rank);
-                    if d < e.2 {
-                        (e.0.lat, e.0.lon, e.2) = (lat, lon, d);
-                    }
                     if key.depth > e.1 {
-                        (e.0.size_m, e.1) = (size_m, key.depth);
+                        (e.0.lat, e.0.lon, e.2, e.0.size_m, e.1) = (lat, lon, d, size_m, key.depth);
+                    } else if key.depth == e.1 && d < e.2 {
+                        (e.0.lat, e.0.lon, e.2) = (lat, lon, d);
                     }
                 }
                 None => found.push((Found { name: n.name.clone(), reference: n.reference.clone(), kind: n.kind, rank: n.rank, lat, lon, size_m, fit: f }, key.depth, d)),

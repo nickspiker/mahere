@@ -151,11 +151,55 @@ pub struct Route {
     pub seconds: f64,
     pub climb_m: f64,
     pub steps: Vec<Step>,
+    /// The ground along the way: the elevation at [`PROFILE_SAMPLES`] points evenly spaced from start to end, NaN where there is no terrain.
+    pub profile: Vec<f32>,
+    /// What draws the route again through finer cells as they arrive (Nick 2026-10-26: zooming in on a stretch fixes its line).
+    pub(crate) again: Option<Again>,
 }
+
+/// A route's runs and ends, kept so it can be finished again once finer cells are on the device.
+#[derive(Clone, Debug)]
+pub(crate) struct Again {
+    runs: Vec<Run>,
+    from: (f64, f64),
+    to: (f64, f64),
+    a: T,
+    b: T,
+    seconds: f64,
+    travel: Travel,
+}
+
+impl Route {
+    /// How many of the route's runs are drawn coarser than the finest depth: finer cells arriving could refine them.
+    pub fn coarse_runs(&self) -> usize {
+        self.again.as_ref().map_or(0, |a| a.runs.iter().filter(|r| r.t.first().is_some_and(|t| t.depth < ROUTE_DEPTH)).count())
+    }
+}
+
+/// The route drawn again through the finer cells the device holds now, or None when no run got finer.
+pub fn refine_route(store: Arc<dyn CellStore>, dem: Arc<dyn CellStore>, route: &Route, cache: Option<Arc<RouteCache>>) -> Option<Route> {
+    let again = route.again.as_ref()?;
+    let mut fine = Cells { store: store.clone(), got: HashMap::new(), cache: cache.clone(), local: true };
+    let mut runs = again.runs.clone();
+    let mut finer = false;
+    for run in &mut runs {
+        let depth = run.t.first().map(|t| t.depth);
+        refine(&mut fine, run);
+        finer |= run.t.first().map(|t| t.depth) != depth;
+    }
+    if !finer {
+        return None;
+    }
+    let mut cells = Cells { store, got: HashMap::new(), cache, local: true };
+    finish_runs(&mut cells, &dem, again.travel, again.from, again.to, again.a, again.b, again.seconds, runs).ok()
+}
+
+/// How many points the route's elevation profile has.
+pub const PROFILE_SAMPLES: usize = 512;
 
 /// A trixel anywhere at the route depth: its diamond, its column and row of the diamond's grid, its half.
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
-struct T {
+pub(crate) struct T {
     d: u8,
     depth: u8,
     x: u32,
@@ -236,6 +280,8 @@ struct Cells {
     store: Arc<dyn CellStore>,
     got: HashMap<CellKey, Option<Arc<RouteCell>>>,
     cache: Option<Arc<RouteCache>>,
+    /// Only what the device holds, never the network: the line's refinement reads the fine cells there are, as the map draws what it has.
+    local: bool,
 }
 
 impl Cells {
@@ -247,7 +293,8 @@ impl Cells {
             self.got.insert(key, shared.clone());
             return shared;
         }
-        let c = match self.store.get(key) {
+        let fetched = if self.local { self.store.get_local(key) } else { self.store.get(key) };
+        let c = match fetched {
             Fetch::Bytes(b) => mahere_tiles::decode_route(&b).map(|mut r| {
                 // A cell baked before the graph: built here from its planes, the same graph the baker makes.
                 if !r.has_graph() {
@@ -334,7 +381,7 @@ fn snap_down(cells: &mut Cells, lat: f64, lon: f64, travel: Travel) -> (T, Vec<(
 
 /// The best route from one point to another by stepping trixel to trixel: what [`find`] did before the graph (2026-10-25), kept to check the graph's routes against.
 pub fn find_trixels(store: Arc<dyn CellStore>, dem: Arc<dyn CellStore>, from: (f64, f64), to: (f64, f64), travel: Travel) -> Result<Route, String> {
-    let mut cells = Cells { store: store.clone(), got: HashMap::new(), cache: None };
+    let mut cells = Cells { store: store.clone(), got: HashMap::new(), cache: None, local: false };
     let (a, b) = (T::of(from.0, from.1), T::of(to.0, to.1));
     if a.d != b.d {
         return Err("the ends are in different diamonds of the map; routes cross no diamond yet".into());
@@ -509,8 +556,10 @@ enum Stand {
 }
 
 /// The shortest run of trixels from `from` to any of `to`, through the trixels of corridor `cor` of way `w` and the clusters at its ends, in texel edges; None when there is none.
+/// Any corridor trixel of the way may carry it, at four times the cost off its own: a hub (one run of trixels touching several nodes, a coarse cell's merged switchbacks) marks its trixels with its first corridor only, and the others share them (Nick 2026-10-26: the Snow Lake route jumped the switchbacks). Another node's trixels still block, so the run cannot stray past the two ends.
 fn trace(cell: &RouteCell, w: u16, cor: u16, from: usize, to: &[usize], ends: [u32; 2]) -> Option<(f64, Vec<usize>)> {
-    let allowed = |j: usize| cell.corridor_at(j, w) == cor || cell.node_of(j, w).is_some_and(|n| n == ends[0] || n == ends[1]);
+    let allowed = |j: usize| cell.corridor_at(j, w) != 0 || cell.node_of(j, w).is_some_and(|n| n == ends[0] || n == ends[1]);
+    let weight = |j: usize| if cell.corridor_at(j, w) == cor || cell.node_of(j, w).is_some() { 1.0 } else { 4.0 };
     let mut dist: HashMap<usize, (f64, usize)> = HashMap::new();
     dist.insert(from, (0.0, usize::MAX));
     let mut heap = BinaryHeap::new();
@@ -529,7 +578,7 @@ fn trace(cell: &RouteCell, w: u16, cor: u16, from: usize, to: &[usize], ends: [u
             if !allowed(j) {
                 continue;
             }
-            let nd = d + grid_m(cell_centre(k), cell_centre(j)) / mahere_tiles::texel_m(ROUTE_DEPTH);
+            let nd = d + grid_m(cell_centre(k), cell_centre(j)) / mahere_tiles::texel_m(ROUTE_DEPTH) * weight(j);
             if dist.get(&j).is_none_or(|o| nd < o.0) {
                 dist.insert(j, (nd, k));
                 heap.push(Reverse(((nd * 256.0) as u64, j)));
@@ -597,7 +646,7 @@ pub fn find(store: Arc<dyn CellStore>, dem: Arc<dyn CellStore>, from: (f64, f64)
 
 /// [`find`] through a cache of cells kept across searches.
 pub fn find_cached(store: Arc<dyn CellStore>, dem: Arc<dyn CellStore>, from: (f64, f64), to: (f64, f64), travel: Travel, cache: Option<Arc<RouteCache>>) -> Result<Route, String> {
-    let mut cells = Cells { store: store.clone(), got: HashMap::new(), cache };
+    let mut cells = Cells { store: store.clone(), got: HashMap::new(), cache, local: false };
     let (a, starts) = snap_down(&mut cells, from.0, from.1, travel);
     let (b, ends) = snap_down(&mut cells, to.0, to.1, travel);
     if starts.is_empty() {
@@ -858,25 +907,9 @@ pub fn find_cached(store: Arc<dyn CellStore>, dem: Arc<dyn CellStore>, from: (f6
             eprintln!("  depth {} cell {} node {} way {} at {:.0} s via {via:?}", n.key.depth, n.key.name(), n.name, n.osm, g);
         }
     }
-    // The chain: each trixel with its way and the metres from the one before; a whole corridor's run carries the corridor's own length (the road's, from the bake) spread along it, so the route measures the road and not the staircase of trixel centres (3 percent long on a winding road).
-    let mut chain: Vec<(T, i64, f64)> = Vec::new();
-    let extend = |chain: &mut Vec<(T, i64, f64)>, run: Vec<T>, osm: i64, arc: Option<f64>| {
-        let start = chain.len();
-        let mut prev = chain.last().map(|c| c.0.lat_lon());
-        for t in run {
-            let ll = t.lat_lon();
-            chain.push((t, osm, prev.map_or(0.0, |p| crow(p, ll))));
-            prev = Some(ll);
-        }
-        if let Some(arc) = arc {
-            let sum: f64 = chain[start..].iter().map(|c| c.2).sum();
-            if sum > 0.0 {
-                for c in &mut chain[start..] {
-                    c.2 *= arc / sum;
-                }
-            }
-        }
-    };
+    // The route as runs of trixels, each along one way: a whole corridor's run carries the corridor's own length (the road's, from the bake).
+    let mut runs: Vec<Run> = Vec::new();
+    let extend = |runs: &mut Vec<Run>, t: Vec<T>, osm: i64, arc: Option<f64>| runs.push(Run { t, osm, arc });
     // From the start trixel to the first node, along its corridor.
     let first = nodes[0].0;
     if let Some((t, osm, st)) = start_stands.iter().find(|(_, osm, st)| *osm == first.osm && match st { Stand::At(n) => *n == first, Stand::Between { a, b, .. } => *a == first || *b == first }) {
@@ -884,12 +917,12 @@ pub fn find_cached(store: Arc<dyn CellStore>, dem: Arc<dyn CellStore>, from: (f6
         if let Some(cell) = cells.get(key) {
             let w = cell.ways.iter().position(|x| x.osm == *osm).map_or(0, |p| p as u16 + 1);
             match st {
-                Stand::At(_) => extend(&mut chain, vec![*t], *osm, None),
+                Stand::At(_) => extend(&mut runs, vec![*t], *osm, None),
                 Stand::Between { cor, a, b, .. } => {
                     let targets: Vec<usize> = cell.node_trixels(first.name, w).into_iter().map(|x| x as usize).collect();
                     match trace(&cell, w, *cor, ti, &targets, [a.name, b.name]) {
-                        Some((_, path)) => extend(&mut chain, path.into_iter().map(|j| T::from_cell(key, j)).collect(), *osm, None),
-                        None => extend(&mut chain, vec![*t], *osm, None),
+                        Some((_, path)) => extend(&mut runs, path.into_iter().map(|j| T::from_cell(key, j)).collect(), *osm, None),
+                        None => extend(&mut runs, vec![*t], *osm, None),
                     }
                 }
             }
@@ -906,10 +939,14 @@ pub fn find_cached(store: Arc<dyn CellStore>, dem: Arc<dyn CellStore>, from: (f6
                     let from_t = cell.node_trixels(prev.name, w);
                     let targets: Vec<usize> = cell.node_trixels(n.name, w).into_iter().map(|x| x as usize).collect();
                     let traced = from_t.iter().find_map(|&f| trace(&cell, w, cor, f as usize, &targets, [c.a, c.b]));
+                    if traced.is_none() && std::env::var_os("MAHERE_ROUTE_LOG").is_some() {
+                        let marked = (0..mahere_tiles::TRI).filter(|&j| cell.corridor_at(j, w) == cor).count();
+                        eprintln!("  untraced corridor {cor} of way {} in {} depth {}: nodes {} -> {} (a {} b {} len {} dir {}), from {:?} to {:?}, {marked} trixels marked", n.osm, n.key.name(), n.key.depth, prev.name, n.name, c.a, c.b, c.len, c.dir, from_t, targets);
+                    }
                     let arc = c.len as f64 / 256.0 * mahere_tiles::texel_m(n.key.depth);
                     match traced {
-                        Some((_, path)) => extend(&mut chain, path.into_iter().map(|j| T::from_cell(n.key, j)).collect(), n.osm, Some(arc)),
-                        None => extend(&mut chain, vec![T::from_cell(n.key, n.name as usize)], n.osm, None),
+                        Some((_, path)) => extend(&mut runs, path.into_iter().map(|j| T::from_cell(n.key, j)).collect(), n.osm, Some(arc)),
+                        None => extend(&mut runs, vec![T::from_cell(n.key, n.name as usize)], n.osm, None),
                     }
                 }
             }
@@ -923,11 +960,11 @@ pub fn find_cached(store: Arc<dyn CellStore>, dem: Arc<dyn CellStore>, from: (f6
                     trace(&cell, w, cor, ti, &targets, [c.a, c.b]).map(|(_, path)| path)
                 });
                 match traced {
-                    Some(path) => extend(&mut chain, path.into_iter().map(|j| T::from_cell(n.key, j)).collect(), n.osm, None),
-                    None => extend(&mut chain, vec![T::from_cell(n.key, n.name as usize)], n.osm, None),
+                    Some(path) => extend(&mut runs, path.into_iter().map(|j| T::from_cell(n.key, j)).collect(), n.osm, None),
+                    None => extend(&mut runs, vec![T::from_cell(n.key, n.name as usize)], n.osm, None),
                 }
             }
-            Via::Turn | Via::Hop | Via::Start | Via::Level { .. } => extend(&mut chain, vec![T::from_cell(n.key, n.name as usize)], n.osm, None),
+            Via::Turn | Via::Hop | Via::Start | Via::Level { .. } => extend(&mut runs, vec![T::from_cell(n.key, n.name as usize)], n.osm, None),
         }
     }
     // From the last node to the end trixel.
@@ -942,16 +979,128 @@ pub fn find_cached(store: Arc<dyn CellStore>, dem: Arc<dyn CellStore>, from: (f6
                 let from_t = cell.node_trixels(lastn.name, w);
                 if let Some((_, mut path)) = from_t.iter().find_map(|&f| trace(&cell, w, cor, f as usize, &[ti], [c.a, c.b])) {
                     path.remove(0);
-                    extend(&mut chain, path.into_iter().map(|j| T::from_cell(key, j)).collect(), osm, None);
+                    extend(&mut runs, path.into_iter().map(|j| T::from_cell(key, j)).collect(), osm, None);
                 }
-            } else if chain.last().is_none_or(|l| l.0 != t) {
-                extend(&mut chain, vec![t], osm, None);
+            } else if runs.last().and_then(|r| r.t.last()).is_none_or(|l| *l != t) {
+                extend(&mut runs, vec![t], osm, None);
+            }
+        }
+    }
+    // Every run drawn through the finest cells the device holds (Nick 2026-10-26: "no cutting switchbacks"): the search's coarse corridors are its hierarchy, the line is the road.
+    let t_fine = std::time::Instant::now();
+    let mut fine = Cells { store: store.clone(), got: HashMap::new(), cache: cells.cache.clone(), local: true };
+    for run in &mut runs {
+        refine(&mut fine, run);
+    }
+    if std::env::var_os("MAHERE_ROUTE_LOG").is_some() {
+        eprintln!("refined {} runs through {} cells in {:.0} ms", runs.len(), fine.got.len(), t_fine.elapsed().as_secs_f64() * 1e3);
+    }
+    finish_runs(&mut cells, &dem, travel, from, to, a, b, seconds, runs)
+}
+
+/// A route from its runs: the chain of trixels with each step's metres (a corridor's length spread along its run, so the route measures the road and not the staircase of trixel centres, 3 percent long on a winding road), finished, and keeping its runs to be drawn again finer.
+#[allow(clippy::too_many_arguments)]
+fn finish_runs(cells: &mut Cells, dem: &Arc<dyn CellStore>, travel: Travel, from: (f64, f64), to: (f64, f64), a: T, b: T, seconds: f64, runs: Vec<Run>) -> Result<Route, String> {
+    let mut chain: Vec<(T, i64, f64)> = Vec::new();
+    for run in &runs {
+        let start = chain.len();
+        let mut prev = chain.last().map(|c| c.0.lat_lon());
+        for &t in &run.t {
+            let ll = t.lat_lon();
+            chain.push((t, run.osm, prev.map_or(0.0, |p| crow(p, ll))));
+            prev = Some(ll);
+        }
+        if let Some(arc) = run.arc {
+            let sum: f64 = chain[start..].iter().map(|c| c.2).sum();
+            if sum > 0.0 {
+                for c in &mut chain[start..] {
+                    c.2 *= arc / sum;
+                }
             }
         }
     }
     // The same trixel twice in a row says nothing.
     chain.dedup_by(|x, y| x.0 == y.0 && x.1 == y.1);
-    finish(&mut cells, &dem, travel, from, to, a, b, seconds, chain)
+    if std::env::var_os("MAHERE_ROUTE_LOG").is_some() {
+        for k in 1..chain.len() {
+            let gap = crow(chain[k - 1].0.lat_lon(), chain[k].0.lat_lon());
+            if gap > 30.0 {
+                eprintln!("  gap {gap:.0} m at {k}: {:?} way {} -> {:?} way {}", chain[k - 1].0, chain[k - 1].1, chain[k].0, chain[k].1);
+            }
+        }
+    }
+    let mut route = finish(cells, dem, travel, from, to, a, b, seconds, chain)?;
+    route.again = Some(Again { runs, from, to, a, b, seconds, travel });
+    Ok(route)
+}
+
+/// A run of a route: trixels along one way, at one depth, and the way's length over them when the bake knows it (a whole corridor).
+#[derive(Clone, Debug)]
+struct Run {
+    t: Vec<T>,
+    osm: i64,
+    arc: Option<f64>,
+}
+
+/// A run drawn a depth finer at a time, as far as the device's cells go: at each depth the way's trixels under the run's (the pyramid is a union, so the road below lies under the band above), and the shortest path through them from under the run's first trixel to under its last. A depth whose cells are missing, or whose trixels do not join, leaves the run as it was.
+fn refine(cells: &mut Cells, run: &mut Run) {
+    while run.t.first().is_some_and(|t| t.depth < ROUTE_DEPTH) {
+        // The candidates: the children carrying the way, sorted so a neighbour is found by binary search.
+        let mut under: Vec<T> = Vec::new();
+        for t in &run.t {
+            for ct in t.children() {
+                let (key, i) = ct.cell();
+                let Some(cell) = cells.get(key) else { return };
+                if cell.ways_at(i).any(|w| cell.ways[w as usize - 1].osm == run.osm) {
+                    under.push(ct);
+                }
+            }
+        }
+        let rank = |t: &T| (t.x, t.y, t.h);
+        under.sort_by_key(rank);
+        under.dedup();
+        let at = |t: &T| under.binary_search_by_key(&rank(t), rank).ok();
+        let (first, last) = (run.t[0], run.t[run.t.len() - 1]);
+        let is_child = |t: &T, of: T| t.depth == of.depth + 1 && mahere_tiles::route::tri_parent(t.x as usize, t.y as usize, t.h as usize) == (of.x as usize, of.y as usize, of.h as usize);
+        let goals: Vec<usize> = under.iter().enumerate().filter(|(_, t)| is_child(t, last)).map(|(k, _)| k).collect();
+        let mut dist = vec![f64::MAX; under.len()];
+        let mut back = vec![usize::MAX; under.len()];
+        let mut heap = BinaryHeap::new();
+        for (k, t) in under.iter().enumerate() {
+            if is_child(t, first) {
+                dist[k] = 0.0;
+                heap.push(Reverse((0u64, k)));
+            }
+        }
+        let mut hit = None;
+        while let Some(Reverse((dk, k))) = heap.pop() {
+            let d = dk as f64 / 256.0;
+            if d > dist[k] + 1e-9 {
+                continue;
+            }
+            if goals.contains(&k) {
+                hit = Some(k);
+                break;
+            }
+            for nt in under[k].around() {
+                let Some(j) = at(&nt) else { continue };
+                let nd = d + grid_m(under[k].centre(), nt.centre());
+                if nd < dist[j] {
+                    dist[j] = nd;
+                    back[j] = k;
+                    heap.push(Reverse(((nd * 256.0) as u64, j)));
+                }
+            }
+        }
+        let Some(mut k) = hit else { return };
+        let mut path = vec![under[k]];
+        while back[k] != usize::MAX {
+            k = back[k];
+            path.push(under[k]);
+        }
+        path.reverse();
+        run.t = path;
+    }
 }
 
 /// A route from its chain of trixels and ways: the points, the length, the steps with their turns, and for a bike or on foot the time and climb from the ground.
@@ -965,7 +1114,7 @@ fn finish(cells: &mut Cells, dem: &Arc<dyn CellStore>, travel: Travel, from: (f6
         _ => 4.0 / 3.6,
     };
     let names: HashMap<i64, String> = chain.iter().filter_map(|s| cells.ways(s.0).into_iter().find(|w| w.0 == s.1).map(|w| (s.1, w.1.name))).collect();
-    let mut route = Route { travel, pts: Vec::with_capacity(chain.len()), metres: 0.0, seconds, climb_m: 0.0, steps: Vec::new() };
+    let mut route = Route { travel, pts: Vec::with_capacity(chain.len()), metres: 0.0, seconds, climb_m: 0.0, steps: Vec::new(), profile: Vec::new(), again: None };
     route.pts.push(from);
     let mut last_way = None;
     for (n, s) in chain.iter().enumerate() {
@@ -995,8 +1144,22 @@ fn finish(cells: &mut Cells, dem: &Arc<dyn CellStore>, travel: Travel, from: (f6
         kept.push(step.clone());
     }
     route.steps = kept;
+    let mut ground = Ground { store: dem.clone(), dems: HashMap::new() };
+    // The profile: the ground at evenly spaced points along the chain.
+    let mut along = 0.0;
+    let mut k = 0;
+    route.profile = (0..PROFILE_SAMPLES)
+        .map(|i| {
+            let want = route.metres * i as f64 / (PROFILE_SAMPLES - 1) as f64;
+            while k + 1 < chain.len() && along + chain[k + 1].2 <= want {
+                k += 1;
+                along += chain[k].2;
+            }
+            ground.elev(chain[k].0).unwrap_or(f32::NAN)
+        })
+        .collect();
     if travel != Travel::Car {
-        let (time, climb) = ground_time(dem, &chain.iter().map(|s| s.0).collect::<Vec<_>>(), travel);
+        let (time, climb) = ground_time(&mut ground, &chain.iter().map(|s| s.0).collect::<Vec<_>>(), travel);
         route.climb_m = climb;
         if let Some(t) = time {
             route.seconds = t + crow(a.lat_lon(), chain[0].0.lat_lon()) / off_way + crow(chain.last().unwrap().0.lat_lon(), b.lat_lon()) / off_way;
@@ -1031,12 +1194,18 @@ fn turn_word(chain: &[(T, i64, f64)], n: usize) -> &'static str {
     }
 }
 
-/// The time along a path on foot or a bike from the ground's own elevation, every few metres: Tobler's hiking function walking, and on a bike its pace plus a minute for every ten metres climbed. With the metres climbed. None when the elevation is not there.
-fn ground_time(store: &Arc<dyn CellStore>, path: &[T], travel: Travel) -> (Option<f64>, f64) {
-    let mut dems: HashMap<CellKey, Option<Arc<Vec<f32>>>> = HashMap::new();
-    let mut elev = |t: T| -> Option<f32> {
+/// The ground's elevation at a trixel, from the terrain layer, each cell read once.
+struct Ground {
+    store: Arc<dyn CellStore>,
+    dems: HashMap<CellKey, Option<Arc<Vec<f32>>>>,
+}
+
+impl Ground {
+    fn elev(&mut self, t: T) -> Option<f32> {
         let (key, i) = t.cell();
-        let plane = dems
+        let store = &self.store;
+        let plane = self
+            .dems
             .entry(key)
             .or_insert_with(|| match store.get(key) {
                 Fetch::Bytes(b) => mahere_tiles::decode_cell(&b).ok().and_then(|p| p.dem).map(|d| Arc::new(d.elev)),
@@ -1044,7 +1213,12 @@ fn ground_time(store: &Arc<dyn CellStore>, path: &[T], travel: Travel) -> (Optio
             })
             .clone()?;
         plane.get(i).copied().filter(|e| e.is_finite())
-    };
+    }
+}
+
+/// The time along a path on foot or a bike from the ground's own elevation, every few metres: Tobler's hiking function walking, and on a bike its pace plus a minute for every ten metres climbed. With the metres climbed. None when the elevation is not there.
+fn ground_time(ground: &mut Ground, path: &[T], travel: Travel) -> (Option<f64>, f64) {
+    let mut elev = |t: T| ground.elev(t);
     let (mut time, mut climb) = (0.0, 0.0);
     let step = 6usize;
     let mut prev: Option<(T, f32)> = None;
@@ -1178,9 +1352,11 @@ mod tests {
                 .fold(f64::MAX, f64::min)
         };
         let offs: Vec<f64> = pts[1..20].iter().map(|p| off((p.0 as f64, p.1 as f64))).collect();
+        // Drawn through the finest cells (all of them are here): a corner is within a few texels of the line, not the coarse depth's forty metres.
         for (p, d) in pts[1..20].iter().zip(&offs) {
-            assert!(*d < 40.0, "the corner at {p:?} is {d:.0} m off the line");
+            assert!(*d < 12.0, "the corner at {p:?} is {d:.0} m off the line");
         }
+        assert_eq!(r.profile.len(), PROFILE_SAMPLES);
         let side_m = 2.0 * 0.003 * 111_320.0;
         assert!((r.metres - road_m - side_m).abs() < 0.02 * road_m, "{} m drawn, {} m of road", r.metres, road_m + side_m);
     }

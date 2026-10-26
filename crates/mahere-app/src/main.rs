@@ -837,6 +837,13 @@ impl FluorApp for MahereApp {
     fn tick(&mut self, ctx: &mut Context) -> bool {
         {
             let (w, h) = Self::dims(ctx);
+            // A copy button: the text onto the system clipboard.
+            if let Some(what) = self.panel.take_copy() {
+                match arboard::Clipboard::new().and_then(|mut c| c.set_text(what)) {
+                    Ok(()) => {}
+                    Err(e) => eprintln!("clipboard: {e}"),
+                }
+            }
             // The search is on while its page is: closing the panel any way ends it.
             if self.searching != self.panel.is_searching() {
                 let (mut ctl, mask) = (self.controls(), self.map.layers());

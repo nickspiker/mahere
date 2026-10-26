@@ -1,6 +1,7 @@
 // One view rendered from the published cells through a fresh vault, as a phone would, saved as PNG: for checking what a phone shows.
 // cargo run --release -p mahere-app --example view -- <out.png> <lat> <lon> <ppd> <w> <h> [theme name]
 // CELLS=<baked dir> renders a local bake instead (a check before upload); the labels are drawn over the map either way.
+// MAHERE_ROUTE=<lat>,<lon>,<lat>,<lon>[,car|bike|foot] draws directions between two points over it (a check of the line against the trail).
 use std::sync::Arc;
 
 use mahere_engine::residency::{DEFAULT_CELLS_URL, HttpStore, LayerStores, TieredStore};
@@ -27,13 +28,29 @@ fn main() {
         let i = mahere_engine::theme::builtin().iter().position(|t| t.name == *name).expect("a built-in theme");
         map.set_theme(i);
     }
+    if let Ok(spec) = std::env::var("MAHERE_ROUTE") {
+        let v: Vec<&str> = spec.split(',').collect();
+        let n = |i: usize| v[i].trim().parse::<f64>().expect("a number");
+        let travel = match v.get(4).map(|s| s.trim()) {
+            Some("car") => mahere_engine::route::Travel::Car,
+            Some("bike") => mahere_engine::route::Travel::Bike,
+            _ => mahere_engine::route::Travel::Foot,
+        };
+        map.set_route_mode(mahere_engine::RouteMode::Directions);
+        map.set_travel(Some(travel));
+        map.set_pin(mahere_engine::Pin::A, (n(0), n(1)));
+        map.set_pin(mahere_engine::Pin::B, (n(2), n(3)));
+    }
     for _ in 0..12000 {
         map.render(w, h);
-        if map.converged() {
+        if map.converged() && !map.routing() {
             break;
         }
         std::thread::sleep(std::time::Duration::from_millis(5));
         map.tick(w, h);
+    }
+    if let Some(r) = map.route() {
+        eprintln!("route {:.2} km, {} points", r.metres / 1000.0, r.pts.len());
     }
     map.render(w, h);
     let mut labels = mahere_panel::labels::Labeller::new();

@@ -102,6 +102,8 @@ pub struct AndroidApp {
     /// Updates (after Photon's): the channels' builds, a download, and a verified APK waiting for the activity to install.
     updater: mahere_update::Updater,
     install: Option<String>,
+    /// Text a copy button asked for, until the activity takes it to the clipboard.
+    copy: Option<String>,
 }
 
 /// Vault writes, off the UI thread. The vault serialises every write through one queue, and the loader fills it with cells while the map streams: a settings save on the UI thread waited behind hundreds of them and the system killed the app as unresponsive. Touch, location and pause now hand their writes here and return at once.
@@ -727,6 +729,9 @@ impl FluorApp for AndroidApp {
     }
 
     fn tick(&mut self, _ctx: &mut Context) -> bool {
+        if let Some(what) = self.panel.take_copy() {
+            self.copy = Some(what);
+        }
         // The search is on while its page is: closing the panel any way ends it (and takes the keyboard down).
         if self.searching != self.panel.is_searching() {
             let (mut ctl, mask) = (self.controls(), self.map.layers());
@@ -972,6 +977,7 @@ pub extern "system" fn Java_nz_mahere_app_MahereActivity_nativeInit(
             u
         },
         install: None,
+        copy: None,
     };
     app.panel.set_ru(ui_ru);
     // A touch screen: the interface size is the pinch on the panel.
@@ -1459,6 +1465,18 @@ pub extern "system" fn Java_nz_mahere_app_MahereActivity_nativeTakeInstall<'a>(e
     }
     match shell(ptr).app().install.take() {
         Some(path) => env.new_string(path).map_or(std::ptr::null_mut(), |s| s.into_raw()),
+        None => std::ptr::null_mut(),
+    }
+}
+
+/// Text a copy button asked for, once, for the activity to put on the clipboard.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_nz_mahere_app_MahereActivity_nativeTakeCopy<'a>(env: JNIEnv<'a>, _class: JClass, ptr: jlong) -> jni::sys::jstring {
+    if ptr == 0 {
+        return std::ptr::null_mut();
+    }
+    match shell(ptr).app().copy.take() {
+        Some(what) => env.new_string(what).map_or(std::ptr::null_mut(), |s| s.into_raw()),
         None => std::ptr::null_mut(),
     }
 }
