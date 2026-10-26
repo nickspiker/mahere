@@ -353,6 +353,8 @@ pub struct MapCore {
     route_error: Option<String>,
     /// When the route on the map was last asked for (navigation asks again as the fix leaves it).
     route_asked: Option<Instant>,
+    /// The cells' routing kept across searches.
+    route_cache: Arc<route::RouteCache>,
     route: Option<Arc<route::Route>>,
     pub route_version: u64,
     route_rx: Option<std::sync::mpsc::Receiver<Result<route::Route, String>>>,
@@ -450,6 +452,7 @@ impl MapCore {
             found_at: None,
             route_error: None,
             route_asked: None,
+            route_cache: Arc::new(route::RouteCache::default()),
             route: None,
             route_version: 0,
             route_rx: None,
@@ -1131,8 +1134,9 @@ impl MapCore {
         // The climb comes from the terrain, its own layer when cells come in layers.
         let dem = self.res.layer_stores().map_or(store.clone(), |l| l.dem);
         let (tx, rx) = std::sync::mpsc::channel();
+        let cache = self.route_cache.clone();
         std::thread::spawn(move || {
-            let _ = tx.send(route::find(store, dem, from, to, travel));
+            let _ = tx.send(route::find_cached(store, dem, from, to, travel, Some(cache)));
         });
         self.route_rx = Some(rx);
         self.route_asked = Some(Instant::now());
