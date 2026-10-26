@@ -69,6 +69,37 @@ fn around(i: usize) -> impl Iterator<Item = usize> {
     })
 }
 
+/// The node trixels clustered where they touch, each given its cluster's name (the lowest trixel in it); None for a trixel that is not a node. Indexed as `trixels` is.
+fn cluster_names(trixels: &[u32], is_node: &[bool]) -> Vec<Option<u32>> {
+    let mut name: Vec<Option<u32>> = vec![None; trixels.len()];
+    for k in 0..trixels.len() {
+        if !is_node[k] || name[k].is_some() {
+            continue;
+        }
+        let mut members = vec![k];
+        name[k] = Some(0);
+        let mut q = 0;
+        while q < members.len() {
+            let i = trixels[members[q]] as usize;
+            q += 1;
+            for j in around(i) {
+                if let Ok(m) = trixels.binary_search(&(j as u32)) {
+                    if is_node[m] && name[m].is_none() {
+                        // Claimed as found, so a cluster never takes a trixel twice.
+                        name[m] = Some(0);
+                        members.push(m);
+                    }
+                }
+            }
+        }
+        let low = members.iter().map(|&m| trixels[m]).min().unwrap();
+        for &m in &members {
+            name[m] = Some(low);
+        }
+    }
+    name
+}
+
 /// Whether a trixel's square touches the cell's edge.
 fn on_border(i: usize) -> bool {
     let (tx, ty) = ((i >> 1) & (TEX - 1), i >> (1 + super::TEX_BITS));
@@ -204,9 +235,12 @@ impl RouteCell {
             }
             comps.push(comp);
         }
-        // Dead ends and isolated runs get nodes at their far ends, so every corridor has two.
+        // Dead ends and isolated runs get nodes at their far ends, so every corridor has two: a component touching one cluster of nodes (or none) is such a run.
+        let first_names = cluster_names(trixels, &is_node);
         for comp in &comps {
-            let touching: Vec<usize> = comp.iter().flat_map(|&k| around(trixels[k] as usize)).filter_map(|j| trixels.binary_search(&(j as u32)).ok()).filter(|&m| is_node[m]).collect();
+            let mut touching: Vec<u32> = comp.iter().flat_map(|&k| around(trixels[k] as usize)).filter_map(|j| trixels.binary_search(&(j as u32)).ok()).filter_map(|m| first_names[m]).collect();
+            touching.sort_unstable();
+            touching.dedup();
             let far_from = |start: &[usize], comp: &[usize]| -> usize {
                 // Breadth first across the component from the given trixels: the last reached is the far end.
                 let mut in_comp = vec![false; trixels.len()];
@@ -252,32 +286,7 @@ impl RouteCell {
         let nodes_before = self.nodes.len();
         let corridors_before = self.corridors.len();
         // Clusters of touching nodes, named by the lowest trixel.
-        let mut name: Vec<Option<u32>> = vec![None; trixels.len()];
-        for k in 0..trixels.len() {
-            if !is_node[k] || name[k].is_some() {
-                continue;
-            }
-            let mut members = vec![k];
-            name[k] = Some(0);
-            let mut q = 0;
-            while q < members.len() {
-                let i = trixels[members[q]] as usize;
-                q += 1;
-                for j in around(i) {
-                    if let Ok(m) = trixels.binary_search(&(j as u32)) {
-                        if is_node[m] && name[m].is_none() {
-                            // Claimed as found, so a cluster never takes a trixel twice.
-                            name[m] = Some(0);
-                            members.push(m);
-                        }
-                    }
-                }
-            }
-            let low = members.iter().map(|&m| trixels[m]).min().unwrap();
-            for &m in &members {
-                name[m] = Some(low);
-            }
-        }
+        let name = cluster_names(trixels, &is_node);
         for k in 0..trixels.len() {
             if let Some(n) = name[k] {
                 self.nodes.push((trixels[k], w, n));
@@ -593,6 +602,104 @@ pub fn bake_routes(roads: &[Road], names: &[Named], junctions: &[(f32, f32)], de
     cells
 }
 
+/// The coarsest depth a way of a class is kept to in the route pyramid (the long middle of a trip stays on the major roads, as the lettering keeps them): motorways, trunks, primaries and ferries to depth 8, secondaries to 9, tertiaries to 10, tracks and paths to 11 (a level deeper than the streets of their rank, for the long walks), residential streets to 12, service roads to 13. Anything else routes only at the base depth.
+pub fn class_floor(class: u8) -> u8 {
+    const FERRY: u8 = mahere_osm::RoadClass::Ferry as u8 + 1;
+    match class {
+        1..=3 | FERRY => 8,
+        4 => 9,
+        5 => 10,
+        8 | 9 => 11,
+        6 => 12,
+        7 => 13,
+        _ => 14,
+    }
+}
+
+/// The parent trixel of a child at the next finer depth, in the parent's grid: the inverse of [`super::tri_children`].
+pub fn tri_parent(cx: usize, cy: usize, ch: usize) -> (usize, usize, usize) {
+    let half = match (cx & 1, cy & 1) {
+        (1, 1) => 1,
+        (0, 0) => 0,
+        _ => ch,
+    };
+    (cx >> 1, cy >> 1, half)
+}
+
+/// The route pyramid: each parent cell's routing from its four children, the way plane the union of theirs (the stack holding what a trixel gets beyond one), the junctions and one-way directions carried up, the ways kept by [`class_floor`] at each depth, and the graph built again at each. The maze stays a maze: a way's trixels are a connected run at every depth, so a route follows it there as at the base (Nick 2026-10-25: "linear preservation rather than straight averaging").
+pub fn pyramid_routes(mut cells: HashMap<CellKey, RouteCell>, base_depth: u8, min_depth: u8) -> HashMap<CellKey, RouteCell> {
+    use rayon::prelude::*;
+    let mut depth = base_depth;
+    while depth > min_depth {
+        let mut parents: Vec<CellKey> = cells.keys().filter(|k| k.depth == depth).map(|k| k.parent()).collect();
+        parents.sort();
+        parents.dedup();
+        let pd = depth - 1;
+        let built: Vec<(CellKey, RouteCell)> = parents
+            .par_iter()
+            .filter_map(|&p| {
+                let kids: [Option<&RouteCell>; 4] = std::array::from_fn(|q| cells.get(&p.child(q as u64)));
+                let mut cell = RouteCell::default();
+                // The ways kept at this depth, by OSM id, numbered afresh; each child's numbers mapped.
+                let mut nums: Vec<HashMap<u16, u16>> = vec![HashMap::new(); 4];
+                for (q, kid) in kids.iter().enumerate() {
+                    let Some(kid) = kid else { continue };
+                    for (n, w) in kid.ways.iter().enumerate() {
+                        if class_floor(w.class) > pd {
+                            continue;
+                        }
+                        let num = match cell.ways.iter().position(|x| x.osm == w.osm) {
+                            Some(i) => i as u16 + 1,
+                            None => {
+                                cell.ways.push(w.clone());
+                                cell.ways.len() as u16
+                            }
+                        };
+                        nums[q].insert(n as u16 + 1, num);
+                    }
+                }
+                if cell.ways.is_empty() {
+                    return None;
+                }
+                let mut joins = std::collections::HashSet::new();
+                let mut dirs: HashMap<(u32, u16), u8> = HashMap::new();
+                for ty in 0..TEX {
+                    for tx in 0..TEX {
+                        for half in 0..2 {
+                            let i = tri_idx(tx, ty, half);
+                            for (q, ci) in super::child_cell_texels(tx, ty, half) {
+                                let Some(kid) = kids[q as usize] else { continue };
+                                for w in kid.ways_at(ci) {
+                                    let Some(&num) = nums[q as usize].get(&w) else { continue };
+                                    cell.add(i, num);
+                                    if kid.is_join(ci) {
+                                        joins.insert(i as u32);
+                                    }
+                                    if let Some(a) = kid.dir.iter().find(|d| d.0 == ci as u32 && d.1 == w).map(|d| d.2) {
+                                        dirs.entry((i as u32, num)).or_insert(a);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                // A junction only where two kept ways still meet.
+                cell.joins = joins.into_iter().filter(|&j| cell.ways_at(j as usize).count() >= 2).collect();
+                cell.joins.sort_unstable();
+                cell.dir = dirs.into_iter().map(|((t, w), a)| (t, w, a)).collect();
+                cell.dir.sort_unstable();
+                cell.stack.sort_unstable();
+                cell.stack.dedup();
+                cell.build_graph();
+                Some((p, cell))
+            })
+            .collect();
+        cells.extend(built);
+        depth -= 1;
+    }
+    cells
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -668,6 +775,78 @@ mod tests {
                     assert_eq!(c.corridors[cor as usize - 1].way, w);
                 }
             }
+        }
+    }
+
+    /// The pyramid keeps a way connected a depth up, drops the classes below their floor, and carries junctions and directions; the parent of a child trixel is the one whose children include it.
+    #[test]
+    fn the_pyramid_keeps_the_maze() {
+        for tx in 0..6 {
+            for ty in 0..6 {
+                for h in 0..2 {
+                    for (cx, cy, ch) in super::super::tri_children(tx, ty, h) {
+                        assert_eq!(tri_parent(cx, cy, ch), (tx, ty, h), "child {:?}", (cx, cy, ch));
+                    }
+                }
+            }
+        }
+        let (lat, lon) = (47.60f32, -122.33f32);
+        let main = road(RoadClass::Primary, 1, vec![(lat, lon - 0.01), (lat, lon + 0.01)], 1, 0);
+        let lane = road(RoadClass::Service, 2, vec![(lat - 0.003, lon), (lat, lon)], 0, 0);
+        let cells = bake_routes(&[main, lane], &[Named::default()], &[(lat, lon)], 14);
+        let all = pyramid_routes(cells, 14, 11);
+        for d in [13u8, 12, 11] {
+            let at: Vec<&RouteCell> = all.iter().filter(|(k, _)| k.depth == d).map(|(_, c)| c).collect();
+            assert!(!at.is_empty(), "depth {d}");
+            let has_lane = at.iter().any(|c| c.ways.iter().any(|w| w.osm == 2));
+            assert_eq!(has_lane, d >= class_floor(RoadClass::Service as u8 + 1), "depth {d}: service road kept {has_lane}");
+            for c in &at {
+                graph_holds(c);
+                // The primary is one way: its corridors say so.
+                let main = c.ways.iter().position(|w| w.osm == 1).map(|p| p as u16 + 1);
+                if let Some(m) = main {
+                    assert!(c.corridors.iter().filter(|k| k.way == m).all(|k| k.dir != 0 || k.a == k.b), "depth {d}: a corridor of the one-way primary lost its direction");
+                }
+            }
+            // The primary's trixels at this depth: one connected run per cell.
+            for c in &at {
+                let Some(m) = c.ways.iter().position(|w| w.osm == 1).map(|p| p as u16 + 1) else { continue };
+                let on: Vec<usize> = (0..TRI).filter(|&i| c.ways_at(i).any(|w| w == m)).collect();
+                let mut seen = vec![false; on.len()];
+                seen[0] = true;
+                let mut q = vec![0usize];
+                while let Some(k) = q.pop() {
+                    for j in around(on[k]) {
+                        if let Ok(x) = on.binary_search(&j) {
+                            if !seen[x] {
+                                seen[x] = true;
+                                q.push(x);
+                            }
+                        }
+                    }
+                }
+                assert!(seen.iter().all(|&s| s), "depth {d}: the primary broke into pieces in a cell");
+            }
+        }
+        // The junction survives to depth 13 (both ways kept) and is gone at 12 with the service road.
+        let joins = |d: u8| all.iter().filter(|(k, _)| k.depth == d).map(|(_, c)| c.joins.len()).sum::<usize>();
+        assert!(joins(13) >= 1);
+        assert_eq!(joins(12), 0);
+    }
+
+    /// A road ending inside a cell: a border cluster, a dead-end node at its far end, and one corridor between them — not every trixel a node.
+    #[test]
+    fn a_dead_end_is_one_corridor() {
+        let (lat, lon) = (47.60f32, -122.33f32);
+        let r = road(RoadClass::Residential, 7, vec![(lat, lon - 0.003), (lat, lon + 0.003)], 1, 0);
+        let cells = bake_routes(&[r], &[Named::default()], &[], 14);
+        for (k, c) in &cells {
+            graph_holds(c);
+            let on = (0..TRI).filter(|&i| c.ways_at(i).next().is_some()).count();
+            let clusters: std::collections::HashSet<u32> = c.nodes.iter().map(|n| n.2).collect();
+            eprintln!("{}: {on} trixels, {} nodes in {} clusters, {} corridors", k.name(), c.nodes.len(), clusters.len(), c.corridors.len());
+            assert!(c.nodes.len() < on, "{}: every trixel a node", k.name());
+            assert!(!c.corridors.is_empty(), "{}: no corridor", k.name());
         }
     }
 

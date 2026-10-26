@@ -144,9 +144,11 @@ fn main() {
 
     // The ways a route follows, a trixel wide at the base depth.
     let t = std::time::Instant::now();
-    let mut routes = mahere_tiles::route::bake_routes(&roads, &names, &feats.junctions, vec_base);
+    let routes = mahere_tiles::route::bake_routes(&roads, &names, &feats.junctions, vec_base);
+    // The pyramid above: the major roads' maze at every coarser depth, for the long middle of a trip.
+    let mut routes = mahere_tiles::route::pyramid_routes(routes, vec_base, min_depth);
     routes.retain(|k, _| keep(k));
-    eprintln!("routes: {} cells, {} stacked, {} joins, {:.1}s", routes.len(), routes.values().map(|r| r.stack.len()).sum::<usize>(), routes.values().map(|r| r.joins.len()).sum::<usize>(), t.elapsed().as_secs_f32());
+    eprintln!("routes: {} cells, {} stacked, {} joins, {} nodes, {} corridors, {:.1}s", routes.len(), routes.values().map(|r| r.stack.len()).sum::<usize>(), routes.values().map(|r| r.joins.len()).sum::<usize>(), routes.values().map(|r| r.nodes.len()).sum::<usize>(), routes.values().map(|r| r.corridors.len()).sum::<usize>(), t.elapsed().as_secs_f32());
     let with_routes = |mut cells: std::collections::HashMap<mahere_tiles::CellKey, mahere_tiles::Cell>| {
         for (k, r) in routes {
             cells.entry(k).or_default().route = Some(r);
