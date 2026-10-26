@@ -55,6 +55,14 @@ struct MahereApp {
     map_span: f64,
     /// The map on the GPU (the phone's compositor, read back into fluor's buffer); None draws it on the CPU.
     gpu: Option<gpu::Gpu>,
+    /// The way of travel routes take (1 car, 2 bike, 3 foot), kept while no route mode is on; whether the search card is up.
+    travel_pref: u8,
+    searching: bool,
+    /// The search running on its own thread, its results to come for the text it was asked; the worker's cache of cells' names.
+    search_rx: Option<std::sync::mpsc::Receiver<Vec<mahere_engine::search::Found>>>,
+    search_cache: std::sync::Arc<std::sync::Mutex<mahere_engine::labels::NamesCache>>,
+    /// A route pin held by the pointer.
+    pin_drag: Option<mahere_engine::Pin>,
 }
 
 impl MahereApp {
@@ -187,7 +195,63 @@ impl MahereApp {
             updater: mahere_update::Updater::new(mahere_store::user_dir()),
             map_span: 0.0,
             gpu: None,
+            travel_pref: 1,
+            searching: false,
+            search_rx: None,
+            search_cache: Default::default(),
+            pin_drag: None,
         }
+    }
+
+    /// The panel's controls as the map and the app stand.
+    fn controls(&self) -> Controls {
+        let route = match self.map.route_mode {
+            mahere_engine::RouteMode::Off => 0,
+            mahere_engine::RouteMode::Directions => 1,
+            mahere_engine::RouteMode::Navigate => 2,
+        };
+        Controls { real_sun: self.map.real_sun, real_light: self.map.real_light, follow_heading: self.map.follow_heading, lock_to_fix: self.map.lock_to_fix, cache_budget: self.cache_budget, theme: self.map.theme, compressed: self.map.compressed(), tool: self.map.tool as u8, pen_rgba: self.map.pen_colour, travel: self.travel_pref, route, search: self.searching, record: false, clear_ink: false, clear_sel: false, locate: false, ruler: self.map.ruler, contour_auto: self.map.contour_hold.is_none(), contour_interval: self.map.contour_hold.unwrap_or(self.map.contour_interval) }
+    }
+
+    /// A search of the view for `query` over the cells the device keeps, on a thread of its own; the places come in through [`Self::poll_search`].
+    fn start_search(&mut self, query: String, w: usize, h: usize) {
+        let Some(cells) = &self.cells else {
+            self.panel.set_found(Vec::new());
+            return;
+        };
+        let job = self.map.search_job(&query, w, h, cells.keys(mahere_tiles::publish::Layer::Base));
+        let cache = self.search_cache.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut cache = cache.lock().unwrap();
+            // A worker's cache of names: bounded, as a long session searches across many views.
+            if cache.len() > 4096 {
+                cache.clear();
+            }
+            let _ = tx.send(mahere_engine::search::run(&job, &mut cache, &mahere_panel::labels::tier));
+        });
+        // Only the newest search's places are shown; an older one still running is let go.
+        self.search_rx = Some(rx);
+    }
+
+    /// The places a finished search found, onto the card: what each is and how far from the view's centre.
+    fn poll_search(&mut self) -> bool {
+        let Some(rx) = &self.search_rx else { return false };
+        let Ok(found) = rx.try_recv() else { return false };
+        self.search_rx = None;
+        let (clat, clon) = (self.map.cam.lat(), self.map.cam.lon());
+        let rows = found
+            .into_iter()
+            .map(|f| {
+                let n = mahere_tiles::Named { kind: f.kind, rank: f.rank, name: f.name.clone(), reference: f.reference.clone() };
+                let m_lon = 111_320.0 * clat.to_radians().cos();
+                let d = (((f.lat - clat) * 111_320.0).powi(2) + ((f.lon - clon) * m_lon).powi(2)).sqrt();
+                let name = if f.reference.is_empty() || f.reference == f.name { f.name.clone() } else if f.name.is_empty() { f.reference.clone() } else { format!("{} ({})", f.name, f.reference) };
+                mahere_panel::SearchRow { name, detail: format!("{} \u{b7} {}", mahere_engine::named_kind(&n), mahere_panel::length_text(d)), lat: f.lat, lon: f.lon }
+            })
+            .collect();
+        self.panel.set_found(rows);
+        true
     }
 
     /// What a tap or a release on the panel changed, applied to the map.
@@ -218,7 +282,39 @@ impl MahereApp {
         if ctl.lock_to_fix != self.map.lock_to_fix {
             self.map.set_lock_to_fix(ctl.lock_to_fix);
         }
-        self.map.set_travel(travel_of(ctl.travel));
+        // Routes (Nick 2026-10-25): directions between two pins or navigation from the fix, by the way of travel kept.
+        self.travel_pref = ctl.travel.max(1);
+        self.searching = ctl.search;
+        let mode = match ctl.route {
+            1 => mahere_engine::RouteMode::Directions,
+            2 => mahere_engine::RouteMode::Navigate,
+            _ => mahere_engine::RouteMode::Off,
+        };
+        self.map.set_route_mode(mode);
+        let travel = if mode == mahere_engine::RouteMode::Off { None } else { travel_of(self.travel_pref) };
+        if travel != self.map.travel {
+            self.map.set_travel(travel);
+            self.map.reroute();
+        }
+        if self.panel.take_swap() {
+            self.map.swap_pins();
+        }
+        if !self.searching && self.map.found_at.take().is_some() {
+            self.map.mark_dirty();
+        }
+        if let Some(act) = self.panel.take_search_act() {
+            use mahere_panel::SearchAct;
+            let (w, h) = self.chrome.dims();
+            match act {
+                SearchAct::Show(lat, lon) => {
+                    self.map.found_at = Some((lat, lon));
+                    self.map.go_to(lat, lon, None, w, h);
+                }
+                SearchAct::Go(lat, lon) => self.map.set_pin(mahere_engine::Pin::Dest, (lat, lon)),
+                SearchAct::From(lat, lon) => self.map.set_pin(mahere_engine::Pin::A, (lat, lon)),
+                SearchAct::To(lat, lon) => self.map.set_pin(mahere_engine::Pin::B, (lat, lon)),
+            }
+        }
         self.map.set_tool(match ctl.tool {
             1 => mahere_engine::ink::Tool::Pen,
             3 => mahere_engine::ink::Tool::Erase,
@@ -451,7 +547,7 @@ impl FluorApp for MahereApp {
                     return EventResponse::StartWindowDrag;
                 }
                 let mut mask = self.map.layers();
-                let mut ctl = Controls { real_sun: self.map.real_sun, real_light: self.map.real_light, follow_heading: self.map.follow_heading, lock_to_fix: self.map.lock_to_fix, cache_budget: self.cache_budget, theme: self.map.theme, compressed: self.map.compressed(), tool: self.map.tool as u8, pen_rgba: self.map.pen_colour, travel: travel_code(self.map.travel), record: false, clear_ink: false, clear_sel: false, locate: false, ruler: self.map.ruler, contour_auto: self.map.contour_hold.is_none(), contour_interval: self.map.contour_hold.unwrap_or(self.map.contour_interval) };
+                let mut ctl = self.controls();
                 let was_open = self.panel.is_open();
                 if self.panel.tap(cx as f32, cy as f32, w, h, &mut mask, &mut ctl, &self.map.themes) {
                     self.apply_controls(ctl, mask);
@@ -462,6 +558,11 @@ impl FluorApp for MahereApp {
                 if was_open {
                     self.panel.close();
                     ctx.window.request_redraw();
+                    return EventResponse::Handled;
+                }
+                // A route pin under the pointer is picked up and moved, not the map.
+                if let Some(pin) = self.map.pin_at(cx as f64, cy as f64, w, h) {
+                    self.pin_drag = Some(pin);
                     return EventResponse::Handled;
                 }
                 self.dragging = true;
@@ -477,7 +578,7 @@ impl FluorApp for MahereApp {
             FEvent::MouseInput { state: ElementState::Released, button: MouseButton::Left } => {
                 // A press on the layer list acts when it lifts without having scrolled.
                 let mut mask = self.map.layers();
-                let mut ctl = Controls { real_sun: self.map.real_sun, real_light: self.map.real_light, follow_heading: self.map.follow_heading, lock_to_fix: self.map.lock_to_fix, cache_budget: self.cache_budget, theme: self.map.theme, compressed: self.map.compressed(), tool: self.map.tool as u8, pen_rgba: self.map.pen_colour, travel: travel_code(self.map.travel), record: false, clear_ink: false, clear_sel: false, locate: false, ruler: self.map.ruler, contour_auto: self.map.contour_hold.is_none(), contour_interval: self.map.contour_hold.unwrap_or(self.map.contour_interval) };
+                let mut ctl = self.controls();
                 if self.panel.release(&mut mask, &mut ctl) {
                     self.apply_controls(ctl, mask);
                     ctx.window.request_redraw();
@@ -486,6 +587,12 @@ impl FluorApp for MahereApp {
                     self.map.end_stroke(w, h);
                     self.drawing = false;
                     self.dragging = false;
+                    ctx.window.request_redraw();
+                    return EventResponse::Handled;
+                }
+                // A pin put down: the route asked for again from where it lies.
+                if self.pin_drag.take().is_some() {
+                    self.map.reroute();
                     ctx.window.request_redraw();
                     return EventResponse::Handled;
                 }
@@ -510,7 +617,7 @@ impl FluorApp for MahereApp {
                     ctx.window.request_redraw();
                 }
                 let (x, y) = (hx as f64, hy as f64);
-                let mut ctl = Controls { real_sun: self.map.real_sun, real_light: self.map.real_light, follow_heading: self.map.follow_heading, lock_to_fix: self.map.lock_to_fix, cache_budget: self.cache_budget, theme: self.map.theme, compressed: self.map.compressed(), tool: self.map.tool as u8, pen_rgba: self.map.pen_colour, travel: travel_code(self.map.travel), record: false, clear_ink: false, clear_sel: false, locate: false, ruler: self.map.ruler, contour_auto: self.map.contour_hold.is_none(), contour_interval: self.map.contour_hold.unwrap_or(self.map.contour_interval) };
+                let mut ctl = self.controls();
                 if self.panel.drag(hx, hy, &mut ctl) {
                     self.cache_budget = ctl.cache_budget;
                     self.map.set_pen_colour(ctl.pen_rgba);
@@ -521,7 +628,10 @@ impl FluorApp for MahereApp {
                     self.last_cursor = (x, y);
                     return EventResponse::Handled;
                 }
-                if self.drawing {
+                if let Some(pin) = self.pin_drag {
+                    self.map.move_pin(pin, x, y, w, h);
+                    ctx.window.request_redraw();
+                } else if self.drawing {
                     self.map.extend_stroke(x, y, 0.5, w, h);
                     ctx.window.request_redraw();
                 } else if self.dragging {
@@ -597,6 +707,41 @@ impl FluorApp for MahereApp {
             FEvent::KeyboardInput { event } => {
                 if event.state != ElementState::Pressed {
                     return EventResponse::Pass;
+                }
+                // The search card up: the keys type into it (Escape still steps back, and closes it).
+                if self.searching && !self.panel.is_open() {
+                    use fluor::event::{Key, NamedKey};
+                    let handled = match &event.logical_key {
+                        Key::Named(NamedKey::Backspace) => {
+                            self.panel.backspace();
+                            true
+                        }
+                        Key::Named(NamedKey::Enter) => {
+                            self.panel.enter();
+                            let (ctl, mask) = (self.controls(), self.map.layers());
+                            self.apply_controls(ctl, mask);
+                            true
+                        }
+                        Key::Named(NamedKey::Escape) => {
+                            self.searching = false;
+                            false
+                        }
+                        _ => match event.text.as_deref() {
+                            Some(t) if !t.chars().all(char::is_control) && !ctx.modifiers.control_key() && !ctx.modifiers.super_key() => {
+                                self.panel.type_text(t);
+                                true
+                            }
+                            _ => false,
+                        },
+                    };
+                    if handled {
+                        ctx.window.request_redraw();
+                        return EventResponse::Handled;
+                    }
+                    if !self.searching {
+                        ctx.window.request_redraw();
+                        return EventResponse::Handled;
+                    }
                 }
                 // Escape steps back: the panel one page up, then closed, then a measurement cleared.
                 if event.logical_key == fluor::event::Key::Named(fluor::event::NamedKey::Escape) {
@@ -682,10 +827,23 @@ impl FluorApp for MahereApp {
         if self.areas.downloading() || self.panel.fonts_due() {
             return Some(Instant::now() + std::time::Duration::from_millis(200));
         }
+        // A search or a route on its way: soon, to show it when it lands.
+        if self.search_rx.is_some() || self.map.routing() {
+            return Some(Instant::now() + std::time::Duration::from_millis(50));
+        }
         if self.map.converged() { None } else { Some(Instant::now()) }
     }
 
     fn tick(&mut self, ctx: &mut Context) -> bool {
+        {
+            let (w, h) = Self::dims(ctx);
+            if let Some(q) = self.panel.take_query() {
+                self.start_search(q, w, h);
+            }
+            if self.poll_search() {
+                ctx.window.request_redraw();
+            }
+        }
         if let Some(moving) = self.spin {
             let (w, h) = Self::dims(ctx);
             if moving {
@@ -801,7 +959,7 @@ impl FluorApp for MahereApp {
         }
         let t1 = Instant::now();
         let areas = self.areas.view(self.map.user.has_selection());
-        self.panel.paint(w, h, self.map.layers(), Controls { real_sun: self.map.real_sun, real_light: self.map.real_light, follow_heading: self.map.follow_heading, lock_to_fix: self.map.lock_to_fix, cache_budget: self.cache_budget, theme: self.map.theme, compressed: self.map.compressed(), tool: self.map.tool as u8, pen_rgba: self.map.pen_colour, travel: travel_code(self.map.travel), record: false, clear_ink: false, clear_sel: false, locate: false, ruler: self.map.ruler, contour_auto: self.map.contour_hold.is_none(), contour_interval: self.map.contour_hold.unwrap_or(self.map.contour_interval) }, &readouts, measure.as_ref(), &themes, &areas, None);
+        self.panel.paint(w, h, self.map.layers(), self.controls(), &readouts, measure.as_ref(), &themes, &areas, None);
         let t2 = Instant::now();
         // On the GPU: the map, its labels, the marks and the panel drawn together, the newest frame landed in fluor's own pixels, copied into the chrome's background layer as it is.
         if let Some(g) = self.gpu.as_mut() {
@@ -999,7 +1157,7 @@ impl mahere_engine::ink::UserStore for DirUser {
     }
 }
 
-/// The panel's navigation code (0 off, 1 car, 2 bike, 3 foot) and the engine's travel, each way.
+/// The panel's way of travel (1 car, 2 bike, 3 foot) as the engine's.
 fn travel_of(code: u8) -> Option<mahere_engine::route::Travel> {
     use mahere_engine::route::Travel;
     match code {
@@ -1010,15 +1168,6 @@ fn travel_of(code: u8) -> Option<mahere_engine::route::Travel> {
     }
 }
 
-fn travel_code(t: Option<mahere_engine::route::Travel>) -> u8 {
-    use mahere_engine::route::Travel;
-    match t {
-        Some(Travel::Car) => 1,
-        Some(Travel::Bike) => 2,
-        Some(Travel::Foot) => 3,
-        None => 0,
-    }
-}
 
 /// The Updates page's view of an updater.
 fn updates_view(u: &mahere_update::Updater) -> mahere_panel::UpdatesView {

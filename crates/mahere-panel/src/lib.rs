@@ -39,8 +39,12 @@ pub struct Controls {
     pub tool: u8,
     /// The pen's colour and opacity, VSF RGB at gamma 2.
     pub pen_rgba: [u8; 4],
-    /// How a tap on the map routes there: 0 it doesn't, 1 by car, 2 by bike, 3 on foot.
+    /// How routes go: 1 by car, 2 by bike, 3 on foot (0 read as by car).
     pub travel: u8,
+    /// What a tap does with routes (Nick 2026-10-25): 0 nothing, 1 directions (the start, then the end), 2 navigation (where to go, from the fix).
+    pub route: u8,
+    /// The search card is up: typing goes to it.
+    pub search: bool,
     /// A track is being recorded (Nick 2026-10-13), the screen on or off.
     pub record: bool,
     /// One-shot asks: the ink or the selection cleared.
@@ -61,9 +65,9 @@ pub struct Controls {
 enum Pick {
     Info,
     Ruler,
-    Drive,
-    Ride,
-    Walk,
+    Search,
+    Directions,
+    Navigate,
     Pen,
     Eraser,
     Select,
@@ -77,9 +81,9 @@ impl Pick {
         match self {
             Pick::Info => "Info",
             Pick::Ruler => "Ruler",
-            Pick::Drive => "Drive",
-            Pick::Ride => "Ride",
-            Pick::Walk => "Walk",
+            Pick::Search => "Search",
+            Pick::Directions => "Directions",
+            Pick::Navigate => "Navigate",
             Pick::Pen => "Pen",
             Pick::Eraser => "Eraser",
             Pick::Select => "Select",
@@ -91,13 +95,13 @@ impl Pick {
 
     /// The tool the controls have on.
     fn current(ctl: &Controls) -> Pick {
-        match (ctl.tool, ctl.travel, ctl.ruler) {
+        match (ctl.tool, ctl.route, ctl.ruler) {
             (1, _, _) => Pick::Pen,
             (2, _, _) => Pick::Select,
             (3, _, _) => Pick::Eraser,
-            (_, 1, _) => Pick::Drive,
-            (_, 2, _) => Pick::Ride,
-            (_, 3, _) => Pick::Walk,
+            _ if ctl.search => Pick::Search,
+            (_, 1, _) => Pick::Directions,
+            (_, 2, _) => Pick::Navigate,
             (_, _, true) => Pick::Ruler,
             _ => Pick::Info,
         }
@@ -105,7 +109,7 @@ impl Pick {
 
     /// The toolbox's list for these controls: the tools, then the pen's colour and the clears beside the tool they belong to.
     fn list(ctl: &Controls) -> Vec<Pick> {
-        let mut v = vec![Pick::Info, Pick::Ruler, Pick::Drive, Pick::Ride, Pick::Walk, Pick::Pen, Pick::Eraser, Pick::Select];
+        let mut v = vec![Pick::Info, Pick::Ruler, Pick::Search, Pick::Directions, Pick::Navigate, Pick::Pen, Pick::Eraser, Pick::Select];
         match Pick::current(ctl) {
             Pick::Pen => v.push(Pick::PenColour),
             // Clearing it all sits with the eraser, the tool for taking ink off (Nick 2026-10-21: the notes are cleaned up, rarely cleared).
@@ -655,7 +659,57 @@ pub struct Panel {
     tool_btn: Option<(f32, f32, f32, f32)>,
     toolbox_open: bool,
     tool_rows: Vec<((f32, f32, f32, f32), Pick)>,
+    /// Search (Nick 2026-10-25): what is typed, whether the host has the latest, the places found (and whether the latest typing has been searched), the one picked, and what to do with it.
+    query: String,
+    query_dirty: bool,
+    search_pending: bool,
+    found: Vec<SearchRow>,
+    picked: Option<usize>,
+    search_act: Option<SearchAct>,
+    search_rows: Vec<((f32, f32, f32, f32), usize)>,
+    search_acts: Vec<((f32, f32, f32, f32), u8)>,
+    search_field: Option<(f32, f32, f32, f32)>,
+    /// The route card's buttons (1 to 3 the way of travel, 4 swap) and a swap asked for.
+    route_pills: Vec<((f32, f32, f32, f32), u8)>,
+    swap: bool,
+    /// The bottom card's top edge as last painted: a tap below it is the card's, never the map's.
+    card_top: Option<f32>,
 }
+
+/// The search card as painted: its height, close button, field and the rects that take taps.
+#[derive(Default)]
+struct SearchCard {
+    band: f32,
+    close: (f32, f32, f32),
+    field: (f32, f32, f32, f32),
+    rows: Vec<((f32, f32, f32, f32), usize)>,
+    acts: Vec<((f32, f32, f32, f32), u8)>,
+}
+
+/// A place the search found, as the card lists it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SearchRow {
+    pub name: String,
+    /// What it is and how far from the screen's centre.
+    pub detail: String,
+    pub lat: f64,
+    pub lon: f64,
+}
+
+/// What the search card asks of the host: show a place, go there, or start or end directions there.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum SearchAct {
+    Show(f64, f64),
+    Go(f64, f64),
+    From(f64, f64),
+    To(f64, f64),
+}
+
+/// Lines of a route card shown, its turns past them left out.
+const ROUTE_LINES: usize = 8;
+
+/// Places the search card lists.
+const SEARCH_ROWS: usize = 6;
 
 impl Default for Panel {
     fn default() -> Self {
@@ -679,7 +733,7 @@ impl Panel {
         let checks = LAYERS.iter().map(|&(l, label)| (l, Checkbox::new(&mut hits, label, 0.0, 0.0, 10.0, 10.0, 10.0, false))).collect();
         let interval = Slider::new(&mut hits, 0.0, 0.0, 10.0, 10.0, 0.0);
         let text_slider = Slider::new(&mut hits, 0.0, 0.0, 10.0, 10.0, text_pos(1.0));
-        Panel { fonts: None, font_cursor: Default::default(), open: false, dirty: true, ru: 1.0, stack: vec![Page::Layers], theme_rows: Vec::new(), edit_rows: Vec::new(), edit_scroll: 0.0, edit_extent: 0.0, press: None, sliders: Vec::new(), field_vals: [0.0; 4], held: None, edits: Vec::new(), hits, shown: vec![true; LAYERS.len()], group_open: GROUPS_OPEN, group_rows: Vec::new(), tree: Vec::new(), layer_open: None, field_open: None, theme_now: None, interval, interval_held: false, text_slider, text_pending: None, ru_request: None, label_scale: 1.0, touch: false, checks, text: TextRenderer::new(), buf: Vec::new(), w: 0, h: 0, font: 16.0, gear: (0.0, 0.0, 0.0), panel_w: 0.0, theme_row: (0.0, 0.0, 0.0), slider: (0.0, 0.0, 0.0), slider_held: false, cache_max: CACHE_MIN + 1, strip_close: None, clear_measure: false, area_rows: Vec::new(), area_acts: Vec::new(), areas: AreasView::default(), update_rows: Vec::new(), update_acts: Vec::new(), updates: UpdatesView::default(), host_orb: None, layers_scroll: 0.0, layers_extent: 0.0, layers_press: None, layers_band: (0.0, 0.0), orb_icon: fluor::host::icon::Icon::from_vsf_bytes(APP_ORB_VSF).ok(), orb_scaled: (0, Vec::new()), locate_btn: None, tool_btn: None, toolbox_open: false, tool_rows: Vec::new() }
+        Panel { fonts: None, font_cursor: Default::default(), open: false, dirty: true, ru: 1.0, stack: vec![Page::Layers], theme_rows: Vec::new(), edit_rows: Vec::new(), edit_scroll: 0.0, edit_extent: 0.0, press: None, sliders: Vec::new(), field_vals: [0.0; 4], held: None, edits: Vec::new(), hits, shown: vec![true; LAYERS.len()], group_open: GROUPS_OPEN, group_rows: Vec::new(), tree: Vec::new(), layer_open: None, field_open: None, theme_now: None, interval, interval_held: false, text_slider, text_pending: None, ru_request: None, label_scale: 1.0, touch: false, checks, text: TextRenderer::new(), buf: Vec::new(), w: 0, h: 0, font: 16.0, gear: (0.0, 0.0, 0.0), panel_w: 0.0, theme_row: (0.0, 0.0, 0.0), slider: (0.0, 0.0, 0.0), slider_held: false, cache_max: CACHE_MIN + 1, strip_close: None, clear_measure: false, area_rows: Vec::new(), area_acts: Vec::new(), areas: AreasView::default(), update_rows: Vec::new(), update_acts: Vec::new(), updates: UpdatesView::default(), host_orb: None, layers_scroll: 0.0, layers_extent: 0.0, layers_press: None, layers_band: (0.0, 0.0), orb_icon: fluor::host::icon::Icon::from_vsf_bytes(APP_ORB_VSF).ok(), orb_scaled: (0, Vec::new()), locate_btn: None, tool_btn: None, toolbox_open: false, tool_rows: Vec::new(), query: String::new(), query_dirty: false, search_pending: false, found: Vec::new(), picked: None, search_act: None, search_rows: Vec::new(), search_acts: Vec::new(), search_field: None, route_pills: Vec::new(), swap: false, card_top: None }
     }
 
     pub fn is_open(&self) -> bool {
@@ -878,20 +932,24 @@ impl Panel {
 
     /// A toolbox pick into the controls: one tool at a time (a tap's info, the ruler, a way to travel, the pen, the selection), or a one-shot.
     fn pick(&mut self, p: Pick, ctl: &mut Controls) {
-        let tool = |ctl: &mut Controls, tool: u8, travel: u8, ruler: bool| {
+        let tool = |ctl: &mut Controls, tool: u8, route: u8, ruler: bool, search: bool| {
             ctl.tool = tool;
-            ctl.travel = travel;
+            ctl.route = route;
             ctl.ruler = ruler;
+            ctl.search = search;
+            if route != 0 && ctl.travel == 0 {
+                ctl.travel = 1;
+            }
         };
         match p {
-            Pick::Info => tool(ctl, 0, 0, false),
-            Pick::Ruler => tool(ctl, 0, 0, true),
-            Pick::Drive => tool(ctl, 0, 1, false),
-            Pick::Ride => tool(ctl, 0, 2, false),
-            Pick::Walk => tool(ctl, 0, 3, false),
-            Pick::Pen => tool(ctl, 1, 0, false),
-            Pick::Select => tool(ctl, 2, 0, false),
-            Pick::Eraser => tool(ctl, 3, 0, false),
+            Pick::Info => tool(ctl, 0, 0, false, false),
+            Pick::Ruler => tool(ctl, 0, 0, true, false),
+            Pick::Search => tool(ctl, 0, 0, false, true),
+            Pick::Directions => tool(ctl, 0, 1, false, false),
+            Pick::Navigate => tool(ctl, 0, 2, false, false),
+            Pick::Pen => tool(ctl, 1, 0, false, false),
+            Pick::Select => tool(ctl, 2, 0, false, false),
+            Pick::Eraser => tool(ctl, 3, 0, false, false),
             Pick::PenColour => {
                 self.open = true;
                 let rgba = ctl.pen_rgba;
@@ -1255,10 +1313,64 @@ impl Panel {
         }
         if let Some((cx, cy, cr)) = self.strip_close {
             if (x - cx).powi(2) + (y - cy).powi(2) <= (cr * 1.4).powi(2) {
-                self.clear_measure = true;
+                if ctl.search {
+                    // Closing the search card ends the search.
+                    ctl.search = false;
+                    self.query.clear();
+                    self.found.clear();
+                    self.picked = None;
+                } else {
+                    self.clear_measure = true;
+                }
                 self.dirty = true;
                 return true;
             }
+        }
+        if let Some(&(_, b)) = self.route_pills.iter().find(|(r, _)| inside(*r)) {
+            if b == 4 {
+                self.swap = true;
+            } else {
+                ctl.travel = b;
+            }
+            self.dirty = true;
+            return true;
+        }
+        if ctl.search {
+            if let Some(&(_, a)) = self.search_acts.iter().find(|(r, _)| inside(*r)) {
+                if let Some(f) = self.picked.and_then(|i| self.found.get(i)) {
+                    let at = (f.lat, f.lon);
+                    self.search_act = Some(match a {
+                        0 => SearchAct::Go(at.0, at.1),
+                        1 => SearchAct::From(at.0, at.1),
+                        _ => SearchAct::To(at.0, at.1),
+                    });
+                    // Going or routing leaves the search for the route's card.
+                    ctl.search = false;
+                    ctl.route = if a == 0 { 2 } else { 1 };
+                    if ctl.travel == 0 {
+                        ctl.travel = 1;
+                    }
+                }
+                self.dirty = true;
+                return true;
+            }
+            if let Some(&(_, i)) = self.search_rows.iter().find(|(r, _)| inside(*r)) {
+                self.picked = Some(i);
+                if let Some(f) = self.found.get(i) {
+                    self.search_act = Some(SearchAct::Show(f.lat, f.lon));
+                }
+                self.dirty = true;
+                return true;
+            }
+            if self.search_field.is_some_and(inside) {
+                // Back to the list from a picked place.
+                self.picked = None;
+                self.dirty = true;
+                return true;
+            }
+        }
+        if self.card_top.is_some_and(|t| y >= t) && !self.open {
+            return true;
         }
         if let Some((bx, by, br)) = self.locate_btn {
             if (x - bx).powi(2) + (y - by).powi(2) <= (br * 1.3).powi(2) {
@@ -1537,10 +1649,42 @@ impl Panel {
         let mut damage = Damage::new();
         let mut canvas = Canvas::new(&mut self.buf, w, h, &mut damage);
         self.strip_close = None;
+        self.route_pills.clear();
+        self.search_rows.clear();
+        self.search_acts.clear();
+        self.search_field = None;
+        self.card_top = None;
         let mut bottom = h as f32;
-        if let Some(m) = measure {
+        if ctl.search {
+            let card = Self::paint_search(&mut canvas, &mut self.text, w, h, font, &self.query, &self.found, self.picked, self.search_pending);
+            self.strip_close = Some(card.close);
+            self.search_field = Some(card.field);
+            self.search_rows = card.rows;
+            self.search_acts = card.acts;
+            let band = card.band;
+            bottom -= band;
+            self.card_top = Some(bottom);
+        } else if let Some(m) = measure {
+            if m.route {
+                // The way of travel and, for directions, the swap: above the card's lines, so painted before its background.
+                let top = h as f32 - Self::strip_band(font, m) + font * 0.3;
+                let (pw, ph) = (font * 3.4, font * 1.25);
+                let mut px = font;
+                for (b, word) in [(1u8, "Car"), (2, "Bike"), (3, "Foot")] {
+                    let r = (px, top, pw, ph);
+                    Self::paint_pill(&mut canvas, &mut self.text, r, word, ctl.travel.max(1) == b, font);
+                    self.route_pills.push((r, b));
+                    px += pw + font * 0.3;
+                }
+                if ctl.route == 1 {
+                    let r = (px + font * 0.4, top, pw, ph);
+                    Self::paint_pill(&mut canvas, &mut self.text, r, "Swap", false, font);
+                    self.route_pills.push((r, 4));
+                }
+            }
             self.strip_close = Some(Self::paint_strip(&mut canvas, &mut self.text, w, h, font, m));
             bottom -= Self::strip_band(font, m);
+            self.card_top = Some(bottom);
         }
         // The locate button, bottom right above any strip; dim without a fix.
         let br = gr * 0.8;
@@ -1847,6 +1991,10 @@ impl Panel {
     /// Returns the close button's centre and radius.
     /// The measurement strip's height: what is at the point, a line each, above the distance and the profile.
     fn strip_band(font: f32, m: &MeasureView) -> f32 {
+        if m.route {
+            // The way-of-travel row, then the card's lines (the first few turns).
+            return font * 2.0 + font * 0.9 + m.info.len().min(ROUTE_LINES) as f32 * font * 1.05;
+        }
         if !m.ruler {
             // The card: what is there, a line each, and where.
             return font * 2.2 + (m.info.len() + 1) as f32 * font * 1.05;
@@ -1929,6 +2077,15 @@ impl Panel {
         text.draw_text_center(canvas, "\u{00d7}", cx, cy, &TextStyle::new(font * 1.1, READOUT), None, None);
         paint::circle_filled(canvas, cx as isize, cy as isize, cr as isize, GEAR_BG, None, None);
         let point = TextStyle::new(font * 0.9, theme::TEXTBOX_TEXT);
+        if m.route {
+            // Below the way-of-travel row: what to tap, the route's summary, then its turns as many as fit.
+            for (k, line) in m.info.iter().take(ROUTE_LINES).enumerate() {
+                let style = if k == 0 { point.clone() } else { TextStyle::new(font * 0.8, READOUT) };
+                text.draw_text_left(canvas, line, margin, strip_top + font * 2.0 + font * 0.5 + k as f32 * font * 1.05, &style, None, None);
+            }
+            paint::fill_rect(canvas, 0, strip_top as isize, w as isize, band as isize, PANEL_BG, None, None);
+            return (cx, cy, cr);
+        }
         for (k, line) in m.info.iter().enumerate() {
             text.draw_text_left(canvas, line, margin, strip_top + font * 0.9 + k as f32 * font * 1.05, &point, None, None);
         }
@@ -1975,6 +2132,128 @@ impl Panel {
         }
         paint::fill_rect(canvas, 0, strip_top as isize, w as isize, band as isize, PANEL_BG, None, None);
         (cx, cy, cr)
+    }
+
+    /// The search card along the bottom: the field, then the places found (or the one picked, with what to do there). Returns its height.
+    #[allow(clippy::too_many_arguments)]
+    fn paint_search(canvas: &mut Canvas, text: &mut TextRenderer, w: usize, h: usize, font: f32, query: &str, found: &[SearchRow], picked: Option<usize>, pending: bool) -> SearchCard {
+        let mut card = SearchCard::default();
+        let margin = font;
+        let row_h = font * 1.45;
+        let field_h = font * 1.6;
+        let content = match picked.and_then(|i| found.get(i)) {
+            Some(_) => font * 3.6,
+            None if found.is_empty() => font * 1.3,
+            None => found.len().min(SEARCH_ROWS) as f32 * row_h,
+        };
+        let band = font * 0.5 + field_h + font * 0.4 + content + font * 0.4;
+        let top = h as f32 - band;
+        // The close button.
+        let (cx, cy, cr) = (w as f32 - font * 0.9, top + font * 0.5 + field_h * 0.5, font * 0.55);
+        text.draw_text_center(canvas, "\u{00d7}", cx, cy, &TextStyle::new(font * 1.1, READOUT), None, None);
+        paint::circle_filled(canvas, cx as isize, cy as isize, cr as isize, GEAR_BG, None, None);
+        card.close = (cx, cy, cr);
+        // The field: what is typed and the caret, or what it is for.
+        let field = (margin, top + font * 0.5, w as f32 - margin * 2.0 - font * 1.8, field_h);
+        let (shown, style) = if query.is_empty() { ("Search the map in view".to_string(), TextStyle::new(font * 0.85, READOUT_DIM)) } else { (format!("{query}|"), TextStyle::new(font * 0.95, theme::TEXTBOX_TEXT)) };
+        text.draw_text_left(canvas, &shown, field.0 + font * 0.6, field.1 + field_h * 0.5, &style, None, None);
+        paint::fill_rect(canvas, field.0 as isize, field.1 as isize, field.2 as isize, field.3 as isize, GEAR_BG, None, None);
+        card.field = field;
+        let y0 = field.1 + field_h + font * 0.4;
+        match picked.and_then(|i| found.get(i).cloned()) {
+            Some(f) => {
+                // The place picked, and what to do there.
+                text.draw_text_left(canvas, &f.name, margin, y0 + font * 0.5, &TextStyle::new(font * 0.95, theme::TEXTBOX_TEXT), None, None);
+                text.draw_text_left(canvas, &f.detail, margin, y0 + font * 1.4, &TextStyle::new(font * 0.75, READOUT), None, None);
+                let (pw, ph) = (font * 4.6, font * 1.3);
+                let mut px = margin;
+                for (a, word) in [(0u8, "Go"), (1, "From here"), (2, "To here")] {
+                    let r = (px, y0 + font * 2.15, pw, ph);
+                    Self::paint_pill(canvas, text, r, word, a == 0, font);
+                    card.acts.push((r, a));
+                    px += pw + font * 0.35;
+                }
+            }
+            None if found.is_empty() => {
+                let say = if query.trim().is_empty() {
+                    "Names in view, from the map kept on this device"
+                } else if pending {
+                    "Searching\u{2026}"
+                } else {
+                    "Nothing in view by that name"
+                };
+                text.draw_text_left(canvas, say, margin, y0 + font * 0.6, &TextStyle::new(font * 0.8, READOUT), None, None);
+            }
+            None => {
+                for (i, f) in found.iter().take(SEARCH_ROWS).enumerate() {
+                    let r = (0.0, y0 + i as f32 * row_h, w as f32, row_h);
+                    text.draw_text_right(canvas, &f.detail, w as f32 - margin, r.1 + row_h * 0.5, &TextStyle::new(font * 0.72, READOUT), None, None);
+                    text.draw_text_left(canvas, &f.name, margin, r.1 + row_h * 0.5, &TextStyle::new(font * 0.9, theme::TEXTBOX_TEXT), None, None);
+                    card.rows.push((r, i));
+                }
+            }
+        }
+        paint::fill_rect(canvas, 0, top as isize, w as isize, band as isize, PANEL_BG, None, None);
+        card.band = band;
+        card
+    }
+
+    /// Text typed into the search.
+    pub fn type_text(&mut self, s: &str) {
+        let s: String = s.chars().filter(|c| !c.is_control()).collect();
+        if s.is_empty() {
+            return;
+        }
+        self.query.push_str(&s);
+        self.typed();
+    }
+
+    /// The search's last character taken back.
+    pub fn backspace(&mut self) {
+        if self.query.pop().is_some() {
+            self.typed();
+        }
+    }
+
+    fn typed(&mut self) {
+        self.picked = None;
+        self.query_dirty = true;
+        self.search_pending = true;
+        self.dirty = true;
+    }
+
+    /// Enter in the search: the first place found picked and shown.
+    pub fn enter(&mut self) {
+        if let Some(f) = self.found.first() {
+            self.picked = Some(0);
+            self.search_act = Some(SearchAct::Show(f.lat, f.lon));
+            self.dirty = true;
+        }
+    }
+
+    /// The search's text when it changed since the last take: the host searches for it.
+    pub fn take_query(&mut self) -> Option<String> {
+        std::mem::take(&mut self.query_dirty).then(|| self.query.clone())
+    }
+
+    /// The places the host found for the latest text.
+    pub fn set_found(&mut self, rows: Vec<SearchRow>) {
+        self.search_pending = false;
+        if rows != self.found {
+            self.found = rows;
+            self.picked = None;
+        }
+        self.dirty = true;
+    }
+
+    /// What the search card asked for, once.
+    pub fn take_search_act(&mut self) -> Option<SearchAct> {
+        self.search_act.take()
+    }
+
+    /// True once after the route card's swap.
+    pub fn take_swap(&mut self) -> bool {
+        std::mem::take(&mut self.swap)
     }
 
     /// True once after a tap on the ruler's close button.

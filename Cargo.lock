@@ -1901,6 +1901,7 @@ dependencies = [
  "mahere-gpu",
  "mahere-panel",
  "mahere-store",
+ "mahere-tiles",
  "mahere-update",
  "ndk",
  "ndk-sys",

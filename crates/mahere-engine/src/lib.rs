@@ -9,6 +9,7 @@ pub mod probe;
 pub mod raster;
 pub mod residency;
 pub mod route;
+pub mod search;
 pub mod sh;
 pub mod theme;
 
@@ -339,6 +340,19 @@ pub struct MapCore {
     names_reloaded: Vec<mahere_tiles::CellKey>,
     /// Navigation (Nick 2026-10-13): how a tap routes there, if it does; the route found and its version; the search running.
     pub travel: Option<route::Travel>,
+    /// What a tap does with routes (Nick 2026-10-25): directions between two pins, or navigation to a destination from the fix.
+    pub route_mode: RouteMode,
+    /// Directions' start and end, latitude and longitude.
+    pub pin_a: Option<(f64, f64)>,
+    pub pin_b: Option<(f64, f64)>,
+    /// Navigation's destination.
+    pub nav_to: Option<(f64, f64)>,
+    /// The place the search picked, marked until the search closes or a route takes it.
+    pub found_at: Option<(f64, f64)>,
+    /// Why the last search found no route.
+    route_error: Option<String>,
+    /// When the route on the map was last asked for (navigation asks again as the fix leaves it).
+    route_asked: Option<Instant>,
     route: Option<Arc<route::Route>>,
     pub route_version: u64,
     route_rx: Option<std::sync::mpsc::Receiver<Result<route::Route, String>>>,
@@ -429,6 +443,13 @@ impl MapCore {
             names_reloaded: Vec::new(),
             geoid_cell: None,
             travel: None,
+            route_mode: RouteMode::Off,
+            pin_a: None,
+            pin_b: None,
+            nav_to: None,
+            found_at: None,
+            route_error: None,
+            route_asked: None,
             route: None,
             route_version: 0,
             route_rx: None,
@@ -1063,6 +1084,7 @@ impl MapCore {
     /// Integrate async-loaded cells. True if a redraw is due: cells arrived or the camera/sun/GPS changed since the last render.
     pub fn tick(&mut self, _w: usize, _h: usize) -> bool {
         let routed = self.poll_route();
+        self.follow_fix();
         let changed = self.res.drain() > 0 || self.dirty || routed;
         // When the first view and the globe's base set are complete, how long that took and the loaders' share (2026-10-22: ten seconds on a relaunch with every cell on the phone).
         if let Some(t) = self.started.filter(|_| self.res.converged() && !self.res.pool.map.is_empty() && self.globe_loading().is_none()) {
@@ -1102,13 +1124,9 @@ impl MapCore {
         self.route.as_deref()
     }
 
-    /// Search for a route from where the ruler starts (the screen centre, or the fix with "Measure from me" on: Nick 2026-10-14, the route started at the fix and found nothing from outside the 1 m areas) to a point, on a thread of its own; the result comes in through [`MapCore::tick`].
-    fn start_route(&mut self, to: (f64, f64), travel: route::Travel) {
-        let centre = (self.cam.lat(), self.cam.lon());
-        let from = match self.gps {
-            Some(g) if self.lock_to_fix => (g.lat, g.lon),
-            _ => centre,
-        };
+    /// Search for a route between two points on a thread of its own; the result comes in through [`MapCore::tick`].
+    fn route_between(&mut self, from: (f64, f64), to: (f64, f64)) {
+        let Some(travel) = self.travel else { return };
         let store = self.res.store();
         // The climb comes from the terrain, its own layer when cells come in layers.
         let dem = self.res.layer_stores().map_or(store.clone(), |l| l.dem);
@@ -1117,39 +1135,180 @@ impl MapCore {
             let _ = tx.send(route::find(store, dem, from, to, travel));
         });
         self.route_rx = Some(rx);
-        self.tap_info.insert(0, format!("Finding a route by {}\u{2026}", travel.word().to_lowercase()));
+        self.route_asked = Some(Instant::now());
+        self.route_error = None;
+        self.dirty = true;
     }
 
-    /// A finished search: the route kept and told at the top of the strip (its length, time and climb, then the turns), or why there is none.
+    /// A finished search: the route kept, or why there is none.
     fn poll_route(&mut self) -> bool {
         let Some(rx) = &self.route_rx else { return false };
         let Ok(found) = rx.try_recv() else { return false };
         self.route_rx = None;
-        self.tap_info.retain(|l| !l.starts_with("Finding a route"));
         match found {
-            Ok(r) => {
-                let mut lines = Vec::new();
-                let mins = (r.seconds / 60.0).round() as i64;
-                let time = if mins >= 60 { format!("{} h {:02} min", mins / 60, mins % 60) } else { format!("{mins} min") };
-                let climb = if r.climb_m >= 1.0 { format!(" \u{b7} {} m up", r.climb_m.round() as i64) } else { String::new() };
-                lines.push(format!("{} \u{b7} {:.1} km \u{b7} {time}{climb}", r.travel.word(), r.metres / 1000.0));
-                for s in r.steps.iter().skip(1).take(4) {
-                    let name = if s.name.is_empty() { "the way" } else { &s.name };
-                    lines.push(format!("{:.1} km  {} {name}", s.at_m / 1000.0, s.turn));
-                }
-                for (k, l) in lines.into_iter().enumerate() {
-                    self.tap_info.insert(k, l);
-                }
-                self.route = Some(Arc::new(r));
-            }
+            Ok(r) => self.route = Some(Arc::new(r)),
             Err(e) => {
                 self.route = None;
-                self.tap_info.insert(0, format!("No route: {e}"));
+                self.route_error = Some(e);
             }
         }
         self.route_version += 1;
         self.dirty = true;
         true
+    }
+
+    /// A route search is on its way.
+    pub fn routing(&self) -> bool {
+        self.route_rx.is_some()
+    }
+
+    /// Directions or navigation, or neither (which clears the pins and the route).
+    pub fn set_route_mode(&mut self, mode: RouteMode) {
+        if mode != self.route_mode {
+            self.route_mode = mode;
+            self.pin_a = None;
+            self.pin_b = None;
+            self.nav_to = None;
+            self.route_error = None;
+            self.clear_route();
+            self.dirty = true;
+        }
+    }
+
+    /// The route asked for again from the pins or the fix as they stand (a pin dropped, the way of travel changed).
+    pub fn reroute(&mut self) {
+        match self.route_mode {
+            RouteMode::Directions => {
+                if let (Some(a), Some(b)) = (self.pin_a, self.pin_b) {
+                    self.route_between(a, b);
+                }
+            }
+            RouteMode::Navigate => {
+                if let (Some(g), Some(to)) = (self.gps, self.nav_to) {
+                    self.route_between((g.lat, g.lon), to);
+                }
+            }
+            RouteMode::Off => {}
+        }
+    }
+
+    /// A pin set where a search found a place or a tap fell: the start or the end of directions (the route asked for when both are down), or navigation's destination.
+    pub fn set_pin(&mut self, pin: Pin, at: (f64, f64)) {
+        match pin {
+            Pin::A => self.pin_a = Some(at),
+            Pin::B => self.pin_b = Some(at),
+            Pin::Dest => self.nav_to = Some(at),
+        }
+        self.clear_route();
+        self.route_error = None;
+        self.reroute();
+        self.dirty = true;
+    }
+
+    /// Directions the other way round.
+    pub fn swap_pins(&mut self) {
+        std::mem::swap(&mut self.pin_a, &mut self.pin_b);
+        self.clear_route();
+        self.reroute();
+        self.dirty = true;
+    }
+
+    /// The pin under screen (x, y), within a finger's reach.
+    pub fn pin_at(&self, x: f64, y: f64, w: usize, h: usize) -> Option<Pin> {
+        let reach = (w.min(h) as f64 / 18.0).max(24.0);
+        [(Pin::A, self.pin_a), (Pin::B, self.pin_b), (Pin::Dest, self.nav_to)]
+            .into_iter()
+            .filter_map(|(p, at)| {
+                let (lat, lon) = at?;
+                let (px, py) = self.cam.geo_to_screen(lat, lon, w, h);
+                let d = ((px - x).powi(2) + (py - y).powi(2)).sqrt();
+                (d <= reach).then_some((p, d))
+            })
+            .min_by(|a, b| a.1.total_cmp(&b.1))
+            .map(|(p, _)| p)
+    }
+
+    /// A pin dragged to screen (x, y): moved, the route left until it is dropped ([`Self::reroute`]).
+    pub fn move_pin(&mut self, pin: Pin, x: f64, y: f64, w: usize, h: usize) {
+        let at = self.cam.screen_to_geo(x, y, w, h);
+        match pin {
+            Pin::A => self.pin_a = Some(at),
+            Pin::B => self.pin_b = Some(at),
+            Pin::Dest => self.nav_to = Some(at),
+        }
+        self.dirty = true;
+    }
+
+    /// Navigation follows the fix: a route asked for when there is none, and again when the fix is off the one there (farther than its accuracy and 40 m), at most every five seconds.
+    fn follow_fix(&mut self) {
+        if self.route_mode != RouteMode::Navigate || self.route_rx.is_some() {
+            return;
+        }
+        let (Some(g), Some(_)) = (self.gps, self.nav_to) else { return };
+        if self.route_asked.is_some_and(|t| t.elapsed() < std::time::Duration::from_secs(5)) {
+            return;
+        }
+        let off = match &self.route {
+            None => self.route_error.is_none() || self.route_asked.is_some_and(|t| t.elapsed() > std::time::Duration::from_secs(30)),
+            Some(r) => along(&r.pts, (g.lat, g.lon)).1 > (g.accuracy_m as f64).max(40.0),
+        };
+        if off {
+            self.reroute();
+        }
+    }
+
+    /// What the route card says: what to tap next, the route's length, time and climb and its turns, or for navigation the next turn and what is left from the fix.
+    pub fn route_card(&self) -> Vec<String> {
+        let finding = self.route_rx.is_some();
+        let word = self.travel.map_or("route", |t| t.word()).to_lowercase();
+        let mut lines = Vec::new();
+        match self.route_mode {
+            RouteMode::Off => return lines,
+            RouteMode::Directions => match (self.pin_a, self.pin_b) {
+                (None, _) => lines.push("Tap the start".to_string()),
+                (Some(_), None) => lines.push("Tap the end".to_string()),
+                _ => {}
+            },
+            RouteMode::Navigate => {
+                if self.nav_to.is_none() {
+                    lines.push("Tap where to go".to_string());
+                } else if self.gps.is_none() {
+                    lines.push("Waiting for a GPS fix".to_string());
+                }
+            }
+        }
+        if finding {
+            lines.push(format!("Finding a route by {word}\u{2026}"));
+        }
+        if let Some(e) = &self.route_error {
+            lines.push(format!("No route: {e}"));
+        }
+        let Some(r) = &self.route else { return lines };
+        let time = |s: f64| {
+            let mins = (s / 60.0).round() as i64;
+            if mins >= 60 { format!("{} h {:02} min", mins / 60, mins % 60) } else { format!("{mins} min") }
+        };
+        let name = |s: &route::Step| if s.name.is_empty() { "the way".to_string() } else { s.name.clone() };
+        match (self.route_mode, self.gps) {
+            (RouteMode::Navigate, Some(g)) => {
+                let (at, _) = along(&r.pts, (g.lat, g.lon));
+                let left = (r.metres - at).max(0.0);
+                if let Some(s) = r.steps.iter().find(|s| s.at_m > at) {
+                    lines.push(format!("In {}: {} {}", length_rounded(s.at_m - at), s.turn, name(s)));
+                } else {
+                    lines.push("Arriving".to_string());
+                }
+                lines.push(format!("{:.1} km \u{b7} {} left", left / 1000.0, time(r.seconds * left / r.metres.max(1.0))));
+            }
+            _ => {
+                let climb = if r.climb_m >= 1.0 { format!(" \u{b7} {} m up", r.climb_m.round() as i64) } else { String::new() };
+                lines.push(format!("{} \u{b7} {:.1} km \u{b7} {}{climb}", r.travel.word(), r.metres / 1000.0, time(r.seconds)));
+                for s in r.steps.iter().skip(1) {
+                    lines.push(format!("{:.1} km  {} {}", s.at_m / 1000.0, s.turn, name(s)));
+                }
+            }
+        }
+        lines
     }
 
     pub fn converged(&self) -> bool {
@@ -1367,7 +1526,20 @@ impl MapCore {
         }
         self.draw_compass(w, h);
         self.draw_globe_ring(w, h);
+        self.draw_pins(w, h);
         &self.canvas
+    }
+
+    /// The route pins: the start green, the end and the destination red, the search's place blue, each a disc in a white ring.
+    fn draw_pins(&mut self, w: usize, h: usize) {
+        let r = (w.min(h) as f32 / 70.0).max(9.0);
+        for (at, colour) in [(self.found_at, [64u8, 156, 255]), (self.pin_a, [52, 168, 83]), (self.pin_b, [220, 60, 50]), (self.nav_to, [220, 60, 50])] {
+            let Some((lat, lon)) = at else { continue };
+            let (x, y) = self.cam.geo_to_screen(lat, lon, w, h);
+            let (x, y) = (x as f32, y as f32);
+            draw_segment(&mut self.canvas, w, h, x, y, x, y, r, [255, 255, 255]);
+            draw_segment(&mut self.canvas, w, h, x, y, x, y, r * 0.72, colour);
+        }
     }
 
     /// The ring round the globe while its base set loads: from the top, clockwise, closing as the ten depth-0 cells arrive, gone when they are all in (Nick 2026-10-22).
@@ -1796,6 +1968,44 @@ mod tests {
         assert!(deep.past_data());
     }
 
+    /// Navigation reads where the fix is along the route: how far along and how far off, the next turn ahead and what is left; directions' taps fill the start, then the end, then start again.
+    #[test]
+    fn navigation_follows_the_fix_and_directions_take_a_then_b() {
+        // A route due north 2 km, then east 1 km, with a turn at the corner.
+        let deg = |m: f64| m / 111_320.0;
+        let (lat0, lon0) = (47.5f64, -122.5f64);
+        let m_lon = 111_320.0 * lat0.to_radians().cos();
+        let pts = vec![(lat0, lon0), (lat0 + deg(2000.0), lon0), (lat0 + deg(2000.0), lon0 + 1000.0 / m_lon)];
+        let (at, off) = along(&pts, (lat0 + deg(500.0), lon0 + 30.0 / m_lon));
+        assert!((at - 500.0).abs() < 1.0 && (off - 30.0).abs() < 1.0, "500 m along, 30 m off: {at} {off}");
+        let (at, _) = along(&pts, (lat0 + deg(2000.0), lon0 + 400.0 / m_lon));
+        assert!((at - 2400.0).abs() < 2.0, "past the corner: {at}");
+
+        let mut map = MapCore::new(Arc::new(Empty), Camera::new(lat0, lon0, 20_000.0, 0.0));
+        map.set_travel(Some(route::Travel::Foot));
+        map.set_route_mode(RouteMode::Navigate);
+        assert_eq!(map.route_card(), vec!["Tap where to go".to_string()]);
+        map.nav_to = Some(pts[2]);
+        assert_eq!(map.route_card(), vec!["Waiting for a GPS fix".to_string()]);
+        map.route = Some(Arc::new(route::Route { travel: route::Travel::Foot, pts: pts.clone(), metres: 3000.0, seconds: 3000.0, climb_m: 0.0, steps: vec![route::Step { name: "North Road".into(), turn: "Start", at_m: 0.0 }, route::Step { name: "East Road".into(), turn: "Turn right onto", at_m: 2000.0 }] }));
+        map.gps = Some(GpsFix { lat: lat0 + deg(1500.0), lon: lon0, accuracy_m: 5.0, height_m: None, v_accuracy_m: None });
+        assert_eq!(map.route_card(), vec!["In 500 m: Turn right onto East Road".to_string(), "1.5 km \u{b7} 25 min left".to_string()]);
+
+        map.set_route_mode(RouteMode::Directions);
+        assert!(map.nav_to.is_none() && map.route.is_none(), "a new mode starts clean");
+        let (w, h) = (400, 300);
+        map.tap(100.0, 100.0, w, h);
+        assert!(map.pin_a.is_some() && map.pin_b.is_none());
+        map.tap(300.0, 200.0, w, h);
+        assert!(map.pin_a.is_some() && map.pin_b.is_some());
+        assert_eq!(map.pin_at(300.0, 200.0, w, h), Some(Pin::B));
+        let b = map.pin_b;
+        map.swap_pins();
+        assert_eq!(map.pin_a, b);
+        map.tap(50.0, 50.0, w, h);
+        assert!(map.pin_a.is_some() && map.pin_b.is_none(), "a third tap starts again");
+    }
+
     /// Shells that draw on demand rely on `tick` to report camera changes (the Android two-finger path has no redraw request of its own).
     #[test]
     fn tick_reports_camera_changes() {
@@ -1931,18 +2141,89 @@ pub struct MeasureView {
     pub ruler: bool,
     /// The target, latitude and longitude.
     pub target: (f64, f64),
+    /// The route card (directions or navigation): its lines and the way of travel, no measurement.
+    pub route: bool,
+}
+
+/// What a tap does with routes.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub enum RouteMode {
+    #[default]
+    Off,
+    /// Directions between two pins, A then B.
+    Directions,
+    /// Navigation to a destination from the fix, following it.
+    Navigate,
+}
+
+/// A route pin.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Pin {
+    A,
+    B,
+    Dest,
+}
+
+/// How far along a route a point is, metres from its start (its nearest place on the route), and how far off it, metres.
+pub fn along(pts: &[(f64, f64)], at: (f64, f64)) -> (f64, f64) {
+    let m_lat = 111_320.0;
+    let m_lon = 111_320.0 * at.0.to_radians().cos();
+    let xy = |p: (f64, f64)| ((p.1 - at.1) * m_lon, (p.0 - at.0) * m_lat);
+    let (mut best, mut best_at, mut run) = (f64::MAX, 0.0, 0.0);
+    for s in pts.windows(2) {
+        let (a, b) = (xy(s[0]), xy(s[1]));
+        let (dx, dy) = (b.0 - a.0, b.1 - a.1);
+        let len2 = dx * dx + dy * dy;
+        let t = if len2 > 0.0 { (-(a.0 * dx + a.1 * dy) / len2).clamp(0.0, 1.0) } else { 0.0 };
+        let (px, py) = (a.0 + dx * t, a.1 + dy * t);
+        let d = (px * px + py * py).sqrt();
+        let len = len2.sqrt();
+        if d < best {
+            best = d;
+            best_at = run + len * t;
+        }
+        run += len;
+    }
+    (best_at, best)
+}
+
+/// A distance ahead as a driver hears it: tens of metres, then hundreds, then kilometres with a decimal.
+fn length_rounded(m: f64) -> String {
+    if m < 100.0 {
+        format!("{} m", ((m / 10.0).round() * 10.0) as i64)
+    } else if m < 1000.0 {
+        format!("{} m", ((m / 50.0).round() * 50.0) as i64)
+    } else {
+        format!("{:.1} km", m / 1000.0)
+    }
 }
 
 impl MapCore {
     /// A tap on the map at screen (x, y): a new measurement to that point.
     pub fn tap(&mut self, x: f64, y: f64, w: usize, h: usize) {
         let target = self.cam.screen_to_geo(x, y, w, h);
+        // Directions: the first tap the start, the next the end, another a new start (Nick 2026-10-25); navigation: a tap is where to go.
+        match self.route_mode {
+            RouteMode::Directions => {
+                match (self.pin_a, self.pin_b) {
+                    (Some(_), None) => self.set_pin(Pin::B, target),
+                    (None, Some(_)) => self.set_pin(Pin::A, target),
+                    (None, None) => self.set_pin(Pin::A, target),
+                    (Some(_), Some(_)) => {
+                        self.pin_b = None;
+                        self.set_pin(Pin::A, target);
+                    }
+                }
+                return;
+            }
+            RouteMode::Navigate => {
+                self.set_pin(Pin::Dest, target);
+                return;
+            }
+            RouteMode::Off => {}
+        }
         self.measure = Some(Measure { target, from_fix: self.lock_to_fix && self.gps.is_some() });
         self.tap_info = self.point_info(x, y, w, h);
-        // Navigating: a tap is where to go.
-        if let Some(t) = self.travel {
-            self.start_route(target, t);
-        }
         self.dirty = true;
     }
 
@@ -1959,6 +2240,10 @@ impl MapCore {
     pub fn clear_measure(&mut self) {
         self.measure = None;
         self.tap_info.clear();
+        self.pin_a = None;
+        self.pin_b = None;
+        self.nav_to = None;
+        self.route_error = None;
         self.clear_route();
         self.dirty = true;
     }
@@ -2163,6 +2448,11 @@ impl MapCore {
 
     /// The measurement for a `w × h` screen with a profile of `samples` points, if one is set.
     pub fn measure_view(&self, w: usize, h: usize, samples: usize) -> Option<MeasureView> {
+        // Directions and navigation: the route card, no line or mark of the ruler's (the pins are drawn in the overlay).
+        if self.route_mode != RouteMode::Off {
+            let at = self.pin_b.or(self.pin_a).or(self.nav_to).unwrap_or((self.cam.lat(), self.cam.lon()));
+            return Some(MeasureView { origin_px: (0.0, 0.0), target_px: (0.0, 0.0), distance_m: 0.0, bearing_deg: 0.0, elev_origin: None, elev_target: None, profile: Vec::new(), info: self.route_card(), ruler: false, target: at, route: true });
+        }
         let m = self.measure?;
         let (olat, olon) = self.measure_origin(w, h)?;
         let (tlat, tlon) = m.target;
@@ -2193,6 +2483,7 @@ impl MapCore {
             info: self.tap_info.clone(),
             ruler: self.ruler,
             target: m.target,
+            route: false,
         })
     }
 

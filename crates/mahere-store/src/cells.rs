@@ -162,6 +162,15 @@ impl VaultCells {
         self.index.lock().unwrap().entries.contains_key(&Self::ix(key, code))
     }
 
+    /// The cells kept for one layer, any depth: what a search over the device reads (the base holds the names).
+    pub fn keys(&self, layer: Layer) -> Vec<CellKey> {
+        let code = layer_code(layer);
+        self.index.lock().unwrap().entries.keys().filter(|(packed, _)| packed >> 6 == code).map(|&(packed, raw)| {
+            let depth = packed & 63;
+            CellKey { depth, prefix: raw >> (60 - 2 * depth as u32) }
+        }).collect()
+    }
+
     /// Bytes of cells the index knows about, the pinned ones included.
     pub fn cached_bytes(&self) -> u64 {
         self.index.lock().unwrap().entries.values().map(|&(_, b)| b as u64).sum()

@@ -14,6 +14,7 @@ crate-type = ["cdylib"]
 # kete and manifestus report through the log facade: forwarded to logcat with everything else (the vault's open time, a refused write).
 log = "0.4"
 mahere-engine = { path = "../mahere-engine" }
+mahere-tiles = { path = "../mahere-tiles" }
 mahere-store = { path = "../mahere-store" }
 fluor = { version = "0.0.6", features = ["host-android"] }
 jni = "0.21"

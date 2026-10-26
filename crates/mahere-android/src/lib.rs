@@ -14,7 +14,6 @@ use fluor::paint::pack_argb;
 use jni::JNIEnv;
 use jni::objects::{JByteBuffer, JClass, JFloatArray, JObject, JString};
 use jni::sys::{jboolean, jdouble, jfloat, jint, jlong};
-use mahere_engine::residency::DEFAULT_CELLS_URL;
 use mahere_engine::{Camera, GpsFix, MapCore};
 use mahere_panel::{Controls, Panel};
 use ndk::native_window::NativeWindow;
@@ -35,6 +34,15 @@ struct TwoFinger {
 
 pub struct AndroidApp {
     map: MapCore,
+    /// The way of travel routes take (1 car, 2 bike, 3 foot), kept while no route mode is on; whether the search card is up, and whether the keyboard was last asked up for it.
+    travel_pref: u8,
+    searching: bool,
+    keyboard_up: bool,
+    /// The search running on its own thread; the worker's cache of cells' names.
+    search_rx: Option<std::sync::mpsc::Receiver<Vec<mahere_engine::search::Found>>>,
+    search_cache: std::sync::Arc<std::sync::Mutex<mahere_engine::labels::NamesCache>>,
+    /// A route pin held by the finger.
+    pin_drag: Option<mahere_engine::Pin>,
     w: usize,
     h: usize,
     dragging: bool,
@@ -146,8 +154,52 @@ fn free_bytes(dir: &str) -> Option<u64> {
 }
 
 impl AndroidApp {
+    /// A search of the view for `query` over the cells the device keeps, on a thread of its own.
+    fn start_search(&mut self, query: String) {
+        let Some(cells) = &self.cells_cache else {
+            self.panel.set_found(Vec::new());
+            return;
+        };
+        let job = self.map.search_job(&query, self.w, self.h, cells.keys(mahere_tiles::publish::Layer::Base));
+        let cache = self.search_cache.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut cache = cache.lock().unwrap();
+            // A worker's cache of names: bounded, the phone's memory being what it is.
+            if cache.len() > 1024 {
+                cache.clear();
+            }
+            let _ = tx.send(mahere_engine::search::run(&job, &mut cache, &mahere_panel::labels::tier));
+        });
+        self.search_rx = Some(rx);
+    }
+
+    /// The places a finished search found, onto the card: what each is and how far from the view's centre.
+    fn poll_search(&mut self) -> bool {
+        let Some(rx) = &self.search_rx else { return false };
+        let Ok(found) = rx.try_recv() else { return false };
+        self.search_rx = None;
+        let (clat, clon) = (self.map.cam.lat(), self.map.cam.lon());
+        let m_lon = 111_320.0 * clat.to_radians().cos();
+        let rows = found
+            .into_iter()
+            .map(|f| {
+                let n = mahere_tiles::Named { kind: f.kind, rank: f.rank, name: f.name.clone(), reference: f.reference.clone() };
+                let d = (((f.lat - clat) * 111_320.0).powi(2) + ((f.lon - clon) * m_lon).powi(2)).sqrt();
+                let name = if f.reference.is_empty() || f.reference == f.name { f.name.clone() } else if f.name.is_empty() { f.reference.clone() } else { format!("{} ({})", f.name, f.reference) };
+                mahere_panel::SearchRow { name, detail: format!("{} \u{b7} {}", mahere_engine::named_kind(&n), mahere_panel::length_text(d)), lat: f.lat, lon: f.lon }
+            })
+            .collect();
+        self.panel.set_found(rows);
+        true
+    }
+
     fn controls(&self) -> Controls {
-        Controls { real_sun: self.map.real_sun, real_light: self.map.real_light, follow_heading: self.map.follow_heading, lock_to_fix: self.map.lock_to_fix, cache_budget: self.cache_budget, theme: self.map.theme, compressed: self.map.compressed(), tool: self.map.tool as u8, pen_rgba: self.map.pen_colour, travel: travel_code(self.map.travel), record: self.recording, clear_ink: false, clear_sel: false, locate: false, ruler: self.map.ruler, contour_auto: self.map.contour_hold.is_none(), contour_interval: self.map.contour_hold.unwrap_or(self.map.contour_interval) }
+        Controls { real_sun: self.map.real_sun, real_light: self.map.real_light, follow_heading: self.map.follow_heading, lock_to_fix: self.map.lock_to_fix, cache_budget: self.cache_budget, theme: self.map.theme, compressed: self.map.compressed(), tool: self.map.tool as u8, pen_rgba: self.map.pen_colour, travel: self.travel_pref, route: match self.map.route_mode {
+            mahere_engine::RouteMode::Off => 0,
+            mahere_engine::RouteMode::Directions => 1,
+            mahere_engine::RouteMode::Navigate => 2,
+        }, search: self.searching, record: self.recording, clear_ink: false, clear_sel: false, locate: false, ruler: self.map.ruler, contour_auto: self.map.contour_hold.is_none(), contour_interval: self.map.contour_hold.unwrap_or(self.map.contour_interval) }
     }
 
     /// A pinch with the panel open: the finger distance's ratio to the last event's scales the interface when it began on the panel, the map's lettering when it began on the map (Nick 2026-10-25: by where the first finger came down).
@@ -233,7 +285,38 @@ impl AndroidApp {
         if ctl.theme != self.map.theme {
             self.map.set_theme(ctl.theme);
         }
-        self.map.set_travel(travel_of(ctl.travel));
+        // Routes (Nick 2026-10-25): directions between two pins or navigation from the fix, by the way of travel kept.
+        self.travel_pref = ctl.travel.max(1);
+        self.searching = ctl.search;
+        let mode = match ctl.route {
+            1 => mahere_engine::RouteMode::Directions,
+            2 => mahere_engine::RouteMode::Navigate,
+            _ => mahere_engine::RouteMode::Off,
+        };
+        self.map.set_route_mode(mode);
+        let travel = if mode == mahere_engine::RouteMode::Off { None } else { travel_of(self.travel_pref) };
+        if travel != self.map.travel {
+            self.map.set_travel(travel);
+            self.map.reroute();
+        }
+        if self.panel.take_swap() {
+            self.map.swap_pins();
+        }
+        if !self.searching && self.map.found_at.take().is_some() {
+            self.map.mark_dirty();
+        }
+        if let Some(act) = self.panel.take_search_act() {
+            use mahere_panel::SearchAct;
+            match act {
+                SearchAct::Show(lat, lon) => {
+                    self.map.found_at = Some((lat, lon));
+                    self.map.go_to(lat, lon, None, self.w, self.h);
+                }
+                SearchAct::Go(lat, lon) => self.map.set_pin(mahere_engine::Pin::Dest, (lat, lon)),
+                SearchAct::From(lat, lon) => self.map.set_pin(mahere_engine::Pin::A, (lat, lon)),
+                SearchAct::To(lat, lon) => self.map.set_pin(mahere_engine::Pin::B, (lat, lon)),
+            }
+        }
         if ctl.record != self.recording {
             self.recording = ctl.record;
             // Each recording a track of its own.
@@ -377,7 +460,7 @@ impl AndroidApp {
 
     fn save_settings(&self) {
         if let Some(store) = &self.store {
-            let s = mahere_store::Settings { cache_budget: self.cache_budget, layer_bits: self.map.layers().bits() as u64, real_sun: self.map.real_sun, real_light: self.map.real_light, follow_heading: self.map.follow_heading, lock_to_fix: self.map.lock_to_fix, theme: self.map.theme as u64, compressed: self.map.compressed(), ui_ru: self.ui_ru, tool: self.map.tool as u8, pen_rgba: Some(self.map.pen_colour), travel: travel_code(self.map.travel), auto_update: self.updater.auto, record: self.recording, ruler: self.map.ruler, contour_hold: self.map.contour_hold };
+            let s = mahere_store::Settings { cache_budget: self.cache_budget, layer_bits: self.map.layers().bits() as u64, real_sun: self.map.real_sun, real_light: self.map.real_light, follow_heading: self.map.follow_heading, lock_to_fix: self.map.lock_to_fix, theme: self.map.theme as u64, compressed: self.map.compressed(), ui_ru: self.ui_ru, tool: self.map.tool as u8, pen_rgba: Some(self.map.pen_colour), travel: self.travel_pref, auto_update: self.updater.auto, record: self.recording, ruler: self.map.ruler, contour_hold: self.map.contour_hold };
             self.persist.settings(store.clone(), s);
         }
     }
@@ -499,6 +582,13 @@ impl FluorApp for AndroidApp {
                     self.dragging = false;
                     return EventResponse::Handled;
                 }
+                // A route pin under the finger is picked up and moved, not the map.
+                if self.two.is_none() {
+                    if let Some(pin) = self.map.pin_at(ctx.cursor_x as f64, ctx.cursor_y as f64, self.w, self.h) {
+                        self.pin_drag = Some(pin);
+                        return EventResponse::Handled;
+                    }
+                }
                 if self.two.is_none() {
                     self.dragging = true;
                     self.travel = 0.0;
@@ -539,6 +629,12 @@ impl FluorApp for AndroidApp {
                     ctx.window.request_redraw();
                     return EventResponse::Handled;
                 }
+                // A pin put down: the route asked for again from where it lies.
+                if self.pin_drag.take().is_some() {
+                    self.map.reroute();
+                    ctx.window.request_redraw();
+                    return EventResponse::Handled;
+                }
                 // A press and release that never travelled is a tap: a new measurement to that point.
                 if self.dragging && self.two.is_none() && !self.had_two && self.travel < 12.0 {
                     // A label under the finger names what it letters first.
@@ -561,7 +657,10 @@ impl FluorApp for AndroidApp {
                     self.last_cursor = (x, y);
                     return EventResponse::Handled;
                 }
-                if self.suppress_move {
+                if let Some(pin) = self.pin_drag {
+                    self.map.move_pin(pin, x, y, self.w, self.h);
+                    ctx.window.request_redraw();
+                } else if self.suppress_move {
                     self.suppress_move = false;
                 } else if self.drawing {
                     self.map.extend_stroke(x, y, self.pressure as f64, self.w, self.h);
@@ -579,6 +678,31 @@ impl FluorApp for AndroidApp {
             }
             // The shell synthesizes MouseWheel from touch-drags for scrolly apps; swallowed — zoom is the two-finger solve's job.
             FEvent::MouseWheel { .. } => EventResponse::Handled,
+            // The soft keyboard types into the search.
+            FEvent::Ime(fluor::event::Ime::Commit(t)) if self.searching => {
+                for c in t.chars() {
+                    match c {
+                        '\n' => self.panel.enter(),
+                        c => self.panel.type_text(&c.to_string()),
+                    }
+                }
+                let (ctl, mask) = (self.controls(), self.map.layers());
+                self.apply_controls(ctl, mask);
+                EventResponse::Handled
+            }
+            FEvent::KeyboardInput { event } if self.searching && event.state == ElementState::Pressed => {
+                use fluor::event::{Key, NamedKey};
+                match &event.logical_key {
+                    Key::Named(NamedKey::Backspace) => self.panel.backspace(),
+                    Key::Named(NamedKey::Enter) => {
+                        self.panel.enter();
+                        let (ctl, mask) = (self.controls(), self.map.layers());
+                        self.apply_controls(ctl, mask);
+                    }
+                    _ => return EventResponse::Pass,
+                }
+                EventResponse::Handled
+            }
             _ => EventResponse::Pass,
         }
     }
@@ -588,7 +712,20 @@ impl FluorApp for AndroidApp {
     }
 
     fn tick(&mut self, _ctx: &mut Context) -> bool {
-        self.map.tick(self.w, self.h)
+        if let Some(q) = self.panel.take_query() {
+            self.start_search(q);
+        }
+        let found = self.poll_search();
+        self.map.tick(self.w, self.h) || found || self.search_rx.is_some()
+    }
+
+    /// The keyboard up while the search card is, down when it goes (fluor's one-shot ask, read after every touch and every frame).
+    fn wants_keyboard(&mut self) -> Option<bool> {
+        if self.searching == self.keyboard_up {
+            return None;
+        }
+        self.keyboard_up = self.searching;
+        Some(self.searching)
     }
 
     fn render(&mut self, target: &mut [u32], ctx: &mut Context) {
@@ -702,6 +839,7 @@ pub extern "system" fn Java_nz_mahere_app_MahereActivity_nativeInit(
     lap("cell stores");
     let session = store.as_ref().and_then(|s| mahere_store::load_session(s));
     let settings = store.as_ref().and_then(|s| mahere_store::load_settings(s));
+    let travel_pref = settings.as_ref().map_or(1, |s| s.travel.max(1));
     lap("session and settings");
     // A saved view only if it is a view (finite, on the globe, at a zoom the map has); without one, a fresh install's whole globe ([`MapCore::fresh_globe`]), which the first GPS fix turns to face.
     let restored = match session {
@@ -755,7 +893,6 @@ pub extern "system" fn Java_nz_mahere_app_MahereActivity_nativeInit(
         if let Some(c) = s.pen_rgba {
             map.set_pen_colour(c);
         }
-        map.set_travel(travel_of(s.travel));
     }
     let recorder = store.clone().map(|s| std::sync::Arc::new(std::sync::Mutex::new(mahere_store::TrackRecorder::new(s))));
     let fonts = mahere_panel::fonts::FontPacks::new(mahere_store::VaultFonts::new(store.clone()), mahere_update::AUTHOR_PUBKEY);
@@ -763,6 +900,12 @@ pub extern "system" fn Java_nz_mahere_app_MahereActivity_nativeInit(
     fonts.set_renderers(1);
     let mut app = AndroidApp {
         map,
+        travel_pref,
+        searching: false,
+        keyboard_up: false,
+        search_rx: None,
+        search_cache: Default::default(),
+        pin_drag: None,
         w: width as usize,
         h: height as usize,
         dragging: false,
@@ -1011,6 +1154,14 @@ pub extern "system" fn Java_nz_mahere_app_MahereActivity_nativeBack(_env: JNIEnv
         return 0;
     }
     let app = shell(ptr).app();
+    // Back closes the search (the keyboard with it).
+    if app.searching && !app.panel.is_open() {
+        let mut ctl = app.controls();
+        ctl.search = false;
+        let mask = app.map.layers();
+        app.apply_controls(ctl, mask);
+        return 1;
+    }
     if app.panel.back() {
         app.save_settings();
         return 1;
@@ -1023,6 +1174,34 @@ pub extern "system" fn Java_nz_mahere_app_MahereActivity_nativeBack(_env: JNIEnv
 }
 
 /// A shared area document, from a file or link the activity received: kept with the areas and opened.
+/// Text the soft keyboard committed: into the search.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_nz_mahere_app_MahereActivity_nativeOnText(mut env: JNIEnv, _class: JClass, ptr: jlong, text: jni::objects::JString) {
+    if ptr == 0 {
+        return;
+    }
+    let Ok(t) = env.get_string(&text) else { return };
+    shell(ptr).on_text_input(t.into());
+}
+
+/// A key the soft keyboard sent (delete, enter), as Android numbers it; true when it was taken.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_nz_mahere_app_MahereActivity_nativeOnKey(_env: JNIEnv, _class: JClass, ptr: jlong, code: jint) -> jboolean {
+    if ptr == 0 {
+        return 0;
+    }
+    shell(ptr).on_key_event(code) as jboolean
+}
+
+/// Whether the keyboard should come up (1), go (-1) or stay as it is (0): read every frame, as the search opens and closes from more than touches.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_nz_mahere_app_MahereActivity_nativePollKeyboard(_env: JNIEnv, _class: JClass, ptr: jlong) -> jint {
+    if ptr == 0 {
+        return 0;
+    }
+    shell(ptr).poll_keyboard()
+}
+
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_nz_mahere_app_MahereActivity_nativeOpenArea(env: JNIEnv, _class: JClass, ptr: jlong, bytes: jni::objects::JByteArray) {
     if ptr == 0 {
@@ -1169,7 +1348,7 @@ pub extern "system" fn Java_nz_mahere_app_MahereActivity_nativeProbeDenied(_env:
 /// A raw front-camera frame: samples in `buf` (`w × h`, `row_stride` bytes a row, packed 10-bit or 16-bit, Bayer order `cfa` as Android numbers it, the sensor's four `black` pedestals and its `white`), the sensor's `orientation`, the lens half-angle tangents across and down the sensor, Android's row-major XYZ→camera matrix, and the frame's `stop` on the exposure ladder (0 the base exposure, each step one stop shorter) with the long frame's. Binned, brought to absolute units by its stop, converted to VSF RGB, turned upright and painted onto the sphere. `stats` gets the clipped fraction and the 99.9th percentile level, which the Activity's exposure loop steers on.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_nz_mahere_app_MahereActivity_nativeOnProbe(
-    mut env: JNIEnv,
+    env: JNIEnv,
     _class: JClass,
     ptr: jlong,
     buf: JByteBuffer,
@@ -1239,7 +1418,7 @@ pub extern "system" fn Java_nz_mahere_app_MahereActivity_nativeOnProbe(
     }
 }
 
-/// The panel's navigation code (0 off, 1 car, 2 bike, 3 foot) and the engine's travel, each way.
+/// The panel's way of travel (1 car, 2 bike, 3 foot) as the engine's.
 fn travel_of(code: u8) -> Option<mahere_engine::route::Travel> {
     use mahere_engine::route::Travel;
     match code {
@@ -1250,15 +1429,6 @@ fn travel_of(code: u8) -> Option<mahere_engine::route::Travel> {
     }
 }
 
-fn travel_code(t: Option<mahere_engine::route::Travel>) -> u8 {
-    use mahere_engine::route::Travel;
-    match t {
-        Some(Travel::Car) => 1,
-        Some(Travel::Bike) => 2,
-        Some(Travel::Foot) => 3,
-        None => 0,
-    }
-}
 
 fn capital(s: &str) -> String {
     let mut c = s.chars();

@@ -25,6 +25,11 @@ import android.view.MotionEvent
 import android.view.SurfaceHolder
 import android.view.SurfaceView
 import android.view.View
+import android.view.KeyEvent
+import android.view.inputmethod.BaseInputConnection
+import android.view.inputmethod.EditorInfo
+import android.view.inputmethod.InputConnection
+import android.view.inputmethod.InputMethodManager
 import kotlin.concurrent.thread
 
 /**
@@ -60,6 +65,9 @@ class MahereActivity : Activity(), SurfaceHolder.Callback, Choreographer.FrameCa
     private external fun nativeGoTo(ptr: Long, lat: Double, lon: Double, ppd: Double)
     private external fun nativeOpenArea(ptr: Long, bytes: ByteArray)
     private external fun nativeBack(ptr: Long): Boolean
+    private external fun nativeOnText(ptr: Long, text: String)
+    private external fun nativeOnKey(ptr: Long, code: Int): Boolean
+    private external fun nativePollKeyboard(ptr: Long): Int
     private external fun nativeTakeInstall(ptr: Long): String?
     private external fun nativeWantsRecording(ptr: Long): Boolean
     private external fun nativeSetUnmetered(ptr: Long, unmetered: Boolean)
@@ -86,7 +94,65 @@ class MahereActivity : Activity(), SurfaceHolder.Callback, Choreographer.FrameCa
     }
     private var cameraAsked = false
 
-    private lateinit var surfaceView: SurfaceView
+    private lateinit var surfaceView: MapSurface
+
+    /// The map's surface, and the text editor the search types into (Nick 2026-10-25): the soft keyboard's text and its delete and enter go to the map; the keyboard is asked not to compose, so each letter arrives as it is typed.
+    inner class MapSurface : SurfaceView(this@MahereActivity) {
+        init {
+            isFocusable = true
+            isFocusableInTouchMode = true
+        }
+
+        override fun onCheckIsTextEditor(): Boolean = true
+
+        override fun onCreateInputConnection(outAttrs: EditorInfo): InputConnection {
+            outAttrs.inputType = EditorInfo.TYPE_CLASS_TEXT or EditorInfo.TYPE_TEXT_VARIATION_VISIBLE_PASSWORD or EditorInfo.TYPE_TEXT_FLAG_NO_SUGGESTIONS
+            outAttrs.imeOptions = EditorInfo.IME_ACTION_SEARCH or EditorInfo.IME_FLAG_NO_FULLSCREEN or EditorInfo.IME_FLAG_NO_EXTRACT_UI
+            return object : BaseInputConnection(this, false) {
+                override fun commitText(text: CharSequence?, newCursorPosition: Int): Boolean {
+                    val ptr = nativePtr
+                    if (ptr != 0L && text != null && text.isNotEmpty()) nativeOnText(ptr, text.toString())
+                    return true
+                }
+
+                override fun deleteSurroundingText(beforeLength: Int, afterLength: Int): Boolean {
+                    val ptr = nativePtr
+                    if (ptr != 0L) repeat(beforeLength.coerceAtLeast(1)) { nativeOnKey(ptr, KeyEvent.KEYCODE_DEL) }
+                    return true
+                }
+
+                override fun sendKeyEvent(event: KeyEvent): Boolean {
+                    val ptr = nativePtr
+                    if (ptr != 0L && event.action == KeyEvent.ACTION_DOWN) {
+                        when (event.keyCode) {
+                            KeyEvent.KEYCODE_DEL, KeyEvent.KEYCODE_ENTER -> nativeOnKey(ptr, event.keyCode)
+                            else -> event.unicodeChar.takeIf { it > 0 }?.let { nativeOnText(ptr, it.toChar().toString()) }
+                        }
+                    }
+                    return true
+                }
+
+                override fun performEditorAction(actionCode: Int): Boolean {
+                    val ptr = nativePtr
+                    if (ptr != 0L) nativeOnKey(ptr, KeyEvent.KEYCODE_ENTER)
+                    return true
+                }
+            }
+        }
+    }
+
+    /// The keyboard up (1) or down (-1) as the map asks; 0 leaves it.
+    private fun keyboard(code: Int) {
+        if (code == 0) return
+        val imm = getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
+        if (code > 0) {
+            surfaceView.requestFocus()
+            imm.restartInput(surfaceView)
+            imm.showSoftInput(surfaceView, 0)
+        } else {
+            imm.hideSoftInputFromWindow(surfaceView.windowToken, 0)
+        }
+    }
     @Volatile private var nativePtr = 0L
     private var surfaceReady = false
     private var assetsStaged = false
@@ -133,7 +199,7 @@ class MahereActivity : Activity(), SurfaceHolder.Callback, Choreographer.FrameCa
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        surfaceView = SurfaceView(this)
+        surfaceView = MapSurface()
         // fluor writes 32-bit pixels into the locked buffer; without this the Surface can default to a 16-bit format and every frame writes past the allocation (SEGV_ACCERR in nativeDraw).
         surfaceView.holder.setFormat(PixelFormat.RGBA_8888)
         surfaceView.holder.addCallback(this)
@@ -252,6 +318,7 @@ class MahereActivity : Activity(), SurfaceHolder.Callback, Choreographer.FrameCa
     override fun doFrame(frameTimeNanos: Long) {
         if (nativePtr != 0L && surfaceReady) {
             nativeDraw(nativePtr, surfaceView.holder.surface)
+            keyboard(nativePollKeyboard(nativePtr))
             syncProbe()
             nativeTakeInstall(nativePtr)?.let { installApk(it) }
             syncRecording()
@@ -423,11 +490,11 @@ class MahereActivity : Activity(), SurfaceHolder.Callback, Choreographer.FrameCa
         val count = event.pointerCount
         val x1 = if (count > 1) event.getX(1) else 0f
         val y1 = if (count > 1) event.getY(1) else 0f
-        nativeOnTouch(
+        keyboard(nativeOnTouch(
             nativePtr, event.actionMasked, count,
             event.getX(0), event.getY(0), x1, y1,
             event.getToolType(0), event.getPressure(0), event.buttonState,
-        )
+        ))
         return true
     }
 

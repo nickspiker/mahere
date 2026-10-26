@@ -209,8 +209,8 @@ fn centred(kind: u8) -> bool {
     kind <= HAMLET || matches!(kind, EXIT | ISLAND | ISLET | BAY | STRAIT | SEA | CAPE | NEIGHBOURHOOD | LOCALITY)
 }
 
-/// Who is lettered first: lower first. None for what is not lettered at all.
-fn tier(n: &Named) -> Option<u8> {
+/// Who is lettered first: lower first. None for what is not lettered at all. The search ranks its finds by it too.
+pub fn tier(n: &Named) -> Option<u8> {
     Some(match n.kind {
         CITY | TOWN => 0,
         PEAK | VOLCANO => 1,
