@@ -10,7 +10,7 @@ use fluor::canvas::{Canvas, Damage};
 use fluor::paint::{self, HitId, HIT_NONE};
 use fluor::text::{TextRenderer, TextStyle};
 use fluor::theme;
-use fluor::widgets::{Checkbox, Slider, Textbox};
+use fluor::widgets::{Button, Checkbox, Slider, Textbox};
 pub use mahere_engine::areas::{AREA_MAX_DEPTH, AREA_MIN_DEPTH, AreaView, AreasView};
 
 /// The app's name as shown beside the orb and as the window's title.
@@ -662,6 +662,9 @@ pub struct Panel {
     tool_btn: Option<(f32, f32, f32, f32)>,
     toolbox_open: bool,
     tool_rows: Vec<((f32, f32, f32, f32), Pick)>,
+    /// The buttons, fluor's pills, and the Updates page's automatic-updates box.
+    pills: Pills,
+    auto_check: Checkbox,
     /// Copy buttons (Nick 2026-10-26: one next to the degrees, the degrees-minutes-seconds and the world code): each with the text it copies, and the text of the one tapped, for the host's clipboard.
     copy_btns: Vec<((f32, f32, f32, f32), String)>,
     copied: Option<String>,
@@ -681,6 +684,49 @@ pub struct Panel {
     swap: bool,
     /// The bottom card's top edge as last painted: a tap below it is the card's, never the map's.
     card_top: Option<f32>,
+}
+
+/// The panel's buttons: fluor's own pills (Nick 2026-10-26: the interface on fluor's native elements), a pool handed out in paint order each frame so a button keeps its rasterized pill between frames, laid out and lettered as each paint wants. Taps are matched to the boxes the painters record, as the layer checkboxes are.
+struct Pills {
+    pool: Vec<Button>,
+    used: usize,
+    hits: HitId,
+}
+
+impl Pills {
+    fn new(hits: HitId) -> Self {
+        Pills { pool: Vec::new(), used: 0, hits }
+    }
+
+    /// A new frame: the pool is handed out from the start again.
+    fn begin(&mut self) {
+        self.used = 0;
+    }
+
+    /// A button at `rect` (left, top, width, height) reading `label`, lit when it is the one in force; its font size `font`. Painted; returns the rect.
+    #[allow(clippy::too_many_arguments)]
+    fn draw(&mut self, canvas: &mut Canvas, text: &mut TextRenderer, rect: (f32, f32, f32, f32), label: &str, lit: bool, font: f32, clip: Option<paint::Clip>) -> (f32, f32, f32, f32) {
+        if self.used == self.pool.len() {
+            self.pool.push(Button::new(&mut self.hits, 0.0, 0.0, 10.0, 10.0, font, label));
+        }
+        let b = &mut self.pool[self.used];
+        self.used += 1;
+        b.set_rect(rect.0 + rect.2 * 0.5, rect.1 + rect.3 * 0.5, rect.2, rect.3);
+        b.set_font_size(font);
+        b.set_label(label);
+        b.set_fill(lit.then_some(theme::BUTTON_HELD));
+        let id = b.hit_id();
+        b.render_content_into(canvas, 0.0, 0.0, text, clip, None, id);
+        rect
+    }
+
+    /// A button sized to its label, left edge at `x`, middle at `y_mid`.
+    #[allow(clippy::too_many_arguments)]
+    fn draw_fit(&mut self, canvas: &mut Canvas, text: &mut TextRenderer, x: f32, y_mid: f32, label: &str, lit: bool, font: f32, clip: Option<paint::Clip>) -> (f32, f32, f32, f32) {
+        let w = text.measure_text(label, &TextStyle::new(font, READOUT)) + font * 1.8;
+        let h = font * 1.5;
+        self.draw(canvas, text, (x, y_mid - h * 0.5, w, h), label, lit, font, clip)
+    }
 }
 
 /// A place in decimal degrees with its hemispheres.
@@ -752,9 +798,12 @@ impl Panel {
     pub fn new() -> Panel {
         let mut hits: HitId = HIT_NONE;
         let checks = LAYERS.iter().map(|&(l, label)| (l, Checkbox::new(&mut hits, label, 0.0, 0.0, 10.0, 10.0, 10.0, false))).collect();
+        let auto_check = Checkbox::new(&mut hits, "Automatic updates", 0.0, 0.0, 10.0, 10.0, 10.0, true);
+        // The buttons take their ids after every checkbox: the counter they are handed is their own from here on.
+        let pills = Pills::new(hits + 1000);
         let interval = Slider::new(&mut hits, 0.0, 0.0, 10.0, 10.0, 0.0);
         let text_slider = Slider::new(&mut hits, 0.0, 0.0, 10.0, 10.0, text_pos(1.0));
-        Panel { fonts: None, font_cursor: Default::default(), open: false, dirty: true, ru: 1.0, stack: vec![Page::Layers], theme_rows: Vec::new(), edit_rows: Vec::new(), edit_scroll: 0.0, edit_extent: 0.0, press: None, sliders: Vec::new(), field_vals: [0.0; 4], held: None, edits: Vec::new(), hits, shown: vec![true; LAYERS.len()], group_open: GROUPS_OPEN, group_rows: Vec::new(), tree: Vec::new(), layer_open: None, field_open: None, theme_now: None, interval, interval_held: false, text_slider, text_pending: None, ru_request: None, label_scale: 1.0, touch: false, checks, text: TextRenderer::new(), buf: Vec::new(), w: 0, h: 0, font: 16.0, gear: (0.0, 0.0, 0.0), panel_w: 0.0, theme_row: (0.0, 0.0, 0.0), slider: (0.0, 0.0, 0.0), slider_held: false, cache_max: CACHE_MIN + 1, strip_close: None, clear_measure: false, area_rows: Vec::new(), area_acts: Vec::new(), areas: AreasView::default(), update_rows: Vec::new(), update_acts: Vec::new(), updates: UpdatesView::default(), host_orb: None, layers_scroll: 0.0, layers_extent: 0.0, layers_press: None, layers_band: (0.0, 0.0), orb_icon: fluor::host::icon::Icon::from_vsf_bytes(APP_ORB_VSF).ok(), orb_scaled: (0, Vec::new()), locate_btn: None, tool_btn: None, toolbox_open: false, tool_rows: Vec::new(), copy_btns: Vec::new(), copied: None, query: String::new(), search_box: None, query_dirty: false, search_pending: false, found: Vec::new(), picked: None, search_act: None, search_rows: Vec::new(), search_acts: Vec::new(), search_field: None, route_pills: Vec::new(), swap: false, card_top: None }
+        Panel { fonts: None, font_cursor: Default::default(), open: false, dirty: true, ru: 1.0, stack: vec![Page::Layers], theme_rows: Vec::new(), edit_rows: Vec::new(), edit_scroll: 0.0, edit_extent: 0.0, press: None, sliders: Vec::new(), field_vals: [0.0; 4], held: None, edits: Vec::new(), hits, shown: vec![true; LAYERS.len()], group_open: GROUPS_OPEN, group_rows: Vec::new(), tree: Vec::new(), layer_open: None, field_open: None, theme_now: None, interval, interval_held: false, text_slider, text_pending: None, ru_request: None, label_scale: 1.0, touch: false, checks, text: TextRenderer::new(), buf: Vec::new(), w: 0, h: 0, font: 16.0, gear: (0.0, 0.0, 0.0), panel_w: 0.0, theme_row: (0.0, 0.0, 0.0), slider: (0.0, 0.0, 0.0), slider_held: false, cache_max: CACHE_MIN + 1, strip_close: None, clear_measure: false, area_rows: Vec::new(), area_acts: Vec::new(), areas: AreasView::default(), update_rows: Vec::new(), update_acts: Vec::new(), updates: UpdatesView::default(), host_orb: None, layers_scroll: 0.0, layers_extent: 0.0, layers_press: None, layers_band: (0.0, 0.0), orb_icon: fluor::host::icon::Icon::from_vsf_bytes(APP_ORB_VSF).ok(), orb_scaled: (0, Vec::new()), locate_btn: None, tool_btn: None, toolbox_open: false, tool_rows: Vec::new(), pills, auto_check, copy_btns: Vec::new(), copied: None, query: String::new(), search_box: None, query_dirty: false, search_pending: false, found: Vec::new(), picked: None, search_act: None, search_rows: Vec::new(), search_acts: Vec::new(), search_field: None, route_pills: Vec::new(), swap: false, card_top: None }
     }
 
     pub fn is_open(&self) -> bool {
@@ -945,9 +994,9 @@ impl Panel {
     }
 
     /// A copy button after a label: a small pill reading "copy", kept with the text it copies.
-    fn paint_copy(canvas: &mut Canvas, text: &mut TextRenderer, copies: &mut Vec<((f32, f32, f32, f32), String)>, x: f32, y_mid: f32, font: f32, what: String) {
-        let r = (x, y_mid - font * 0.5, font * 2.3, font * 1.0);
-        Self::paint_pill(canvas, text, r, "copy", false, font * 0.85);
+    #[allow(clippy::too_many_arguments)]
+    fn paint_copy(canvas: &mut Canvas, text: &mut TextRenderer, pills: &mut Pills, copies: &mut Vec<((f32, f32, f32, f32), String)>, x: f32, y_mid: f32, font: f32, what: String) {
+        let r = pills.draw_fit(canvas, text, x, y_mid, "copy", false, font * 0.6, None);
         copies.push((r, what));
     }
 
@@ -1748,6 +1797,7 @@ impl Panel {
         let mut canvas = Canvas::new(&mut self.buf, w, h, &mut damage);
         self.strip_close = None;
         self.copy_btns.clear();
+        self.pills.begin();
         self.route_pills.clear();
         self.search_rows.clear();
         self.search_acts.clear();
@@ -1762,17 +1812,17 @@ impl Panel {
                 let mut px = font;
                 for (b, word) in [(1u8, "Car"), (2, "Bike"), (3, "Foot")] {
                     let r = (px, top, pw, ph);
-                    Self::paint_pill(&mut canvas, &mut self.text, r, word, ctl.travel.max(1) == b, font);
+                    self.pills.draw(&mut canvas, &mut self.text, r, word, ctl.travel.max(1) == b, font * 0.8, None);
                     self.route_pills.push((r, b));
                     px += pw + font * 0.3;
                 }
                 if ctl.route == 1 {
                     let r = (px + font * 0.4, top, pw, ph);
-                    Self::paint_pill(&mut canvas, &mut self.text, r, "Swap", false, font);
+                    self.pills.draw(&mut canvas, &mut self.text, r, "Swap", false, font * 0.8, None);
                     self.route_pills.push((r, 4));
                 }
             }
-            self.strip_close = Some(Self::paint_strip(&mut canvas, &mut self.text, w, h, font, m, &mut self.copy_btns));
+            self.strip_close = Some(Self::paint_strip(&mut canvas, &mut self.text, &mut self.pills, w, h, font, m, &mut self.copy_btns));
             bottom -= Self::strip_band(&mut self.text, w, font, m);
             self.card_top = Some(bottom);
         }
@@ -1794,12 +1844,12 @@ impl Panel {
             let mut ry = btn.1 - gap - rh;
             for p in rows.into_iter().rev() {
                 let rect = (rx, ry, rw, rh);
-                Self::paint_pill(&mut canvas, &mut self.text, rect, p.word(), p == current, font);
+                self.pills.draw(&mut canvas, &mut self.text, rect, p.word(), p == current, font * 0.8, None);
                 self.tool_rows.push((rect, p));
                 ry -= rh + gap;
             }
         }
-        Self::paint_pill(&mut canvas, &mut self.text, btn, current.word(), current != Pick::Info, font);
+        self.pills.draw(&mut canvas, &mut self.text, btn, current.word(), current != Pick::Info, font * 0.8, None);
         if !self.open {
             // The scale bar, bottom left; the open panel shows the scale itself.
             Self::paint_scale(&mut canvas, &mut self.text, font, font * 0.8, bottom - font * 0.8, r.m_per_px, (w as f32 * 0.3).min(font * 10.0), r.contour_major_m);
@@ -1820,8 +1870,8 @@ impl Panel {
                 }
                 Page::Field(f) => Self::paint_field(&mut canvas, &mut self.text, font, rail, cw, self.gear, f, &mut self.sliders, self.field_vals, current),
                 Page::Pen => Self::paint_pen(&mut canvas, &mut self.text, font, rail, cw, self.gear, &mut self.sliders, self.field_vals),
-                Page::Areas => self.area_rows = Self::paint_areas(&mut canvas, &mut self.text, font, rail, cw, self.gear, &self.areas),
-                Page::Updates => self.update_rows = Self::paint_updates(&mut canvas, &mut self.text, font, rail, cw, self.gear, &self.updates),
+                Page::Areas => self.area_rows = Self::paint_areas(&mut canvas, &mut self.text, &mut self.pills, font, rail, cw, self.gear, &self.areas),
+                Page::Updates => self.update_rows = Self::paint_updates(&mut canvas, &mut self.text, &mut self.pills, &mut self.auto_check, font, rail, cw, self.gear, &self.updates),
                 Page::Search => {
                     // The field: a fluor textbox, focused, holding the query as typed.
                     let (fx, fy, fw, fh) = (rail + font * 0.9, self.gear.1 + self.gear.2 + font * 0.9 + font * 1.6 * 1.3, cw - font * 1.8, font * 1.7);
@@ -1833,12 +1883,12 @@ impl Panel {
                         tb.set_text(&self.query, &mut self.text);
                     }
                     tb.set_focused(true);
-                    let card = Self::paint_search_page(&mut canvas, &mut self.text, tb, font, rail, cw, self.gear, &self.found, self.picked, self.search_pending, self.query.trim().is_empty());
+                    let card = Self::paint_search_page(&mut canvas, &mut self.text, &mut self.pills, tb, font, rail, cw, self.gear, &self.found, self.picked, self.search_pending, self.query.trim().is_empty());
                     self.search_field = Some(card.field);
                     self.search_rows = card.rows;
                     self.search_acts = card.acts;
                 }
-                Page::Area(i) => self.area_rows = Self::paint_area(&mut canvas, &mut self.text, font, rail, cw, self.gear, &self.areas, i, &mut self.sliders, self.field_vals[0] as u8),
+                Page::Area(i) => self.area_rows = Self::paint_area(&mut canvas, &mut self.text, &mut self.pills, font, rail, cw, self.gear, &self.areas, i, &mut self.sliders, self.field_vals[0] as u8),
                 Page::Layers => {}
             }
             paint::fill_rect(&mut canvas, 0, 0, self.panel_w as isize, h as isize, PANEL_BG, None, None);
@@ -1875,7 +1925,7 @@ impl Panel {
                 let dms = dms_text(r.lat, r.lon);
                 for (label, shown, what) in [("position", value.clone(), format!("{:.6}, {:.6}", r.lat, r.lon)), ("d\u{b0} m\u{2032} s\u{2033}", dms.clone(), dms)] {
                     let lw = self.text.draw_text_left(&mut canvas, label, x, y, &dim, None, None);
-                    Self::paint_copy(&mut canvas, &mut self.text, &mut self.copy_btns, x + lw + font * 0.4, y, font * 0.85, what);
+                    Self::paint_copy(&mut canvas, &mut self.text, &mut self.pills, &mut self.copy_btns, x + lw + font * 0.4, y, font * 0.85, what);
                     y += font * 0.95;
                     self.text.draw_text_right(&mut canvas, &shown, right, y, &small, None, None);
                     y += line;
@@ -1900,7 +1950,7 @@ impl Panel {
             }
         }
         let lw = self.text.draw_text_left(&mut canvas, "world", x, y, &dim, None, None);
-        Self::paint_copy(&mut canvas, &mut self.text, &mut self.copy_btns, x + lw + font * 0.4, y, font * 0.85, words.clone());
+        Self::paint_copy(&mut canvas, &mut self.text, &mut self.pills, &mut self.copy_btns, x + lw + font * 0.4, y, font * 0.85, words.clone());
         y += font * 0.9;
         for l in &world_lines {
             if y > h as f32 {
@@ -2169,17 +2219,6 @@ impl Panel {
     }
 
     /// A rounded button with its word centred, lit when it is the one on; text first, then the body under it.
-    fn paint_pill(canvas: &mut Canvas, text: &mut TextRenderer, r: (f32, f32, f32, f32), word: &str, lit: bool, font: f32) {
-        let (x, y, w, h) = r;
-        let ink = if lit { theme::TEXTBOX_TEXT } else { READOUT };
-        text.draw_text_center(canvas, word, x + w * 0.5, y + h * 0.5, &TextStyle::new(font * 0.8, ink), None, None);
-        let rad = (h * 0.5) as isize;
-        let bg = if lit { SLIDER_USED } else { GEAR_BG };
-        paint::fill_rect(canvas, (x + h * 0.5) as isize, y as isize, (w - h) as isize, h as isize, bg, None, None);
-        paint::circle_filled(canvas, (x + h * 0.5) as isize, (y + h * 0.5) as isize, rad, bg, None, None);
-        paint::circle_filled(canvas, (x + w - h * 0.5) as isize, (y + h * 0.5) as isize, rad, bg, None, None);
-    }
-
     /// The locate button: a crosshair (four arms and a dot) on the gear's dark disc, dim without a fix.
     fn paint_locate(canvas: &mut Canvas, x: f32, y: f32, r: f32, live: bool) {
         let ink = if live { theme::TEXTBOX_TEXT } else { READOUT_DIM };
@@ -2195,7 +2234,7 @@ impl Panel {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn paint_strip(canvas: &mut Canvas, text: &mut TextRenderer, w: usize, h: usize, font: f32, m: &MeasureView, copies: &mut Vec<((f32, f32, f32, f32), String)>) -> (f32, f32, f32) {
+    fn paint_strip(canvas: &mut Canvas, text: &mut TextRenderer, pills: &mut Pills, w: usize, h: usize, font: f32, m: &MeasureView, copies: &mut Vec<((f32, f32, f32, f32), String)>) -> (f32, f32, f32) {
         // What is at the point, a line each, above the distance and the profile; the strip grows to hold them.
         let info_h = m.info.len() as f32 * font * 1.05;
         let band = Self::strip_band(text, w, font, m);
@@ -2237,7 +2276,7 @@ impl Panel {
             let words = vsf::types::WorldCoord::from_lat_lon(lat, lon).to_words();
             for (shown, copy) in [(degrees_text(lat, lon), format!("{lat:.6}, {lon:.6}")), (dms_text(lat, lon), dms_text(lat, lon))] {
                 let tw = text.draw_text_left(canvas, &shown, margin, y, &style, None, None);
-                Self::paint_copy(canvas, text, copies, margin + tw + font * 0.6, y, font, copy);
+                Self::paint_copy(canvas, text, pills, copies, margin + tw + font * 0.6, y, font, copy);
                 y += font * 1.05;
             }
             // The words wrapped to the width left of the copy button.
@@ -2245,7 +2284,7 @@ impl Panel {
             for (k, l) in lines.iter().enumerate() {
                 let tw = text.draw_text_left(canvas, l, margin, y, &style, None, None);
                 if k == 0 {
-                    Self::paint_copy(canvas, text, copies, margin + tw + font * 0.6, y, font, words.clone());
+                    Self::paint_copy(canvas, text, pills, copies, margin + tw + font * 0.6, y, font, words.clone());
                 }
                 y += font * 1.05;
             }
@@ -2293,7 +2332,7 @@ impl Panel {
 
     /// The search page: the title, the field (the textbox, drawn by fluor), then the places found a row each (what it is and how far, small), or the one picked with Go, From here and To here. Returns the rects that take taps.
     #[allow(clippy::too_many_arguments)]
-    fn paint_search_page(canvas: &mut Canvas, text: &mut TextRenderer, tb: &mut Textbox, font: f32, ox: f32, cw: f32, gear: (f32, f32, f32), found: &[SearchRow], picked: Option<usize>, pending: bool, empty: bool) -> SearchCard {
+    fn paint_search_page(canvas: &mut Canvas, text: &mut TextRenderer, pills: &mut Pills, tb: &mut Textbox, font: f32, ox: f32, cw: f32, gear: (f32, f32, f32), found: &[SearchRow], picked: Option<usize>, pending: bool, empty: bool) -> SearchCard {
         let mut card = SearchCard::default();
         let x0 = ox + font * 0.9;
         let row = font * 1.6;
@@ -2311,11 +2350,15 @@ impl Panel {
             Some(f) => {
                 text.draw_text_left(canvas, &f.name, x0, y + font * 0.5, &TextStyle::new(font * 0.95, theme::TEXTBOX_TEXT), clip, None);
                 text.draw_text_left(canvas, &f.detail, x0, y + font * 1.4, &TextStyle::new(font * 0.75, READOUT), clip, None);
-                let (pw, ph) = ((fw - font * 0.7) / 3.0, font * 1.3);
-                let mut px = x0;
+                // Each button as wide as its word, in a row that wraps where the panel is narrow.
+                let (mut px, mut py) = (x0, y + font * 2.8);
                 for (a, word) in [(0u8, "Go"), (1, "From here"), (2, "To here")] {
-                    let r = (px, y + font * 2.15, pw, ph);
-                    Self::paint_pill(canvas, text, r, word, a == 0, font);
+                    let pw = text.measure_text(word, &TextStyle::new(font * 0.8, READOUT)) + font * 1.44;
+                    if px + pw > x0 + fw && px > x0 {
+                        px = x0;
+                        py += font * 1.55;
+                    }
+                    let r = pills.draw_fit(canvas, text, px, py, word, a == 0, font * 0.8, None);
                     card.acts.push((r, a));
                     px += pw + font * 0.35;
                 }
@@ -2721,7 +2764,8 @@ impl Panel {
 impl Panel {
     /// The areas list: the back row, a row to save the selection (dim without one), then every area with what is on the device.
     /// The Updates page: this build, then each channel's row (a tap gets its build, when it is not this one), the line of what is happening and a download's bar, and the automatic switch.
-    fn paint_updates(canvas: &mut Canvas, text: &mut TextRenderer, font: f32, ox: f32, cw: f32, gear: (f32, f32, f32), u: &UpdatesView) -> Vec<(f32, f32, UpdateRow)> {
+    #[allow(clippy::too_many_arguments)]
+    fn paint_updates(canvas: &mut Canvas, text: &mut TextRenderer, pills: &mut Pills, auto_check: &mut Checkbox, font: f32, ox: f32, cw: f32, gear: (f32, f32, f32), u: &UpdatesView) -> Vec<(f32, f32, UpdateRow)> {
         let x0 = ox + font * 0.9;
         let row = font * 1.6;
         let mut y = gear.1 + gear.2 + font * 0.9 + row * 0.5;
@@ -2735,9 +2779,14 @@ impl Panel {
         text.draw_text_left(canvas, &format!("This build  {}", u.this), x0, y, &small, None, None);
         y += row * 1.1;
         for (i, (label, detail, live)) in u.channels.iter().enumerate() {
-            text.draw_text_left(canvas, label, x0, y, if *live { &title } else { &dim }, None, None);
+            // A build to get is a button; the rest is said.
+            if *live {
+                pills.draw_fit(canvas, text, x0, y, label, false, font * 0.85, None);
+            } else {
+                text.draw_text_left(canvas, label, x0, y, &dim, None, None);
+            }
             if !detail.is_empty() {
-                text.draw_text_left(canvas, detail, x0 + font * 0.4, y + font * 0.95, &small, None, None);
+                text.draw_text_left(canvas, detail, x0 + font * 0.4, y + font * if *live { 1.15 } else { 0.95 }, &small, None, None);
             }
             rows.push((y + font * 0.4, row * 0.75, UpdateRow::Get(i)));
             y += row * 1.5;
@@ -2753,13 +2802,16 @@ impl Panel {
             y += row * 0.8;
         }
         y += row * 0.4;
-        text.draw_text_left(canvas, &format!("{}  Automatic updates", if u.auto { "\u{2611}" } else { "\u{2610}" }), x0, y, &title, None, None);
+        auto_check.set_font_size(font);
+        auto_check.set_checked(u.auto);
+        auto_check.set_rect(x0 + (cw - font * 1.8) * 0.5, y, cw - font * 1.8, font * 1.4);
+        auto_check.render_content_into(canvas, text, None, None);
         text.draw_text_left(canvas, "release builds, on Wi-Fi", x0 + font * 0.4, y + font * 0.95, &small, None, None);
         rows.push((y, row * 0.5, UpdateRow::Auto));
         rows
     }
 
-    fn paint_areas(canvas: &mut Canvas, text: &mut TextRenderer, font: f32, ox: f32, cw: f32, gear: (f32, f32, f32), areas: &AreasView) -> Vec<(f32, f32, AreaRow)> {
+    fn paint_areas(canvas: &mut Canvas, text: &mut TextRenderer, pills: &mut Pills, font: f32, ox: f32, cw: f32, gear: (f32, f32, f32), areas: &AreasView) -> Vec<(f32, f32, AreaRow)> {
         let x0 = ox + font * 0.9;
         let right = ox + cw - font * 0.9;
         let row = font * 1.6;
@@ -2771,7 +2823,11 @@ impl Panel {
         text.draw_text_left(canvas, "\u{2039}  Areas", x0, y, &title, None, None);
         rows.push((y, row * 0.5, AreaRow::Back));
         y += row * 1.2;
-        text.draw_text_left(canvas, "+  Save selection", x0, y, if areas.has_selection { &title } else { &dim }, None, None);
+        if areas.has_selection {
+            pills.draw_fit(canvas, text, x0, y, "+  Save selection", false, font * 0.85, None);
+        } else {
+            text.draw_text_left(canvas, "+  Save selection", x0, y, &dim, None, None);
+        }
         rows.push((y, row * 0.5, AreaRow::Save));
         y += row * 1.2;
         // Each area two lines: its name, then what is on the device, small.
@@ -2792,7 +2848,8 @@ impl Panel {
 
     /// One area: its detail on a slider (texel size, cells and an estimate, or what is on the device), a download's progress, then its actions.
     #[allow(clippy::too_many_arguments)]
-    fn paint_area(canvas: &mut Canvas, text: &mut TextRenderer, font: f32, ox: f32, cw: f32, gear: (f32, f32, f32), areas: &AreasView, i: usize, sliders: &mut [Slider], depth: u8) -> Vec<(f32, f32, AreaRow)> {
+    #[allow(clippy::too_many_arguments)]
+    fn paint_area(canvas: &mut Canvas, text: &mut TextRenderer, pills: &mut Pills, font: f32, ox: f32, cw: f32, gear: (f32, f32, f32), areas: &AreasView, i: usize, sliders: &mut [Slider], depth: u8) -> Vec<(f32, f32, AreaRow)> {
         let x0 = ox + font * 0.9;
         let sw = cw - font * 1.8;
         let row = font * 1.6;
@@ -2843,7 +2900,7 @@ impl Panel {
             vec![("Download", AreaRow::Download)]
         };
         for (label, r) in actions.into_iter().chain([("\u{203a}  Share", AreaRow::Share), ("\u{25cb}  Show selection", AreaRow::Show), ("\u{2715}  Delete", AreaRow::Delete)]) {
-            text.draw_text_left(canvas, label, x0, y, &title, None, None);
+            pills.draw_fit(canvas, text, x0, y, label, false, font * 0.85, None);
             rows.push((y, row * 0.5, r));
             y += row;
         }
