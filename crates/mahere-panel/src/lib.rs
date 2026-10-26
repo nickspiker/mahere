@@ -913,6 +913,26 @@ impl Panel {
         self.copied.take()
     }
 
+    /// The query as a place of its own: seven words that check out as a world code, in any case and however spaced, or a pair of decimal degrees (latitude then longitude, a comma or a space between).
+    fn typed_place(query: &str) -> Option<SearchRow> {
+        let q = query.trim().to_lowercase();
+        let words: Vec<&str> = q.split(|c: char| !c.is_alphabetic()).filter(|w| !w.is_empty()).collect();
+        if words.len() == 7 {
+            let words = words.join(" ");
+            if let Some(c) = vsf::types::WorldCoord::from_words(&words) {
+                let (lat, lon) = c.to_lat_lon();
+                return Some(SearchRow { name: words, detail: format!("World code \u{b7} {}", degrees_text(lat, lon)), lat, lon });
+            }
+        }
+        let nums: Vec<f64> = q.split(|c: char| c == ',' || c.is_whitespace()).filter(|t| !t.is_empty()).map(|t| t.trim_end_matches('\u{b0}').parse::<f64>()).collect::<Result<_, _>>().ok()?;
+        if let [lat, lon] = nums[..] {
+            if lat.abs() <= 90.0 && lon.abs() <= 180.0 {
+                return Some(SearchRow { name: degrees_text(lat, lon), detail: format!("Degrees \u{b7} {}", vsf::types::WorldCoord::from_lat_lon(lat, lon).to_words()), lat, lon });
+            }
+        }
+        None
+    }
+
     /// Words wrapped to a width, none cut.
     fn wrap_words(text: &mut TextRenderer, words: &str, style: &TextStyle, max_w: f32) -> Vec<String> {
         let mut lines: Vec<String> = Vec::new();
@@ -2363,6 +2383,11 @@ impl Panel {
     /// The places the host found for the latest text.
     pub fn set_found(&mut self, rows: Vec<SearchRow>) {
         self.search_pending = false;
+        // A place typed as itself goes first (Nick 2026-10-26: a world code in any case, if it checks out, is somewhere to go).
+        let mut rows = rows;
+        if let Some(row) = Self::typed_place(&self.query) {
+            rows.insert(0, row);
+        }
         if rows != self.found {
             self.found = rows;
             self.picked = None;
@@ -2864,4 +2889,18 @@ fn pen_swatch(rgba: [u8; 4]) -> u32 {
 fn swatch(c: [u8; 3]) -> u32 {
     let c = mahere_engine::colour::Display::default().swatch(c);
     (theme::dark(theme::fmt(((c[0] as u32) << 16) | ((c[1] as u32) << 8) | c[2] as u32)) & 0x00FF_FFFF) | 0xFF00_0000
+}
+
+#[cfg(test)]
+mod typed_place_tests {
+    #[test]
+    fn a_typed_world_code_or_degrees_is_a_place() {
+        let row = super::Panel::typed_place("  Holly STINKY biggest, canopy pneumatic quarterly silent ").expect("a world code");
+        assert!((row.lat - 47.445453).abs() < 1e-4 && (row.lon + 121.423522).abs() < 1e-4, "{row:?}");
+        assert!(row.detail.starts_with("World code"));
+        let row = super::Panel::typed_place("47.4455, -121.4235").expect("degrees");
+        assert!((row.lat - 47.4455).abs() < 1e-9 && (row.lon + 121.4235).abs() < 1e-9);
+        assert!(super::Panel::typed_place("holly stinky biggest canopy pneumatic quarterly loud").is_none(), "a code that does not check out");
+        assert!(super::Panel::typed_place("snow lake").is_none());
+    }
 }
