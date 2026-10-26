@@ -449,6 +449,7 @@ pub fn find_trixels(store: Arc<dyn CellStore>, dem: Arc<dyn CellStore>, from: (f
         i = states[i].3;
     }
     chain.reverse();
+    let chain = chain.iter().enumerate().map(|(k, &(t, osm))| (t, osm, if k == 0 { 0.0 } else { crow(chain[k - 1].0.lat_lon(), t.lat_lon()) })).collect();
     finish(&mut cells, &dem, travel, from, to, a, b, seconds, chain)
 }
 
@@ -467,8 +468,8 @@ enum Via {
     Corridor(u16),
     Turn,
     Hop,
-    /// To the same place a depth up or down the pyramid.
-    Level,
+    /// To the same place a depth up or down the pyramid: the trixel stood on there, and the corridor it lies in (0 at a node), whose run to the node reached is part of the way.
+    Level { at: T, cor: u16 },
 }
 
 impl T {
@@ -730,29 +731,40 @@ pub fn find_cached(store: Arc<dyn CellStore>, dem: Arc<dyn CellStore>, from: (f6
         let texel = mahere_tiles::texel_m(depth);
         let here = ll_of(&mut cells, n, &mut node_ll);
         // A depth's maze is walked within its reach of an end and outside the finer depth's: the fine maze near the ends, the major roads' between, each depth taking over where the finer one's reach ends.
-        let within = |r: f64| crow(here, start_ll) < r || crow(here, goal_ll) < r;
+        let near = |ll: (f64, f64), r: f64| crow(ll, start_ll) < r || crow(ll, goal_ll) < r;
+        let within = |r: f64| near(here, r);
         let walk = within(reach(depth)) && (depth == ROUTE_DEPTH || !within(reach(depth + 1)));
         let trixels = cell.node_trixels(n.name, w);
         // To the same place at another depth: a node there, or a point along a corridor there, whose two ends cost their way along it (the way is on every parent and child trixel of its own, the pyramid being a union).
         let level = |cells: &mut Cells, states: &mut Vec<(Node, f64, usize, Via)>, open: &mut BinaryHeap<Reverse<(u64, usize)>>, index: &mut HashMap<Node, usize>, node_ll: &mut HashMap<Node, (f64, f64)>, t: T| -> bool {
             let Some((st, c, cw)) = stand(cells, t, n.osm) else { return false };
+            // Standing in a corridor there and going on to its end is a walk at that depth: not where a finer depth holds this spot and the spot is within its reach (Nick 2026-10-26: the Snow Lake walk was drawn at depth 8, its corridors a hair cheaper than the fine maze's for having fewer cells to cross).
+            if matches!(st, Stand::Between { .. }) && t.depth < ROUTE_DEPTH && near(t.lat_lon(), reach(t.depth + 1)) {
+                let finer = t.children().iter().any(|ct| {
+                    let (ck, ci) = ct.cell();
+                    cells.get(ck).is_some_and(|cc| cc.ways_at(ci).any(|x| cc.ways[x as usize - 1].osm == n.osm))
+                });
+                if finer {
+                    return false;
+                }
+            }
             let sp = travel.speed(&c.ways[cw as usize - 1]).unwrap_or(speed);
             let tm = mahere_tiles::texel_m(t.depth);
             match st {
                 Stand::At(m) => {
                     let est = estimate(ll_of(cells, m, node_ll));
-                    push(states, open, index, m, g, i, Via::Level, est);
+                    push(states, open, index, m, g, i, Via::Level { at: t, cor: 0 }, est);
                 }
                 Stand::Between { cor, a: ma, b: mb, to_a, to_b } => {
                     let k = c.corridors[cor as usize - 1];
                     let keep = travel.keeps_one_ways();
                     if !keep || k.dir != 1 {
                         let est = estimate(ll_of(cells, ma, node_ll));
-                        push(states, open, index, ma, g + to_a * tm / sp, i, Via::Level, est);
+                        push(states, open, index, ma, g + to_a * tm / sp, i, Via::Level { at: t, cor }, est);
                     }
                     if !keep || k.dir != 2 {
                         let est = estimate(ll_of(cells, mb, node_ll));
-                        push(states, open, index, mb, g + to_b * tm / sp, i, Via::Level, est);
+                        push(states, open, index, mb, g + to_b * tm / sp, i, Via::Level { at: t, cor }, est);
                     }
                 }
             }
@@ -765,16 +777,18 @@ pub fn find_cached(store: Arc<dyn CellStore>, dem: Arc<dyn CellStore>, from: (f6
                 climbed |= level(&mut cells, &mut states, &mut open, &mut index, &mut node_ll, T::from_cell(n.key, t as usize).parent());
             }
         }
-        // Down a depth, near the goal: the fine maze for the last leg.
-        if depth < ROUTE_DEPTH && crow(here, goal_ll) < reach(depth + 1) {
+        // Down a depth, where the finer maze is this spot's (within its reach of an end): the fine maze for the first and last legs, and the depth the trip's middle belongs to.
+        let mut descended = false;
+        if depth < ROUTE_DEPTH && within(reach(depth + 1)) {
             for &t in &trixels {
                 for ct in T::from_cell(n.key, t as usize).children() {
-                    level(&mut cells, &mut states, &mut open, &mut index, &mut node_ll, ct);
+                    descended |= level(&mut cells, &mut states, &mut open, &mut index, &mut node_ll, ct);
                 }
             }
         }
-        // A node that cannot climb (no coarser cell yet, or a way not kept there) walks on at its own depth.
-        if !walk && climbed {
+        // A node that can neither climb (no coarser cell yet, a way not kept there, the coarsest depth) nor come down (no finer cell here) walks on at its own depth.
+        // Either move is enough: the coarsest depth walked on wherever it could not climb (Nick 2026-10-26, the Snow Lake walk drawn in 100 m pieces), its corridors a hair cheaper than the fine maze's for having fewer cells to cross.
+        if !walk && (climbed || descended) {
             continue;
         }
         // Along the corridors from this node.
@@ -844,7 +858,25 @@ pub fn find_cached(store: Arc<dyn CellStore>, dem: Arc<dyn CellStore>, from: (f6
             eprintln!("  depth {} cell {} node {} way {} at {:.0} s via {via:?}", n.key.depth, n.key.name(), n.name, n.osm, g);
         }
     }
-    let mut chain: Vec<(T, i64)> = Vec::new();
+    // The chain: each trixel with its way and the metres from the one before; a whole corridor's run carries the corridor's own length (the road's, from the bake) spread along it, so the route measures the road and not the staircase of trixel centres (3 percent long on a winding road).
+    let mut chain: Vec<(T, i64, f64)> = Vec::new();
+    let extend = |chain: &mut Vec<(T, i64, f64)>, run: Vec<T>, osm: i64, arc: Option<f64>| {
+        let start = chain.len();
+        let mut prev = chain.last().map(|c| c.0.lat_lon());
+        for t in run {
+            let ll = t.lat_lon();
+            chain.push((t, osm, prev.map_or(0.0, |p| crow(p, ll))));
+            prev = Some(ll);
+        }
+        if let Some(arc) = arc {
+            let sum: f64 = chain[start..].iter().map(|c| c.2).sum();
+            if sum > 0.0 {
+                for c in &mut chain[start..] {
+                    c.2 *= arc / sum;
+                }
+            }
+        }
+    };
     // From the start trixel to the first node, along its corridor.
     let first = nodes[0].0;
     if let Some((t, osm, st)) = start_stands.iter().find(|(_, osm, st)| *osm == first.osm && match st { Stand::At(n) => *n == first, Stand::Between { a, b, .. } => *a == first || *b == first }) {
@@ -852,12 +884,12 @@ pub fn find_cached(store: Arc<dyn CellStore>, dem: Arc<dyn CellStore>, from: (f6
         if let Some(cell) = cells.get(key) {
             let w = cell.ways.iter().position(|x| x.osm == *osm).map_or(0, |p| p as u16 + 1);
             match st {
-                Stand::At(_) => chain.push((*t, *osm)),
+                Stand::At(_) => extend(&mut chain, vec![*t], *osm, None),
                 Stand::Between { cor, a, b, .. } => {
                     let targets: Vec<usize> = cell.node_trixels(first.name, w).into_iter().map(|x| x as usize).collect();
                     match trace(&cell, w, *cor, ti, &targets, [a.name, b.name]) {
-                        Some((_, path)) => chain.extend(path.into_iter().map(|j| (T::from_cell(key, j), *osm))),
-                        None => chain.push((*t, *osm)),
+                        Some((_, path)) => extend(&mut chain, path.into_iter().map(|j| T::from_cell(key, j)).collect(), *osm, None),
+                        None => extend(&mut chain, vec![*t], *osm, None),
                     }
                 }
             }
@@ -874,13 +906,28 @@ pub fn find_cached(store: Arc<dyn CellStore>, dem: Arc<dyn CellStore>, from: (f6
                     let from_t = cell.node_trixels(prev.name, w);
                     let targets: Vec<usize> = cell.node_trixels(n.name, w).into_iter().map(|x| x as usize).collect();
                     let traced = from_t.iter().find_map(|&f| trace(&cell, w, cor, f as usize, &targets, [c.a, c.b]));
+                    let arc = c.len as f64 / 256.0 * mahere_tiles::texel_m(n.key.depth);
                     match traced {
-                        Some((_, path)) => chain.extend(path.into_iter().map(|j| (T::from_cell(n.key, j), n.osm))),
-                        None => chain.push((T::from_cell(n.key, n.name as usize), n.osm)),
+                        Some((_, path)) => extend(&mut chain, path.into_iter().map(|j| T::from_cell(n.key, j)).collect(), n.osm, Some(arc)),
+                        None => extend(&mut chain, vec![T::from_cell(n.key, n.name as usize)], n.osm, None),
                     }
                 }
             }
-            Via::Turn | Via::Hop | Via::Start | Via::Level => chain.push((T::from_cell(n.key, n.name as usize), n.osm)),
+            // A level move that stood in a corridor at the new depth walked that corridor to the node (Nick 2026-10-26: the line cut the switchbacks where the search climbed or came down mid-corridor): its run traced, as a corridor's is.
+            Via::Level { at, cor } if cor != 0 => {
+                let (key, ti) = at.cell();
+                let traced = cells.get(key).and_then(|cell| {
+                    let w = cell.ways.iter().position(|x| x.osm == n.osm).map_or(0, |p| p as u16 + 1);
+                    let c = cell.corridors[cor as usize - 1];
+                    let targets: Vec<usize> = cell.node_trixels(n.name, w).into_iter().map(|x| x as usize).collect();
+                    trace(&cell, w, cor, ti, &targets, [c.a, c.b]).map(|(_, path)| path)
+                });
+                match traced {
+                    Some(path) => extend(&mut chain, path.into_iter().map(|j| T::from_cell(n.key, j)).collect(), n.osm, None),
+                    None => extend(&mut chain, vec![T::from_cell(n.key, n.name as usize)], n.osm, None),
+                }
+            }
+            Via::Turn | Via::Hop | Via::Start | Via::Level { .. } => extend(&mut chain, vec![T::from_cell(n.key, n.name as usize)], n.osm, None),
         }
     }
     // From the last node to the end trixel.
@@ -895,10 +942,10 @@ pub fn find_cached(store: Arc<dyn CellStore>, dem: Arc<dyn CellStore>, from: (f6
                 let from_t = cell.node_trixels(lastn.name, w);
                 if let Some((_, mut path)) = from_t.iter().find_map(|&f| trace(&cell, w, cor, f as usize, &[ti], [c.a, c.b])) {
                     path.remove(0);
-                    chain.extend(path.into_iter().map(|j| (T::from_cell(key, j), osm)));
+                    extend(&mut chain, path.into_iter().map(|j| T::from_cell(key, j)).collect(), osm, None);
                 }
             } else if chain.last().is_none_or(|l| l.0 != t) {
-                chain.push((t, osm));
+                extend(&mut chain, vec![t], osm, None);
             }
         }
     }
@@ -909,7 +956,7 @@ pub fn find_cached(store: Arc<dyn CellStore>, dem: Arc<dyn CellStore>, from: (f6
 
 /// A route from its chain of trixels and ways: the points, the length, the steps with their turns, and for a bike or on foot the time and climb from the ground.
 #[allow(clippy::too_many_arguments)]
-fn finish(cells: &mut Cells, dem: &Arc<dyn CellStore>, travel: Travel, from: (f64, f64), to: (f64, f64), a: T, b: T, seconds: f64, chain: Vec<(T, i64)>) -> Result<Route, String> {
+fn finish(cells: &mut Cells, dem: &Arc<dyn CellStore>, travel: Travel, from: (f64, f64), to: (f64, f64), a: T, b: T, seconds: f64, chain: Vec<(T, i64, f64)>) -> Result<Route, String> {
     if chain.is_empty() {
         return Err("no route between them on the ways baked so far".into());
     }
@@ -921,13 +968,8 @@ fn finish(cells: &mut Cells, dem: &Arc<dyn CellStore>, travel: Travel, from: (f6
     let mut route = Route { travel, pts: Vec::with_capacity(chain.len()), metres: 0.0, seconds, climb_m: 0.0, steps: Vec::new() };
     route.pts.push(from);
     let mut last_way = None;
-    let mut last_pt: Option<(f64, f64)> = None;
     for (n, s) in chain.iter().enumerate() {
-        let ll = s.0.lat_lon();
-        if let Some(p) = last_pt {
-            route.metres += crow(p, ll);
-        }
-        last_pt = Some(ll);
+        route.metres += s.2;
         if last_way != Some(s.1) {
             let name = names.get(&s.1).cloned().unwrap_or_default();
             let turn = if n == 0 { "Start" } else { turn_word(&chain, n) };
@@ -964,7 +1006,7 @@ fn finish(cells: &mut Cells, dem: &Arc<dyn CellStore>, travel: Travel, from: (f6
 }
 
 /// Left, right or straight at step `n` of a chain: the turn between the heading over the thirty metres before and the thirty after.
-fn turn_word(chain: &[(T, i64)], n: usize) -> &'static str {
+fn turn_word(chain: &[(T, i64, f64)], n: usize) -> &'static str {
     let here = chain[n].0.lat_lon();
     let mut k = n;
     while k > 0 && crow(chain[k].0.lat_lon(), here) < 30.0 {
@@ -1104,6 +1146,43 @@ mod tests {
         // The cells decode slowly unoptimised (93 of them): the limit is the optimised build's.
         let limit = if cfg!(debug_assertions) { 8000 } else { 1500 };
         assert!(took.as_millis() < limit, "{took:?}");
+    }
+
+    /// A long trip's line follows the road at every depth it was found at (Nick 2026-10-26, the Snow Lake walk: the line cut the switchbacks where the search climbed or came down mid-corridor): a zigzag highway's every corner lies on the route drawn, and the length is the road's.
+    #[test]
+    fn a_long_trip_is_drawn_along_the_road() {
+        let (lat, lon) = (47.60f32, -122.33f32);
+        // 30 km east, swinging 400 m north and south every 1.5 km.
+        let (w, e) = (lon - 0.2, lon + 0.2);
+        let pts: Vec<(f32, f32)> = (0..=20).map(|k| (lat + if k % 2 == 0 { -0.0036 } else { 0.0036 }, w + (e - w) * k as f32 / 20.0)).collect();
+        let road_m: f64 = pts.windows(2).map(|p| crow((p[0].0 as f64, p[0].1 as f64), (p[1].0 as f64, p[1].1 as f64))).sum();
+        let highway = Road { class: RoadClass::Primary, pts: pts.clone(), weight: 0.5, uses: use_bits::MOTOR | use_bits::FOOT | use_bits::BIKE, name: 4, travel: Tags { way: 4, speed_kmh: 90, oneway: 0, layer: 0, ..Default::default() } };
+        let (p0, pn) = (pts[0], pts[20]);
+        // A side street south off its west end, one north off its east end.
+        let west = road(1, vec![(p0.0 - 0.003, p0.1), p0], 0, 0);
+        let east = road(2, vec![pn, (pn.0 + 0.003, pn.1)], 0, 0);
+        let store = baked(&[highway, west, east], &[p0, pn]);
+        let r = find(store.clone(), store, (p0.0 as f64 - 0.0025, p0.1 as f64), (pn.0 as f64 + 0.0025, pn.1 as f64), Travel::Car).unwrap();
+        // Metres from a point to the nearest piece of the route drawn.
+        let off = |q: (f64, f64)| -> f64 {
+            let k = q.0.to_radians().cos();
+            r.pts
+                .windows(2)
+                .map(|s| {
+                    let (ax, ay) = ((s[0].1 - q.1) * k, s[0].0 - q.0);
+                    let (bx, by) = ((s[1].1 - q.1) * k, s[1].0 - q.0);
+                    let (dx, dy) = (bx - ax, by - ay);
+                    let t = if dx * dx + dy * dy > 0.0 { (-(ax * dx + ay * dy) / (dx * dx + dy * dy)).clamp(0.0, 1.0) } else { 0.0 };
+                    ((ax + t * dx).powi(2) + (ay + t * dy).powi(2)).sqrt() * 111_320.0
+                })
+                .fold(f64::MAX, f64::min)
+        };
+        let offs: Vec<f64> = pts[1..20].iter().map(|p| off((p.0 as f64, p.1 as f64))).collect();
+        for (p, d) in pts[1..20].iter().zip(&offs) {
+            assert!(*d < 40.0, "the corner at {p:?} is {d:.0} m off the line");
+        }
+        let side_m = 2.0 * 0.003 * 111_320.0;
+        assert!((r.metres - road_m - side_m).abs() < 0.02 * road_m, "{} m drawn, {} m of road", r.metres, road_m + side_m);
     }
 
     #[test]
