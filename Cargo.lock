@@ -1601,8 +1601,6 @@ dependencies = [
 [[package]]
 name = "ihi"
 version = "0.0.48"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e820ef1c51d912e9c78a84cf71319ee3b758c66a264c96bdd2c8d6f2ab4c6969"
 dependencies = [
  "blake3",
  "i256",
@@ -1757,8 +1755,6 @@ dependencies = [
 [[package]]
 name = "kete"
 version = "0.0.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "840e2fea0ff8de23c0e7fa14d98f89d37639fa8a0ad255ff6e65d50ea9f14b4c"
 dependencies = [
  "blake3",
  "chacha20poly1305 0.11.0",
@@ -2040,8 +2036,6 @@ dependencies = [
 [[package]]
 name = "manifestus"
 version = "0.0.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a47504a3393cd7fe6f2468ab571365dc85f07c243f233acd679dd690ba787ccb"
 dependencies = [
  "blake3",
  "hashbrown 0.15.5",
@@ -3820,8 +3814,6 @@ checksum = "c7c4ceeeca15c8384bbc3e011dbd8fccb7f068a440b752b7d9b32ceb0ca0e2e8"
 [[package]]
 name = "tohu"
 version = "0.0.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3d50206f52e870b9b5303bbe1836efafcab7ee90566112531a1e9cfb659a51d7"
 dependencies = [
  "base64",
  "blake3",

@@ -1,38 +1,26 @@
-//! The cell cache on the device as plain files (Nick 2026-10-18): one file per cell and layer, as the bucket serves it, and an index document of when each was last used and its size, so the cache is purged oldest-first to a budget and an area's cells are kept whatever the budget.
-//! Cells were vault entries until 0.222; the vault opened by walking an index of every one (8 to 63 s on the phone, the map black meanwhile) and wrote each as its own durable commit. Cells are public and fetched again at will, a layer checked against the hash its base names, so a file that is torn or lost costs a download and nothing more; the vault keeps the user's own data.
-//! Layout: `<dir>/e<epoch>/<layer>/<depth>/<ancestor four levels up>/<cell>.vsf`, the bucket's ETag beside it as `<cell>.tag`, the index at `<dir>/e<epoch>/index.vsf`.
+//! The cell cache on the device, in the vault (Nick 2026-10-25: everything in the vault, which is ferros' file system and has to be fast enough to hold it). Each cell's layer is a bulk vault entry under its VSF key (the keys cells had before 0.223), its ETag beside it, and an index entry records when each was last used and its size, so the cache is purged oldest-first to a budget and an area's cells are kept whatever the budget.
+//! Cells left the vault on 2026-10-18 because it opened by walking every entry (8 to 63 s on the phone) and wrote each cell as a durable commit of its own; kete now opens lazily and writes in batches (manifestus 2026-10-25: 1.1 ms a 40 KB cell at 128 a batch, the open 30 ms at any size). The plain files they went to named cells by their bucket names, which a Mac's or Windows's file system takes letter case out of: two cells named alike but for case were one file there, each showing the other's roads and names.
+//! Writes from the loaders queue here and go to the vault a burst at a time ([`kete::FlatStorage::write_device_bulk`], kept out of kete's read cache); reads see a queued or landing write at once.
 
 use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::path::Path;
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::Duration;
 
+use kete::FlatStorage;
 use mahere_engine::residency::{CELL_EPOCH, CellCache, CellStore, Fetch};
 use mahere_tiles::CellKey;
 use mahere_tiles::publish::Layer;
 
-use crate::{decode_cell_index, encode_cell_index, et_now};
+use crate::{cell_key, cells_index_key, decode_cell_index, encode_cell_index, et_now, tag_key};
 
-/// New cells between writes of the index: a cell the index has not heard of when the app dies is a file the budget does not count until the index is made again from the files.
+/// New cells between writes of the index: a cell the index has not heard of when the app dies is one the budget does not count.
 const FLUSH_EVERY: u32 = 256;
 
-/// The device's cell files.
-pub struct CellFiles {
-    root: PathBuf,
-    index: Mutex<Index>,
-    /// Cells an area keeps on the device: never purged, and not counted against the budget.
-    pinned: Mutex<HashSet<(u8, u64)>>,
-}
+/// How long the writer lets a burst of puts gather before it writes them as one batch.
+const GATHER: Duration = Duration::from_millis(40);
 
-#[derive(Default)]
-struct Index {
-    /// (depth with the layer in its top bits, raw cell) → (last use, Eagle Time; bytes).
-    entries: HashMap<(u8, u64), (i64, u32)>,
-    /// New cells since the last write of the index.
-    unsaved: u32,
-}
-
-/// A layer's code: in the index key's depth byte (depths stop at 30) and in the vault keys of old.
+/// A layer's code: in the index key's depth byte (depths stop at 30) and in the vault keys.
 pub(crate) fn layer_code(layer: Layer) -> u8 {
     match layer {
         Layer::Base => 0,
@@ -51,40 +39,66 @@ fn layer_dir(code: u8) -> &'static str {
     }
 }
 
-/// A file written whole or not at all: beside its place under a name of its own, then renamed over it.
-fn write_whole(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    static PART: AtomicU64 = AtomicU64::new(0);
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let part = path.with_extension(format!("part{}-{}", std::process::id(), PART.fetch_add(1, Ordering::Relaxed)));
-    std::fs::write(&part, bytes)?;
-    std::fs::rename(&part, path).inspect_err(|_| {
-        let _ = std::fs::remove_file(&part);
-    })
+#[derive(Default)]
+struct Index {
+    /// (depth with the layer in its top bits, raw cell) → (last use, Eagle Time; bytes).
+    entries: HashMap<(u8, u64), (i64, u32)>,
+    /// New cells since the last write of the index.
+    unsaved: u32,
 }
 
-impl CellFiles {
-    /// The cache under `dir`, its index read; with no index (a first start, or one lost), made again from the files there.
-    pub fn open(dir: &Path) -> Arc<CellFiles> {
-        let root = files_root(dir);
-        let _ = std::fs::create_dir_all(&root);
-        take_old_files(&dir.join(format!("e{CELL_EPOCH}")), &root);
-        let mut index = Index::default();
-        match std::fs::read(root.join("index.vsf")) {
-            Ok(bytes) => index.entries = decode_cell_index(&bytes),
-            Err(_) => index.entries = scan(&root),
+/// The writes on their way to the vault: queued, and the batch being written (an Arc, so a reader looks in it without holding up the write).
+#[derive(Default)]
+struct Writes {
+    queue: Mutex<Vec<(String, Vec<u8>)>>,
+    landing: Mutex<Arc<Vec<(String, Vec<u8>)>>>,
+    wake: Condvar,
+}
+
+impl Writes {
+    /// A write queued, replacing one to the same key still queued.
+    fn push(&self, key: String, bytes: Vec<u8>) {
+        let mut q = self.queue.lock().unwrap();
+        match q.iter_mut().find(|(k, _)| *k == key) {
+            Some(e) => e.1 = bytes,
+            None => q.push((key, bytes)),
         }
-        Arc::new(CellFiles { root, index: Mutex::new(index), pinned: Mutex::new(HashSet::new()) })
+        self.wake.notify_one();
+    }
+
+    /// The newest bytes queued or landing for `key`.
+    fn find(&self, key: &str) -> Option<Vec<u8>> {
+        if let Some((_, b)) = self.queue.lock().unwrap().iter().rev().find(|(k, _)| k == key) {
+            return Some(b.clone());
+        }
+        let landing = self.landing.lock().unwrap().clone();
+        landing.iter().rev().find(|(k, _)| k == key).map(|(_, b)| b.clone())
+    }
+}
+
+/// The device's cells, in the vault.
+pub struct VaultCells {
+    vault: Arc<FlatStorage>,
+    index: Mutex<Index>,
+    /// Cells an area keeps on the device: never purged, and not counted against the budget.
+    pinned: Mutex<HashSet<(u8, u64)>>,
+    writes: Arc<Writes>,
+}
+
+impl VaultCells {
+    /// The cell cache in `vault`, its index read, its writer started.
+    pub fn open(vault: Arc<FlatStorage>) -> Arc<VaultCells> {
+        let entries = vault.read_device(&cells_index_key()).ok().flatten().map(|b| decode_cell_index(&b)).unwrap_or_default();
+        let writes = Arc::new(Writes::default());
+        let (w, v) = (writes.clone(), vault.clone());
+        if let Err(e) = std::thread::Builder::new().name("cells into the vault".into()).spawn(move || writer(&v, &w)) {
+            eprintln!("cells: the vault's writer did not start ({e}), cells are not kept");
+        }
+        Arc::new(VaultCells { vault, index: Mutex::new(Index { entries, unsaved: 0 }), pinned: Mutex::new(HashSet::new()), writes })
     }
 
     fn ix(key: CellKey, code: u8) -> (u8, u64) {
         (key.depth | code << 6, key.raw())
-    }
-
-    fn path(&self, key: CellKey, code: u8) -> PathBuf {
-        let group = key.ancestor(key.depth.saturating_sub(4));
-        self.root.join(layer_dir(code)).join(format!("{:02}", key.depth)).join(group.file_name()).join(format!("{}.vsf", key.file_name()))
     }
 
     fn touch(&self, key: CellKey, code: u8, bytes: usize, seen: i64) {
@@ -98,7 +112,7 @@ impl CellFiles {
         }
     }
 
-    /// Write the index document.
+    /// Write the index (queued with the cells).
     pub fn flush(&self) {
         let bytes = {
             let mut ix = self.index.lock().unwrap();
@@ -106,49 +120,46 @@ impl CellFiles {
             encode_cell_index(&ix.entries)
         };
         if let Some(b) = bytes {
-            if let Err(e) = write_whole(&self.root.join("index.vsf"), &b) {
-                eprintln!("cells: index not written: {e}");
-            }
+            self.writes.push(cells_index_key(), b);
         }
     }
 
     fn get_layer(&self, key: CellKey, code: u8) -> Fetch {
-        match std::fs::read(self.path(key, code)) {
-            Ok(b) => {
+        let k = cell_key(key, code);
+        if let Some(b) = self.writes.find(&k) {
+            return Fetch::Bytes(b);
+        }
+        match self.vault.read_device_bulk(&k) {
+            Ok(Some(b)) => {
                 self.touch(key, code, b.len(), et_now());
                 Fetch::Bytes(b)
             }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Fetch::Absent,
-            Err(e) => Fetch::Failed(e.to_string()),
+            Ok(None) => Fetch::Absent,
+            Err(e) => Fetch::Failed(format!("{e:?}")),
         }
     }
 
-    fn put_layer(&self, key: CellKey, code: u8, bytes: &[u8], seen: i64) {
-        match write_whole(&self.path(key, code), bytes) {
-            Ok(()) => self.touch(key, code, bytes.len(), seen),
-            Err(e) => eprintln!("cells: {} {} not kept: {e}", key.name(), layer_dir(code)),
-        }
+    fn put_layer(&self, key: CellKey, code: u8, bytes: &[u8]) {
+        self.writes.push(cell_key(key, code), bytes.to_vec());
+        self.touch(key, code, bytes.len(), et_now());
     }
 
     fn tag_of(&self, key: CellKey, code: u8) -> Option<String> {
-        std::fs::read_to_string(self.path(key, code).with_extension("tag")).ok()
+        let k = tag_key(key, code);
+        let b = match self.writes.find(&k) {
+            Some(b) => b,
+            None => self.vault.read_device_bulk(&k).ok()??,
+        };
+        String::from_utf8(b).ok()
     }
 
     fn set_tag_of(&self, key: CellKey, code: u8, tag: &str) {
-        let _ = write_whole(&self.path(key, code).with_extension("tag"), tag.as_bytes());
+        self.writes.push(tag_key(key, code), tag.as_bytes().to_vec());
     }
 
     /// Whether a cell's layer is kept here.
-    pub(crate) fn has(&self, key: CellKey, code: u8) -> bool {
-        self.path(key, code).is_file()
-    }
-
-    /// A cell brought in from elsewhere (the vault of old), with when it was last used there.
-    pub(crate) fn adopt(&self, key: CellKey, code: u8, bytes: &[u8], tag: Option<&str>, seen: i64) {
-        self.put_layer(key, code, bytes, seen);
-        if let Some(t) = tag {
-            self.set_tag_of(key, code, t);
-        }
+    pub fn has(&self, key: CellKey, code: u8) -> bool {
+        self.index.lock().unwrap().entries.contains_key(&Self::ix(key, code))
     }
 
     /// Bytes of cells the index knows about, the pinned ones included.
@@ -167,7 +178,7 @@ impl CellFiles {
         *self.pinned.lock().unwrap() = keys.into_iter().map(|k| (k.depth, k.raw())).collect();
     }
 
-    /// Delete the least recently used unpinned cells until they fit `budget` bytes; returns how many went. The pinned cells stay whatever the budget.
+    /// Delete the least recently used unpinned cells until they fit `budget` bytes, one vault batch for the lot; returns how many went. The pinned cells stay whatever the budget.
     pub fn purge_to(&self, budget: u64) -> usize {
         let victims: Vec<(u8, u64)> = {
             let ix = self.index.lock().unwrap();
@@ -192,115 +203,147 @@ impl CellFiles {
             }
             out
         };
+        if victims.is_empty() {
+            return 0;
+        }
+        let mut gone = Vec::with_capacity(victims.len() * 2);
         for &(packed, raw) in &victims {
             let (depth, code) = (packed & 63, packed >> 6);
             let key = CellKey { depth, prefix: raw >> (60 - 2 * depth as u32) };
-            let path = self.path(key, code);
-            let _ = std::fs::remove_file(&path);
-            let _ = std::fs::remove_file(path.with_extension("tag"));
-            self.index.lock().unwrap().entries.remove(&(packed, raw));
+            gone.push(cell_key(key, code));
+            gone.push(tag_key(key, code));
         }
-        if !victims.is_empty() {
-            self.flush();
+        if let Err(e) = self.vault.delete_device_batch(&gone) {
+            eprintln!("cells: the purge's deletes failed, kept for the next: {e:?}");
+            return 0;
         }
+        {
+            let mut ix = self.index.lock().unwrap();
+            for k in &victims {
+                ix.entries.remove(k);
+            }
+        }
+        self.flush();
         victims.len()
     }
 
-    /// One of a published cell's layers as a cache of its own over the same files, index and pins.
-    pub fn layer(self: &Arc<Self>, layer: Layer) -> Arc<CellFileLayer> {
-        Arc::new(CellFileLayer { cells: self.clone(), code: layer_code(layer) })
+    /// One of a published cell's layers as a cache of its own over the same vault, index and pins.
+    pub fn layer(self: &Arc<Self>, layer: Layer) -> Arc<VaultCellLayer> {
+        Arc::new(VaultCellLayer { cells: self.clone(), code: layer_code(layer) })
     }
-}
 
-/// The index made again from the files themselves, each dated now: a first start finds nothing, one whose index was lost keeps what it had.
-/// The cell files under a cache directory: named by [`CellKey::file_name`], which no file system confuses.
-fn files_root(dir: &Path) -> PathBuf {
-    dir.join(format!("e{CELL_EPOCH}-hex"))
-}
-
-/// The cells kept under their bucket names (before 2026-10-25), taken into `root` once: renamed where the file system tells letter case apart (Linux, Android), so nothing is fetched again and the areas' cells stay; dropped on a Mac or Windows, where two cells named alike but for case had shared one file and no copy there can be trusted. The index goes along: it is keyed by the cells, not their names.
-fn take_old_files(old: &Path, root: &Path) {
-    if !old.is_dir() {
-        return;
-    }
-    if cfg!(any(target_os = "macos", target_os = "windows")) {
-        eprintln!("cells: the cache kept under case-blind names is dropped and fetched again as it is needed");
-        // Away from the path first, so a large cache is deleted beside the start and never taken for the old layout again.
-        let gone = old.with_extension("dropped");
-        if std::fs::rename(old, &gone).is_ok() {
-            std::thread::spawn(move || {
-                let _ = std::fs::remove_dir_all(&gone);
-            });
+    /// The cells a Mahere from 2026-10-18 to 2026-10-25 kept as plain files under `dir`, moved into the vault on a thread of their own, the files deleted as they go: nothing fetched again, the areas' cells kept. The tree named by bucket names (`e<epoch>`) is dropped instead on a Mac or Windows, where two cells named alike but for case had shared one file and no copy there can be trusted. Stopped part way, the next start goes on with what is left.
+    pub fn take_files(self: &Arc<Self>, dir: &Path) {
+        let roots: Vec<(std::path::PathBuf, bool)> = [(dir.join(format!("e{CELL_EPOCH}-hex")), true), (dir.join(format!("e{CELL_EPOCH}")), false)].into_iter().filter(|(p, _)| p.is_dir()).collect();
+        let dropped = dir.join(format!("e{CELL_EPOCH}.dropped"));
+        if roots.is_empty() && !dropped.is_dir() {
+            return;
         }
-        return;
+        let cells = self.clone();
+        let spawned = std::thread::Builder::new().name("cell files into the vault".into()).spawn(move || {
+            let _ = std::fs::remove_dir_all(&dropped);
+            for (root, hex) in roots {
+                if !hex && cfg!(any(target_os = "macos", target_os = "windows")) {
+                    eprintln!("cells: the files kept under case-blind names are dropped and fetched again as they are needed");
+                    let _ = std::fs::remove_dir_all(&root);
+                    continue;
+                }
+                cells.take_tree(&root, hex);
+            }
+        });
+        if let Err(e) = spawned {
+            eprintln!("cells: the move of the cell files did not start: {e}");
+        }
     }
-    let mut moved = 0usize;
-    for code in 0..4u8 {
-        let Ok(depths) = std::fs::read_dir(old.join(layer_dir(code))) else { continue };
-        for d in depths.flatten() {
-            let Ok(groups) = std::fs::read_dir(d.path()) else { continue };
-            for g in groups.flatten() {
-                let Ok(files) = std::fs::read_dir(g.path()) else { continue };
-                for f in files.flatten() {
-                    let name = f.file_name();
-                    let Some(name) = name.to_str() else { continue };
-                    // The cell's file and its tag beside it.
-                    let Some((stem, ext)) = name.split_once('.') else { continue };
-                    if ext != "vsf" && ext != "tag" {
-                        continue;
-                    }
-                    let Some(key) = CellKey::from_name(stem) else { continue };
-                    let group = key.ancestor(key.depth.saturating_sub(4));
-                    let dir = root.join(layer_dir(code)).join(format!("{:02}", key.depth)).join(group.file_name());
-                    if std::fs::create_dir_all(&dir).is_ok() && std::fs::rename(f.path(), dir.join(format!("{}.{ext}", key.file_name()))).is_ok() {
-                        moved += 1;
+
+    /// [`Self::take_files`] for one tree: its files read a few dozen at a time, written to the vault as one batch, then deleted.
+    fn take_tree(&self, root: &Path, hex: bool) {
+        let t = std::time::Instant::now();
+        let mut files: Vec<(CellKey, u8, std::path::PathBuf)> = Vec::new();
+        for code in 0..4u8 {
+            let Ok(depths) = std::fs::read_dir(root.join(layer_dir(code))) else { continue };
+            for d in depths.flatten() {
+                let Ok(groups) = std::fs::read_dir(d.path()) else { continue };
+                for g in groups.flatten() {
+                    let Ok(entries) = std::fs::read_dir(g.path()) else { continue };
+                    for f in entries.flatten() {
+                        let name = f.file_name();
+                        let Some(stem) = name.to_str().and_then(|n| n.strip_suffix(".vsf")) else { continue };
+                        let key = if hex { CellKey::from_file_name(stem) } else { CellKey::from_name(stem) };
+                        if let Some(key) = key {
+                            files.push((key, code, f.path()));
+                        }
                     }
                 }
             }
         }
-    }
-    let _ = std::fs::rename(old.join("index.vsf"), root.join("index.vsf"));
-    let _ = std::fs::remove_dir_all(old);
-    eprintln!("cells: {moved} files renamed to case-free names");
-}
-
-fn scan(root: &Path) -> HashMap<(u8, u64), (i64, u32)> {
-    let mut out = HashMap::new();
-    let now = et_now();
-    for code in 0..4u8 {
-        let Ok(depths) = std::fs::read_dir(root.join(layer_dir(code))) else { continue };
-        for d in depths.flatten() {
-            let Ok(groups) = std::fs::read_dir(d.path()) else { continue };
-            for g in groups.flatten() {
-                let Ok(files) = std::fs::read_dir(g.path()) else { continue };
-                for f in files.flatten() {
-                    let name = f.file_name();
-                    let Some(name) = name.to_str().and_then(|n| n.strip_suffix(".vsf")) else { continue };
-                    if let (Some(key), Ok(meta)) = (CellKey::from_file_name(name), f.metadata()) {
-                        out.insert(CellFiles::ix(key, code), (now, meta.len() as u32));
-                    }
+        let mut moved = 0usize;
+        for chunk in files.chunks(32) {
+            let mut batch: Vec<(String, Vec<u8>)> = Vec::with_capacity(chunk.len() * 2);
+            let mut sizes = Vec::with_capacity(chunk.len());
+            for (key, code, path) in chunk {
+                let Ok(bytes) = std::fs::read(path) else { continue };
+                sizes.push((*key, *code, bytes.len()));
+                batch.push((cell_key(*key, *code), bytes));
+                if let Ok(tag) = std::fs::read(path.with_extension("tag")) {
+                    batch.push((tag_key(*key, *code), tag));
                 }
             }
+            if let Err(e) = self.vault.write_device_bulk(&batch) {
+                eprintln!("cells: the move of the cell files stopped ({e:?}), the next start goes on");
+                self.flush();
+                return;
+            }
+            let now = et_now();
+            for (key, code, len) in sizes {
+                self.touch(key, code, len, now);
+            }
+            for (_, _, path) in chunk {
+                let _ = std::fs::remove_file(path);
+                let _ = std::fs::remove_file(path.with_extension("tag"));
+            }
+            moved += chunk.len();
         }
+        self.flush();
+        let _ = std::fs::remove_dir_all(root);
+        eprintln!("cells: {moved} cell files moved into the vault in {:.1} s", t.elapsed().as_secs_f32());
     }
-    out
 }
 
-/// A published cell's layer (the base, terrain, imagery or infrared) in the files.
-pub struct CellFileLayer {
-    cells: Arc<CellFiles>,
+/// The writer: a burst of queued writes gathered, then written as one vault batch, while reads find them in `landing`.
+fn writer(vault: &FlatStorage, writes: &Writes) {
+    loop {
+        {
+            let mut q = writes.queue.lock().unwrap();
+            while q.is_empty() {
+                q = writes.wake.wait(q).unwrap();
+            }
+        }
+        std::thread::sleep(GATHER);
+        let batch = Arc::new(std::mem::take(&mut *writes.queue.lock().unwrap()));
+        *writes.landing.lock().unwrap() = batch.clone();
+        if let Err(e) = vault.write_device_bulk(&batch) {
+            eprintln!("cells: {} writes to the vault failed, fetched again when wanted: {e:?}", batch.len());
+        }
+        *writes.landing.lock().unwrap() = Arc::new(Vec::new());
+    }
+}
+
+/// A published cell's layer (the base, terrain, imagery or infrared) in the vault.
+pub struct VaultCellLayer {
+    cells: Arc<VaultCells>,
     code: u8,
 }
 
-impl CellStore for CellFiles {
+impl CellStore for VaultCells {
     fn get(&self, key: CellKey) -> Fetch {
         self.get_layer(key, 0)
     }
 }
 
-impl CellCache for CellFiles {
+impl CellCache for VaultCells {
     fn put(&self, key: CellKey, bytes: &[u8]) {
-        self.put_layer(key, 0, bytes, et_now());
+        self.put_layer(key, 0, bytes);
     }
 
     fn tag(&self, key: CellKey) -> Option<String> {
@@ -312,15 +355,15 @@ impl CellCache for CellFiles {
     }
 }
 
-impl CellStore for CellFileLayer {
+impl CellStore for VaultCellLayer {
     fn get(&self, key: CellKey) -> Fetch {
         self.cells.get_layer(key, self.code)
     }
 }
 
-impl CellCache for CellFileLayer {
+impl CellCache for VaultCellLayer {
     fn put(&self, key: CellKey, bytes: &[u8]) {
-        self.cells.put_layer(key, self.code, bytes, et_now());
+        self.cells.put_layer(key, self.code, bytes);
     }
 
     fn tag(&self, key: CellKey) -> Option<String> {
@@ -329,88 +372,5 @@ impl CellCache for CellFileLayer {
 
     fn set_tag(&self, key: CellKey, tag: &str) {
         self.cells.set_tag_of(key, self.code, tag);
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn scratch(name: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("mahere-cells-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&d);
-        d
-    }
-
-    /// A cell and its layers are kept, read back, tagged, counted, and found again by a cache opened over the same files, with or without its index.
-    #[test]
-    fn cells_survive_a_reopen_and_a_lost_index() {
-        let dir = scratch("reopen");
-        let key = CellKey { depth: 14, prefix: 12345 };
-        {
-            let c = CellFiles::open(&dir);
-            c.put(key, b"base");
-            c.layer(Layer::Dem).put(key, b"terrain!");
-            c.layer(Layer::Dem).set_tag(key, "\"etag\"");
-            assert!(matches!(c.get(key), Fetch::Bytes(b) if b == b"base"));
-            assert!(matches!(c.layer(Layer::Img).get(key), Fetch::Absent));
-            assert_eq!(c.layer(Layer::Dem).tag(key).as_deref(), Some("\"etag\""));
-            assert_eq!(c.cached_bytes(), 12);
-            c.flush();
-        }
-        let c = CellFiles::open(&dir);
-        assert_eq!(c.cached_bytes(), 12, "the index read back");
-        assert!(matches!(c.layer(Layer::Dem).get(key), Fetch::Bytes(b) if b == b"terrain!"));
-        drop(c);
-        std::fs::remove_file(files_root(&dir).join("index.vsf")).unwrap();
-        let c = CellFiles::open(&dir);
-        assert_eq!(c.cached_bytes(), 12, "the index made again from the files");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// Cells kept under their bucket names are found under the case-free ones after an open, their index with them; two names alike but for case are two files.
-    #[test]
-    fn old_names_are_taken_in() {
-        let dir = scratch("names");
-        let (a, b) = (CellKey { depth: 14, prefix: 0x0aa5 }, CellKey { depth: 14, prefix: 0x0aa5 + 1 });
-        let old = dir.join(format!("e{CELL_EPOCH}"));
-        for (key, bytes) in [(a, b"a".as_slice()), (b, b"bb")] {
-            let group = key.ancestor(key.depth - 4);
-            let d = old.join("base").join("14").join(group.name());
-            std::fs::create_dir_all(&d).unwrap();
-            std::fs::write(d.join(format!("{}.vsf", key.name())), bytes).unwrap();
-        }
-        let c = CellFiles::open(&dir);
-        if cfg!(any(target_os = "macos", target_os = "windows")) {
-            assert!(matches!(c.get(a), Fetch::Absent), "a case-blind file system's old cache is dropped");
-        } else {
-            assert!(matches!(c.get(a), Fetch::Bytes(x) if x == b"a"));
-            assert!(matches!(c.get(b), Fetch::Bytes(x) if x == b"bb"));
-            assert_eq!(c.cached_bytes(), 3, "the index made from the renamed files");
-        }
-        assert!(!old.exists());
-        for k in [a, b] {
-            assert_eq!(CellKey::from_file_name(&k.file_name()), Some(k));
-            assert_eq!(k.file_name(), k.file_name().to_lowercase());
-        }
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// The purge takes the oldest unpinned cells, imagery before terrain before bases, and never a pinned one.
-    #[test]
-    fn the_purge_keeps_pins_and_bases_longest() {
-        let dir = scratch("purge");
-        let c = CellFiles::open(&dir);
-        let (a, b, p) = (CellKey { depth: 12, prefix: 1 }, CellKey { depth: 12, prefix: 2 }, CellKey { depth: 12, prefix: 3 });
-        c.put(a, &[0; 100]);
-        c.layer(Layer::Img).put(b, &[0; 100]);
-        c.put(p, &[0; 100]);
-        c.set_pinned([p]);
-        assert_eq!(c.purge_to(100), 1);
-        assert!(matches!(c.layer(Layer::Img).get(b), Fetch::Absent), "the imagery went first");
-        assert!(matches!(c.get(a), Fetch::Bytes(_)));
-        assert_eq!(c.purge_to(0), 1);
-        assert!(matches!(c.get(p), Fetch::Bytes(_)), "a pinned cell stays whatever the budget");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }

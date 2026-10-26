@@ -58,7 +58,7 @@ pub struct AndroidApp {
     centered_once: bool,
     store: Option<std::sync::Arc<mahere_store::FlatStorage>>,
     /// The dated cell cache, flushed at the pause moment.
-    cells_cache: Option<std::sync::Arc<mahere_store::CellFiles>>,
+    cells_cache: Option<std::sync::Arc<mahere_store::VaultCells>>,
     recorder: Option<std::sync::Arc<std::sync::Mutex<mahere_store::TrackRecorder>>>,
     /// Recording a track (Nick 2026-10-13): fixes go to the recorder only while this is on, and the activity runs the track service, which owns the GPS meanwhile.
     recording: bool,
@@ -692,28 +692,12 @@ pub extern "system" fn Java_nz_mahere_app_MahereActivity_nativeInit(
     // The vault: session, tracks, and the on-device cell cache (kete).
     let store = mahere_store::open(Some(&dir)).ok();
     lap("vault open");
-    // What the vault holds, for its open time: entries and the blocks they pin.
-    if let Some(st) = store.as_ref().and_then(|s| s.vault_stats().ok()) {
-        eprintln!("vault: {} entries in {} blocks of {} bytes, generation {}", st.live_entries, st.live_blocks, st.block_bytes, st.generation);
-        // A vault far past the user's own data: what is in it, by kind, from a thread of its own.
-        if st.live_entries > 1000 {
-            let v = store.clone().unwrap();
-            let _ = std::thread::Builder::new().name("vault census".into()).spawn(move || match mahere_store::vault_census(&v) {
-                Ok(kinds) => {
-                    for (kind, n, bytes) in kinds {
-                        eprintln!("vault census: {n} {kind} ({} KB)", bytes / 1024);
-                    }
-                }
-                Err(e) => eprintln!("vault census failed: {e:?}"),
-            });
-        }
-    }
-    // Cells stream from the bucket through the cell files; `cells-local` (pushed by hand) overrides for offline development.
+    // Cells stream from the bucket through the vault; `cells-local` (pushed by hand) overrides for offline development.
     let local = std::path::PathBuf::from(format!("{dir}/cells-local"));
-    // The cells as files beside the vault (2026-10-18); those an older Mahere kept in the vault move out on a thread of their own.
-    let (cell_store, layer_stores, cells_cache) = mahere_store::cell_stores(local.is_dir().then_some(local.as_path()), Some(&mahere_store::cells_dir(Some(&dir))));
-    if let (Some(v), Some(c)) = (&store, &cells_cache) {
-        mahere_store::migrate_vault_cells(v.clone(), c.clone());
+    let (cell_store, layer_stores, cells_cache) = mahere_store::cell_stores(local.is_dir().then_some(local.as_path()), store.clone());
+    // The plain cell files of 2026-10-18 to 2026-10-25 move into the vault on a thread of their own.
+    if let Some(c) = &cells_cache {
+        c.take_files(&mahere_store::cells_dir(Some(&dir)));
     }
     lap("cell stores");
     let session = store.as_ref().and_then(|s| mahere_store::load_session(s));

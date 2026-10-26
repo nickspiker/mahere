@@ -35,7 +35,7 @@ struct MahereApp {
     /// The UI scale kept from the last launch, handed to fluor once; the scale last kept.
     zoom_restore: Option<f32>,
     kept_ru: f32,
-    cells: Option<std::sync::Arc<mahere_store::CellFiles>>,
+    cells: Option<std::sync::Arc<mahere_store::VaultCells>>,
     last_save: Instant,
     panel: Panel,
     /// The map's lettering, and when the camera last moved: labels are laid out once it has rested a quarter second, and hidden while it moves.
@@ -862,17 +862,17 @@ fn main() {
         return;
     }
     let vault = mahere_store::open(None).ok();
-    // A local bake (argv[1], or data/cells) serves directly; otherwise cells come from the bucket through the cell files, like the phone.
+    // A local bake (argv[1], or data/cells) serves directly; otherwise cells come from the bucket through the vault, like the phone.
     let local = std::env::args().nth(1).map(std::path::PathBuf::from).unwrap_or_else(|| "data/cells".into());
     if local.is_dir() {
         eprintln!("cells: {}", local.display());
     } else {
-        eprintln!("cells: {} (kept in {})", DEFAULT_CELLS_URL, mahere_store::cells_dir(None).display());
+        eprintln!("cells: {} (kept in the vault)", DEFAULT_CELLS_URL);
     }
-    let (store, layer_stores, cells) = mahere_store::cell_stores(local.is_dir().then_some(local.as_path()), Some(&mahere_store::cells_dir(None)));
-    // Cells an older Mahere kept in the vault move into the files on a thread of their own.
-    if let (Some(v), Some(c)) = (&vault, &cells) {
-        mahere_store::migrate_vault_cells(v.clone(), c.clone());
+    let (store, layer_stores, cells) = mahere_store::cell_stores(local.is_dir().then_some(local.as_path()), vault.clone());
+    // The plain cell files a Mahere of 2026-10-18 to 2026-10-25 kept move into the vault on a thread of their own.
+    if let Some(c) = &cells {
+        c.take_files(&mahere_store::cells_dir(None));
     }
     let mut session = vault.as_ref().and_then(|s| mahere_store::load_session(s));
     // MAHERE_AT=lat,lon,ppd[,bearing°]: open there instead of the saved view (a place to look at again, a report to reproduce).
