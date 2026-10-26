@@ -55,14 +55,14 @@ pub struct Row {
     pub build: u64,
     /// The version, major, minor and patch (Nick 2026-10-15: Photon's numbering): a release is x.y.0, a dev build carries its patch. [0, 0, 0] for a row from before.
     pub version: [u64; 3],
-    /// What a person reads, "0.216.0+457980b".
+    /// What a person reads, "0.2.7".
     pub name: String,
     pub url: String,
     pub hash: [u8; 32],
     pub size: u64,
 }
 
-/// A version from its text, "0.216.1" or "0.216.1+457980b".
+/// A version from its text, "0.2.7" (or "0.216.1+457980b", as builds before 2026-10-26 were named).
 pub fn parse_version(s: &str) -> Option<[u64; 3]> {
     let core = s.split('+').next()?;
     let mut it = core.split('.').map(|p| p.parse::<u64>().ok());
@@ -80,7 +80,7 @@ pub fn our_build() -> u64 {
     option_env!("MAHERE_VERSION_CODE").and_then(|s| s.parse().ok()).unwrap_or(0)
 }
 
-/// This build's name, "0.178+457980b", or "local" for a build no script stamped.
+/// This build's name, "0.2.7", or "local" for a build no script stamped.
 pub fn our_name() -> &'static str {
     option_env!("MAHERE_VERSION_NAME").unwrap_or("local")
 }

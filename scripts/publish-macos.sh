@@ -1,5 +1,5 @@
 #!/bin/sh
-# A dev build for macOS (Apple Silicon): the signed binary under its version and the dev manifest's macOS row; the tree then moves to the next patch. A release is release.sh's (Nick 2026-10-25: a dev build for the Mac).
+# A dev build for macOS (Apple Silicon): the signed binary under its version and the dev manifest's macOS row; the patch moves on at the next publish after a change. A release is release.sh's (Nick 2026-10-25: a dev build for the Mac).
 . "$(dirname "$0")/lib-publish.sh"
 begin_dev
 build_macos

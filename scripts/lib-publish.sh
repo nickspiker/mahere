@@ -42,9 +42,9 @@ begin_dev() {
     fi
 }
 
-# end_dev: the dev build published, the tree moved to the next patch, so a local build never wears a published version.
+# end_dev: nothing since the tag (begin_dev moves the patch at the next publish after a change); kept so the platform scripts read the same.
 end_dev() {
-    set_version "$MAJOR.$MINOR.$((PATCH + 1))" "Version $MAJOR.$MINOR.$((PATCH + 1)), after dev $MAJOR.$MINOR.$PATCH was published"
+    :
 }
 
 BASE=https://brobdingnagian.holdmyoscilloscope.com/mahere

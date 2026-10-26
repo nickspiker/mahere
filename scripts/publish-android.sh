@@ -1,5 +1,5 @@
 #!/bin/sh
-# A dev build for Android: the APK under its version, the dev manifest's Android row, and mahere-dev.apk; the tree then moves to the next patch. A release is release.sh's.
+# A dev build for Android: the APK under its version, the dev manifest's Android row, and mahere-dev.apk; the patch moves on at the next publish after a change. A release is release.sh's.
 . "$(dirname "$0")/lib-publish.sh"
 begin_dev
 build_android
