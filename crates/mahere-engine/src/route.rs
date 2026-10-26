@@ -1101,7 +1101,9 @@ mod tests {
         assert_eq!(named, ["East Road", "The Highway", "North Road"], "{:?}", r.steps);
         // The middle is measured on the coarse grid, a staircase along the highway: within a tenth.
         assert!((r.metres - 29_000.0).abs() < 2900.0, "{} m", r.metres);
-        assert!(took.as_millis() < 1500, "{took:?}");
+        // The cells decode slowly unoptimised (93 of them): the limit is the optimised build's.
+        let limit = if cfg!(debug_assertions) { 8000 } else { 1500 };
+        assert!(took.as_millis() < limit, "{took:?}");
     }
 
     #[test]

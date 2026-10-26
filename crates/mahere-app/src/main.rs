@@ -708,8 +708,8 @@ impl FluorApp for MahereApp {
                 if event.state != ElementState::Pressed {
                     return EventResponse::Pass;
                 }
-                // The search card up: the keys type into it (Escape still steps back, and closes it).
-                if self.searching && !self.panel.is_open() {
+                // The search page up: the keys type into it (Escape still steps back, and closes it).
+                if self.searching {
                     use fluor::event::{Key, NamedKey};
                     let handled = match &event.logical_key {
                         Key::Named(NamedKey::Backspace) => {
@@ -837,6 +837,13 @@ impl FluorApp for MahereApp {
     fn tick(&mut self, ctx: &mut Context) -> bool {
         {
             let (w, h) = Self::dims(ctx);
+            // The search is on while its page is: closing the panel any way ends it.
+            if self.searching != self.panel.is_searching() {
+                let (mut ctl, mask) = (self.controls(), self.map.layers());
+                ctl.search = self.panel.is_searching();
+                self.apply_controls(ctl, mask);
+                ctx.window.request_redraw();
+            }
             if let Some(q) = self.panel.take_query() {
                 self.start_search(q, w, h);
             }

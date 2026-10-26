@@ -727,6 +727,12 @@ impl FluorApp for AndroidApp {
     }
 
     fn tick(&mut self, _ctx: &mut Context) -> bool {
+        // The search is on while its page is: closing the panel any way ends it (and takes the keyboard down).
+        if self.searching != self.panel.is_searching() {
+            let (mut ctl, mask) = (self.controls(), self.map.layers());
+            ctl.search = self.panel.is_searching();
+            self.apply_controls(ctl, mask);
+        }
         if let Some(q) = self.panel.take_query() {
             self.start_search(q);
         }
@@ -734,7 +740,7 @@ impl FluorApp for AndroidApp {
         self.map.tick(self.w, self.h) || found || self.search_rx.is_some()
     }
 
-    /// The keyboard up while the search card is, down when it goes (fluor's one-shot ask, read after every touch and every frame).
+    /// The keyboard up while the search page is, down when it goes (fluor's one-shot ask, read after every touch and every frame).
     fn wants_keyboard(&mut self) -> Option<bool> {
         if self.searching == self.keyboard_up {
             return None;
@@ -1172,14 +1178,6 @@ pub extern "system" fn Java_nz_mahere_app_MahereActivity_nativeBack(_env: JNIEnv
         return 0;
     }
     let app = shell(ptr).app();
-    // Back closes the search (the keyboard with it).
-    if app.searching && !app.panel.is_open() {
-        let mut ctl = app.controls();
-        ctl.search = false;
-        let mask = app.map.layers();
-        app.apply_controls(ctl, mask);
-        return 1;
-    }
     if app.panel.back() {
         app.save_settings();
         return 1;

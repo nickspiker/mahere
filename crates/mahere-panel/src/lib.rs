@@ -9,7 +9,7 @@ use fluor::canvas::{Canvas, Damage};
 use fluor::paint::{self, HitId, HIT_NONE};
 use fluor::text::{TextRenderer, TextStyle};
 use fluor::theme;
-use fluor::widgets::{Checkbox, Slider};
+use fluor::widgets::{Checkbox, Slider, Textbox};
 pub use mahere_engine::areas::{AREA_MAX_DEPTH, AREA_MIN_DEPTH, AreaView, AreasView};
 
 /// The app's name as shown beside the orb and as the window's title.
@@ -487,6 +487,8 @@ enum Page {
     /// The saved areas, and one of them.
     Areas,
     Area(usize),
+    /// Search (Nick 2026-10-26: a page of its own, the field up top, the places found below).
+    Search,
     /// Updates: this build, the release and dev channels' builds, automatic updates.
     Updates,
 }
@@ -659,8 +661,9 @@ pub struct Panel {
     tool_btn: Option<(f32, f32, f32, f32)>,
     toolbox_open: bool,
     tool_rows: Vec<((f32, f32, f32, f32), Pick)>,
-    /// Search (Nick 2026-10-25): what is typed, whether the host has the latest, the places found (and whether the latest typing has been searched), the one picked, and what to do with it.
+    /// Search (Nick 2026-10-25): what is typed, whether the host has the latest, the places found (and whether the latest typing has been searched), the one picked, and what to do with it. The field is a fluor textbox on the search page.
     query: String,
+    search_box: Option<Textbox>,
     query_dirty: bool,
     search_pending: bool,
     found: Vec<SearchRow>,
@@ -676,11 +679,9 @@ pub struct Panel {
     card_top: Option<f32>,
 }
 
-/// The search card as painted: its height, close button, field and the rects that take taps.
+/// The search page as painted: its field and the rects that take taps.
 #[derive(Default)]
 struct SearchCard {
-    band: f32,
-    close: (f32, f32, f32),
     field: (f32, f32, f32, f32),
     rows: Vec<((f32, f32, f32, f32), usize)>,
     acts: Vec<((f32, f32, f32, f32), u8)>,
@@ -709,7 +710,6 @@ pub enum SearchAct {
 const ROUTE_LINES: usize = 8;
 
 /// Places the search card lists.
-const SEARCH_ROWS: usize = 6;
 
 impl Default for Panel {
     fn default() -> Self {
@@ -733,7 +733,7 @@ impl Panel {
         let checks = LAYERS.iter().map(|&(l, label)| (l, Checkbox::new(&mut hits, label, 0.0, 0.0, 10.0, 10.0, 10.0, false))).collect();
         let interval = Slider::new(&mut hits, 0.0, 0.0, 10.0, 10.0, 0.0);
         let text_slider = Slider::new(&mut hits, 0.0, 0.0, 10.0, 10.0, text_pos(1.0));
-        Panel { fonts: None, font_cursor: Default::default(), open: false, dirty: true, ru: 1.0, stack: vec![Page::Layers], theme_rows: Vec::new(), edit_rows: Vec::new(), edit_scroll: 0.0, edit_extent: 0.0, press: None, sliders: Vec::new(), field_vals: [0.0; 4], held: None, edits: Vec::new(), hits, shown: vec![true; LAYERS.len()], group_open: GROUPS_OPEN, group_rows: Vec::new(), tree: Vec::new(), layer_open: None, field_open: None, theme_now: None, interval, interval_held: false, text_slider, text_pending: None, ru_request: None, label_scale: 1.0, touch: false, checks, text: TextRenderer::new(), buf: Vec::new(), w: 0, h: 0, font: 16.0, gear: (0.0, 0.0, 0.0), panel_w: 0.0, theme_row: (0.0, 0.0, 0.0), slider: (0.0, 0.0, 0.0), slider_held: false, cache_max: CACHE_MIN + 1, strip_close: None, clear_measure: false, area_rows: Vec::new(), area_acts: Vec::new(), areas: AreasView::default(), update_rows: Vec::new(), update_acts: Vec::new(), updates: UpdatesView::default(), host_orb: None, layers_scroll: 0.0, layers_extent: 0.0, layers_press: None, layers_band: (0.0, 0.0), orb_icon: fluor::host::icon::Icon::from_vsf_bytes(APP_ORB_VSF).ok(), orb_scaled: (0, Vec::new()), locate_btn: None, tool_btn: None, toolbox_open: false, tool_rows: Vec::new(), query: String::new(), query_dirty: false, search_pending: false, found: Vec::new(), picked: None, search_act: None, search_rows: Vec::new(), search_acts: Vec::new(), search_field: None, route_pills: Vec::new(), swap: false, card_top: None }
+        Panel { fonts: None, font_cursor: Default::default(), open: false, dirty: true, ru: 1.0, stack: vec![Page::Layers], theme_rows: Vec::new(), edit_rows: Vec::new(), edit_scroll: 0.0, edit_extent: 0.0, press: None, sliders: Vec::new(), field_vals: [0.0; 4], held: None, edits: Vec::new(), hits, shown: vec![true; LAYERS.len()], group_open: GROUPS_OPEN, group_rows: Vec::new(), tree: Vec::new(), layer_open: None, field_open: None, theme_now: None, interval, interval_held: false, text_slider, text_pending: None, ru_request: None, label_scale: 1.0, touch: false, checks, text: TextRenderer::new(), buf: Vec::new(), w: 0, h: 0, font: 16.0, gear: (0.0, 0.0, 0.0), panel_w: 0.0, theme_row: (0.0, 0.0, 0.0), slider: (0.0, 0.0, 0.0), slider_held: false, cache_max: CACHE_MIN + 1, strip_close: None, clear_measure: false, area_rows: Vec::new(), area_acts: Vec::new(), areas: AreasView::default(), update_rows: Vec::new(), update_acts: Vec::new(), updates: UpdatesView::default(), host_orb: None, layers_scroll: 0.0, layers_extent: 0.0, layers_press: None, layers_band: (0.0, 0.0), orb_icon: fluor::host::icon::Icon::from_vsf_bytes(APP_ORB_VSF).ok(), orb_scaled: (0, Vec::new()), locate_btn: None, tool_btn: None, toolbox_open: false, tool_rows: Vec::new(), query: String::new(), search_box: None, query_dirty: false, search_pending: false, found: Vec::new(), picked: None, search_act: None, search_rows: Vec::new(), search_acts: Vec::new(), search_field: None, route_pills: Vec::new(), swap: false, card_top: None }
     }
 
     pub fn is_open(&self) -> bool {
@@ -888,10 +888,22 @@ impl Panel {
         *self.stack.last().unwrap_or(&Page::Layers)
     }
 
+    /// Whether the search page is up (the hosts route typing to it and raise the keyboard).
+    pub fn is_searching(&self) -> bool {
+        self.open && self.page() == Page::Search
+    }
+
     /// Back one page; leaving the editor asks the host to save.
     fn pop(&mut self) {
-        if let Some(Page::Edit) = self.stack.pop() {
-            self.edits.push(ThemeEdit::Done);
+        match self.stack.pop() {
+            Some(Page::Edit) => self.edits.push(ThemeEdit::Done),
+            Some(Page::Search) => {
+                self.query.clear();
+                self.found.clear();
+                self.picked = None;
+                self.search_pending = false;
+            }
+            _ => {}
         }
         if self.stack.is_empty() {
             self.stack.push(Page::Layers);
@@ -944,7 +956,13 @@ impl Panel {
         match p {
             Pick::Info => tool(ctl, 0, 0, false, false),
             Pick::Ruler => tool(ctl, 0, 0, true, false),
-            Pick::Search => tool(ctl, 0, 0, false, true),
+            Pick::Search => {
+                tool(ctl, 0, 0, false, true);
+                self.open = true;
+                if self.page() != Page::Search {
+                    self.stack.push(Page::Search);
+                }
+            }
             Pick::Directions => tool(ctl, 0, 1, false, false),
             Pick::Navigate => tool(ctl, 0, 2, false, false),
             Pick::Pen => tool(ctl, 1, 0, false, false),
@@ -957,6 +975,9 @@ impl Panel {
             }
             Pick::ClearInk => ctl.clear_ink = true,
             Pick::ClearSel => ctl.clear_sel = true,
+        }
+        if !ctl.search && self.page() == Page::Search {
+            self.pop();
         }
     }
 
@@ -1086,6 +1107,9 @@ impl Panel {
 
     pub fn close(&mut self) {
         if self.open {
+            if self.page() == Page::Search {
+                self.pop();
+            }
             self.open = false;
             self.dirty = true;
         }
@@ -1313,15 +1337,7 @@ impl Panel {
         }
         if let Some((cx, cy, cr)) = self.strip_close {
             if (x - cx).powi(2) + (y - cy).powi(2) <= (cr * 1.4).powi(2) {
-                if ctl.search {
-                    // Closing the search card ends the search.
-                    ctl.search = false;
-                    self.query.clear();
-                    self.found.clear();
-                    self.picked = None;
-                } else {
-                    self.clear_measure = true;
-                }
+                self.clear_measure = true;
                 self.dirty = true;
                 return true;
             }
@@ -1334,40 +1350,6 @@ impl Panel {
             }
             self.dirty = true;
             return true;
-        }
-        if ctl.search {
-            if let Some(&(_, a)) = self.search_acts.iter().find(|(r, _)| inside(*r)) {
-                if let Some(f) = self.picked.and_then(|i| self.found.get(i)) {
-                    let at = (f.lat, f.lon);
-                    self.search_act = Some(match a {
-                        0 => SearchAct::Go(at.0, at.1),
-                        1 => SearchAct::From(at.0, at.1),
-                        _ => SearchAct::To(at.0, at.1),
-                    });
-                    // Going or routing leaves the search for the route's card.
-                    ctl.search = false;
-                    ctl.route = if a == 0 { 2 } else { 1 };
-                    if ctl.travel == 0 {
-                        ctl.travel = 1;
-                    }
-                }
-                self.dirty = true;
-                return true;
-            }
-            if let Some(&(_, i)) = self.search_rows.iter().find(|(r, _)| inside(*r)) {
-                self.picked = Some(i);
-                if let Some(f) = self.found.get(i) {
-                    self.search_act = Some(SearchAct::Show(f.lat, f.lon));
-                }
-                self.dirty = true;
-                return true;
-            }
-            if self.search_field.is_some_and(inside) {
-                // Back to the list from a picked place.
-                self.picked = None;
-                self.dirty = true;
-                return true;
-            }
         }
         if self.card_top.is_some_and(|t| y >= t) && !self.open {
             return true;
@@ -1452,6 +1434,47 @@ impl Panel {
                         self.dirty = true;
                         return true;
                     }
+                }
+                return true;
+            }
+            Page::Search => {
+                if self.on_title(y) {
+                    self.pop();
+                    ctl.search = false;
+                    self.dirty = true;
+                    return true;
+                }
+                if let Some(&(_, a)) = self.search_acts.iter().find(|(r, _)| inside(*r)) {
+                    if let Some(f) = self.picked.and_then(|i| self.found.get(i)) {
+                        let at = (f.lat, f.lon);
+                        self.search_act = Some(match a {
+                            0 => SearchAct::Go(at.0, at.1),
+                            1 => SearchAct::From(at.0, at.1),
+                            _ => SearchAct::To(at.0, at.1),
+                        });
+                        // Going or routing leaves the search for the map and the route's card.
+                        ctl.search = false;
+                        ctl.route = if a == 0 { 2 } else { 1 };
+                        if ctl.travel == 0 {
+                            ctl.travel = 1;
+                        }
+                        self.pop();
+                        self.open = false;
+                    }
+                    self.dirty = true;
+                    return true;
+                }
+                if let Some(&(_, i)) = self.search_rows.iter().find(|(r, _)| inside(*r)) {
+                    self.picked = Some(i);
+                    if let Some(f) = self.found.get(i) {
+                        self.search_act = Some(SearchAct::Show(f.lat, f.lon));
+                    }
+                    self.dirty = true;
+                    return true;
+                }
+                if self.search_field.is_some_and(inside) {
+                    self.picked = None;
+                    self.dirty = true;
                 }
                 return true;
             }
@@ -1655,16 +1678,7 @@ impl Panel {
         self.search_field = None;
         self.card_top = None;
         let mut bottom = h as f32;
-        if ctl.search {
-            let card = Self::paint_search(&mut canvas, &mut self.text, w, h, font, &self.query, &self.found, self.picked, self.search_pending);
-            self.strip_close = Some(card.close);
-            self.search_field = Some(card.field);
-            self.search_rows = card.rows;
-            self.search_acts = card.acts;
-            let band = card.band;
-            bottom -= band;
-            self.card_top = Some(bottom);
-        } else if let Some(m) = measure {
+        if let Some(m) = measure {
             if m.route {
                 // The way of travel and, for directions, the swap: above the card's lines, so painted before its background.
                 let top = h as f32 - Self::strip_band(font, m) + font * 0.3;
@@ -1732,6 +1746,22 @@ impl Panel {
                 Page::Pen => Self::paint_pen(&mut canvas, &mut self.text, font, rail, cw, self.gear, &mut self.sliders, self.field_vals),
                 Page::Areas => self.area_rows = Self::paint_areas(&mut canvas, &mut self.text, font, rail, cw, self.gear, &self.areas),
                 Page::Updates => self.update_rows = Self::paint_updates(&mut canvas, &mut self.text, font, rail, cw, self.gear, &self.updates),
+                Page::Search => {
+                    // The field: a fluor textbox, focused, holding the query as typed.
+                    let (fx, fy, fw, fh) = (rail + font * 0.9, self.gear.1 + self.gear.2 + font * 0.9 + font * 1.6 * 1.3, cw - font * 1.8, font * 1.7);
+                    let hits = &mut self.hits;
+                    let tb = self.search_box.get_or_insert_with(|| Textbox::new(hits, fx + fw * 0.5, fy + fh * 0.5, fw, fh, font));
+                    tb.set_rect(fx + fw * 0.5, fy + fh * 0.5, fw, fh);
+                    tb.set_font_size(font, &mut self.text);
+                    if tb.chars.iter().collect::<String>() != self.query {
+                        tb.set_text(&self.query, &mut self.text);
+                    }
+                    tb.set_focused(true);
+                    let card = Self::paint_search_page(&mut canvas, &mut self.text, tb, font, rail, cw, self.gear, &self.found, self.picked, self.search_pending, self.query.trim().is_empty());
+                    self.search_field = Some(card.field);
+                    self.search_rows = card.rows;
+                    self.search_acts = card.acts;
+                }
                 Page::Area(i) => self.area_rows = Self::paint_area(&mut canvas, &mut self.text, font, rail, cw, self.gear, &self.areas, i, &mut self.sliders, self.field_vals[0] as u8),
                 Page::Layers => {}
             }
@@ -2134,67 +2164,55 @@ impl Panel {
         (cx, cy, cr)
     }
 
-    /// The search card along the bottom: the field, then the places found (or the one picked, with what to do there). Returns its height.
+    /// The search page: the title, the field (the textbox, drawn by fluor), then the places found a row each (what it is and how far, small), or the one picked with Go, From here and To here. Returns the rects that take taps.
     #[allow(clippy::too_many_arguments)]
-    fn paint_search(canvas: &mut Canvas, text: &mut TextRenderer, w: usize, h: usize, font: f32, query: &str, found: &[SearchRow], picked: Option<usize>, pending: bool) -> SearchCard {
+    fn paint_search_page(canvas: &mut Canvas, text: &mut TextRenderer, tb: &mut Textbox, font: f32, ox: f32, cw: f32, gear: (f32, f32, f32), found: &[SearchRow], picked: Option<usize>, pending: bool, empty: bool) -> SearchCard {
         let mut card = SearchCard::default();
-        let margin = font;
-        let row_h = font * 1.45;
-        let field_h = font * 1.6;
-        let content = match picked.and_then(|i| found.get(i)) {
-            Some(_) => font * 3.6,
-            None if found.is_empty() => font * 1.3,
-            None => found.len().min(SEARCH_ROWS) as f32 * row_h,
-        };
-        let band = font * 0.5 + field_h + font * 0.4 + content + font * 0.4;
-        let top = h as f32 - band;
-        // The close button.
-        let (cx, cy, cr) = (w as f32 - font * 0.9, top + font * 0.5 + field_h * 0.5, font * 0.55);
-        text.draw_text_center(canvas, "\u{00d7}", cx, cy, &TextStyle::new(font * 1.1, READOUT), None, None);
-        paint::circle_filled(canvas, cx as isize, cy as isize, cr as isize, GEAR_BG, None, None);
-        card.close = (cx, cy, cr);
-        // The field: what is typed and the caret, or what it is for.
-        let field = (margin, top + font * 0.5, w as f32 - margin * 2.0 - font * 1.8, field_h);
-        let (shown, style) = if query.is_empty() { ("Search the map in view".to_string(), TextStyle::new(font * 0.85, READOUT_DIM)) } else { (format!("{query}|"), TextStyle::new(font * 0.95, theme::TEXTBOX_TEXT)) };
-        text.draw_text_left(canvas, &shown, field.0 + font * 0.6, field.1 + field_h * 0.5, &style, None, None);
-        paint::fill_rect(canvas, field.0 as isize, field.1 as isize, field.2 as isize, field.3 as isize, GEAR_BG, None, None);
-        card.field = field;
-        let y0 = field.1 + field_h + font * 0.4;
-        match picked.and_then(|i| found.get(i).cloned()) {
+        let x0 = ox + font * 0.9;
+        let row = font * 1.6;
+        let mut y = gear.1 + gear.2 + font * 0.9 + row * 0.5;
+        let title = TextStyle::new(font, theme::TEXTBOX_TEXT);
+        text.draw_text_left(canvas, "\u{2039}  Search", x0, y, &title, None, None);
+        y += row * 1.3;
+        let (fw, fh) = (cw - font * 1.8, font * 1.7);
+        card.field = (x0, y, fw, fh);
+        tb.render_content_into(canvas, 0.0, 0.0, text, None, None, None, HIT_NONE);
+        y += fh + font * 0.6;
+        // The names end at the panel's edge.
+        let clip = Some(paint::Clip::new(0, 0, (ox + cw - font * 0.5).max(0.0) as usize, canvas.height));
+        match picked.and_then(|i| found.get(i)) {
             Some(f) => {
-                // The place picked, and what to do there.
-                text.draw_text_left(canvas, &f.name, margin, y0 + font * 0.5, &TextStyle::new(font * 0.95, theme::TEXTBOX_TEXT), None, None);
-                text.draw_text_left(canvas, &f.detail, margin, y0 + font * 1.4, &TextStyle::new(font * 0.75, READOUT), None, None);
-                let (pw, ph) = (font * 4.6, font * 1.3);
-                let mut px = margin;
+                text.draw_text_left(canvas, &f.name, x0, y + font * 0.5, &TextStyle::new(font * 0.95, theme::TEXTBOX_TEXT), clip, None);
+                text.draw_text_left(canvas, &f.detail, x0, y + font * 1.4, &TextStyle::new(font * 0.75, READOUT), clip, None);
+                let (pw, ph) = ((fw - font * 0.7) / 3.0, font * 1.3);
+                let mut px = x0;
                 for (a, word) in [(0u8, "Go"), (1, "From here"), (2, "To here")] {
-                    let r = (px, y0 + font * 2.15, pw, ph);
+                    let r = (px, y + font * 2.15, pw, ph);
                     Self::paint_pill(canvas, text, r, word, a == 0, font);
                     card.acts.push((r, a));
                     px += pw + font * 0.35;
                 }
             }
             None if found.is_empty() => {
-                let say = if query.trim().is_empty() {
-                    "Names in view, from the map kept on this device"
+                let say = if empty {
+                    "Names in view, from the map on this device"
                 } else if pending {
                     "Searching\u{2026}"
                 } else {
                     "Nothing in view by that name"
                 };
-                text.draw_text_left(canvas, say, margin, y0 + font * 0.6, &TextStyle::new(font * 0.8, READOUT), None, None);
+                text.draw_text_left(canvas, say, x0, y + font * 0.6, &TextStyle::new(font * 0.8, READOUT), None, None);
             }
             None => {
-                for (i, f) in found.iter().take(SEARCH_ROWS).enumerate() {
-                    let r = (0.0, y0 + i as f32 * row_h, w as f32, row_h);
-                    text.draw_text_right(canvas, &f.detail, w as f32 - margin, r.1 + row_h * 0.5, &TextStyle::new(font * 0.72, READOUT), None, None);
-                    text.draw_text_left(canvas, &f.name, margin, r.1 + row_h * 0.5, &TextStyle::new(font * 0.9, theme::TEXTBOX_TEXT), None, None);
+                let row_h = font * 1.9;
+                for (i, f) in found.iter().take(14).enumerate() {
+                    let r = (ox, y + i as f32 * row_h, cw, row_h);
+                    text.draw_text_left(canvas, &f.name, x0, r.1 + font * 0.55, &TextStyle::new(font * 0.9, theme::TEXTBOX_TEXT), clip, None);
+                    text.draw_text_left(canvas, &f.detail, x0 + font * 0.4, r.1 + font * 1.4, &TextStyle::new(font * 0.72, READOUT_DIM), clip, None);
                     card.rows.push((r, i));
                 }
             }
         }
-        paint::fill_rect(canvas, 0, top as isize, w as isize, band as isize, PANEL_BG, None, None);
-        card.band = band;
         card
     }
 

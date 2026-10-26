@@ -294,7 +294,8 @@ impl GpuHost {
         // The overlay repaints when what it shows changes: the panel (open: its readouts follow the camera), the compass (bearing), the size. The pin is the shader's.
         // An unlocked measurement's profile follows the screen centre, so the camera is part of the stamp while one exists.
         let cam_part = if panel.is_open() || map.has_measure() { (c.lat().to_bits(), c.lon().to_bits(), c.ppd.to_bits()) } else { (0, 0, 0) };
-        let measure_part = map.measure_view(w as usize, h as usize, 2).map(|m| (m.target_px.0.to_bits() as u64, m.target_px.1.to_bits() as u64, (m.distance_m.round() as u32)));
+        let measure_view = map.measure_view(w as usize, h as usize, 2);
+        let measure_part = measure_view.as_ref().map(|m| (m.target_px.0.to_bits() as u64, m.target_px.1.to_bits() as u64, (m.distance_m.round() as u32)));
         if self.style_version != Some(map.style_version()) {
             self.map.update_style(&self.queue, map.luts());
             self.style_version = Some(map.style_version());
@@ -314,6 +315,15 @@ impl GpuHost {
             map.past_data().hash(&mut hs);
             // The contours' spacing over the scale bar.
             map.contour_major().map(f32::to_bits).hash(&mut hs);
+            // The route's pins (Nick 2026-10-26: the dots did not show on the phone), its mode and each new route, and the card's lines.
+            for pin in [map.pin_a, map.pin_b, map.nav_to, map.found_at] {
+                pin.map(|(a, b)| (a.to_bits(), b.to_bits())).hash(&mut hs);
+            }
+            (map.route_mode as u8).hash(&mut hs);
+            map.route_version.hash(&mut hs);
+            if let Some(m) = &measure_view {
+                m.info.hash(&mut hs);
+            }
             // The ring round the globe while its base set loads: each cell's arrival, and the zoom it circles.
             if let Some(done) = map.globe_loading() {
                 ((done * 10.0).round() as u32, c.ppd.to_bits()).hash(&mut hs);
@@ -332,7 +342,7 @@ impl GpuHost {
             self.map.set_labels(&self.device, &self.queue, &[], &[]);
         }
         self.map.pin = map.gps_screen(w as usize, h as usize);
-        self.map.measure = map.measure_view(w as usize, h as usize, 2).map(|m| (m.origin_px.0, m.origin_px.1, m.target_px.0, m.target_px.1));
+        self.map.measure = measure_view.as_ref().map(|m| (m.origin_px.0, m.origin_px.1, m.target_px.0, m.target_px.1));
         // A bearing or readout change repaints at most a few times a second (the orientation sensor would otherwise repaint the panel's text every frame); the panel opening, closing or a row flipping repaints at once.
         self.labels_ms += t_labels.elapsed().as_secs_f32() * 1000.0;
         let t_overlay = std::time::Instant::now();
