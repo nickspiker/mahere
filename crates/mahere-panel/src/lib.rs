@@ -1046,8 +1046,13 @@ impl Panel {
     }
 
     /// The map's lettering over the UI scale.
+    /// A change is a frame: the phone draws nothing until something is dirty, and the lettering is laid out again from that frame (Nick 2026-10-26: a pinch on the map with the panel open did not size the text).
     pub fn set_label_scale(&mut self, t: f32) {
-        self.label_scale = t.clamp(LABEL_MIN, LABEL_MAX);
+        let t = t.clamp(LABEL_MIN, LABEL_MAX);
+        if t != self.label_scale {
+            self.label_scale = t;
+            self.dirty = true;
+        }
     }
 
     pub fn label_scale(&self) -> f32 {
