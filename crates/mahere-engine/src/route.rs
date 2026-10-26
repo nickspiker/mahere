@@ -37,6 +37,9 @@ const MAX_STATES: usize = 6_000_000;
 /// How far from a way a start or an end may be, trixels (about 340 m at depth 14).
 const SNAP_REACH: i64 = 200;
 
+/// How far a start or an end looks for a way at a coarser depth, metres: the fine maze is not everywhere, and a trip from open country starts on the nearest major road.
+const SNAP_REACH_M: f64 = 2000.0;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Travel {
     Car,
@@ -281,25 +284,27 @@ impl Cells {
     }
 }
 
-/// The ways a point could start or end on: the nearest trixels carrying a way this travel may use, found in rings out to [`SNAP_REACH`], each with the metres off the way.
+/// The ways a point could start or end on: the nearest trixels carrying a way this travel may use, found in rings out to [`SNAP_REACH`] (or [`SNAP_REACH_M`] at a coarser depth), each with the metres off the way.
 fn snap(cells: &mut Cells, at: T, travel: Travel) -> Vec<(T, i64, f64)> {
     let mut found = Vec::new();
-    for r in 0..=SNAP_REACH {
+    let texel = mahere_tiles::texel_m(at.depth);
+    let rings = if at.depth == ROUTE_DEPTH { SNAP_REACH } else { (SNAP_REACH_M / texel) as i64 };
+    for r in 0..=rings {
         for dy in -r..=r {
             for dx in -r..=r {
                 if dx.abs() != r && dy.abs() != r {
                     continue;
                 }
                 let (x, y) = (at.x as i64 + dx, at.y as i64 + dy);
-                let s = side(ROUTE_DEPTH) as i64;
+                let s = side(at.depth) as i64;
                 if x < 0 || y < 0 || x >= s || y >= s {
                     continue;
                 }
                 for h in 0..2u8 {
-                    let t = T { d: at.d, depth: ROUTE_DEPTH, x: x as u32, y: y as u32, h };
+                    let t = T { d: at.d, depth: at.depth, x: x as u32, y: y as u32, h };
                     for (osm, way, _, _) in cells.ways(t) {
                         if travel.speed(&way).is_some() {
-                            found.push((t, osm, grid_m(at.centre(), t.centre())));
+                            found.push((t, osm, grid_m(at.centre(), t.centre()) / mahere_tiles::texel_m(ROUTE_DEPTH) * texel));
                         }
                     }
                 }
@@ -307,12 +312,24 @@ fn snap(cells: &mut Cells, at: T, travel: Travel) -> Vec<(T, i64, f64)> {
         }
         // Rings a few trixels past the first find, so a closer way just beyond a corner is not missed.
         if let Some(&(_, _, best)) = found.iter().min_by(|a, b| a.2.total_cmp(&b.2)) {
-            if r as f64 * mahere_tiles::texel_m(ROUTE_DEPTH) > best + 10.0 {
+            if r as f64 * texel > best + 10.0 {
                 break;
             }
         }
     }
     found
+}
+
+/// A point's ways at the finest depth that has any near it: the fine maze where it is baked, the major roads' elsewhere.
+fn snap_down(cells: &mut Cells, lat: f64, lon: f64, travel: Travel) -> (T, Vec<(T, i64, f64)>) {
+    for depth in (ROUTE_MIN..=ROUTE_DEPTH).rev() {
+        let at = T::at(lat, lon, depth);
+        let found = snap(cells, at, travel);
+        if !found.is_empty() {
+            return (at, found);
+        }
+    }
+    (T::of(lat, lon), Vec::new())
 }
 
 /// The best route from one point to another by stepping trixel to trixel: what [`find`] did before the graph (2026-10-25), kept to check the graph's routes against.
@@ -580,16 +597,14 @@ pub fn find(store: Arc<dyn CellStore>, dem: Arc<dyn CellStore>, from: (f64, f64)
 /// [`find`] through a cache of cells kept across searches.
 pub fn find_cached(store: Arc<dyn CellStore>, dem: Arc<dyn CellStore>, from: (f64, f64), to: (f64, f64), travel: Travel, cache: Option<Arc<RouteCache>>) -> Result<Route, String> {
     let mut cells = Cells { store: store.clone(), got: HashMap::new(), cache };
-    let (a, b) = (T::of(from.0, from.1), T::of(to.0, to.1));
-    let starts = snap(&mut cells, a, travel);
-    let ends = snap(&mut cells, b, travel);
+    let (a, starts) = snap_down(&mut cells, from.0, from.1, travel);
+    let (b, ends) = snap_down(&mut cells, to.0, to.1, travel);
     if starts.is_empty() {
         return Err("no way to start on near here".into());
     }
     if ends.is_empty() {
         return Err("no way to arrive on near the target".into());
     }
-    let texel = mahere_tiles::texel_m(ROUTE_DEPTH);
     let top = travel.top_speed();
     // Getting to and from the way: walked, or driven slowly.
     let off_way = match travel {
@@ -639,6 +654,7 @@ pub fn find_cached(store: Arc<dyn CellStore>, dem: Arc<dyn CellStore>, from: (f6
     for &(t, osm, m) in &starts {
         let Some((st, cell, w)) = stand(&mut cells, t, osm) else { continue };
         let speed = travel.speed(&cell.ways[w as usize - 1]).unwrap_or(off_way);
+        let texel = mahere_tiles::texel_m(t.depth);
         let g0 = m / off_way;
         match &st {
             Stand::At(n) => {
@@ -668,6 +684,7 @@ pub fn find_cached(store: Arc<dyn CellStore>, dem: Arc<dyn CellStore>, from: (f6
     for &(t, osm, m) in &ends {
         let Some((st, cell, w)) = stand(&mut cells, t, osm) else { continue };
         let speed = travel.speed(&cell.ways[w as usize - 1]).unwrap_or(off_way);
+        let texel = mahere_tiles::texel_m(t.depth);
         let extra = m / off_way;
         let mut add = |n: Node, g: f64| {
             if goal.get(&n).is_none_or(|o| g < o.0) {
@@ -940,7 +957,7 @@ fn finish(cells: &mut Cells, dem: &Arc<dyn CellStore>, travel: Travel, from: (f6
         let (time, climb) = ground_time(dem, &chain.iter().map(|s| s.0).collect::<Vec<_>>(), travel);
         route.climb_m = climb;
         if let Some(t) = time {
-            route.seconds = t + grid_m(a.centre(), chain[0].0.centre()) / off_way + grid_m(chain.last().unwrap().0.centre(), b.centre()) / off_way;
+            route.seconds = t + crow(a.lat_lon(), chain[0].0.lat_lon()) / off_way + crow(chain.last().unwrap().0.lat_lon(), b.lat_lon()) / off_way;
         }
     }
     Ok(route)

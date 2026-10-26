@@ -71,6 +71,9 @@ fn main() {
     let vectors_only = args.iter().any(|a| a == "--vectors-only");
     // --terrain-only: the elevation alone, merged over the bake (its vectors, imagery and overlays kept), for re-running the terrain after a fix in its sampling.
     let terrain_only = args.iter().any(|a| a == "--terrain-only");
+    // --routes-only: the route maze alone (the ways kept at the base depth by their class floor, and the pyramid above), merged over the cells there (2026-10-26: a state's major roads into the planet's depth-8 cells, for town-to-town routing before the planet's own route bake).
+    let routes_only = args.iter().any(|a| a == "--routes-only");
+    let vectors_only = vectors_only || routes_only;
     let tifs = list("--dem");
     assert!(vectors_only || !tifs.is_empty(), "--dem <tif>...");
     // Imagery: --naip <tif>... (red, green, blue, near-infrared in one file, or true colour alone), --nir <tif>... (a separate near-infrared band, as Sentinel-2 ships it), --img-base <depth> (default the vector base, never past depth 14).
@@ -129,7 +132,10 @@ fn main() {
     eprintln!("{} lines, {} areas, {} named points in box, {} names, {:.1}s", roads.len(), areas.len(), points.len(), names.len().saturating_sub(1), t.elapsed().as_secs_f32());
 
     let t = std::time::Instant::now();
-    let (mut line, mut ids) = mahere_tiles::bake_lines_named(&roads, &points, &names, vec_base, min_depth);
+    // Routes alone: the ways their class keeps at the base depth, nothing else stamped.
+    let roads: Vec<mahere_osm::Road> = if routes_only { roads.into_iter().filter(|r| r.class.routable() && mahere_tiles::route::class_floor(r.class_id()) <= vec_base).collect() } else { roads };
+    let (areas, points) = if routes_only { (Vec::new(), Vec::new()) } else { (areas, points) };
+    let (mut line, mut ids) = if routes_only { Default::default() } else { mahere_tiles::bake_lines_named(&roads, &points, &names, vec_base, min_depth) };
     line.retain(|k, _| keep(k));
     eprintln!("line layer: {} cells, {:.1}s", line.len(), t.elapsed().as_secs_f32());
     let t = std::time::Instant::now();
