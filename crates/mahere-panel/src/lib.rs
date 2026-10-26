@@ -10,7 +10,7 @@ use fluor::canvas::{Canvas, Damage};
 use fluor::paint::{self, HitId, HIT_NONE};
 use fluor::text::{TextRenderer, TextStyle};
 use fluor::theme;
-use fluor::widgets::{Button, Checkbox, Slider, Textbox};
+use fluor::widgets::{Button, Checkbox, Choice, List, ListRow, Slider, Textbox, Trail};
 pub use mahere_engine::areas::{AREA_MAX_DEPTH, AREA_MIN_DEPTH, AreaView, AreasView};
 
 /// The app's name as shown beside the orb and as the window's title.
@@ -526,7 +526,6 @@ enum UpdateRow {
 enum AreaRow {
     Back,
     Save,
-    Open(usize),
     Download,
     Cancel,
     Refresh,
@@ -661,10 +660,16 @@ pub struct Panel {
     /// The toolbox: its button as last painted (left, top, width, height), whether its list is up, and the list's rows.
     tool_btn: Option<(f32, f32, f32, f32)>,
     toolbox_open: bool,
-    tool_rows: Vec<((f32, f32, f32, f32), Pick)>,
+    tool_rows: Vec<Pick>,
     /// The buttons, fluor's pills, and the Updates page's automatic-updates box.
     pills: Pills,
     auto_check: Checkbox,
+    /// fluor's own choices and lists (Nick 2026-10-26): the way of travel and the toolbox; the themes, the areas and the places found.
+    travel: Choice,
+    toolbox: Choice,
+    theme_list: List,
+    area_list: List,
+    search_list: List,
     /// Copy buttons (Nick 2026-10-26: one next to the degrees, the degrees-minutes-seconds and the world code): each with the text it copies, and the text of the one tapped, for the host's clipboard.
     copy_btns: Vec<((f32, f32, f32, f32), String)>,
     copied: Option<String>,
@@ -799,11 +804,15 @@ impl Panel {
         let mut hits: HitId = HIT_NONE;
         let checks = LAYERS.iter().map(|&(l, label)| (l, Checkbox::new(&mut hits, label, 0.0, 0.0, 10.0, 10.0, 10.0, false))).collect();
         let auto_check = Checkbox::new(&mut hits, "Automatic updates", 0.0, 0.0, 10.0, 10.0, 10.0, true);
+        let travel = Choice::new(&mut hits, &["Car", "Bike", "Foot"], 0, 10.0);
+        let mut toolbox = Choice::new(&mut hits, &[], 0, 10.0);
+        toolbox.set_vertical(true);
+        let (theme_list, area_list, search_list) = (List::new(&mut hits, 0.0, 0.0, 10.0, 10.0, 10.0), List::new(&mut hits, 0.0, 0.0, 10.0, 10.0, 10.0), List::new(&mut hits, 0.0, 0.0, 10.0, 10.0, 10.0));
         // The buttons take their ids after every checkbox: the counter they are handed is their own from here on.
         let pills = Pills::new(hits + 1000);
         let interval = Slider::new(&mut hits, 0.0, 0.0, 10.0, 10.0, 0.0);
         let text_slider = Slider::new(&mut hits, 0.0, 0.0, 10.0, 10.0, text_pos(1.0));
-        Panel { fonts: None, font_cursor: Default::default(), open: false, dirty: true, ru: 1.0, stack: vec![Page::Layers], theme_rows: Vec::new(), edit_rows: Vec::new(), edit_scroll: 0.0, edit_extent: 0.0, press: None, sliders: Vec::new(), field_vals: [0.0; 4], held: None, edits: Vec::new(), hits, shown: vec![true; LAYERS.len()], group_open: GROUPS_OPEN, group_rows: Vec::new(), tree: Vec::new(), layer_open: None, field_open: None, theme_now: None, interval, interval_held: false, text_slider, text_pending: None, ru_request: None, label_scale: 1.0, touch: false, checks, text: TextRenderer::new(), buf: Vec::new(), w: 0, h: 0, font: 16.0, gear: (0.0, 0.0, 0.0), panel_w: 0.0, theme_row: (0.0, 0.0, 0.0), slider: (0.0, 0.0, 0.0), slider_held: false, cache_max: CACHE_MIN + 1, strip_close: None, clear_measure: false, area_rows: Vec::new(), area_acts: Vec::new(), areas: AreasView::default(), update_rows: Vec::new(), update_acts: Vec::new(), updates: UpdatesView::default(), host_orb: None, layers_scroll: 0.0, layers_extent: 0.0, layers_press: None, layers_band: (0.0, 0.0), orb_icon: fluor::host::icon::Icon::from_vsf_bytes(APP_ORB_VSF).ok(), orb_scaled: (0, Vec::new()), locate_btn: None, tool_btn: None, toolbox_open: false, tool_rows: Vec::new(), pills, auto_check, copy_btns: Vec::new(), copied: None, query: String::new(), search_box: None, query_dirty: false, search_pending: false, found: Vec::new(), picked: None, search_act: None, search_rows: Vec::new(), search_acts: Vec::new(), search_field: None, route_pills: Vec::new(), swap: false, card_top: None }
+        Panel { fonts: None, font_cursor: Default::default(), open: false, dirty: true, ru: 1.0, stack: vec![Page::Layers], theme_rows: Vec::new(), edit_rows: Vec::new(), edit_scroll: 0.0, edit_extent: 0.0, press: None, sliders: Vec::new(), field_vals: [0.0; 4], held: None, edits: Vec::new(), hits, shown: vec![true; LAYERS.len()], group_open: GROUPS_OPEN, group_rows: Vec::new(), tree: Vec::new(), layer_open: None, field_open: None, theme_now: None, interval, interval_held: false, text_slider, text_pending: None, ru_request: None, label_scale: 1.0, touch: false, checks, text: TextRenderer::new(), buf: Vec::new(), w: 0, h: 0, font: 16.0, gear: (0.0, 0.0, 0.0), panel_w: 0.0, theme_row: (0.0, 0.0, 0.0), slider: (0.0, 0.0, 0.0), slider_held: false, cache_max: CACHE_MIN + 1, strip_close: None, clear_measure: false, area_rows: Vec::new(), area_acts: Vec::new(), areas: AreasView::default(), update_rows: Vec::new(), update_acts: Vec::new(), updates: UpdatesView::default(), host_orb: None, layers_scroll: 0.0, layers_extent: 0.0, layers_press: None, layers_band: (0.0, 0.0), orb_icon: fluor::host::icon::Icon::from_vsf_bytes(APP_ORB_VSF).ok(), orb_scaled: (0, Vec::new()), locate_btn: None, tool_btn: None, toolbox_open: false, tool_rows: Vec::new(), pills, auto_check, travel, toolbox, theme_list, area_list, search_list, copy_btns: Vec::new(), copied: None, query: String::new(), search_box: None, query_dirty: false, search_pending: false, found: Vec::new(), picked: None, search_act: None, search_rows: Vec::new(), search_acts: Vec::new(), search_field: None, route_pills: Vec::new(), swap: false, card_top: None }
     }
 
     pub fn is_open(&self) -> bool {
@@ -1445,7 +1454,7 @@ impl Panel {
         if self.toolbox_open {
             self.toolbox_open = false;
             self.dirty = true;
-            if let Some(&(_, pick)) = self.tool_rows.iter().find(|(r, _)| inside(*r)) {
+            if let Some(pick) = self.toolbox.index_at(x, y).and_then(|i| self.tool_rows.get(i).copied()) {
                 self.pick(pick, ctl);
             }
             return true;
@@ -1469,8 +1478,13 @@ impl Panel {
         if let Some(&(_, b)) = self.route_pills.iter().find(|(r, _)| inside(*r)) {
             if b == 4 {
                 self.swap = true;
-            } else {
-                ctl.travel = b;
+            }
+            self.dirty = true;
+            return true;
+        }
+        if self.card_top.is_some() && self.travel.click_at(x, y) {
+            if let Some(i) = self.travel.take_change() {
+                ctl.travel = i as u8 + 1;
             }
             self.dirty = true;
             return true;
@@ -1498,21 +1512,18 @@ impl Panel {
         }
         match self.page() {
             Page::Themes => {
-                let n = self.theme_rows.len();
-                for (i, &(cy, hh)) in self.theme_rows.iter().enumerate() {
-                    if (y - cy).abs() <= hh {
-                        if i == 0 {
-                            self.pop();
-                        } else if i + 1 == n {
-                            self.stack.push(Page::Edit);
-                            self.edit_scroll = 0.0;
-                        } else {
-                            ctl.theme = i - 1;
-                        }
-                        self.dirty = true;
-                        return true;
+                // The title goes back, the button opens the editor, a row of the list is the theme.
+                if self.theme_rows.first().is_some_and(|&(cy, hh)| (y - cy).abs() <= hh) {
+                    self.pop();
+                } else if self.theme_rows.get(1).is_some_and(|&(cy, hh)| (y - cy).abs() <= hh) {
+                    self.stack.push(Page::Edit);
+                    self.edit_scroll = 0.0;
+                } else if self.theme_list.click_at(x, y) {
+                    if let Some(i) = self.theme_list.take_click() {
+                        ctl.theme = i;
                     }
                 }
+                self.dirty = true;
                 return true;
             }
             Page::Edit => {
@@ -1588,10 +1599,12 @@ impl Panel {
                     self.dirty = true;
                     return true;
                 }
-                if let Some(&(_, i)) = self.search_rows.iter().find(|(r, _)| inside(*r)) {
-                    self.picked = Some(i);
-                    if let Some(f) = self.found.get(i) {
-                        self.search_act = Some(SearchAct::Show(f.lat, f.lon));
+                if self.picked.is_none() && self.search_list.click_at(x, y) {
+                    if let Some(i) = self.search_list.take_click() {
+                        self.picked = Some(i);
+                        if let Some(f) = self.found.get(i) {
+                            self.search_act = Some(SearchAct::Show(f.lat, f.lon));
+                        }
                     }
                     self.dirty = true;
                     return true;
@@ -1613,15 +1626,19 @@ impl Panel {
                                     self.area_acts.push(AreaAct::Save);
                                 }
                             }
-                            AreaRow::Open(i) => {
-                                let depth = self.areas.areas.get(i).map_or(AREA_MAX_DEPTH, |a| a.depth);
-                                self.stack.push(Page::Area(i));
-                                self.open_area_slider(depth);
-                            }
                             _ => {}
                         }
                         self.dirty = true;
                         return true;
+                    }
+                }
+                // A row of the list opens the area's page.
+                if self.area_list.click_at(x, y) {
+                    if let Some(i) = self.area_list.take_click() {
+                        let depth = self.areas.areas.get(i).map_or(AREA_MAX_DEPTH, |a| a.depth);
+                        self.stack.push(Page::Area(i));
+                        self.open_area_slider(depth);
+                        self.dirty = true;
                     }
                 }
                 return true;
@@ -1809,13 +1826,11 @@ impl Panel {
                 // The way of travel and, for directions, the swap: above the card's lines, so painted before its background.
                 let top = h as f32 - Self::strip_band(&mut self.text, w, font, m) + font * 0.3;
                 let (pw, ph) = (font * 3.4, font * 1.25);
-                let mut px = font;
-                for (b, word) in [(1u8, "Car"), (2, "Bike"), (3, "Foot")] {
-                    let r = (px, top, pw, ph);
-                    self.pills.draw(&mut canvas, &mut self.text, r, word, ctl.travel.max(1) == b, font * 0.8, None);
-                    self.route_pills.push((r, b));
-                    px += pw + font * 0.3;
-                }
+                self.travel.set_font_size(font * 0.8);
+                self.travel.set_selected(ctl.travel.max(1) as usize - 1);
+                self.travel.set_rect(font, top, pw * 3.0 + font * 0.7, ph);
+                self.travel.render_content_into(&mut canvas, &mut self.text, None, None);
+                let px = font + pw * 3.0 + font * 0.9;
                 if ctl.route == 1 {
                     let r = (px + font * 0.4, top, pw, ph);
                     self.pills.draw(&mut canvas, &mut self.text, r, "Swap", false, font * 0.8, None);
@@ -1838,16 +1853,20 @@ impl Panel {
         self.tool_rows.clear();
         let current = Pick::current(&ctl);
         if self.toolbox_open {
+            // The tools, one in force, down a column above the button.
             let rows = Pick::list(&ctl);
-            let (rw, rh, gap) = (font * 7.0, font * 1.45, font * 0.2);
-            let rx = btn.0 + btn.2 - rw;
-            let mut ry = btn.1 - gap - rh;
-            for p in rows.into_iter().rev() {
-                let rect = (rx, ry, rw, rh);
-                self.pills.draw(&mut canvas, &mut self.text, rect, p.word(), p == current, font * 0.8, None);
-                self.tool_rows.push((rect, p));
-                ry -= rh + gap;
+            let words: Vec<&str> = rows.iter().map(|p| p.word()).collect();
+            if self.toolbox.labels() != words {
+                self.toolbox.set_labels(&mut self.hits, &words);
             }
+            self.toolbox.set_font_size(font * 0.8);
+            self.toolbox.set_selected(rows.iter().position(|&p| p == current).unwrap_or(0));
+            let (rw, rh, gap) = (font * 7.0, font * 1.45, font * 0.35);
+            let n = rows.len() as f32;
+            let th = rh * n + gap * (n - 1.0);
+            self.toolbox.set_rect(btn.0 + btn.2 - rw, btn.1 - font * 0.2 - th, rw, th);
+            self.toolbox.render_content_into(&mut canvas, &mut self.text, None, None);
+            self.tool_rows = rows;
         }
         self.pills.draw(&mut canvas, &mut self.text, btn, current.word(), current != Pick::Info, font * 0.8, None);
         if !self.open {
@@ -1860,7 +1879,7 @@ impl Panel {
             let cw = self.panel_w - rail;
             let current = themes.get(ctl.theme);
             match page {
-                Page::Themes => self.theme_rows = Self::paint_themes(&mut canvas, &mut self.text, font, rail, cw, self.gear, h, themes, ctl.theme),
+                Page::Themes => self.theme_rows = Self::paint_themes(&mut canvas, &mut self.text, &mut self.pills, &mut self.theme_list, font, rail, cw, self.gear, themes, ctl.theme),
                 Page::Edit => {
                     if let Some(t) = current {
                         let (rows, extent) = Self::paint_edit(&mut canvas, &mut self.text, font, rail, cw, self.gear, h, t, self.edit_scroll);
@@ -1870,7 +1889,7 @@ impl Panel {
                 }
                 Page::Field(f) => Self::paint_field(&mut canvas, &mut self.text, font, rail, cw, self.gear, f, &mut self.sliders, self.field_vals, current),
                 Page::Pen => Self::paint_pen(&mut canvas, &mut self.text, font, rail, cw, self.gear, &mut self.sliders, self.field_vals),
-                Page::Areas => self.area_rows = Self::paint_areas(&mut canvas, &mut self.text, &mut self.pills, font, rail, cw, self.gear, &self.areas),
+                Page::Areas => self.area_rows = Self::paint_areas(&mut canvas, &mut self.text, &mut self.pills, &mut self.area_list, font, rail, cw, self.gear, &self.areas),
                 Page::Updates => self.update_rows = Self::paint_updates(&mut canvas, &mut self.text, &mut self.pills, &mut self.auto_check, font, rail, cw, self.gear, &self.updates),
                 Page::Search => {
                     // The field: a fluor textbox, focused, holding the query as typed.
@@ -1883,7 +1902,7 @@ impl Panel {
                         tb.set_text(&self.query, &mut self.text);
                     }
                     tb.set_focused(true);
-                    let card = Self::paint_search_page(&mut canvas, &mut self.text, &mut self.pills, tb, font, rail, cw, self.gear, &self.found, self.picked, self.search_pending, self.query.trim().is_empty());
+                    let card = Self::paint_search_page(&mut canvas, &mut self.text, &mut self.pills, &mut self.search_list, tb, font, rail, cw, h, self.gear, &self.found, self.picked, self.search_pending, self.query.trim().is_empty());
                     self.search_field = Some(card.field);
                     self.search_rows = card.rows;
                     self.search_acts = card.acts;
@@ -2332,7 +2351,7 @@ impl Panel {
 
     /// The search page: the title, the field (the textbox, drawn by fluor), then the places found a row each (what it is and how far, small), or the one picked with Go, From here and To here. Returns the rects that take taps.
     #[allow(clippy::too_many_arguments)]
-    fn paint_search_page(canvas: &mut Canvas, text: &mut TextRenderer, pills: &mut Pills, tb: &mut Textbox, font: f32, ox: f32, cw: f32, gear: (f32, f32, f32), found: &[SearchRow], picked: Option<usize>, pending: bool, empty: bool) -> SearchCard {
+    fn paint_search_page(canvas: &mut Canvas, text: &mut TextRenderer, pills: &mut Pills, list: &mut List, tb: &mut Textbox, font: f32, ox: f32, cw: f32, h: usize, gear: (f32, f32, f32), found: &[SearchRow], picked: Option<usize>, pending: bool, empty: bool) -> SearchCard {
         let mut card = SearchCard::default();
         let x0 = ox + font * 0.9;
         let row = font * 1.6;
@@ -2374,13 +2393,12 @@ impl Panel {
                 text.draw_text_left(canvas, say, x0, y + font * 0.6, &TextStyle::new(font * 0.8, READOUT), None, None);
             }
             None => {
-                let row_h = font * 1.9;
-                for (i, f) in found.iter().take(14).enumerate() {
-                    let r = (ox, y + i as f32 * row_h, cw, row_h);
-                    text.draw_text_left(canvas, &f.name, x0, r.1 + font * 0.55, &TextStyle::new(font * 0.9, theme::TEXTBOX_TEXT), clip, None);
-                    text.draw_text_left(canvas, &f.detail, x0 + font * 0.4, r.1 + font * 1.4, &TextStyle::new(font * 0.72, READOUT_DIM), clip, None);
-                    card.rows.push((r, i));
-                }
+                // The places found, a list down the rest of the page.
+                list.set_font_size(font * 0.9);
+                list.set_rows(found.iter().map(|f| ListRow::new(f.name.clone()).detail(f.detail.clone())).collect());
+                list.set_selected(None);
+                list.set_rect(ox, y, cw, (h as f32 - y - font * 0.5).max(font));
+                list.render_content_into(canvas, text, clip, None);
             }
         }
         card
@@ -2614,9 +2632,10 @@ impl Panel {
 impl Panel {
     /// The theme page: a back row, one row per theme (the current one ticked), and under them the legend of the chosen theme — the terrain ramp, the land cover swatches, the line classes and the inks. Returns the rows as (centre y, half height), the back row first.
     #[allow(clippy::too_many_arguments)]
-    fn paint_themes(canvas: &mut Canvas, text: &mut TextRenderer, font: f32, ox: f32, panel_w: f32, gear: (f32, f32, f32), h: usize, themes: &[Theme], current: usize) -> Vec<(f32, f32)> {
+    /// The Themes page: the title, the themes as a list with the current one picked, and a button to edit the current one. Returns the title's row and the button's.
+    #[allow(clippy::too_many_arguments)]
+    fn paint_themes(canvas: &mut Canvas, text: &mut TextRenderer, pills: &mut Pills, list: &mut List, font: f32, ox: f32, panel_w: f32, gear: (f32, f32, f32), themes: &[Theme], current: usize) -> Vec<(f32, f32)> {
         let x0 = ox + font * 0.9;
-        let panel_w = ox + panel_w;
         let row = font * 1.6;
         let mut y = gear.1 + gear.2 + font * 0.9 + row * 0.5;
         let mut rows = Vec::new();
@@ -2624,20 +2643,20 @@ impl Panel {
         text.draw_text_left(canvas, "\u{2039}  Themes", x0, y, &title, None, None);
         rows.push((y, row * 0.5));
         y += row * 1.2;
-        for (i, t) in themes.iter().enumerate() {
-            let mark = if i == current { "\u{25cf}" } else { "\u{25cb}" };
-            text.draw_text_left(canvas, &format!("{mark}  {}", t.name), x0, y, &title, None, None);
-            rows.push((y, row * 0.5));
-            y += row;
-        }
-        // The last row opens the editor on the current theme.
+        list.set_font_size(font);
+        list.set_rows(themes.iter().map(|t| ListRow::new(t.name.clone())).collect());
+        list.set_selected(Some(current));
+        let lh = list.extent();
+        list.set_rect(ox + font * 0.3, y - row * 0.5, panel_w - font * 0.6, lh);
+        list.render_content_into(canvas, text, None, None);
+        y += lh + row * 0.3;
+        // Under the list, the editor on the current theme.
         let edit_label = match themes.get(current) {
             Some(t) => format!("\u{270e}  Edit {}", t.name),
             None => "\u{270e}  Edit".into(),
         };
-        text.draw_text_left(canvas, &edit_label, x0, y, &title, None, None);
+        pills.draw_fit(canvas, text, x0, y, &edit_label, false, font * 0.85, None);
         rows.push((y, row * 0.5));
-        let _ = (y, panel_w, h);
         rows
     }
 }
@@ -2811,7 +2830,8 @@ impl Panel {
         rows
     }
 
-    fn paint_areas(canvas: &mut Canvas, text: &mut TextRenderer, pills: &mut Pills, font: f32, ox: f32, cw: f32, gear: (f32, f32, f32), areas: &AreasView) -> Vec<(f32, f32, AreaRow)> {
+    #[allow(clippy::too_many_arguments)]
+    fn paint_areas(canvas: &mut Canvas, text: &mut TextRenderer, pills: &mut Pills, list: &mut List, font: f32, ox: f32, cw: f32, gear: (f32, f32, f32), areas: &AreasView) -> Vec<(f32, f32, AreaRow)> {
         let x0 = ox + font * 0.9;
         let right = ox + cw - font * 0.9;
         let row = font * 1.6;
@@ -2830,19 +2850,18 @@ impl Panel {
         }
         rows.push((y, row * 0.5, AreaRow::Save));
         y += row * 1.2;
-        // Each area two lines: its name, then what is on the device, small.
-        for (i, a) in areas.areas.iter().enumerate() {
-            text.draw_text_left(canvas, &a.name, x0, y, &title, None, None);
-            let status = match (a.progress, a.fetched) {
-                (Some((done, total, _)), _) if total > 0 => format!("downloading  {}%", done * 100 / total),
-                (_, Some(b)) => format!("{} on this device", bytes_text(b)),
-                _ => "not downloaded".to_string(),
-            };
-            text.draw_text_left(canvas, &status, x0 + font * 0.4, y + font * 0.95, &small, None, None);
-            rows.push((y + font * 0.4, row * 0.75, AreaRow::Open(i)));
-            y += row * 1.5;
-        }
-        let _ = right;
+        // Each area a row: its name, then what is on the device, and a chevron to its page.
+        let status = |a: &AreaView| match (a.progress, a.fetched) {
+            (Some((done, total, _)), _) if total > 0 => format!("downloading  {}%", done * 100 / total),
+            (_, Some(b)) => format!("{} on this device", bytes_text(b)),
+            _ => "not downloaded".to_string(),
+        };
+        list.set_font_size(font);
+        list.set_rows(areas.areas.iter().map(|a| ListRow::new(a.name.clone()).detail(status(a)).trail(Trail::Chevron)).collect());
+        list.set_selected(None);
+        list.set_rect(ox + font * 0.3, y - row * 0.5, cw - font * 0.6, list.extent());
+        list.render_content_into(canvas, text, None, None);
+        let _ = (right, small);
         rows
     }
 

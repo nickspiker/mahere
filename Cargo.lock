@@ -1171,10 +1171,11 @@ dependencies = [
 
 [[package]]
 name = "fluor"
-version = "0.0.6"
+version = "0.0.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b17f1dee58b15354f7fb63b9d286dc76c93c2ec33d399377dcd9b8734f063e93"
+checksum = "aa627b2a4b9e564e45d56ee8b4b116623fe4c43b2fa4ccd4c3e16da12c0014d0"
 dependencies = [
+ "arboard",
  "block2 0.6.2",
  "cosmic-text",
  "jni 0.21.1",
@@ -1199,6 +1200,7 @@ dependencies = [
  "wgpu",
  "wide",
  "windows 0.58.0",
+ "windows-core 0.58.0",
  "winit",
  "x11rb",
 ]
@@ -1976,7 +1978,6 @@ dependencies = [
 name = "mahere-app"
 version = "0.4.1"
 dependencies = [
- "arboard",
  "bytemuck",
  "fluor",
  "mahere-coord",

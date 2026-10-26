@@ -855,10 +855,7 @@ impl FluorApp for MahereApp {
             let (w, h) = Self::dims(ctx);
             // A copy button: the text onto the system clipboard.
             if let Some(what) = self.panel.take_copy() {
-                match arboard::Clipboard::new().and_then(|mut c| c.set_text(what)) {
-                    Ok(()) => {}
-                    Err(e) => eprintln!("clipboard: {e}"),
-                }
+                ctx.window.set_clipboard(&what);
             }
             // The search is on while its page is: closing the panel any way ends it.
             if self.searching != self.panel.is_searching() {
