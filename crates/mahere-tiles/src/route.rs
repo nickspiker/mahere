@@ -44,6 +44,8 @@ pub struct RouteCell {
     /// Per trixel, the corridor (1-based; 0 none: a node, or no way) of the plane's way; and of each stacked way, parallel to `stack`.
     pub cor: Vec<u16>,
     pub stackcor: Vec<u16>,
+    /// At bake time only (never written): each stamped trixel's distance along its way's own line, metres from the line's start, sorted by (trixel, way). A corridor's length is the difference at its two nodes — the road's true length, whatever its bearing on the grid (Nick 2026-10-26: a corridor's trixel steps are a staircase, 12 to 21 percent short and 9 points apart by bearing). Carried up the pyramid; a cell read from its section has none, and its graph measures the staircase.
+    pub arc: Vec<(u32, u16, f32)>,
 }
 
 /// A run of one way's trixels between two nodes.
@@ -139,6 +141,11 @@ impl RouteCell {
         self.dir[lo..].iter().take_while(|&&(t, _, _)| t == i).find(|&&(_, w, _)| w == way).map(|&(_, _, a)| a as f32 / 256.0 * std::f32::consts::TAU)
     }
 
+    /// The distance along the way at a trixel, where the bake recorded it.
+    fn arc_at(&self, i: usize, w: u16) -> Option<f32> {
+        self.arc.binary_search_by_key(&(i as u32, w), |a| (a.0, a.1)).ok().map(|k| self.arc[k].2)
+    }
+
     fn add(&mut self, i: usize, w: u16) {
         if self.way.is_empty() {
             self.way = vec![0; TRI];
@@ -175,7 +182,7 @@ impl RouteCell {
     }
 
     /// The graph from the stamped planes: on each way, its nodes (the junctions, the trixels on the cell's edge, the dead ends), clustered where they touch, and the corridors between them with their lengths and directions. Built after the stamping, and again after a pyramid merge.
-    pub fn build_graph(&mut self) {
+    pub fn build_graph(&mut self, depth: u8) {
         self.nodes.clear();
         self.corridors.clear();
         self.cor = if self.way.is_empty() { Vec::new() } else { vec![0; TRI] };
@@ -198,13 +205,13 @@ impl RouteCell {
             let mut trixels = std::mem::take(&mut on_way[w as usize]);
             trixels.sort_unstable();
             trixels.dedup();
-            self.graph_of_way(w, &trixels);
+            self.graph_of_way(w, &trixels, depth);
         }
         self.nodes.sort_unstable();
     }
 
     /// One way's nodes and corridors. The way's trixels are visited in a set the size of the cell; components of the non-node trixels are its corridors.
-    fn graph_of_way(&mut self, w: u16, trixels: &[u32]) {
+    fn graph_of_way(&mut self, w: u16, trixels: &[u32], depth: u8) {
         // Nodes first: junctions and the edge.
         let mut is_node: Vec<bool> = trixels.iter().map(|&t| self.is_join(t as usize) || on_border(t as usize)).collect();
         // A way that shares only one trixel with the cell is a node by itself.
@@ -380,8 +387,20 @@ impl RouteCell {
                 }
                 let Some(inner) = best else { continue };
                 // The two steps from the clusters onto the component, a texel edge each or so.
-                let len = ((inner + 2.0) * 256.0) as u32;
+                let staircase = inner + 2.0;
                 let (a, b) = (clusters[x].0, clusters[y].0);
+                // The road's own length between the two nodes where the bake recorded it: the distance along the way at a node trixel of each cluster next to the component. Trusted when it is near the staircase (a way cut into pieces at a region's edge counts from each piece's start).
+                let arc_of = |cluster: &(u32, Vec<usize>)| -> Option<f32> {
+                    cluster.1.iter().flat_map(|&k| around(trixels[k] as usize)).filter_map(|j| trixels.binary_search(&(j as u32)).ok()).filter(|&m| name[m] == Some(cluster.0)).find_map(|m| self.arc_at(trixels[m] as usize, w))
+                };
+                let true_len = match (arc_of(&clusters[x]), arc_of(&clusters[y])) {
+                    (Some(sa), Some(sb)) if a != b => {
+                        let d = (sb - sa).abs() as f64 / super::texel_m(depth);
+                        (d > staircase * 0.5 && d < staircase * 1.5).then_some(d)
+                    }
+                    _ => None,
+                };
+                let len = (true_len.unwrap_or(staircase) * 256.0) as u32;
                 // The direction, from the one-way angles on the component against the run from a to b.
                 let dir = {
                     let (pa, pb) = (centre(a as usize), centre(b as usize));
@@ -529,7 +548,7 @@ impl RouteCell {
         if stackcor.len() != stack.len() {
             stackcor = vec![0; stack.len()];
         }
-        Some(RouteCell { way, ways, stack, joins: u32s("join"), dir, nodes, corridors, cor, stackcor })
+        Some(RouteCell { way, ways, stack, joins: u32s("join"), dir, nodes, corridors, cor, stackcor, arc: Vec::new() })
     }
 }
 
@@ -557,8 +576,15 @@ pub fn bake_routes(roads: &[Road], names: &[Named], junctions: &[(f32, f32)], de
             name: names.get(road.name as usize).map(|n| n.label()).unwrap_or_default(),
         };
         let mut prev: Option<(u8, f64, f64)> = None;
+        // The distance along the way's own line, metres from its start, at the point before this one.
+        let mut along = 0.0f64;
+        let mut prev_ll: Option<(f32, f32)> = None;
         for &(lat, lon) in &road.pts {
             let (d, gx, gy) = locate(lat, lon);
+            let seg_m = prev_ll.map_or(0.0, |(pla, plo)| {
+                let k = ((pla as f64 + lat as f64) * 0.5).to_radians().cos();
+                (((lat - pla) as f64 * 111_320.0).powi(2) + ((lon - plo) as f64 * 111_320.0 * k).powi(2)).sqrt()
+            });
             if let Some((pd, px, py)) = prev.filter(|p| p.0 == d) {
                 let (dx, dy) = (gx - px, gy - py);
                 let len = dx.hypot(dy);
@@ -576,12 +602,15 @@ pub fn bake_routes(roads: &[Road], names: &[Named], junctions: &[(f32, f32)], de
                         cell.ways.len() as u16
                     });
                     cell.add(i, w);
+                    cell.arc.push((i as u32, w, (along + seg_m * t) as f32));
                     if road.travel.oneway != 0 && directed.entry(key).or_default().insert((i as u32, w)) {
                         cell.dir.push((i as u32, w, angle));
                     }
                 }
             }
             prev = Some((d, gx, gy));
+            prev_ll = Some((lat, lon));
+            along += seg_m;
         }
     }
     for &(lat, lon) in junctions {
@@ -597,7 +626,10 @@ pub fn bake_routes(roads: &[Road], names: &[Named], junctions: &[(f32, f32)], de
         cell.joins.sort_unstable();
         cell.joins.dedup();
         cell.dir.sort_unstable();
-        cell.build_graph();
+        // The first stamping of a trixel keeps its distance along the way.
+        cell.arc.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
+        cell.arc.dedup_by_key(|a| (a.0, a.1));
+        cell.build_graph(depth);
     }
     cells
 }
@@ -678,6 +710,9 @@ pub fn pyramid_routes(mut cells: HashMap<CellKey, RouteCell>, base_depth: u8, mi
                                     if let Some(a) = kid.dir.iter().find(|d| d.0 == ci as u32 && d.1 == w).map(|d| d.2) {
                                         dirs.entry((i as u32, num)).or_insert(a);
                                     }
+                                    if let Some(m) = kid.arc_at(ci, w) {
+                                        cell.arc.push((i as u32, num, m));
+                                    }
                                 }
                             }
                         }
@@ -690,7 +725,9 @@ pub fn pyramid_routes(mut cells: HashMap<CellKey, RouteCell>, base_depth: u8, mi
                 cell.dir.sort_unstable();
                 cell.stack.sort_unstable();
                 cell.stack.dedup();
-                cell.build_graph();
+                cell.arc.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
+                cell.arc.dedup_by_key(|a| (a.0, a.1));
+                cell.build_graph(pd);
                 Some((p, cell))
             })
             .collect();
@@ -734,7 +771,9 @@ mod tests {
         // And the section round-trips, graph included.
         let s = c.section().unwrap();
         let fields: HashMap<String, Vec<vsf::VsfType>> = s.fields.into_iter().map(|f| (f.name, f.values)).collect();
-        assert_eq!(RouteCell::decode(&fields).as_ref(), Some(c));
+        let mut written = c.clone();
+        written.arc.clear();
+        assert_eq!(RouteCell::decode(&fields), Some(written));
         for c in cells.values() {
             graph_holds(c);
         }
@@ -847,6 +886,26 @@ mod tests {
             eprintln!("{}: {on} trixels, {} nodes in {} clusters, {} corridors", k.name(), c.nodes.len(), clusters.len(), c.corridors.len());
             assert!(c.nodes.len() < on, "{}: every trixel a node", k.name());
             assert!(!c.corridors.is_empty(), "{}: no corridor", k.name());
+        }
+    }
+
+    /// How far the corridor lengths of a straight road stray from its true length, by its bearing.
+    #[test]
+    fn corridor_lengths_by_bearing() {
+        let (lat, lon) = (47.60f32, -122.33f32);
+        for deg in [0, 15, 30, 45, 60, 75, 90, 105, 120, 135, 150, 165] {
+            let a = (deg as f64).to_radians();
+            // 300 m long, well inside one cell.
+            let (dn, de) = (150.0 * a.cos(), 150.0 * a.sin());
+            let k = (lat as f64).to_radians().cos();
+            let p0 = (lat - (dn / 111_320.0) as f32, lon - (de / 111_320.0 / k) as f32);
+            let p1 = (lat + (dn / 111_320.0) as f32, lon + (de / 111_320.0 / k) as f32);
+            let r = road(RoadClass::Residential, 1, vec![p0, p1], 0, 0);
+            let cells = bake_routes(&[r], &[Named::default()], &[], 14);
+            let len: f64 = cells.values().flat_map(|c| c.corridors.iter()).map(|k| k.len as f64 / 256.0 * super::super::texel_m(14)).sum();
+            eprintln!("bearing {deg:3}: corridors {len:.0} m for 300 m, {:+.1}%", (len / 300.0 - 1.0) * 100.0);
+            // The road's own length, less the few metres inside the end nodes.
+            assert!((len / 300.0 - 1.0).abs() < 0.05, "bearing {deg}: {len:.0} m");
         }
     }
 

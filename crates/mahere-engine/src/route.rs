@@ -252,7 +252,7 @@ impl Cells {
                 // A cell baked before the graph: built here from its planes, the same graph the baker makes.
                 if !r.has_graph() {
                     let t = std::time::Instant::now();
-                    r.build_graph();
+                    r.build_graph(key.depth);
                     if std::env::var_os("MAHERE_ROUTE_LOG").is_some() {
                         eprintln!("graph: {} ways, {} nodes, {} corridors built in {:.1} ms", r.ways.len(), r.nodes.len(), r.corridors.len(), t.elapsed().as_secs_f64() * 1e3);
                     }
