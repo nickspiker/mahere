@@ -4,6 +4,7 @@
 
 pub mod fonts;
 pub mod labels;
+pub mod place;
 
 use fluor::canvas::{Canvas, Damage};
 use fluor::paint::{self, HitId, HIT_NONE};
@@ -913,7 +914,7 @@ impl Panel {
         self.copied.take()
     }
 
-    /// The query as a place of its own: seven words that check out as a world code, in any case and however spaced, or a pair of decimal degrees (latitude then longitude, a comma or a space between).
+    /// The query as a place of its own: seven words that check out as a world code, in any case and however spaced, or a latitude and longitude written any way ([`place::parse`]).
     fn typed_place(query: &str) -> Option<SearchRow> {
         let q = query.trim().to_lowercase();
         let words: Vec<&str> = q.split(|c: char| !c.is_alphabetic()).filter(|w| !w.is_empty()).collect();
@@ -924,13 +925,8 @@ impl Panel {
                 return Some(SearchRow { name: words, detail: format!("World code \u{b7} {}", degrees_text(lat, lon)), lat, lon });
             }
         }
-        let nums: Vec<f64> = q.split(|c: char| c == ',' || c.is_whitespace()).filter(|t| !t.is_empty()).map(|t| t.trim_end_matches('\u{b0}').parse::<f64>()).collect::<Result<_, _>>().ok()?;
-        if let [lat, lon] = nums[..] {
-            if lat.abs() <= 90.0 && lon.abs() <= 180.0 {
-                return Some(SearchRow { name: degrees_text(lat, lon), detail: format!("Degrees \u{b7} {}", vsf::types::WorldCoord::from_lat_lon(lat, lon).to_words()), lat, lon });
-            }
-        }
-        None
+        let (lat, lon) = place::parse(&q)?;
+        Some(SearchRow { name: degrees_text(lat, lon), detail: format!("{} \u{b7} {}", dms_text(lat, lon), vsf::types::WorldCoord::from_lat_lon(lat, lon).to_words()), lat, lon })
     }
 
     /// Words wrapped to a width, none cut.
@@ -2013,6 +2009,11 @@ impl Panel {
             if b.y + b.h < band_top || b.y > footer_top {
                 continue;
             }
+            // The pages at the foot are rows to open, not boxes to tick (Nick 2026-10-26: "random checkboxes next to things like updates").
+            if matches!(l, Layer::Areas | Layer::Updates) {
+                self.text.draw_text_left(&mut canvas, cb.label(), b.x + self.font * 0.3, b.y + b.h * 0.5, &TextStyle::new(self.font * 0.9, theme::TEXTBOX_TEXT), clip, None);
+                continue;
+            }
             // Greyed: a wash of the panel colour over the row, painted first so it lies on top.
             if inert(&mask, &ctl, *l) {
                 paint::fill_rect(&mut canvas, b.x as isize, b.y as isize, b.w as isize, b.h as isize, PANEL_DIM, clip, None);
@@ -2735,7 +2736,9 @@ impl Panel {
         y += row * 1.1;
         for (i, (label, detail, live)) in u.channels.iter().enumerate() {
             text.draw_text_left(canvas, label, x0, y, if *live { &title } else { &dim }, None, None);
-            text.draw_text_left(canvas, detail, x0 + font * 0.4, y + font * 0.95, &small, None, None);
+            if !detail.is_empty() {
+                text.draw_text_left(canvas, detail, x0 + font * 0.4, y + font * 0.95, &small, None, None);
+            }
             rows.push((y + font * 0.4, row * 0.75, UpdateRow::Get(i)));
             y += row * 1.5;
         }

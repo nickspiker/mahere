@@ -85,6 +85,12 @@ pub fn our_name() -> &'static str {
     option_env!("MAHERE_VERSION_NAME").unwrap_or("local")
 }
 
+/// A version as people read it (Nick 2026-10-26: "I don't care about build numbers, just version. if the leading is zero, omit. 3.2 that's it"): "0.3.2" is "3.2", "1.2.3" stays, and a name from before 2026-10-26 loses the hash after its '+'.
+pub fn short_name(name: &str) -> String {
+    let name = name.split('+').next().unwrap_or("");
+    name.strip_prefix("0.").unwrap_or(name).to_string()
+}
+
 /// This build's platform and architecture as the manifests name them.
 pub fn our_platform() -> (&'static str, &'static str) {
     let platform = if cfg!(target_os = "android") {

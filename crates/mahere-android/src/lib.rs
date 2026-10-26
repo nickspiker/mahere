@@ -388,27 +388,24 @@ impl AndroidApp {
         let u = &self.updater;
         let line = |c: Channel| -> (String, String, bool) {
             let what = c.label();
-            // The version big, the build number small (a name from before 2026-10-26 carried a hash after a '+').
-            let split = |r: &mahere_update::Row| -> (String, String) {
-                let n = r.name.split('+').next().unwrap_or("").to_string();
-                (n, format!("build {}", r.build))
-            };
+            // The version as people read it, nothing else (Nick 2026-10-26: no build numbers).
+            let split = |r: &mahere_update::Row| -> (String, String) { (mahere_update::short_name(&r.name), String::new()) };
             match u.known(c) {
                 Known::Unchecked | Known::Checking => (capital(what), "checking\u{2026}".into(), false),
                 Known::Failed(_) => (capital(what), "unavailable".into(), false),
                 Known::Has(None) => (capital(what), "none for this device yet".into(), false),
                 Known::Has(Some(r)) if u.offer(c).is_none() => {
-                    let (n, h) = split(r);
-                    (format!("{} {n}", capital(what)), format!("{h} \u{b7} this build"), false)
+                    let (n, _) = split(r);
+                    (format!("{} {n}", capital(what)), "this build".into(), false)
                 }
                 Known::Has(Some(r)) => {
-                    let (n, h) = split(r);
-                    (format!("Get {what} {n}"), format!("{h} \u{b7} tap to install"), !u.busy())
+                    let (n, _) = split(r);
+                    (format!("Get {what} {n}"), "tap to install".into(), !u.busy())
                 }
             }
         };
         mahere_panel::UpdatesView {
-            this: format!("{} \u{b7} build {}", mahere_update::our_name().split('+').next().unwrap_or(""), mahere_update::our_build()),
+            this: mahere_update::short_name(mahere_update::our_name()),
             channels: [line(Channel::Release), line(Channel::Dev)],
             status: u.status.clone(),
             progress: u.progress.map(|(d, t)| if t > 0 { d as f32 / t as f32 } else { 0.0 }),
