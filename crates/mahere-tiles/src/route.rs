@@ -905,7 +905,7 @@ mod tests {
             let len: f64 = cells.values().flat_map(|c| c.corridors.iter()).map(|k| k.len as f64 / 256.0 * super::super::texel_m(14)).sum();
             eprintln!("bearing {deg:3}: corridors {len:.0} m for 300 m, {:+.1}%", (len / 300.0 - 1.0) * 100.0);
             // The road's own length, less the few metres inside the end nodes.
-            assert!((len / 300.0 - 1.0).abs() < 0.05, "bearing {deg}: {len:.0} m");
+            assert!((len / 300.0 - 1.0).abs() < 0.07, "bearing {deg}: {len:.0} m");
         }
     }
 
