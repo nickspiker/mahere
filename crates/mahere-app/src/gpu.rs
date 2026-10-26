@@ -55,7 +55,8 @@ impl Gpu {
         limits
     }
 
-    /// The map on fluor's device (asked for with [`Self::limits`] and the map's features): its frame goes under the chrome as it is.
+    /// The map on fluor's device (asked for with [`Self::limits`] and the map's features): its frame goes under the chrome as it is. Not on Windows, whose fluor presents thru GDI.
+    #[cfg(not(target_os = "windows"))]
     pub fn on(device: wgpu::Device, queue: wgpu::Queue, adapter: &wgpu::Adapter) -> Gpu {
         let info = adapter.get_info();
         eprintln!("gpu: {} ({:?}), the map under fluor's chrome", info.name, info.backend);
