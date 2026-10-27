@@ -1126,8 +1126,10 @@ fn main() {
     if let Some(v) = &vault {
         map.set_themes(mahere_store::themes::load_all(v));
     }
+    let docs = std::sync::Arc::new(mahere_store::VaultDocs::new(vault.clone()));
+    areas.set_docs(docs.clone());
     let mut app = MahereApp::new(map, areas);
-    app.docs = Some(std::sync::Arc::new(mahere_store::VaultDocs::new(vault.clone())));
+    app.docs = Some(docs);
     // Font packs (Nick 2026-10-16): names in scripts the binary lacks draw in their own face once its pack, signed by the author, is fetched.
     let fonts = mahere_panel::fonts::FontPacks::new(mahere_store::VaultFonts::new(vault.clone()), mahere_update::AUTHOR_PUBKEY);
     // Each renderer loads only the packs its own text wants; a document is let go once one has loaded it, read again from the vault for another that wants it later.

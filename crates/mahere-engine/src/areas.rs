@@ -65,6 +65,8 @@ pub struct Areas {
     cells: Arc<dyn CellStore>,
     /// The other layers' stores, when cells come published in layers: an area's download takes its terrain and imagery too, so both are there offline.
     extra: Vec<Arc<dyn CellStore>>,
+    /// Where address documents come from: an area's download takes the ZIPs it covers, so an address there is found offline (Nick 2026-10-27).
+    docs: Option<Arc<dyn crate::geocode::DocStore>>,
 }
 
 /// Eagle Time now.
@@ -75,7 +77,7 @@ fn et_now() -> i64 {
 
 impl Areas {
     pub fn new(cells: Arc<dyn CellStore>) -> Areas {
-        Areas { list: Vec::new(), store: None, cells, extra: Vec::new() }
+        Areas { list: Vec::new(), store: None, cells, extra: Vec::new(), docs: None }
     }
 
     /// Downloads take these layers (the terrain, the imagery) as well as the base.
@@ -186,7 +188,25 @@ impl Areas {
         progress.total.store(cells.len() as u64, Ordering::Relaxed);
         e.download = Some(progress.clone());
         let (store, extra) = (self.cells.clone(), self.extra.clone());
+        // The ZIPs whose boxes meet the area's, from the index: their documents fetched with the cells.
+        if let Some(docs) = self.docs.clone() {
+            let corners: Vec<(f64, f64)> = e.area.cells.iter().flat_map(|(k, _)| k.corners()).collect();
+            let (la0, lo0, la1, lo1) = corners.iter().fold((90.0f64, 180.0f64, -90.0f64, -180.0f64), |b, &(a, o)| (b.0.min(a), b.1.min(o), b.2.max(a), b.3.max(o)));
+            std::thread::spawn(move || {
+                let Some(index) = docs.doc(mahere_tiles::addr::INDEX_PATH).and_then(|b| mahere_tiles::addr::ZipIndex::decode(&b)) else { return };
+                let zips: Vec<u32> = index.zips.iter().filter(|(_, b)| b[0] <= la1 && b[2] >= la0 && b[1] <= lo1 && b[3] >= lo0).map(|z| z.0).collect();
+                for z in &zips {
+                    let _ = docs.doc(&mahere_tiles::addr::zip_path(*z));
+                }
+                eprintln!("areas: {} ZIP documents on the device for the area", zips.len());
+            });
+        }
         std::thread::spawn(move || fetch_all(store, extra, cells, progress, refresh));
+    }
+
+    /// Where address documents come from, for an area's download to take its ZIPs.
+    pub fn set_docs(&mut self, docs: Arc<dyn crate::geocode::DocStore>) {
+        self.docs = Some(docs);
     }
 
     pub fn cancel(&mut self, i: usize) {

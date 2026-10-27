@@ -900,6 +900,9 @@ pub extern "system" fn Java_nz_mahere_app_MahereActivity_nativeInit(
     let cam = restored.unwrap_or_else(|| Camera::new(0.0, 0.0, 1.0, 0.0));
     eprintln!("camera: {:.5} {:.5} ppd {:.1} bearing {:.3}", cam.lat(), cam.lon(), cam.ppd, cam.bearing());
     let mut areas = mahere_engine::areas::Areas::new(cell_store.clone());
+    // Address documents: the vault's copies, else the bucket's; an area's download takes the ZIPs it covers.
+    let docs = std::sync::Arc::new(mahere_store::VaultDocs::new(store.clone()));
+    areas.set_docs(docs.clone());
     if let Some(l) = &layer_stores {
         areas.set_layer_stores(vec![l.dem.clone(), l.img.clone()]);
     }
@@ -959,7 +962,7 @@ pub extern "system" fn Java_nz_mahere_app_MahereActivity_nativeInit(
         search_rx: None,
         search_next: None,
         search_cache: Default::default(),
-        docs: Some(std::sync::Arc::new(mahere_store::VaultDocs::new(store.clone()))),
+        docs: Some(docs.clone()),
         pin_drag: None,
         w: width as usize,
         h: height as usize,
