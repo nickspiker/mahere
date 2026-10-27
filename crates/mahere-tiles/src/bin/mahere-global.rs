@@ -5,6 +5,7 @@
 //! `--top` builds the depths above the regions from the region cells already written, once every region is done.
 //!
 //! Bathymetry: `--bathy <dir of GEBCO GeoTIFFs>` (see `bathymetry`).
+//! Routes: `--osm <dir> --routes` stamps each region's major roads (the classes the route pyramid keeps at depth 8: motorways, trunks, primaries and ferries) into its depth-8 cells as the route maze with its graph, merged over the cells there, finished regions in `<out>/.global-routes-done` — a trip between towns anywhere routes on them (Nick 2026-10-27).
 //! Names: `--osm <dir> --names` runs the region pass again with names (roads, rail, power and boundaries by their names and refs, the named places, summits and passes as points, the named lakes' names over the WorldCover water), finished regions in `<out>/.global-names-done`; `--osm <dir> --top` then carries lines and names above the regions, a point outranking a line and a higher-ranked point a lower one, so the coarsest levels keep the greatest summits and cities.
 //! Geoid: `--geoid <EGM2008 GeoTIFF>` bakes the geoid's height above the ellipsoid (centimetres) into every depth-2 cell, sampled at each texel's centre, with means up to depth 0 (Nick 2026-10-13).
 //! Imagery: `--img <tile dir> --img-index <tile list>` bakes the imagery layer instead, into the same cells (their terrain carried over untouched), from one-degree four-band tiles (the ESA WorldCover Sentinel-2 composite's 37 m level, pulled by `cog-level`): every texel box-filtered from sixteen samples, regions over open sea skipped, finished regions in `<out>/.global-img-done`; with `--top` it builds the imagery above the regions. `--img-loss` sets the codec's loss (default 16 levels).
@@ -100,6 +101,8 @@ fn main() {
     if let Some(dir) = arg(&args, "--osm") {
         if args.iter().any(|a| a == "--top") {
             top_vectors(&out, region_depth);
+        } else if args.iter().any(|a| a == "--routes") {
+            osm_routes(&out, &dir, depth, region_depth, bbox_arg(&args));
         } else {
             osm_lines(&out, &dir, depth, region_depth, bbox_arg(&args), args.iter().any(|a| a == "--names"));
         }
@@ -709,6 +712,50 @@ fn osm_lines(out: &Path, dir: &str, depth: u8, region_depth: u8, bbox: Option<Ve
         writeln!(done_file, "{} {}", region.depth, region.prefix).unwrap();
     }
     eprintln!("osm: {baked} regions baked, {missing} extracts missing");
+}
+
+/// The route maze of each region's major roads, at the base depth alone (the engine's coarsest, where a long trip's middle runs), merged over the region's cells.
+fn osm_routes(out: &Path, dir: &str, depth: u8, region_depth: u8, bbox: Option<Vec<f64>>) {
+    let done_path = out.join(".global-routes-done");
+    let done = done_list(&done_path);
+    let mut done_file = std::fs::OpenOptions::new().create(true).append(true).open(&done_path).unwrap();
+    let (mut baked, mut missing) = (0, 0);
+    for (diamond, cu, cv, region) in regions(region_depth) {
+        if done.contains(&(region.depth, region.prefix)) || !region_in_box(&squares_of_region(region), &bbox) {
+            continue;
+        }
+        let path = Path::new(dir).join(format!("{diamond}-{cu}-{cv}.osm.pbf"));
+        if !path.exists() {
+            missing += 1;
+            continue;
+        }
+        let t = std::time::Instant::now();
+        // Only the ways the maze keeps at this depth are read, so the densest region fits in memory; junctions are theirs alone.
+        let keep = mahere_osm::Keep { line: route_line, area: no_area, outlines: false };
+        let feats = mahere_osm::load_features_keeping(path.to_str().unwrap(), &keep).expect("osm extract");
+        let roads: Vec<mahere_osm::Road> = feats.roads.into_iter().filter(|r| route_line(r.class)).collect();
+        let n = if roads.is_empty() {
+            0
+        } else {
+            let routes = mahere_tiles::route::bake_routes(&roads, &feats.names, &feats.junctions, depth);
+            let n = routes.len();
+            use rayon::prelude::*;
+            routes.into_par_iter().for_each(|(k, r)| {
+                let cell = Cell { route: Some(r), ..Default::default() };
+                mahere_tiles::write_cell(out, k, &cell, &Loss { dem_m: 0.0, img: 0 }).expect("write cell");
+            });
+            n
+        };
+        baked += 1;
+        eprintln!("routes region {baked} {diamond}/{cu}/{cv}: {} ways, {n} cells, {:.1}s", roads.len(), t.elapsed().as_secs_f32());
+        writeln!(done_file, "{} {}", region.depth, region.prefix).unwrap();
+    }
+    eprintln!("routes: {baked} regions baked, {missing} extracts missing");
+}
+
+/// A way the route maze keeps at the planet's depth: routable, and of a class whose floor is 8 (motorways, trunks, primaries, ferries).
+fn route_line(c: mahere_osm::RoadClass) -> bool {
+    c.routable() && mahere_tiles::route::class_floor(c as u8 + 1) <= 8
 }
 
 fn major_line(c: mahere_osm::RoadClass) -> bool {
