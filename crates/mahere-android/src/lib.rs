@@ -40,6 +40,8 @@ pub struct AndroidApp {
     keyboard_up: bool,
     /// The search running on its own thread; the worker's cache of cells' names.
     search_rx: Option<std::sync::mpsc::Receiver<Vec<mahere_engine::search::Found>>>,
+    /// The query typed while a search ran, for the next (Nick 2026-10-26: "search sticks hard" — every keystroke started a search and they queued behind one another).
+    search_next: Option<String>,
     search_cache: std::sync::Arc<std::sync::Mutex<mahere_engine::labels::NamesCache>>,
     /// A route pin held by the finger.
     pin_drag: Option<mahere_engine::Pin>,
@@ -158,15 +160,23 @@ fn free_bytes(dir: &str) -> Option<u64> {
 
 impl AndroidApp {
     /// A search of the view for `query` over the cells the device keeps, on a thread of its own.
+    /// One search at a time: a query typed while one runs waits as the next, the keystrokes between folded into it.
     fn start_search(&mut self, query: String) {
+        if self.search_rx.is_some() {
+            self.search_next = Some(query);
+            return;
+        }
         let Some(cells) = &self.cells_cache else {
             self.panel.set_found(Vec::new());
             return;
         };
-        let job = self.map.search_job(&query, self.w, self.h, cells.keys(mahere_tiles::publish::Layer::Base));
+        let cells = cells.clone();
+        let mut job = self.map.search_job(&query, self.w, self.h, Vec::new());
         let cache = self.search_cache.clone();
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
+            // The cells the device keeps, listed on the worker: the index is long on a phone that has looked around.
+            job.cached = cells.keys(mahere_tiles::publish::Layer::Base);
             let mut cache = cache.lock().unwrap();
             // A worker's cache of names: bounded, the phone's memory being what it is.
             if cache.len() > 1024 {
@@ -182,6 +192,9 @@ impl AndroidApp {
         let Some(rx) = &self.search_rx else { return false };
         let Ok(found) = rx.try_recv() else { return false };
         self.search_rx = None;
+        if let Some(next) = self.search_next.take() {
+            self.start_search(next);
+        }
         let (clat, clon) = (self.map.cam.lat(), self.map.cam.lon());
         let m_lon = 111_320.0 * clat.to_radians().cos();
         let rows = found
@@ -930,6 +943,7 @@ pub extern "system" fn Java_nz_mahere_app_MahereActivity_nativeInit(
         searching: false,
         keyboard_up: false,
         search_rx: None,
+        search_next: None,
         search_cache: Default::default(),
         pin_drag: None,
         w: width as usize,

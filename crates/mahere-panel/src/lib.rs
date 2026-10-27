@@ -1256,7 +1256,8 @@ impl Panel {
         let pad = self.font * 0.6;
         self.gear = self.host_orb.unwrap_or((pad + r, pad + r, r));
         let r = self.gear.2;
-        self.panel_w = (self.font * 13.0).min(w as f32 * 0.7);
+        // The column, or the whole screen for the search (Nick 2026-10-26: "Search needs to fill the screen left/right"): its field and the places found want the width.
+        self.panel_w = if self.page() == Page::Search { w as f32 } else { (self.font * 13.0).min(w as f32 * 0.7) };
         let row = self.font * 1.7;
         let x0 = self.font * 0.8;
         // The footer: the cache slider and the readouts, fixed at the bottom, the layers scrolling above it.

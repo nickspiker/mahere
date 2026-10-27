@@ -63,6 +63,8 @@ struct MahereApp {
     searching: bool,
     /// The search running on its own thread, its results to come for the text it was asked; the worker's cache of cells' names.
     search_rx: Option<std::sync::mpsc::Receiver<Vec<mahere_engine::search::Found>>>,
+    /// The query typed while a search ran, for the next: one search at a time.
+    search_next: Option<String>,
     search_cache: std::sync::Arc<std::sync::Mutex<mahere_engine::labels::NamesCache>>,
     /// A route pin held by the pointer.
     pin_drag: Option<mahere_engine::Pin>,
@@ -203,6 +205,7 @@ impl MahereApp {
             travel_pref: 1,
             searching: false,
             search_rx: None,
+            search_next: None,
             search_cache: Default::default(),
             pin_drag: None,
         }
@@ -219,15 +222,22 @@ impl MahereApp {
     }
 
     /// A search of the view for `query` over the cells the device keeps, on a thread of its own; the places come in through [`Self::poll_search`].
+    /// One search at a time: a query typed while one runs waits as the next, the keystrokes between folded into it.
     fn start_search(&mut self, query: String, w: usize, h: usize) {
+        if self.search_rx.is_some() {
+            self.search_next = Some(query);
+            return;
+        }
         let Some(cells) = &self.cells else {
             self.panel.set_found(Vec::new());
             return;
         };
-        let job = self.map.search_job(&query, w, h, cells.keys(mahere_tiles::publish::Layer::Base));
+        let cells = cells.clone();
+        let mut job = self.map.search_job(&query, w, h, Vec::new());
         let cache = self.search_cache.clone();
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
+            job.cached = cells.keys(mahere_tiles::publish::Layer::Base);
             let mut cache = cache.lock().unwrap();
             // A worker's cache of names: bounded, as a long session searches across many views.
             if cache.len() > 4096 {
@@ -869,6 +879,11 @@ impl FluorApp for MahereApp {
             }
             if self.poll_search() {
                 ctx.window.request_redraw();
+            }
+            if self.search_rx.is_none() {
+                if let Some(next) = self.search_next.take() {
+                    self.start_search(next, w, h);
+                }
             }
         }
         if let Some(moving) = self.spin {
