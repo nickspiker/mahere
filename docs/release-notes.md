@@ -1,5 +1,21 @@
 # Mahere release notes
 
+## 6.0 · October 2026
+
+### Addresses
+- Type an address into the search and navigate to it: "647 Talon Trail, 59912", with the town and state or without, or just the number and street to look near where the map is.
+- It finds the house on its block and on its side of the street, from the US Census Bureau's address ranges, and exactly where OpenStreetMap places the address. A street called a Lane where you typed Trail is still found, and the result says which street it used.
+- Washington and Montana for now. Addresses are fetched the first time you search a ZIP and kept on your device, and downloading an area takes its ZIPs along so its addresses work offline.
+
+### Places and businesses
+- The search finds cafés, restaurants, gas stations, grocery stores, shops, hotels, banks, pharmacies, clinics, schools and more in the 1 m areas: type "starbucks" and every one in view comes up, nearest first.
+- They are found, not drawn: the map stays as clean as before.
+
+### Directions everywhere
+- Directions between any two towns on the planet's major roads: Seattle to Portland, Paris to Brussels, Southworth to Columbia Falls.
+- Trips that leave a 1 m area now carry on along the highway instead of detouring: Snoqualmie Pass to Ellensburg goes over I-90, not around by Chinook Pass.
+- A trip that starts near a road the detailed map cuts off at an area's edge starts on the highway instead.
+
 ## 5.0 · October 2026
 
 ### One set of controls
