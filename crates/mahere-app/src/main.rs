@@ -62,7 +62,9 @@ struct MahereApp {
     travel_pref: u8,
     searching: bool,
     /// The search running on its own thread, its results to come for the text it was asked; the worker's cache of cells' names.
-    search_rx: Option<std::sync::mpsc::Receiver<Vec<mahere_engine::search::Found>>>,
+    search_rx: Option<std::sync::mpsc::Receiver<(Vec<mahere_engine::search::Found>, Vec<mahere_tiles::addr::Found>)>>,
+    /// Address documents for the geocoder: the vault's copies, else the bucket's (Nick 2026-10-27).
+    docs: Option<std::sync::Arc<mahere_store::VaultDocs>>,
     /// The query typed while a search ran, for the next: one search at a time.
     search_next: Option<String>,
     search_cache: std::sync::Arc<std::sync::Mutex<mahere_engine::labels::NamesCache>>,
@@ -207,6 +209,7 @@ impl MahereApp {
             search_rx: None,
             search_next: None,
             search_cache: Default::default(),
+            docs: None,
             pin_drag: None,
         }
     }
@@ -228,22 +231,25 @@ impl MahereApp {
             self.search_next = Some(query);
             return;
         }
-        let Some(cells) = &self.cells else {
-            self.panel.set_found(Vec::new());
-            return;
-        };
-        let cells = cells.clone();
+        let cells = self.cells.clone();
+        let docs = self.docs.clone();
         let mut job = self.map.search_job(&query, w, h, Vec::new());
         let cache = self.search_cache.clone();
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
+            // An address typed: its places from its ZIP's document, or the ZIPs near the view.
+            let addresses = docs.map(|d| mahere_engine::geocode::geocode(&job.query, (job.cam.lat(), job.cam.lon()), &*d)).unwrap_or_default();
+            let Some(cells) = cells else {
+                let _ = tx.send((Vec::new(), addresses));
+                return;
+            };
             job.cached = cells.keys(mahere_tiles::publish::Layer::Base);
             let mut cache = cache.lock().unwrap();
             // A worker's cache of names: bounded, as a long session searches across many views.
             if cache.len() > 4096 {
                 cache.clear();
             }
-            let _ = tx.send(mahere_engine::search::run(&job, &mut cache, &mahere_panel::labels::tier));
+            let _ = tx.send((mahere_engine::search::run(&job, &mut cache, &mahere_panel::labels::tier), addresses));
         });
         // Only the newest search's places are shown; an older one still running is let go.
         self.search_rx = Some(rx);
@@ -252,10 +258,19 @@ impl MahereApp {
     /// The places a finished search found, onto the card: what each is and how far from the view's centre.
     fn poll_search(&mut self) -> bool {
         let Some(rx) = &self.search_rx else { return false };
-        let Ok(found) = rx.try_recv() else { return false };
+        let Ok((found, addresses)) = rx.try_recv() else { return false };
         self.search_rx = None;
         let (clat, clon) = (self.map.cam.lat(), self.map.cam.lon());
-        let rows = found
+        // Typed addresses first: the address as found, how it was found, how far.
+        let mut rows: Vec<mahere_panel::SearchRow> = addresses
+            .into_iter()
+            .map(|f| {
+                let m_lon = 111_320.0 * clat.to_radians().cos();
+                let d = (((f.lat - clat) * 111_320.0).powi(2) + ((f.lon - clon) * m_lon).powi(2)).sqrt();
+                mahere_panel::SearchRow { name: f.label, detail: format!("{} \u{b7} {}", f.detail, mahere_panel::length_text(d)), lat: f.lat, lon: f.lon }
+            })
+            .collect();
+        let names: Vec<mahere_panel::SearchRow> = found
             .into_iter()
             .map(|f| {
                 let n = mahere_tiles::Named { kind: f.kind, rank: f.rank, name: f.name.clone(), reference: f.reference.clone() };
@@ -265,6 +280,7 @@ impl MahereApp {
                 mahere_panel::SearchRow { name, detail: format!("{} \u{b7} {}", mahere_engine::named_kind(&n), mahere_panel::length_text(d)), lat: f.lat, lon: f.lon }
             })
             .collect();
+        rows.extend(names);
         self.panel.set_found(rows);
         true
     }
@@ -1111,6 +1127,7 @@ fn main() {
         map.set_themes(mahere_store::themes::load_all(v));
     }
     let mut app = MahereApp::new(map, areas);
+    app.docs = Some(std::sync::Arc::new(mahere_store::VaultDocs::new(vault.clone())));
     // Font packs (Nick 2026-10-16): names in scripts the binary lacks draw in their own face once its pack, signed by the author, is fetched.
     let fonts = mahere_panel::fonts::FontPacks::new(mahere_store::VaultFonts::new(vault.clone()), mahere_update::AUTHOR_PUBKEY);
     // Each renderer loads only the packs its own text wants; a document is let go once one has loaded it, read again from the vault for another that wants it later.

@@ -39,7 +39,9 @@ pub struct AndroidApp {
     searching: bool,
     keyboard_up: bool,
     /// The search running on its own thread; the worker's cache of cells' names.
-    search_rx: Option<std::sync::mpsc::Receiver<Vec<mahere_engine::search::Found>>>,
+    search_rx: Option<std::sync::mpsc::Receiver<(Vec<mahere_engine::search::Found>, Vec<mahere_tiles::addr::Found>)>>,
+    /// Address documents for the geocoder: the vault's copies, else the bucket's (Nick 2026-10-27).
+    docs: Option<std::sync::Arc<mahere_store::VaultDocs>>,
     /// The query typed while a search ran, for the next (Nick 2026-10-26: "search sticks hard" — every keystroke started a search and they queued behind one another).
     search_next: Option<String>,
     search_cache: std::sync::Arc<std::sync::Mutex<mahere_engine::labels::NamesCache>>,
@@ -166,15 +168,18 @@ impl AndroidApp {
             self.search_next = Some(query);
             return;
         }
-        let Some(cells) = &self.cells_cache else {
-            self.panel.set_found(Vec::new());
-            return;
-        };
-        let cells = cells.clone();
+        let cells = self.cells_cache.clone();
+        let docs = self.docs.clone();
         let mut job = self.map.search_job(&query, self.w, self.h, Vec::new());
         let cache = self.search_cache.clone();
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
+            // An address typed: its places from its ZIP's document, or the ZIPs near the view.
+            let addresses = docs.map(|d| mahere_engine::geocode::geocode(&job.query, (job.cam.lat(), job.cam.lon()), &*d)).unwrap_or_default();
+            let Some(cells) = cells else {
+                let _ = tx.send((Vec::new(), addresses));
+                return;
+            };
             // The cells the device keeps, listed on the worker: the index is long on a phone that has looked around.
             job.cached = cells.keys(mahere_tiles::publish::Layer::Base);
             let mut cache = cache.lock().unwrap();
@@ -182,7 +187,7 @@ impl AndroidApp {
             if cache.len() > 1024 {
                 cache.clear();
             }
-            let _ = tx.send(mahere_engine::search::run(&job, &mut cache, &mahere_panel::labels::tier));
+            let _ = tx.send((mahere_engine::search::run(&job, &mut cache, &mahere_panel::labels::tier), addresses));
         });
         self.search_rx = Some(rx);
     }
@@ -190,14 +195,22 @@ impl AndroidApp {
     /// The places a finished search found, onto the card: what each is and how far from the view's centre.
     fn poll_search(&mut self) -> bool {
         let Some(rx) = &self.search_rx else { return false };
-        let Ok(found) = rx.try_recv() else { return false };
+        let Ok((found, addresses)) = rx.try_recv() else { return false };
         self.search_rx = None;
         if let Some(next) = self.search_next.take() {
             self.start_search(next);
         }
         let (clat, clon) = (self.map.cam.lat(), self.map.cam.lon());
         let m_lon = 111_320.0 * clat.to_radians().cos();
-        let rows = found
+        // Typed addresses first: the address as found, how it was found, how far.
+        let mut rows: Vec<mahere_panel::SearchRow> = addresses
+            .into_iter()
+            .map(|f| {
+                let d = (((f.lat - clat) * 111_320.0).powi(2) + ((f.lon - clon) * m_lon).powi(2)).sqrt();
+                mahere_panel::SearchRow { name: f.label, detail: format!("{} \u{b7} {}", f.detail, mahere_panel::length_text(d)), lat: f.lat, lon: f.lon }
+            })
+            .collect();
+        let names: Vec<mahere_panel::SearchRow> = found
             .into_iter()
             .map(|f| {
                 let n = mahere_tiles::Named { kind: f.kind, rank: f.rank, name: f.name.clone(), reference: f.reference.clone() };
@@ -206,6 +219,7 @@ impl AndroidApp {
                 mahere_panel::SearchRow { name, detail: format!("{} \u{b7} {}", mahere_engine::named_kind(&n), mahere_panel::length_text(d)), lat: f.lat, lon: f.lon }
             })
             .collect();
+        rows.extend(names);
         self.panel.set_found(rows);
         true
     }
@@ -945,6 +959,7 @@ pub extern "system" fn Java_nz_mahere_app_MahereActivity_nativeInit(
         search_rx: None,
         search_next: None,
         search_cache: Default::default(),
+        docs: Some(std::sync::Arc::new(mahere_store::VaultDocs::new(store.clone()))),
         pin_drag: None,
         w: width as usize,
         h: height as usize,

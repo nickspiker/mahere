@@ -1132,6 +1132,14 @@ impl RemoteStore for HttpStore {
 }
 
 impl HttpStore {
+    /// A file beside the cells by its path (an address document, `addr/<zip>.vsf`), or None when it is not there or the network is not.
+    pub fn fetch_path(&self, path: &str) -> Option<Vec<u8>> {
+        match self.fetch_url(&format!("{}/{path}", self.base)) {
+            Fetch::Bytes(b) => Some(b),
+            _ => None,
+        }
+    }
+
     fn fetch_url(&self, url: &str) -> Fetch {
         match self.agent.get(url).call() {
             Ok(resp) => {

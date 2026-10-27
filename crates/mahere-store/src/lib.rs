@@ -1185,3 +1185,39 @@ impl mahere_panel::fonts::PackSource for VaultFonts {
         }
     }
 }
+
+/// Address documents (`addr/<zip>.vsf`, the ZIP index `addr/zips.vsf`) for the geocoder: the device's copy in the vault, else the bucket's, kept in the vault for the next time and for offline (Nick 2026-10-27). Without a vault, the bucket alone.
+pub struct VaultDocs {
+    vault: Option<Arc<FlatStorage>>,
+    http: mahere_engine::residency::HttpStore,
+}
+
+impl VaultDocs {
+    pub fn new(vault: Option<Arc<FlatStorage>>) -> VaultDocs {
+        VaultDocs { vault, http: mahere_engine::residency::HttpStore::new(mahere_engine::residency::DEFAULT_CELLS_URL) }
+    }
+
+    fn key(path: &str) -> String {
+        vault_key(&[name("doc"), name(path)])
+    }
+
+    /// Whether the device holds a document already (an area's download fetches what it lacks).
+    pub fn has(&self, path: &str) -> bool {
+        self.vault.as_ref().is_some_and(|v| matches!(v.read_device(&Self::key(path)), Ok(Some(_))))
+    }
+}
+
+impl mahere_engine::geocode::DocStore for VaultDocs {
+    fn doc(&self, path: &str) -> Option<Vec<u8>> {
+        if let Some(v) = &self.vault {
+            if let Ok(Some(b)) = v.read_device(&Self::key(path)) {
+                return Some(b);
+            }
+        }
+        let b = self.http.fetch_path(path)?;
+        if let Some(v) = &self.vault {
+            let _ = v.write_device(&Self::key(path), &b);
+        }
+        Some(b)
+    }
+}
