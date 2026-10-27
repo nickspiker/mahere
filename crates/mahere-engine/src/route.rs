@@ -332,7 +332,7 @@ impl Cells {
 }
 
 /// The ways a point could start or end on: the nearest trixels carrying a way this travel may use, found in rings out to [`SNAP_REACH`] (or [`SNAP_REACH_M`] at a coarser depth), each with the metres off the way.
-fn snap(cells: &mut Cells, at: T, travel: Travel) -> Vec<(T, i64, f64)> {
+fn snap(cells: &mut Cells, at: T, travel: Travel, point: (f64, f64)) -> Vec<(T, i64, f64)> {
     let mut found = Vec::new();
     let texel = mahere_tiles::texel_m(at.depth);
     let rings = if at.depth == ROUTE_DEPTH { SNAP_REACH } else { (SNAP_REACH_M / texel) as i64 };
@@ -351,7 +351,8 @@ fn snap(cells: &mut Cells, at: T, travel: Travel) -> Vec<(T, i64, f64)> {
                     let t = T { d: at.d, depth: at.depth, x: x as u32, y: y as u32, h };
                     for (osm, way, _, _) in cells.ways(t) {
                         if travel.speed(&way).is_some() {
-                            found.push((t, osm, grid_m(at.centre(), t.centre()) / mahere_tiles::texel_m(ROUTE_DEPTH) * texel));
+                            // From the point itself, not its trixel's centre: at a coarse depth a road a few hundred metres off can share the point's trixel.
+                            found.push((t, osm, crow(point, t.lat_lon())));
                         }
                     }
                 }
@@ -367,16 +368,21 @@ fn snap(cells: &mut Cells, at: T, travel: Travel) -> Vec<(T, i64, f64)> {
     found
 }
 
-/// A point's ways at the finest depth that has any near it: the fine maze where it is baked, the major roads' elsewhere.
+/// A point's ways at the finest depth that has any near it, and at every coarser one that has (2026-10-27: a start on a 1 m area's edge snapped to a minor road the area's coarse cells cut off, a dead end, with I-90 in the planet's cells a few hundred metres further): each costs its walk to the way, so the search starts on whichever connects.
 fn snap_down(cells: &mut Cells, lat: f64, lon: f64, travel: Travel) -> (T, Vec<(T, i64, f64)>) {
+    let mut first: Option<T> = None;
+    let mut all = Vec::new();
     for depth in (ROUTE_MIN..=ROUTE_DEPTH).rev() {
         let at = T::at(lat, lon, depth);
-        let found = snap(cells, at, travel);
+        let found = snap(cells, at, travel, (lat, lon));
         if !found.is_empty() {
-            return (at, found);
+            // A coarser depth's way is a fallback for when the finest one does not connect: its walk counts double and half a kilometre more, so a start on a side street stays on it.
+            let fallback = first.is_some();
+            first.get_or_insert(at);
+            all.extend(found.into_iter().map(|(t, osm, m)| (t, osm, if fallback { m * 2.0 + 500.0 } else { m })));
         }
     }
-    (T::of(lat, lon), Vec::new())
+    (first.unwrap_or_else(|| T::of(lat, lon)), all)
 }
 
 /// The best route from one point to another by stepping trixel to trixel: what [`find`] did before the graph (2026-10-25), kept to check the graph's routes against.
@@ -386,8 +392,8 @@ pub fn find_trixels(store: Arc<dyn CellStore>, dem: Arc<dyn CellStore>, from: (f
     if a.d != b.d {
         return Err("the ends are in different diamonds of the map; routes cross no diamond yet".into());
     }
-    let starts = snap(&mut cells, a, travel);
-    let ends = snap(&mut cells, b, travel);
+    let starts = snap(&mut cells, a, travel, from);
+    let ends = snap(&mut cells, b, travel, to);
     if starts.is_empty() {
         return Err("no way to start on near here".into());
     }
@@ -516,7 +522,8 @@ enum Via {
     Turn,
     Hop,
     /// To the same place a depth up or down the pyramid: the trixel stood on there, and the corridor it lies in (0 at a node), whose run to the node reached is part of the way.
-    Level { at: T, cor: u16 },
+    /// `dead`: up from a node where the finer maze ended (an area's edge cuts the road): this node drives on at its own depth.
+    Level { at: T, cor: u16, dead: bool },
 }
 
 impl T {
@@ -649,6 +656,10 @@ pub fn find_cached(store: Arc<dyn CellStore>, dem: Arc<dyn CellStore>, from: (f6
     let mut cells = Cells { store: store.clone(), got: HashMap::new(), cache, local: false };
     let (a, starts) = snap_down(&mut cells, from.0, from.1, travel);
     let (b, ends) = snap_down(&mut cells, to.0, to.1, travel);
+    if std::env::var_os("MAHERE_ROUTE_LOG").is_some() {
+        let show = |v: &[(T, i64, f64)]| v.iter().take(6).map(|(t, osm, m)| format!("d{} way {osm} {m:.0} m", t.depth)).collect::<Vec<_>>().join(", ");
+        eprintln!("snapped: start at depth {} [{}], end at depth {} [{}]", a.depth, show(&starts), b.depth, show(&ends));
+    }
     if starts.is_empty() {
         return Err("no way to start on near here".into());
     }
@@ -760,7 +771,7 @@ pub fn find_cached(store: Arc<dyn CellStore>, dem: Arc<dyn CellStore>, from: (f6
     }
     let mut done: Option<(usize, f64)> = None;
     while let Some(Reverse((_, i))) = open.pop() {
-        let (n, g, _, _) = states[i];
+        let (n, g, _, via_here) = states[i];
         if done.is_some_and(|(_, best)| g >= best) {
             break;
         }
@@ -782,10 +793,15 @@ pub fn find_cached(store: Arc<dyn CellStore>, dem: Arc<dyn CellStore>, from: (f6
         // A depth's maze is walked within its reach of an end and outside the finer depth's: the fine maze near the ends, the major roads' between, each depth taking over where the finer one's reach ends.
         let near = |ll: (f64, f64), r: f64| crow(ll, start_ll) < r || crow(ll, goal_ll) < r;
         let within = |r: f64| near(here, r);
-        let walk = within(reach(depth)) && (depth == ROUTE_DEPTH || !within(reach(depth + 1)));
+        // Up from a dead end below (2026-10-27: I-90 ends at the Leavenworth area's edge in its fine cells; the planet's I-90 went back down into them instead of on, and Cle Elum to Ellensburg went by Chinook Pass): walked, whatever its depth.
+        let forced = matches!(via_here, Via::Level { dead: true, .. });
+        if std::env::var_os("MAHERE_ROUTE_TRACE").is_some() {
+            eprintln!("expand\t{depth}\t{:.5}\t{:.5}\t{}\t{:.0}\t{:?}\t{forced}\t{}", here.0, here.1, n.osm, g, via_here, cell.ways[w as usize - 1].name);
+        }
+        let reached = within(reach(depth));
         let trixels = cell.node_trixels(n.name, w);
         // To the same place at another depth: a node there, or a point along a corridor there, whose two ends cost their way along it (the way is on every parent and child trixel of its own, the pyramid being a union).
-        let level = |cells: &mut Cells, states: &mut Vec<(Node, f64, usize, Via)>, open: &mut BinaryHeap<Reverse<(u64, usize)>>, index: &mut HashMap<Node, usize>, node_ll: &mut HashMap<Node, (f64, f64)>, t: T| -> bool {
+        let level = |cells: &mut Cells, states: &mut Vec<(Node, f64, usize, Via)>, open: &mut BinaryHeap<Reverse<(u64, usize)>>, index: &mut HashMap<Node, usize>, node_ll: &mut HashMap<Node, (f64, f64)>, t: T, dead: bool| -> bool {
             let Some((st, c, cw)) = stand(cells, t, n.osm) else { return false };
             // Standing in a corridor there and going on to its end is a walk at that depth: not where a finer depth holds this spot and the spot is within its reach (Nick 2026-10-26: the Snow Lake walk was drawn at depth 8, its corridors a hair cheaper than the fine maze's for having fewer cells to cross).
             if matches!(st, Stand::Between { .. }) && t.depth < ROUTE_DEPTH && near(t.lat_lon(), reach(t.depth + 1)) {
@@ -802,18 +818,18 @@ pub fn find_cached(store: Arc<dyn CellStore>, dem: Arc<dyn CellStore>, from: (f6
             match st {
                 Stand::At(m) => {
                     let est = estimate(ll_of(cells, m, node_ll));
-                    push(states, open, index, m, g, i, Via::Level { at: t, cor: 0 }, est);
+                    push(states, open, index, m, g, i, Via::Level { at: t, cor: 0, dead }, est);
                 }
                 Stand::Between { cor, a: ma, b: mb, to_a, to_b } => {
                     let k = c.corridors[cor as usize - 1];
                     let keep = travel.keeps_one_ways();
                     if !keep || k.dir != 1 {
                         let est = estimate(ll_of(cells, ma, node_ll));
-                        push(states, open, index, ma, g + to_a * tm / sp, i, Via::Level { at: t, cor }, est);
+                        push(states, open, index, ma, g + to_a * tm / sp, i, Via::Level { at: t, cor, dead }, est);
                     }
                     if !keep || k.dir != 2 {
                         let est = estimate(ll_of(cells, mb, node_ll));
-                        push(states, open, index, mb, g + to_b * tm / sp, i, Via::Level { at: t, cor }, est);
+                        push(states, open, index, mb, g + to_b * tm / sp, i, Via::Level { at: t, cor, dead }, est);
                     }
                 }
             }
@@ -821,9 +837,22 @@ pub fn find_cached(store: Arc<dyn CellStore>, dem: Arc<dyn CellStore>, from: (f6
         };
         // Up a depth, where the way is kept there.
         let mut climbed = false;
+        // A dead end here: the way has one corridor from this node and no other way joins it.
+        let dead = cell.corridors.iter().filter(|c| c.way == w && (c.a == n.name || c.b == n.name)).count() <= 1 && !trixels.iter().any(|&t| cell.is_join(t as usize));
         if depth > ROUTE_MIN && mahere_tiles::route::class_floor(cell.ways[w as usize - 1].class) <= depth - 1 {
             for &t in &trixels {
-                climbed |= level(&mut cells, &mut states, &mut open, &mut index, &mut node_ll, T::from_cell(n.key, t as usize).parent());
+                // The parent texel, else one beside it: a road drawn a texel wide at two depths does not always pass through the parent of each of its fine texels (2026-10-27: I-90 left the Leavenworth area's cells and never stepped up onto the planet's, so Seattle to Ellensburg went by way of Canada).
+                let p = T::from_cell(n.key, t as usize).parent();
+                if !level(&mut cells, &mut states, &mut open, &mut index, &mut node_ll, p, dead) {
+                    for q in p.around() {
+                        if level(&mut cells, &mut states, &mut open, &mut index, &mut node_ll, q, dead) {
+                            climbed = true;
+                            break;
+                        }
+                    }
+                } else {
+                    climbed = true;
+                }
             }
         }
         // Down a depth, where the finer maze is this spot's (within its reach of an end): the fine maze for the first and last legs, and the depth the trip's middle belongs to.
@@ -831,10 +860,12 @@ pub fn find_cached(store: Arc<dyn CellStore>, dem: Arc<dyn CellStore>, from: (f6
         if depth < ROUTE_DEPTH && within(reach(depth + 1)) {
             for &t in &trixels {
                 for ct in T::from_cell(n.key, t as usize).children() {
-                    descended |= level(&mut cells, &mut states, &mut open, &mut index, &mut node_ll, ct);
+                    descended |= level(&mut cells, &mut states, &mut open, &mut index, &mut node_ll, ct, false);
                 }
             }
         }
+        // A depth is walked within its reach of an end and outside the finer depth's, or inside the finer one's where the finer maze has no way to come down to (2026-10-27: east of Cle Elum the Leavenworth area has no fine cells, so every coarser depth left I-90 to a finer one that was not there).
+        let walk = forced || (reached && (depth == ROUTE_DEPTH || !within(reach(depth + 1)) || !descended));
         // A node that can neither climb (no coarser cell yet, a way not kept there, the coarsest depth) nor come down (no finer cell here) walks on at its own depth.
         // Either move is enough: the coarsest depth walked on wherever it could not climb (Nick 2026-10-26, the Snow Lake walk drawn in 100 m pieces), its corridors a hair cheaper than the fine maze's for having fewer cells to cross.
         if !walk && (climbed || descended) {
@@ -951,7 +982,7 @@ pub fn find_cached(store: Arc<dyn CellStore>, dem: Arc<dyn CellStore>, from: (f6
                 }
             }
             // A level move that stood in a corridor at the new depth walked that corridor to the node (Nick 2026-10-26: the line cut the switchbacks where the search climbed or came down mid-corridor): its run traced, as a corridor's is.
-            Via::Level { at, cor } if cor != 0 => {
+            Via::Level { at, cor, .. } if cor != 0 => {
                 let (key, ti) = at.cell();
                 let traced = cells.get(key).and_then(|cell| {
                     let w = cell.ways.iter().position(|x| x.osm == n.osm).map_or(0, |p| p as u16 + 1);

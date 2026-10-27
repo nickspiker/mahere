@@ -15,6 +15,7 @@
 //! Files are zstd'd VSF at `{name}.vsf.zst` where the name is the cell's flattened VSF value (`u` depth, `wm` cell) in base64url: no delimiters, no numerals — a directory layout that is byte-for-byte the bucket.
 
 pub mod ac;
+pub mod addr;
 pub mod area;
 /// The ownership and motor vehicle use classes, for the renderers and the themes.
 pub use mahere_osm::landuse;
@@ -487,7 +488,10 @@ pub fn bake_lines_named(feats: &[Road], points: &[mahere_osm::names::Point], nam
         cells.entry(key).or_insert_with(ClassCell::new_line);
         let id = ids.entry(key).or_default();
         let held = id.line_at(i);
-        if held == 0 || !names[held as usize].is_point() || names[held as usize].rank < names[pt.name as usize].rank {
+        // A business never takes a road's or a place's texel: it is one of tens of thousands in a city, and the road's name is what the map letters.
+        let business = names::is_business(names[pt.name as usize].kind);
+        let replaces = held == 0 || (!business && (!names[held as usize].is_point() || names::is_business(names[held as usize].kind))) || (names[held as usize].is_point() && names[held as usize].rank < names[pt.name as usize].rank && (business == names::is_business(names[held as usize].kind)));
+        if replaces {
             id.set_line(i, pt.name);
         }
     }

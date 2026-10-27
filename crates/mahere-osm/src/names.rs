@@ -82,12 +82,79 @@ pub enum PointKind {
     Cave,
     Gate,
     Ford,
+    // Added 2026-10-27 (Nick: "make it so I can search for Starbucks"): businesses and services, found by the search, never lettered; after the rest so a cell's kinds keep their meaning.
+    Cafe,
+    Restaurant,
+    FastFood,
+    Bar,
+    Fuel,
+    Grocery,
+    Shop,
+    Lodging,
+    Bank,
+    Pharmacy,
+    Health,
+    PostOffice,
+    Library,
+    School,
+    Worship,
+    Attraction,
+    Business,
+}
+
+/// The first business kind: every kind from it on is a business or a service.
+pub const FIRST_BUSINESS: PointKind = PointKind::Cafe;
+
+/// Whether a name's kind is a business or a service: found by the search, not lettered, and kept at the finest zooms only.
+pub fn is_business(kind: u8) -> bool {
+    kind >= POINT + FIRST_BUSINESS as u8
 }
 
 /// What each [`PointKind`] is called, by its index.
-pub const POINT_NAMES: [&str; 31] = [
+pub const POINT_NAMES: [&str; 48] = [
     "City", "Town", "Village", "Hamlet", "Peak", "Volcano", "Pass", "Viewpoint", "Trailhead", "Waterfall", "Spring", "Campsite", "Hut", "Exit", "Island", "Islet", "Bay", "Strait", "Sea", "Cape", "Neighbourhood", "Locality", "Drinking water", "Toilets", "Shelter", "Ranger station", "Lookout", "Hot spring", "Cave", "Gate", "Ford",
+    "Cafe", "Restaurant", "Fast food", "Bar", "Fuel", "Grocery", "Shop", "Lodging", "Bank", "Pharmacy", "Health", "Post office", "Library", "School", "Place of worship", "Attraction", "Business",
 ];
+
+impl PointKind {
+    /// A business's or a service's kind from its tags, if it is one: what a café, a shop, a hotel or an office is tagged as.
+    pub fn business<'a>(tags: impl Iterator<Item = (&'a str, &'a str)>) -> Option<PointKind> {
+        use PointKind::*;
+        let mut kind = None;
+        let mut other = false;
+        for (k, v) in tags {
+            let k2 = match (k, v) {
+                ("amenity", "cafe") => Some(Cafe),
+                ("amenity", "restaurant") => Some(Restaurant),
+                ("amenity", "fast_food" | "food_court" | "ice_cream") => Some(FastFood),
+                ("amenity", "bar" | "pub" | "biergarten" | "nightclub") => Some(Bar),
+                ("amenity", "fuel" | "charging_station") => Some(Fuel),
+                ("amenity", "bank" | "atm" | "bureau_de_change") => Some(Bank),
+                ("amenity", "pharmacy") | ("shop", "chemist") => Some(Pharmacy),
+                ("amenity", "hospital" | "clinic" | "doctors" | "dentist" | "veterinary") | ("healthcare", _) => Some(Health),
+                ("amenity", "post_office") => Some(PostOffice),
+                ("amenity", "library") => Some(Library),
+                ("amenity", "school" | "college" | "university" | "kindergarten") => Some(School),
+                ("amenity", "place_of_worship") => Some(Worship),
+                ("shop", "supermarket" | "convenience" | "greengrocer" | "bakery" | "butcher" | "deli" | "grocery" | "health_food") => Some(Grocery),
+                ("shop", _) => Some(Shop),
+                ("tourism", "hotel" | "motel" | "hostel" | "guest_house" | "apartment" | "chalet") => Some(Lodging),
+                ("tourism", "museum" | "attraction" | "zoo" | "aquarium" | "theme_park" | "gallery") => Some(Attraction),
+                // Named parking, benches and the like are not places anyone searches for.
+                ("amenity", "parking" | "parking_space" | "parking_entrance" | "bicycle_parking" | "bench" | "waste_basket" | "waste_disposal" | "recycling" | "vending_machine" | "post_box" | "telephone" | "loading_dock" | "motorcycle_parking" | "grave_yard" | "fountain" | "clock" | "hunting_stand" | "bbq" | "drinking_water" | "toilets" | "shelter" | "ranger_station") => None,
+                ("amenity", _) | ("office", _) | ("craft", _) | ("leisure", "fitness_centre" | "sports_centre" | "bowling_alley" | "golf_course" | "marina") => {
+                    other = true;
+                    None
+                }
+                _ => None,
+            };
+            if let Some(k2) = k2 {
+                kind = Some(kind.map_or(k2, |k: PointKind| if (k2 as u8) < (k as u8) { k2 } else { k }));
+            }
+        }
+        kind.or(other.then_some(Business))
+    }
+}
 
 impl PointKind {
     /// The kinds marked on the map whether or not they have a name (a tap, a gate): an unnamed one carries its kind's word for the tap card, and the map draws its mark alone.
@@ -97,9 +164,9 @@ impl PointKind {
     }
 
     /// The kind an island's, a bay's or a cape's outline names (a closed way or a multipolygon), labelled at a point inside it.
-    pub fn of_outline<'a>(tags: impl Iterator<Item = (&'a str, &'a str)>) -> Option<PointKind> {
+    pub fn of_outline<'a>(tags: impl Iterator<Item = (&'a str, &'a str)> + Clone) -> Option<PointKind> {
         let mut kind = None;
-        for (k, v) in tags {
+        for (k, v) in tags.clone() {
             kind = kind.or(match (k, v) {
                 ("place", "island") => Some(PointKind::Island),
                 ("place", "islet") => Some(PointKind::Islet),
@@ -108,7 +175,8 @@ impl PointKind {
                 _ => None,
             });
         }
-        kind
+        // A business drawn as its building: named inside it.
+        kind.or_else(|| PointKind::business(tags))
     }
 }
 
@@ -351,7 +419,7 @@ mod tests {
         assert_eq!(kind(&[("man_made", "tower"), ("tower:type", "communication")]), None, "a radio mast is no lookout");
         assert_eq!(kind(&[("natural", "hot_spring")]), Some(PointKind::HotSpring));
         assert_eq!(kind(&[("place", "neighbourhood")]), Some(PointKind::Neighbourhood));
-        assert_eq!(POINT_NAMES.len(), PointKind::Ford as usize + 1);
+        assert_eq!(POINT_NAMES.len(), PointKind::Business as usize + 1);
         assert!(PointKind::Gate.marks_unnamed() && !PointKind::Island.marks_unnamed());
     }
 }

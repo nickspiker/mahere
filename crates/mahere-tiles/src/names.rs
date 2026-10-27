@@ -5,7 +5,10 @@ use std::collections::HashMap;
 
 use rayon::prelude::*;
 
-pub use mahere_osm::names::{AREA, POINT, POINT_NAMES};
+pub use mahere_osm::names::{AREA, POINT, POINT_NAMES, is_business};
+
+/// The coarsest depth a business is carried to: below it a texel is a block or more, and a business there would take a street's name.
+pub const BUSINESS_MIN_DEPTH: u8 = 13;
 
 use super::{child_cell_texels, disk_to_mem, mem_to_disk, raw_u16, tri_idx, CellKey, ClassCell, Named, TEX, TRI};
 
@@ -258,6 +261,9 @@ pub fn pyramid_ids(mut ids: HashMap<CellKey, IdCell>, line: &HashMap<CellKey, Cl
                                         continue;
                                     }
                                     let n = &names[id as usize];
+                                    if n.is_point() && is_business(n.kind) && depth - 1 < BUSINESS_MIN_DEPTH {
+                                        continue;
+                                    }
                                     if n.is_point() {
                                         if point == 0 || n.rank > names[point as usize].rank {
                                             point = id;

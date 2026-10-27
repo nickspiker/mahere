@@ -9,6 +9,7 @@ pub mod probe;
 pub mod raster;
 pub mod residency;
 pub mod route;
+pub mod geocode;
 pub mod search;
 pub mod sh;
 pub mod theme;

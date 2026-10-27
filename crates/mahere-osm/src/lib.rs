@@ -2,6 +2,7 @@
 //!
 //! Three parallel passes over the extract: relations (multipolygon areas), ways (lines, closed-way areas, relation members), then only the referenced nodes. Waterways get a weight from their upstream network length — the catchment proxy OSM can give — so a map can draw the Waikato and a headwater trickle differently without a styling table.
 
+pub mod addr;
 pub mod hydro;
 pub mod landuse;
 pub mod names;
@@ -493,6 +494,37 @@ pub struct Features {
 }
 
 /// A feature's `name` and `ref` tags, empty when it has none. A freeway ramp without a name says where it goes (Nick 2026-10-16: "take exit 165A toward Seneca St"): "toward" its destinations, its destination refs as its ref.
+/// A node's named point, if it is one: a place, a summit, a mark, or (where the reader keeps outlines, a full bake) a business or a service with its name and its brand.
+fn point_of<'a>(kinds: impl Iterator<Item = (&'a str, &'a str)>, more: impl Iterator<Item = (&'a str, &'a str)>, labels: impl Iterator<Item = (&'a str, &'a str)> + Clone, keep: &Keep) -> Option<((names::PointKind, u32), (String, String))> {
+    if let Some(p) = names::PointKind::from_tags(kinds) {
+        return Some((p, name_tags(labels)));
+    }
+    if !keep.outlines {
+        return None;
+    }
+    let kind = names::PointKind::business(more)?;
+    Some(((kind, 10), business_names(labels)))
+}
+
+/// A business's name and its brand as the reference, so "Starbucks" finds every one whatever each is called; an unnamed one goes by its brand.
+fn business_names<'a>(tags: impl Iterator<Item = (&'a str, &'a str)>) -> (String, String) {
+    let (mut name, mut brand) = (String::new(), String::new());
+    for (k, v) in tags {
+        match k {
+            "name" => name = v.to_string(),
+            "brand" => brand = v.to_string(),
+            _ => {}
+        }
+    }
+    if name.is_empty() {
+        return (brand, String::new());
+    }
+    if name.contains(&brand) {
+        brand.clear();
+    }
+    (name, brand)
+}
+
 fn name_tags<'a>(tags: impl Iterator<Item = (&'a str, &'a str)>) -> (String, String) {
     let (mut name, mut reference) = (String::new(), String::new());
     let (mut link, mut destination, mut destination_ref) = (false, String::new(), String::new());
@@ -631,7 +663,7 @@ pub fn load_features_keeping(path: &str, keep: &Keep) -> Result<Features, osmpbf
                 let closed = refs.len() >= 4 && refs.first() == refs.last();
                 if closed && !is_member && keep.outlines {
                     if let Some(kind) = names::PointKind::of_outline(w.tags()) {
-                        let names = name_tags(w.tags());
+                        let names = if names::is_business(names::POINT + kind as u8) { business_names(w.tags()) } else { name_tags(w.tags()) };
                         if !names.0.is_empty() {
                             out.push(WayRec::Outline(kind, refs.clone(), names));
                         }
@@ -673,8 +705,8 @@ pub fn load_features_keeping(path: &str, keep: &Keep) -> Result<Features, osmpbf
     let nodes: Vec<NodeRec> = ElementReader::from_path(path)?.par_map_reduce(
         |element| {
             let (id, lat, lon, point) = match element {
-                Element::Node(n) => (n.id(), n.lat(), n.lon(), names::PointKind::from_tags(n.tags()).map(|p| (p, name_tags(n.tags())))),
-                Element::DenseNode(n) => (n.id(), n.lat(), n.lon(), names::PointKind::from_tags(n.tags()).map(|p| (p, name_tags(n.tags())))),
+                Element::Node(n) => (n.id(), n.lat(), n.lon(), point_of(n.tags(), n.tags(), n.tags(), keep)),
+                Element::DenseNode(n) => (n.id(), n.lat(), n.lon(), point_of(n.tags(), n.tags(), n.tags(), keep)),
                 _ => return Vec::new(),
             };
             let mut out = Vec::new();

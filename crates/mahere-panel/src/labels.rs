@@ -227,6 +227,8 @@ pub fn tier(n: &Named) -> Option<u8> {
         FERRY | RIDGE => 6,
         EXIT => 7,
         ISLET | CAPE | LOCALITY | AERIALWAY | CLIFF => 8,
+        // Businesses and services: past every density's cut, so never lettered, but found by the search after everything else that fits as well.
+        k if mahere_tiles::names::is_business(k) => 20,
         k if k >= POINT => 9,
         k if k >= AREA => 8,
         _ => 7,
