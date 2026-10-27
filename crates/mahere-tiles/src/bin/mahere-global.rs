@@ -737,7 +737,9 @@ fn osm_routes(out: &Path, dir: &str, depth: u8, region_depth: u8, bbox: Option<V
         let n = if roads.is_empty() {
             0
         } else {
-            let routes = mahere_tiles::route::bake_routes(&roads, &feats.names, &feats.junctions, depth);
+            let mut routes = mahere_tiles::route::bake_routes(&roads, &feats.names, &feats.junctions, depth);
+            // Only the region's own cells: its extract reaches past its edge, and a cell's route section is replaced whole when written again, so a neighbour's stub of a road would overwrite the road on the seam (2026-10-27: Olympia to Longview broke at a region edge).
+            routes.retain(|k, _| k.ancestor(region_depth) == region);
             let n = routes.len();
             use rayon::prelude::*;
             routes.into_par_iter().for_each(|(k, r)| {
