@@ -50,7 +50,7 @@ struct MahereApp {
     gpu: Option<gpu::Gpu>,
     /// The one-copy lock, held for the process; its listener starts once the event loop can be woken.
     instance: Option<instance::Instance>,
-    /// The person's fleet: their preferences and themes, the same on every device (MAHERE_SYNC while new).
+    /// The person's fleet: their preferences and themes, the same on every device.
     fleet: Option<fleet::FleetSync>,
     /// The preferences as last sent to or taken from the fleet.
     synced_prefs: Option<mahere_store::sync::Prefs>,
@@ -310,6 +310,10 @@ impl MahereApp {
             for e in entries {
                 seen.insert(e.key.clone());
                 if e.updated <= sync::stamp(&store, &e.key) {
+                    // Not newer than ours: this device already has it — which is also what it last synced, so the first save tick does not send it again.
+                    if e.key == sync::PREFS_KEY && self.synced_prefs.is_none() {
+                        self.synced_prefs = sync::bytes_of(&e).and_then(|b| sync::Prefs::decode(&b));
+                    }
                     continue;
                 }
                 if e.key == sync::PREFS_KEY {

@@ -1,5 +1,5 @@
 //! The desktop's fleet sync (Nick 2026-10-22): a thread of its own joins the person's fleet, pulls Mahere's entries from the fleet state and pushes this device's changes (see mahere_store::sync). Pulls ride edges — attestation, the window coming to the front — never a timer; the UI applies what arrives in its tick.
-//! Off unless MAHERE_SYNC is set, while the push into the live fleet state is new; MAHERE_SYNC=pull joins and pulls but only logs what it would push.
+//! Always on for an attested person — the person's own devices, and the fleet key only their members hold (Nick 2026-11-01: "if attested, two way sync is always granted"). MAHERE_SYNC=pull joins and pulls but only logs what it would push; MAHERE_SYNC=off leaves the fleet alone. Both are for debugging.
 
 use mahere_store::sync::{Fleet, SettingEntry};
 use std::sync::mpsc::{channel, Receiver, Sender};
@@ -28,7 +28,10 @@ const PULL_GAP: Duration = Duration::from_secs(30);
 
 impl FleetSync {
     pub fn start() -> Option<FleetSync> {
-        let mode = std::env::var("MAHERE_SYNC").ok()?;
+        let mode = std::env::var("MAHERE_SYNC").unwrap_or_default();
+        if mode == "off" {
+            return None;
+        }
         let read_only = mode == "pull";
         let (tx, jobs) = channel::<Job>();
         let (out, rx) = channel::<Arrived>();

@@ -3,7 +3,7 @@
 //! What never goes: the camera (where the person last looked), the cell cache, anything that only makes sense on one device.
 
 use fgtw::client::{FgtwResponse, FgtwTransport, FleetSealer};
-use fgtw::fstate::{merge_fstate, FleetState};
+use fgtw::fstate::{fstate_from_bytes, fstate_to_bytes, merge_fstate, FleetState};
 pub use fgtw::fstate::SettingEntry;
 use vsf::VsfType;
 
@@ -48,7 +48,8 @@ impl FleetSealer for Sealer {
 /// This device's seat in the person's fleet.
 pub struct Fleet {
     handle_proof: [u8; 32],
-    device: fgtw::keys::Keypair,
+    /// Every scheme this device declared to its fleet (Ed25519, Falcon, SLH-DSA), derived from the machine as Photon derives it: a fleet whose members all declared post-quantum keys refuses an envelope signed with less.
+    signer: fgtw::pq::SigningBundle,
     key: [u8; 32],
 }
 
@@ -58,29 +59,88 @@ impl Fleet {
         let Some(s) = tohu::session() else { return Ok(None) };
         let fp = tohu::device::machine_fingerprint().map_err(|e| format!("machine fingerprint: {e}"))?;
         let device = fgtw::keys::derive_device_keypair(&fp);
-        Ok(fgtw::client::recover_fleet_key(&Http, &s.handle_proof, &device, &s.identity_seed)?.map(|key| Fleet { handle_proof: s.handle_proof, device, key }))
+        let Some(key) = fgtw::client::recover_fleet_key(&Http, &s.handle_proof, &device, &s.identity_seed)? else { return Ok(None) };
+        let signer = fgtw::pq::SigningBundle::derive(&fp);
+        Ok(Some(Fleet { handle_proof: s.handle_proof, signer, key }))
+    }
+
+    /// The slot's document, opened: None when nothing is published yet.
+    fn pull_raw(&self) -> Result<Option<Vec<u8>>, String> {
+        let mut section = vsf::VsfSection::new("fstate_get");
+        section.add_field("hp", VsfType::hP(self.handle_proof.to_vec()));
+        let req = vsf::VsfBuilder::new().creation_time_oscillations(vsf::eagle_time_oscillations()).add_section_direct(section).build().map_err(|e| format!("fstate_get build: {e}"))?;
+        let resp = Http.post(req)?;
+        if fgtw::client::is_error(&resp.body, "not_found") {
+            return Ok(None);
+        }
+        if let Some((reason, detail)) = fgtw::client::error_frame(&resp.body) {
+            return Err(format!("fgtw fstate_get {reason}: {detail}"));
+        }
+        if !(200..300).contains(&resp.status) {
+            return Err(format!("FGTW transport {}", resp.status));
+        }
+        let (header, end) = vsf::verification::read_verified(&resp.body, None).map_err(|e| format!("fstate_get response: {e}"))?;
+        let stored = header.primary_section(&resp.body, end).map_err(|e| format!("fstate_get section: {e}"))?;
+        let sealed = match stored.get_field("bl").and_then(|f| f.values.first()) {
+            Some(VsfType::ge(b)) => b.clone(),
+            _ => return Ok(None),
+        };
+        Sealer.open(&sealed, &self.key).map(Some)
     }
 
     /// The fleet's Mahere entries (tombstones included — a delete must reach every device).
     pub fn pull(&self) -> Result<Vec<SettingEntry>, String> {
-        Ok(fgtw::client::pull_fstate(&Http, &Sealer, &self.handle_proof, &self.key)?
-            .map(|s| s.global_settings.into_iter().filter(|e| e.key.starts_with(PREFIX)).collect())
-            .unwrap_or_default())
+        let Some(doc) = self.pull_raw()? else { return Ok(Vec::new()) };
+        Ok(fstate_from_bytes(&doc)?.global_settings.into_iter().filter(|e| e.key.starts_with(PREFIX)).collect())
     }
 
     /// Publish entries: pull the slot, merge ours in key by key, push the result. A failed pull pushes nothing — the merge base would be unknown, and pushing over it could erase the roster (Photon's rule, kept).
+    /// Nor does a slot written in a NEWER format than this build knows: fgtw reads a roster it does not understand as empty, so merging over it and pushing would wipe the fleet's roster. Mahere waits for an update instead.
     pub fn push(&self, entries: Vec<SettingEntry>) -> Result<(), String> {
         if entries.iter().any(|e| !e.key.starts_with(PREFIX)) {
             return Err("only mahere.* keys are Mahere's to write".into());
         }
-        let slot = match fgtw::client::pull_fstate(&Http, &Sealer, &self.handle_proof, &self.key) {
-            Ok(Some(s)) => s,
+        let slot = match self.pull_raw() {
+            Ok(Some(doc)) => {
+                if newer_than_ours(&doc) {
+                    return Err("the fleet state is a newer format than this Mahere knows — not pushing over it; Mahere needs an update".into());
+                }
+                fstate_from_bytes(&doc)?
+            }
             Ok(None) => FleetState::default(),
             Err(e) => return Err(format!("push skipped, pull failed: {e}")),
         };
+        let (roster, others, maps) = (slot.roster.len(), slot.global_settings.iter().filter(|e| !e.key.starts_with(PREFIX)).count(), slot.device_settings.len());
         let merged = merge_with(slot, entries);
-        fgtw::client::push_fstate(&Http, &Sealer, &self.handle_proof, &self.device, &self.key, &merged)
+        // What rides through untouched, said every time: the roster, everyone else's settings, the device maps.
+        let after = (merged.roster.len(), merged.global_settings.iter().filter(|e| !e.key.starts_with(PREFIX)).count(), merged.device_settings.len());
+        if after != (roster, others, maps) {
+            return Err(format!("merge changed what is not Mahere's ({roster}, {others}, {maps} -> {after:?}) — not pushing"));
+        }
+        eprintln!("fleet: pushing over {roster} roster entries, {others} other settings, {maps} device maps — unchanged");
+        fgtw::client::push_fstate(&Http, &Sealer, &self.handle_proof, &self.signer, &self.key, &merged)
     }
+}
+
+/// The highest format version any section of a fleet-state document carries.
+fn max_version(doc: &[u8]) -> Option<usize> {
+    let (header, end) = vsf::VsfHeader::decode(doc).ok()?;
+    let sections = header.sections(doc, end).ok()?;
+    sections
+        .iter()
+        .flat_map(|s| s.fields.iter())
+        .filter(|f| f.name == "version")
+        .filter_map(|f| match f.values.first() {
+            Some(VsfType::z(n)) => Some(*n),
+            _ => None,
+        })
+        .max()
+}
+
+/// Whether a slot document carries a section newer than this build's fgtw writes.
+fn newer_than_ours(doc: &[u8]) -> bool {
+    let ours = max_version(&fstate_to_bytes(&FleetState::default())).unwrap_or(0);
+    max_version(doc).is_some_and(|v| v > ours)
 }
 
 /// The slot with our entries merged in: everything else in it — the roster, Photon's settings, every device map — exactly as it was.
@@ -189,6 +249,19 @@ mod tests {
         p.onto(&mut s);
         assert_eq!((s.cache_budget, s.ui_ru, s.real_sun, s.tool), (7 << 30, 1.5, true, 2), "the device's own settings stay");
         assert_eq!(Prefs::of(&s), p);
+    }
+
+    /// A document from a newer fgtw is refused before any merge; one in our own format is not.
+    #[test]
+    fn a_newer_format_is_never_pushed_over() {
+        let ours = fstate_to_bytes(&FleetState::default());
+        assert!(!newer_than_ours(&ours));
+        let v = max_version(&ours).unwrap();
+        // A section a future fgtw would write: our roster schema at the next version.
+        let mut sec = vsf::VsfSection::new("roster");
+        sec.add_field("version", VsfType::z(v + 1));
+        let future = vsf::VsfBuilder::new().creation_time_oscillations(vsf::eagle_time_oscillations()).add_section_direct(sec).build().unwrap();
+        assert!(newer_than_ours(&future));
     }
 
     /// Our merge leaves everything that is not ours exactly as it was, and newest wins key by key.
