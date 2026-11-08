@@ -99,6 +99,8 @@ pub fn our_platform() -> (&'static str, &'static str) {
         "macOS"
     } else if cfg!(target_os = "windows") {
         "Windows"
+    } else if cfg!(target_os = "ferros") {
+        "ferros"
     } else {
         "Linux"
     };

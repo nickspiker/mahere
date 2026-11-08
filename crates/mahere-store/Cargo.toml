@@ -11,9 +11,20 @@ kete = { version = "0.0.5" }
 mahere-engine = { path = "../mahere-engine" }
 mahere-tiles = { path = "../mahere-tiles" }
 mahere-coord = { path = "../mahere-coord" }
-zstd = "0.13"
 blake3 = "1"
 vsf = { version = "0.10" }
 rand = "0.8"
-ureq = "2"
 mahere-panel = { path = "../mahere-panel" }
+
+# ferros (docs/STD-TARGET.md in the ferros repo) has no TLS and no std sockets: there ureq carries no TLS (an https fetch answers that it cannot), and zstd leaves out the dictionary builder and the legacy formats, whose C wants a hosted libc (stdio, qsort_r, clock); Mahere trains no dictionaries and reads no pre-1.0 frames.
+[target.'cfg(not(target_os = "ferros"))'.dependencies]
+ureq = "2"
+zstd = "0.13"
+
+[target.'cfg(target_os = "ferros")'.dependencies]
+ureq = { version = "2", default-features = false }
+zstd = { version = "0.13", default-features = false }
+
+# target_os = "ferros" is a device running ferros, as a process of its kernel (a JSON target, docs/STD-TARGET.md in the ferros repo): rustc does not know the name, so the cfg is declared here.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_os, values("ferros"))'] }

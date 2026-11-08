@@ -1,0 +1,24 @@
+[package]
+name = "mahere-ferros"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "mahere on ferros: the touch-device app (mahere-device) as a ferros process, a kist — fluor's ferros host over the display server's app surface and the touch server, two fingers from the touch server's contacts, the fix from the gps endpoint, the vault scope keyed by the device's ira"
+
+[[bin]]
+name = "mahere"
+path = "src/main.rs"
+
+# Only a ferros build has anything to build here (ferros tools/mahere-build.sh); a host build of the workspace gets a program that says so.
+[target.'cfg(target_os = "ferros")'.dependencies]
+mahere-device = { path = "../mahere-device" }
+mahere-engine = { path = "../mahere-engine" }
+mahere-store = { path = "../mahere-store" }
+# fluor's host-ferros is turned on from the build's command line until a published fluor has it.
+fluor = { version = "0.0.7", default-features = false, features = ["std", "text", "icon", "rayon", "simd"] }
+# rand 0.8 (mahere-store) through getrandom 0.2: its `custom` backend is ferros_rt's, the kernel's entropy (the spawn's --entropy grant).
+getrandom = { version = "0.2", features = ["custom"] }
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_os, values("ferros"))'] }

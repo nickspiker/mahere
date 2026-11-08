@@ -1,7 +1,7 @@
 [workspace]
 resolver = "3"
 members = ["crates/*"]
-# mahere-android only compiles for Android targets (cargo ndk -p mahere-android); host-side `cargo build/test` skips it.
+# mahere-android only compiles for Android targets (cargo ndk -p mahere-android) and mahere-ferros only for ferros (the ferros repo's tools/mahere-build.sh); host-side `cargo build/test` skips them and mahere-device, the touch-device app both run.
 default-members = [
     "crates/mahere-app",
     "crates/mahere-coord",

@@ -8,8 +8,14 @@ description = "mahere's host-independent map core: camera, terrain reservoir eng
 
 [dependencies]
 mahere-coord = { path = "../mahere-coord" }
-ureq = "2"
 mahere-tiles = { path = "../mahere-tiles" }
 rayon = "1"
 rustc-hash = "2"
 vsf = { version = "0.10" }
+
+# ferros (docs/STD-TARGET.md in the ferros repo) has no TLS and no std sockets: there ureq carries no TLS (an https fetch answers that it cannot). The map's cells on a ferros device come from the vault.
+[target.'cfg(not(target_os = "ferros"))'.dependencies]
+ureq = "2"
+
+[target.'cfg(target_os = "ferros")'.dependencies]
+ureq = { version = "2", default-features = false }

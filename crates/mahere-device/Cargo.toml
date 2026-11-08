@@ -1,0 +1,29 @@
+[package]
+name = "mahere-device"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "mahere on a touch device: the app Android and ferros both run (the map, the panel, the two-finger solve, GPS, the vault), under each platform's fluor shell"
+
+[dependencies]
+mahere-engine = { path = "../mahere-engine" }
+mahere-tiles = { path = "../mahere-tiles" }
+mahere-store = { path = "../mahere-store" }
+mahere-panel = { path = "../mahere-panel" }
+mahere-update = { path = "../mahere-update" }
+
+# The fluor shell the platform hosts the app in: Android's (JNI, ANativeWindow), ferros's (the display server's app surface and the touch server; turned on from the build's command line until a published fluor has it, ferros tools/mahere-build.sh), the desktop's for a host build of the workspace.
+[target.'cfg(target_os = "android")'.dependencies]
+fluor = { version = "0.0.7", features = ["host-android"] }
+libc = "0.2"
+
+[target.'cfg(target_os = "ferros")'.dependencies]
+fluor = { version = "0.0.7", default-features = false, features = ["std", "text", "icon", "rayon", "simd"] }
+
+[target.'cfg(not(any(target_os = "android", target_os = "ferros")))'.dependencies]
+fluor = { version = "0.0.7", features = ["host-winit"] }
+
+# target_os = "ferros" is a device running ferros, as a process of its kernel (a JSON target, docs/STD-TARGET.md in the ferros repo): rustc does not know the name, so the cfg is declared here.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_os, values("ferros"))'] }

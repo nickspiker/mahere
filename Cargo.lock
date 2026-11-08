@@ -1960,6 +1960,7 @@ dependencies = [
  "libc",
  "log",
  "mahere-coord",
+ "mahere-device",
  "mahere-engine",
  "mahere-gpu",
  "mahere-panel",
@@ -2008,6 +2009,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "mahere-device"
+version = "0.6.1"
+dependencies = [
+ "fluor",
+ "libc",
+ "mahere-engine",
+ "mahere-panel",
+ "mahere-store",
+ "mahere-tiles",
+ "mahere-update",
+]
+
+[[package]]
 name = "mahere-engine"
 version = "0.6.1"
 dependencies = [
@@ -2017,6 +2031,17 @@ dependencies = [
  "rustc-hash 2.1.3",
  "ureq",
  "vsf",
+]
+
+[[package]]
+name = "mahere-ferros"
+version = "0.6.1"
+dependencies = [
+ "fluor",
+ "getrandom 0.2.17",
+ "mahere-device",
+ "mahere-engine",
+ "mahere-store",
 ]
 
 [[package]]

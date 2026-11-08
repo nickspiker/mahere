@@ -11,9 +11,16 @@ mahere-coord = { path = "../mahere-coord" }
 mahere-dem = { path = "../mahere-dem" }
 mahere-osm = { path = "../mahere-osm" }
 rayon = "1"
+vsf = { version = "0.10", features = ["text"] }
+
+# ferros (docs/STD-TARGET.md in the ferros repo) has no TLS and no std sockets: there ureq carries no TLS (an https fetch answers that it cannot), and zstd leaves out the dictionary builder and the legacy formats, whose C wants a hosted libc (stdio, qsort_r, clock); Mahere trains no dictionaries and reads no pre-1.0 frames.
+[target.'cfg(not(target_os = "ferros"))'.dependencies]
 ureq = "2"
 zstd = "0.13"
-vsf = { version = "0.10", features = ["text"] }
+
+[target.'cfg(target_os = "ferros")'.dependencies]
+ureq = { version = "2", default-features = false }
+zstd = { version = "0.13", default-features = false }
 
 [dev-dependencies]
 png = "0.17"

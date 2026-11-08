@@ -70,6 +70,16 @@ cargo test                          # coordinates, tiles, engine, store
 
 Without a local `data/cells`, both frontends stream cells from the public bucket (`https://brobdingnagian.holdmyoscilloscope.com/mahere/cells/…`, the same `{layer}/{cell}.vsf.zst` layout) into the kete vault on the device, and serve them from there afterwards — the Android APK carries no map data. `scripts/publish-cells.sh` syncs a bake to the bucket; `scripts/publish-android.sh` builds the release-signed APK and puts it at `https://brobdingnagian.holdmyoscilloscope.com/mahere/mahere.apk`, which the project page links.
 
+## ferros
+
+On [ferros](https://github.com/nickspiker/ferros) Mahere is a kist: the real app as a process of the ferros kernel, on its std target `aarch64-unknown-ferros` (ferros `docs/STD-TARGET.md`), never a stripped copy.
+
+- **The app** is `mahere-device`, the touch-device app Android runs too (the map, the panel, the two-finger solve, GPS, the vault), moved out of `mahere-android` so both platforms build the same code. With a GPU host (Android's Vulkan) the host draws; without one (ferros, whose Mali is not a wgpu adapter, and Android without Vulkan) the app composes the map, its lettering and the panel on the CPU, as the desktop's CPU path does.
+- **The shell** is `mahere-ferros` (a binary, `mahere`), Android's JNI shell's twin: fluor's ferros host (`fluor::host::ferros::run_app_with`) draws into the display server's app surface and hands over the touch server's contacts, two fingers going to the solve and one to fluor's pointer; the fix comes from the `gps` endpoint once a second; the vault is the process's scope of the kernel's, kete's secret derived from the device's ira for Mahere (nothing kept beside it).
+- **Spawn order** (grant slots): `--use display --use touch --dma surface --ira --store <scope> --entropy`, then `--use gps` when the person lets the map know where they are.
+- **The manifests** carry `cfg(target_os = "ferros")` arms: no wgpu or winit there, ureq without TLS, zstd without its dictionary builder and legacy formats (their C wants a hosted libc). The build (ferros `tools/mahere-build.sh`) takes fluor and kete from their source trees (their ferros parts are not published yet), libc with a ferros arm, and keeps its own lockfile, `ferros/Cargo.lock`, so `Cargo.lock` stays the desktop's and Android's.
+- **Not yet**: cells reach a ferros device only through its vault — there is no TLS on ferros and ureq has no transport over its ip server (the bucket also answers plain HTTP); the vault scope is a development one until ferros gives each installed kist its own; the updater finds no ferros build in the manifests (a kist is installed and updated by the device). The altitude from the `gps` endpoint is not used until its datum is known.
+
 ## License
 
 MIT or Apache-2.0, at your option.

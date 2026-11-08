@@ -37,6 +37,11 @@ pub fn open(base: Option<&str>) -> Result<Arc<FlatStorage>, String> {
     FlatStorage::open_device_shared(APP, secret).map_err(|e| format!("vault open: {e:?}"))
 }
 
+/// Open THE mahere vault with a device secret the platform holds itself, where nothing is kept beside the rings: on ferros the vault is the process's scope of the kernel's, and the secret is derived from the device's ira for Mahere (mahere-ferros), the same every boot, never stored.
+pub fn open_with_secret(secret: [u8; 32]) -> Result<Arc<FlatStorage>, String> {
+    FlatStorage::open_device_shared(APP, secret).map_err(|e| format!("vault open: {e:?}"))
+}
+
 fn dirs_config() -> Option<String> {
     // Windows has no HOME, as a rule: its per-user application data (2026-10-16, the first Windows build).
     std::env::var("XDG_CONFIG_HOME")
@@ -564,6 +569,13 @@ pub fn cell_stores(local: Option<&std::path::Path>, vault: Option<Arc<FlatStorag
             return (Arc::new(LayerDir(dir.to_path_buf(), Layer::Base)), Some(layers), None);
         }
         return (Arc::new(DirStore(dir.to_path_buf())), None, None);
+    }
+    // ferros: no way to the bucket yet (no TLS there, and ureq has no transport over the ip server; ferros docs/STD-TARGET.md), so the device's cells are the vault's alone, and a cell it lacks is absent rather than a fetch failing every few seconds.
+    #[cfg(target_os = "ferros")]
+    if let Some(v) = &vault {
+        let cache = VaultCells::open(v.clone());
+        let layers = LayerStores { dem: cache.layer(Layer::Dem), img: cache.layer(Layer::Img), nir: cache.layer(Layer::Nir) };
+        return (cache.clone(), Some(layers), Some(cache));
     }
     let remote = |l: Layer| Arc::new(HttpStore::layer(DEFAULT_CELLS_URL, l));
     match vault {
