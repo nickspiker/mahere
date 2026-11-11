@@ -1,14 +1,15 @@
 //! Mahere's way to the network on ferros: connections over the ip server's client TCP (ferros payloads/ip, its `udp` endpoint: 1 SEND, 2 RECV, 3 INFO, 4 CONNECT, 5 SEND, 6 RECV, 7 CLOSE), the server's address from the DNS server ip reports, for mahere-engine's plain HTTP ([`Dial`]). Nick 2026-11-11: "we have tcp and http so let's get the full meal deal wired up with mahere".
 //!
-//! Every wait is a receive the ip server holds until something comes (the wait byte of its ops 2 and 6, which its INFO says it has), never a poll (Nick 2026-11-10: "No polling!"): a loader thread blocks in the call as it blocks on a socket elsewhere. The two deadlines are real ones: a DNS question lost on the way is asked again after a second, and a connection that brings nothing for 32 s is given up.
+//! Every wait is a receive the ip server holds until something comes (the wait byte of its ops 2 and 6), never a poll (Nick 2026-11-10: "No polling!"): a loader thread blocks in the call as it blocks on a socket elsewhere. The two deadlines are real ones: a DNS question lost on the way is asked again after a second, and a connection that brings nothing for 32 s is given up.
+//! The ip server's TCP since 2026-11-11 (Nick: "sounds like it needs re-engineered"): sixteen connections, a 1 MiB window each, receives of up to 256 KiB; Mahere takes four connections at once and reads each a big reply at a time.
 
 use crate::ferros::sys;
 use mahere_engine::plain_http::{Conn, Dial};
 use std::io;
 use std::sync::{Arc, Condvar, Mutex};
 
-/// INFO's last byte (the 72nd): bit 0, the ip server holds receives.
-const DOES_HOLD: u8 = 1;
+/// The ip server's INFO reply: 71 bytes (addresses, flags, the DNS servers).
+const INFO_LEN: usize = 71;
 /// The port DNS questions leave from and their answers come to: the ip server hands a port's datagrams to whoever asks for that port, so each process has its own (httptest 53053, fgtw and the kist installer 53054).
 const DNS_PORT: u16 = 53055;
 /// How long one DNS question waits for its answer (WHY a deadline: a datagram lost on the way is never answered), and how many times it is asked.
@@ -16,12 +17,14 @@ const DNS_WAIT_S: u8 = 1;
 const DNS_TRIES: usize = 1 << 2;
 /// How long a connection may bring nothing before it is given up: 32 s, the ip server's own idle reaping time (WHY a deadline: ip fails a connection only when what it sent goes unanswered, and a GET's body is all receiving; a server gone silent mid-body would hold a loader for ever).
 const STALL_S: u8 = 1 << 5;
-/// The connections Mahere holds at once: one of the ip server's two, the other left to the device's own (attest's fgtw, the kist installer). The loaders wait their turn on it, a doorbell (a condition variable), not a poll.
-const CONNECTIONS: usize = 1;
-/// The ip server's replies: a TCP receive carries at most 2047 bytes after its state byte, and the kernel cuts a reply at the caller's buffer, so the buffer is the server's whole reply.
-const REPLY: usize = 1 << 11;
-/// The most of a request one SEND carries (WHY: the ip server receives a request into a 2 KiB buffer and the kernel cuts what does not fit; a request is a few hundred bytes, so this never splits one in practice).
-const SEND_MAX: usize = 1 << 10;
+/// The connections Mahere holds at once: four of the ip server's sixteen, the rest left to the device's own (attest's fgtw, the kist installer) and other apps. The loaders wait their turn, a doorbell (a condition variable), not a poll.
+const CONNECTIONS: usize = 1 << 2;
+/// The most data one TCP receive asks for: 256 KiB, all one reply of the ip server carries (its RECV_MAX, the kernel's largest reply); the buffer holds the state byte ahead of it.
+const RECV_MOST: usize = 1 << 18;
+/// A DNS answer's reply: the datagram's 21 bytes of family, address and ports, then a message of at most 1472 bytes.
+const DNS_REPLY: usize = 1 << 11;
+/// The most of a request one SEND carries: a call carries 4096 bytes (the kernel's limit), less the op and the handle.
+const SEND_MAX: usize = (1 << 12) - 2;
 
 /// The ip server at grant slot `slot`, the address last resolved, and the turn for a connection.
 pub struct IpNet {
@@ -38,8 +41,8 @@ impl IpNet {
         if n == sys::ERR {
             return Err(format!("the ip server refused the call at slot {slot} (no network grant)"));
         }
-        if n < 72 || info[71] & DOES_HOLD == 0 {
-            return Err("the ip server does not hold receives (it is from before 2026-11-11: store the new ip)".into());
+        if n < INFO_LEN as u64 {
+            return Err("the ip server's INFO is short".into());
         }
         Ok(IpNet { slot, found: Arc::new(Mutex::new(None)), turn: Arc::new((Mutex::new(0), Condvar::new())) })
     }
@@ -60,7 +63,7 @@ impl IpNet {
         let t = std::time::Instant::now();
         let mut info = [0u8; 128];
         let n = self.call(&[3], &mut info)?;
-        if n < 72 {
+        if n < INFO_LEN {
             return Err(io::Error::other("the ip server's INFO is short"));
         }
         let flags = info[50];
@@ -113,7 +116,7 @@ impl IpNet {
         q.extend_from_slice(&qtype.to_be_bytes());
         q.extend_from_slice(&[0, 1]);
         let mut status = [0u8; 16];
-        let mut out = vec![0u8; REPLY];
+        let mut out = vec![0u8; DNS_REPLY];
         let hold = [2, (DNS_PORT >> 8) as u8, DNS_PORT as u8, DNS_WAIT_S];
         for _ in 0..DNS_TRIES {
             // Sent (0), or the next hop still being resolved (1: the question is asked again after its wait); no address (2) or refused (3) end it.
@@ -199,9 +202,10 @@ impl Dial for IpNet {
         let mut r = [0u8; 16];
         let n = self.call(&req, &mut r)?;
         match (n, r[0]) {
-            (2.., 0) => Ok(Box::new(IpConn { slot: self.slot, handle: r[1], rx: Vec::new(), at: 0, closed: false, found: self.found.clone(), _turn: turn })),
+            (2.., 0) => Ok(Box::new(IpConn { slot: self.slot, handle: r[1], rx: vec![0u8; 1 + RECV_MOST], at: 1, len: 1, state: 1, closed: false, found: self.found.clone(), _turn: turn })),
             (_, 2) => Err(io::Error::new(io::ErrorKind::AddrNotAvailable, "no address yet")),
             (_, 4) => Err(io::Error::other("the ip server has no free connection")),
+            (_, 6) => Err(io::Error::other("the ip server has no memory for another connection")),
             _ => Err(io::Error::other("the ip server refused the connection")),
         }
     }
@@ -229,12 +233,14 @@ impl Drop for Turn {
     }
 }
 
-/// One connection on the ip server: its handle, what came in and has not been read, whether the server closed.
+/// One connection on the ip server: its handle, the last reply (its state byte, then data read up to `at` of `len`), the state it said last, whether the server closed.
 struct IpConn {
     slot: u64,
     handle: u8,
     rx: Vec<u8>,
     at: usize,
+    len: usize,
+    state: u8,
     closed: bool,
     found: Arc<Mutex<Option<(String, u8, [u8; 16])>>>,
     /// Dropped after the connection's close (fields drop in order, after `drop`).
@@ -250,17 +256,23 @@ impl IpConn {
 
 impl io::Read for IpConn {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        if self.at == self.rx.len() {
+        // Held until data, a change of the connection's state (it opened, the server closed, it failed), or STALL_S with nothing; the reply lands in `rx` whole, its data read from it until it is used up.
+        let mut ask = [6, self.handle, STALL_S, 0, 0, 0, 0];
+        ask[3..7].copy_from_slice(&(RECV_MOST as u32).to_be_bytes());
+        while self.at == self.len {
             if self.closed {
                 return Ok(0);
             }
-            // Held until data, a close or a failure, or STALL_S with nothing.
-            let mut reply = vec![0u8; REPLY];
-            let n = self.call(&[6, self.handle, STALL_S], &mut reply)?;
+            let n = sys::call(self.slot, &ask, &mut self.rx);
+            if n == sys::ERR {
+                return Err(io::Error::other("the ip server refused the call"));
+            }
+            // WHY the min: the length is the kernel's, never past the buffer it was given.
+            let n = (n as usize).min(self.rx.len());
             if n == 0 {
                 return Err(io::Error::other("the ip server answered nothing (nobody present)"));
             }
-            let state = reply[0];
+            let state = self.rx[0];
             match state {
                 5 => return Err(io::Error::new(io::ErrorKind::NotConnected, "the connection is gone")),
                 4 => {
@@ -270,20 +282,24 @@ impl io::Read for IpConn {
                 }
                 _ => {}
             }
-            reply.truncate(n);
-            reply.remove(0);
-            if reply.is_empty() {
-                // The server closed and everything has been read, or the wait ran out with nothing.
+            self.at = 1;
+            self.len = n;
+            if n == 1 {
+                // The server closed and everything has been read.
                 if state == 3 {
                     self.closed = true;
                     return Ok(0);
                 }
+                // The connection opened: wait again. The same state with nothing: the wait ran out.
+                if state != self.state {
+                    self.state = state;
+                    continue;
+                }
                 return Err(io::Error::new(io::ErrorKind::TimedOut, format!("nothing for {STALL_S} s")));
             }
-            self.rx = reply;
-            self.at = 0;
+            self.state = state;
         }
-        let k = (self.rx.len() - self.at).min(buf.len());
+        let k = (self.len - self.at).min(buf.len());
         buf[..k].copy_from_slice(&self.rx[self.at..self.at + k]);
         self.at += k;
         Ok(k)
@@ -291,7 +307,7 @@ impl io::Read for IpConn {
 }
 
 impl io::Write for IpConn {
-    /// What the connection's send buffer took (the ip server sends it as the peer's window allows); none taken is an error, never a retry loop (a request goes onto a fresh connection whose 2 KiB buffer is empty).
+    /// What the connection's send buffer took (the ip server sends it as the peer's window allows); none taken is an error, never a retry loop (a request goes onto a fresh connection whose 256 KiB buffer is empty).
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         let part = &buf[..buf.len().min(SEND_MAX)];
         let mut req = Vec::with_capacity(2 + part.len());
