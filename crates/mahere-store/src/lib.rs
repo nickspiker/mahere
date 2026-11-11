@@ -570,9 +570,9 @@ pub fn cell_stores(local: Option<&std::path::Path>, vault: Option<Arc<FlatStorag
         }
         return (Arc::new(DirStore(dir.to_path_buf())), None, None);
     }
-    // ferros: no way to the bucket yet (no TLS there, and ureq has no transport over the ip server; ferros docs/STD-TARGET.md), so the device's cells are the vault's alone, and a cell it lacks is absent rather than a fetch failing every few seconds.
+    // ferros: the bucket over plain HTTP behind the vault, as everywhere, once the shell has a way to the network (its `udp` grant to the ip server, plain_http's dial); without one the device's cells are the vault's alone, and a cell it lacks is absent rather than a fetch failing every few seconds.
     #[cfg(target_os = "ferros")]
-    if let Some(v) = &vault {
+    if let (Some(v), None) = (&vault, mahere_engine::plain_http::dial()) {
         let cache = VaultCells::open(v.clone());
         let layers = LayerStores { dem: cache.layer(Layer::Dem), img: cache.layer(Layer::Img), nir: cache.layer(Layer::Nir) };
         return (cache.clone(), Some(layers), Some(cache));

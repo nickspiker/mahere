@@ -13,12 +13,9 @@ rayon = "1"
 rustc-hash = "2"
 vsf = { version = "0.10" }
 
-# ferros (docs/STD-TARGET.md in the ferros repo) has no TLS and no std sockets: there ureq carries no TLS (an https fetch answers that it cannot). The map's cells on a ferros device come from the vault.
+# The bucket over HTTPS. ferros (docs/STD-TARGET.md in the ferros repo) has no TLS and no std sockets: there the bucket is reached over plain HTTP through the connections Mahere's ferros shell dials over the ip server (plain_http, mahere-ferros), and ureq is not built.
 [target.'cfg(not(target_os = "ferros"))'.dependencies]
 ureq = "2"
-
-[target.'cfg(target_os = "ferros")'.dependencies]
-ureq = { version = "2", default-features = false }
 
 # target_os = "ferros" is a device running ferros (its std target, ferros docs/STD-TARGET.md): rustc does not know the name, so the cfg is declared here.
 [lints.rust]

@@ -5,17 +5,18 @@ use mahere_device::{DeviceApp, NoGpu};
 use mahere_engine::GpsFix;
 use std::sync::{Arc, Mutex};
 
-/// The grant slots, in the spawn's order (slot 0 is the console): the display endpoint, the touch endpoint, this process's surface, the ira. The vault scope (`--store`) and the entropy follow, found by kete and ferros_rt by asking each grant; `--use gps` comes last, when the person grants it.
+/// The grant slots, in the spawn's order (slot 0 is the console): the display endpoint, the touch endpoint, this process's surface, the ira. The vault scope (`--store`) and the entropy follow, found by kete and ferros_rt by asking each grant; then `--use gps`, when the person grants it, and `--use udp`, the ip server (the network: the cells from the bucket behind the vault).
 const DISPLAY: u64 = 1;
 const TOUCH: u64 = 2;
 const SURFACE: u64 = 3;
 const IRA: u64 = 4;
 const GPS: u64 = 7;
+const UDP: u64 = 8;
 
 type Shell = FerrosShell<DeviceApp<NoGpu>>;
 
 /// The kernel, as this process reaches it (ferros KERNEL.md, the process ABI): the call, the ira key, the grants page. Inlined as fluor's and kete's are: ferros_sys is no_std and not a published crate.
-mod sys {
+pub(crate) mod sys {
     use core::arch::asm;
 
     pub const ERR: u64 = u64::MAX;
@@ -83,6 +84,18 @@ pub fn run() {
             None
         }
     };
+    // The network before the app opens its cell stores: with it the cells come from the vault, then the bucket over plain HTTP, kept in the vault as they come (as on every other platform); without it from the vault alone.
+    if sys::grant_count() > UDP {
+        match crate::net::IpNet::open(UDP) {
+            Ok(net) => {
+                mahere_engine::plain_http::set_dial(Arc::new(net));
+                println!("mahere: the network at slot {UDP}; cells from {} behind the vault", mahere_engine::residency::DEFAULT_CELLS_URL);
+            }
+            Err(e) => println!("mahere: no network: {e}; cells from the vault alone"),
+        }
+    } else {
+        println!("mahere: no network grant (slot {UDP}); cells from the vault alone");
+    }
     // The size comes from the shell at once (`on_resize` as it is made): the panel's, the frame being the whole panel.
     let app: DeviceApp<NoGpu> = DeviceApp::open(0, 0, store, None);
     let fixes: Arc<Mutex<Option<GpsFix>>> = Arc::new(Mutex::new(None));

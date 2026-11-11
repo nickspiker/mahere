@@ -4,6 +4,7 @@ pub mod areas;
 pub mod colour;
 pub mod ink;
 pub mod labels;
+pub mod plain_http;
 pub mod plan;
 pub mod probe;
 pub mod raster;

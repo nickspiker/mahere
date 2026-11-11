@@ -861,7 +861,11 @@ fn load_cell(store: &dyn CellStore, layers: Option<&LayerStores>, want: u8, key:
 // ==================== TIERED STORE: VAULT CACHE OVER THE BUCKET ====================
 
 /// Where the baked cells live publicly. The path under it is exactly a cell's `CellKey::path`, so the bake directory and the bucket are the same thing.
+#[cfg(not(target_os = "ferros"))]
 pub const DEFAULT_CELLS_URL: &str = "https://brobdingnagian.holdmyoscilloscope.com/mahere/cells";
+/// The same bucket over plain HTTP on ferros, which speaks no TLS (Nick 2026-11-11: "we have tcp and http so let's get the full meal deal wired up with mahere"; the bucket answers port 80 as it answers 443).
+#[cfg(target_os = "ferros")]
+pub const DEFAULT_CELLS_URL: &str = "http://brobdingnagian.holdmyoscilloscope.com/mahere/cells";
 
 /// Cell format epoch: bumped whenever the encoding changes incompatibly. It rides on the fetch URL as a query (so the CDN edge, which caches a key for hours, sees a new key) and in the vault key (so a cached cell of an older format is never read back as this one). Old clients keep fetching the old objects they understand.
 pub const CELL_EPOCH: u32 = 8;
@@ -1072,15 +1076,17 @@ impl CellStore for TieredStore {
     }
 }
 
-/// The bucket over HTTPS. 404 is absence; anything else is a failure.
+/// The bucket over HTTPS (on ferros over plain HTTP, through [`crate::plain_http`]). 404 is absence; anything else is a failure.
 pub struct HttpStore {
     base: String,
+    #[cfg(not(target_os = "ferros"))]
     agent: ureq::Agent,
     /// The published layer this store fetches (`<base>/<layer>/<cell>.vsf`); None for a baked directory served as it is (`<base>/<cell>.vsf.zst`).
     layer: Option<mahere_tiles::publish::Layer>,
 }
 
 impl HttpStore {
+    #[cfg(not(target_os = "ferros"))]
     pub fn new(base: &str) -> HttpStore {
         // A connection kept for every loader (ureq keeps one a host by default, so eleven of twelve loaders paid a TCP and TLS handshake on every cell, about 160 ms each).
         let agent = ureq::AgentBuilder::new()
@@ -1089,6 +1095,12 @@ impl HttpStore {
             .max_idle_connections_per_host(32)
             .build();
         HttpStore { base: base.trim_end_matches('/').to_string(), agent, layer: None }
+    }
+
+    /// On ferros the connections are the platform's ([`crate::plain_http::set_dial`]): nothing to keep here.
+    #[cfg(target_os = "ferros")]
+    pub fn new(base: &str) -> HttpStore {
+        HttpStore { base: base.trim_end_matches('/').to_string(), layer: None }
     }
 
     /// One published layer of the cells under `base`.
@@ -1104,6 +1116,7 @@ impl HttpStore {
     }
 }
 
+#[cfg(not(target_os = "ferros"))]
 impl RemoteStore for HttpStore {
     fn check(&self, key: CellKey, tag: Option<&str>) -> Checked {
         let url = self.url(key);
@@ -1139,6 +1152,52 @@ impl RemoteStore for HttpStore {
     }
 }
 
+/// On ferros, the same outcomes from [`crate::plain_http::get`]: 200 the bytes, 304 the kept copy, 404 absence; each fetch said on the console (the device's only window on whether its network reaches the bucket).
+#[cfg(target_os = "ferros")]
+impl RemoteStore for HttpStore {
+    fn check(&self, key: CellKey, tag: Option<&str>) -> Checked {
+        match self.got(&self.url(key), tag) {
+            Ok(g) if g.status == 304 => Checked::Same,
+            Ok(g) if (200..300).contains(&g.status) => Checked::Changed(g.body, g.etag),
+            Ok(g) if g.status == 404 => Checked::Gone,
+            Ok(g) => Checked::Failed(format!("HTTP {}", g.status)),
+            Err(e) => Checked::Failed(e),
+        }
+    }
+
+    fn fetch(&self, key: CellKey) -> Fetch {
+        self.fetch_url(&self.url(key))
+    }
+
+    fn fetch_named(&self, key: CellKey, name: &str) -> Fetch {
+        self.fetch_url(&format!("{}&h={name}", self.url(key)))
+    }
+}
+
+#[cfg(target_os = "ferros")]
+impl HttpStore {
+    fn fetch_url(&self, url: &str) -> Fetch {
+        match self.got(url, None) {
+            Ok(g) if (200..300).contains(&g.status) => Fetch::Bytes(g.body),
+            Ok(g) if g.status == 404 => Fetch::Absent,
+            Ok(g) => Fetch::Failed(format!("HTTP {}", g.status)),
+            Err(e) => Fetch::Failed(e),
+        }
+    }
+
+    /// One GET, said on the console: the path under the base, then the status, the bytes and the time, or why it failed.
+    fn got(&self, url: &str, tag: Option<&str>) -> Result<crate::plain_http::Got, String> {
+        let t = std::time::Instant::now();
+        let r = crate::plain_http::get(url, tag);
+        let path = url.strip_prefix(self.base.as_str()).unwrap_or(url);
+        match &r {
+            Ok(g) => eprintln!("mahere: fetch {path}: {} {} bytes in {} ms", g.status, g.body.len(), t.elapsed().as_millis()),
+            Err(e) => eprintln!("mahere: fetch {path} failed in {} ms: {e}", t.elapsed().as_millis()),
+        }
+        r
+    }
+}
+
 impl HttpStore {
     /// A file beside the cells by its path (an address document, `addr/<zip>.vsf`), or None when it is not there or the network is not.
     pub fn fetch_path(&self, path: &str) -> Option<Vec<u8>> {
@@ -1147,7 +1206,10 @@ impl HttpStore {
             _ => None,
         }
     }
+}
 
+#[cfg(not(target_os = "ferros"))]
+impl HttpStore {
     fn fetch_url(&self, url: &str) -> Fetch {
         match self.agent.get(url).call() {
             Ok(resp) => {
