@@ -750,6 +750,10 @@ impl<G: MapGpu> FluorApp for DeviceApp<G> {
                 self.apply_controls(ctl, mask);
                 EventResponse::Handled
             }
+            // Escape steps back, as Android's back button does (`nativeBack`): ferros's back tap arrives as Escape (ferros WINDOWS.md "The helm"). The panel one page up, then closed; with it closed already, nothing more here.
+            FEvent::KeyboardInput { event } if event.state == ElementState::Pressed && event.logical_key == fluor::event::Key::Named(fluor::event::NamedKey::Escape) => {
+                if self.panel.back() { EventResponse::Handled } else { EventResponse::Pass }
+            }
             FEvent::KeyboardInput { event } if self.searching && event.state == ElementState::Pressed => {
                 use fluor::event::{Key, NamedKey};
                 match &event.logical_key {
