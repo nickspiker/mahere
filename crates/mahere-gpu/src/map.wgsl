@@ -991,8 +991,8 @@ fn compose(d: u32, u: u32, v: u32, pos: vec2<f32>, ce: vec4<u32>, cf: vec4<u32>,
             { let f = fold(Fold(out.k2, out.c2), hv3(ink.rgb), hf(contour_cov * ink.a)); out.k2 = f.k; out.c2 = f.c; }
         }
     }
-    // Where the wanted terrain cell has not arrived at all (no reference and no absent marker), the cell's two triangles each take a random dark colour of their own, the CPU's loading_noise, where nothing at any depth stands in; a coarser stand-in draws as it is.
-    if (want_dem && !baking() && found_depth != U.depths.x && lookup(d, U.depths.x, u, v) == NONE) {
+    // Where nothing at any depth stands in for the wanted terrain cell (not arrived yet, or no cell there at any depth), the cell's two triangles each take a random dark colour of their own, the CPU's loading_noise: no data is a dark mesh, never the theme's background (owner 2026-11-11); a coarser stand-in draws as it is.
+    if (want_dem && !baking() && found_depth == NONE) {
         let s = 30u - U.depths.x;
         let m = (1u << s) - 1u;
         let side = (((u & m) + (v & m)) >> s) & 1u;

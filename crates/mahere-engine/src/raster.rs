@@ -971,18 +971,12 @@ fn compose_rgb(dem: &DemRef, vec: &VecRef, pool: &Pool, diamond: u8, uq: i64, vq
             rgb = lerp3(rgb, lin(rgb3(if contour.1 { st.contour_index } else { st.contour })), contour.0 * alpha(if contour.1 { st.contour_index } else { st.contour }));
         }
     }
-    // Where the wanted terrain cell has not arrived at all (no entry yet, loaded or confirmed absent) and nothing at any depth stands in, the cell's two triangles each take a random dark colour of their own: a loading view shows the wanted cells as a dark mesh; a coarser stand-in draws as it is, untinted (Nick 2026-10-10).
-    if (mask.dem || mask.contours || mask.slope) && dem_ref_depth(dem) != Some(luts.dem_depth) {
-        let key = CellKey { depth: luts.dem_depth, prefix: raw_of(diamond, uq, vq) >> (60 - 2 * luts.dem_depth as u32) };
-        if !pool.map.contains_key(&key) {
-            let shift = 16 + 30 - luts.dem_depth as u32;
-            let m = (1i64 << shift) - 1;
-            let half = (((uq & m) + (vq & m)) >> shift) & 1;
-            let noise = lin(loading_noise(diamond as u32, luts.dem_depth as u32, (uq >> shift) as u32, (vq >> shift) as u32, half as u32));
-            if dem_ref_depth(dem).is_none() {
-                rgb = noise;
-            }
-        }
+    // Where nothing at any depth stands in for the wanted terrain cell (it has not arrived yet, or the store has no cell there at any depth: ferros's vault with none of the bake), the cell's two triangles each take a random dark colour of their own, a dark mesh; a coarser stand-in draws as it is, untinted (Nick 2026-10-10). No data is never the theme's flat background (owner 2026-11-11: "it was ALWAYS dark coloured for anything we don't have"): until then a cell confirmed absent at every depth turned the mesh into the background as its load finished, the whole map on a device with an empty vault.
+    if (mask.dem || mask.contours || mask.slope) && dem_ref_depth(dem).is_none() {
+        let shift = 16 + 30 - luts.dem_depth as u32;
+        let m = (1i64 << shift) - 1;
+        let half = (((uq & m) + (vq & m)) >> shift) & 1;
+        rgb = lin(loading_noise(diamond as u32, luts.dem_depth as u32, (uq >> shift) as u32, (vq >> shift) as u32, half as u32));
     }
     pack(luts, user_marks(rgb, user, raw_of(diamond, uq, vq), luts.dem_depth))
 }
@@ -1226,6 +1220,60 @@ mod tests {
         let tl = lin(t);
         let expect = pack(&luts, [tl[0] * e[0].max(0.0), tl[1] * e[1].max(0.0), tl[2] * e[2].max(0.0)]);
         assert_eq!(canvas[(h / 2) * w + w / 2], expect);
+    }
+
+    /// No data is a dark mesh, never the theme's background (owner 2026-11-11, ferros with an empty vault): a frame whose cells are confirmed absent at every depth draws each triangle in its own dark colour, as one whose cells have not arrived; and an absent cell with a coarser one holding terrain draws that coarser terrain, as if the absent one had never been asked for.
+    #[test]
+    fn absent_everywhere_is_the_dark_mesh_and_a_parent_stands_in() {
+        let cam = crate::Camera::new(46.2, -121.5, 6000.0, 0.0);
+        let raw = mahere_coord::Coord::from_lat_lon(cam.lat(), cam.lon()).raw();
+        let luts = FrameLuts {
+            pole: [0.0, 1.0, 0.0],
+            disk: [128.0, 64.0, 1.0e9],
+            hypso: build_hypso_lut(),
+            style: Style::default(),
+            sun: [0.0, 0.0, 1.0],
+            mask: LayerMask { contours: false, ..LayerMask::default() }.effective(),
+            dem_depth: 6,
+            contours: Contours { interval: 0.0, index_every: 5, m_per_px: 1.0, lo_m: 0.0, hi_m: 4000.0 },
+            light: crate::sh::Sh9::sun_and_sky(315.0, 40.0).quadratic((0.0, 1.0)),
+            display: crate::colour::Display::default(),
+            compressed: true,
+        };
+        let (w, h) = (64usize, 64usize);
+        let render = |pool: &Pool| {
+            let mut canvas = vec![0u32; w * h];
+            render_frame(&mut canvas, w, h, &cam, pool, &luts, 6, 13, &crate::ink::UserLayer::default());
+            canvas
+        };
+        // Every depth from the wanted one down to the root confirmed absent (what an empty store answers).
+        let mut absent = Pool::default();
+        for depth in MIN_DEPTH..=6 {
+            absent.map.insert(CellKey { depth, prefix: raw >> (60 - 2 * depth as u32) }, Entry::default());
+        }
+        let bg = pack(&luts, lin(rgb3(luts.style.bg)));
+        let pending = render(&Pool::default());
+        let none = render(&absent);
+        assert!(none.iter().all(|&p| p != bg), "a pixel with no data at any depth drew the theme's background");
+        assert_eq!(none, pending, "no data at any depth draws as a cell not arrived: the dark mesh");
+        // A coarser cell with terrain under the absent ones: it draws, the same as with the absent markers gone.
+        let flat = Entry {
+            present: crate::residency::PRESENT_DEM,
+            elev_lo: 6000,
+            elev_hi: 6000,
+            dem: Some(DemPacked { texel: vec![6000u64 | (32767u64 << 48); mahere_tiles::TRI].into_boxed_slice() }),
+            exists: true,
+            layers: u8::MAX,
+            ..Entry::default()
+        };
+        let mut parent = Pool::default();
+        parent.map.insert(CellKey { depth: 4, prefix: raw >> (60 - 2 * 4) }, flat);
+        let alone = render(&parent);
+        for depth in [5u8, 6] {
+            parent.map.insert(CellKey { depth, prefix: raw >> (60 - 2 * depth as u32) }, Entry::default());
+        }
+        assert_eq!(render(&parent), alone, "an absent cell over a coarser one draws the coarser terrain");
+        assert!(alone.iter().zip(&pending).any(|(a, p)| a != p), "the coarser terrain is not the mesh");
     }
 }
 
