@@ -19,3 +19,7 @@ ureq = "2"
 
 [target.'cfg(target_os = "ferros")'.dependencies]
 ureq = { version = "2", default-features = false }
+
+# target_os = "ferros" is a device running ferros (its std target, ferros docs/STD-TARGET.md): rustc does not know the name, so the cfg is declared here.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_os, values("ferros"))'] }

@@ -259,6 +259,8 @@ pub struct MapCore {
     home: Camera,
     /// Measured cost of the last `render` call in milliseconds.
     pub last_frame_ms: f32,
+    /// What the last traced frame reported ([`MapCore::trace_frame`]): the next is logged only when it differs.
+    last_trace: Option<FrameTrace>,
     /// Pixels the screen's top-right marks (the compass, the heading and the zoom) move down, below a host's own controls there (the desktop's window buttons, Nick 2026-10-17); 0 on the phone.
     pub marks_top: f32,
     pub last_straddle_blocks: usize,
@@ -405,6 +407,7 @@ impl MapCore {
             dem_depth: DEM_BASE_DEPTH,
             home,
             last_frame_ms: 0.0,
+            last_trace: None,
             marks_top: 0.0,
             last_straddle_blocks: 0,
             dirty: true,
@@ -1804,12 +1807,54 @@ impl MapCore {
         // Residency: request what the lattice says we need, nearest-first.
         let center = Coord::from_lat_lon(self.cam.lat(), self.cam.lon());
         let (cu, cv) = center.uv();
+        if trace() {
+            self.trace_frame(&want, w, h);
+        }
         self.res.want(self.with_globe(want), (cu, cv));
 
         self.draw_gps(w, h);
         self.draw_compass(w, h);
         self.draw_measure(w, h);
         self.last_frame_ms = t0.elapsed().as_secs_f32() * 1000.0;
+    }
+
+    /// The frame as the residency sees it, logged when it changes (ferros, or MAHERE_TRACE): the camera, the depths, and each terrain cell the frame wants at its depth: resident with terrain, confirmed absent, arrived empty, or not arrived; of those without terrain, how many a coarser cell stands in for and how many have nothing at any depth (drawn as the dark mesh).
+    fn trace_frame(&mut self, want: &[mahere_tiles::CellKey], w: usize, h: usize) {
+        let pool = &self.res.pool;
+        let mut t = FrameTrace { dem_depth: self.dem_depth, vec_depth: self.vec_depth, pool: pool.map.len() as u32, ..FrameTrace::default() };
+        for k in want.iter().filter(|k| k.depth == self.dem_depth) {
+            t.wanted += 1;
+            match pool.map.get(k) {
+                Some(e) if e.dem.is_some() => {
+                    t.terrain += 1;
+                    continue;
+                }
+                Some(e) if e.is_absent() => t.absent += 1,
+                Some(_) => t.empty += 1,
+                None => t.pending += 1,
+            }
+            let below = (k.depth > raster::MIN_DEPTH).then(|| raster::probe(pool, k.depth - 1, k.prefix >> 2, |e| e.dem.is_some())).flatten();
+            match below {
+                Some((_, d, _)) => {
+                    t.stand_in += 1;
+                    t.stand_in_depth = t.stand_in_depth.max(d);
+                }
+                None => t.nothing += 1,
+            }
+        }
+        for e in pool.map.values() {
+            t.pool_terrain += e.dem.is_some() as u32;
+            t.pool_absent += e.is_absent() as u32;
+        }
+        if self.last_trace == Some(t) {
+            return;
+        }
+        let c = &self.cam;
+        eprintln!(
+            "map frame {w} x {h}: camera {:.5} {:.5} ppd {:.1} bearing {:.3}; depths terrain {} vectors {}; {} terrain cells wanted: {} with terrain, {} absent, {} arrived empty, {} not arrived; of the rest {} drawn from a coarser cell (finest depth {}), {} with nothing at any depth (the dark mesh); pool {} cells, {} with terrain, {} absent",
+            c.lat(), c.lon(), c.ppd, c.bearing(), t.dem_depth, t.vec_depth, t.wanted, t.terrain, t.absent, t.empty, t.pending, t.stand_in, t.stand_in_depth, t.nothing, t.pool, t.pool_terrain, t.pool_absent
+        );
+        self.last_trace = Some(t);
     }
 
     /// The measurement for a CPU frontend: the line from origin to target and a crosshair on the target.
@@ -1917,6 +1962,29 @@ impl MapCore {
 
 // Keep TEX re-exported for frontends/tests that size things off cells.
 pub use mahere_tiles::TEX as CELL_TEX;
+
+/// Whether the residency's working is logged: always on ferros (no other way to see it there yet), elsewhere with MAHERE_TRACE set.
+pub(crate) fn trace() -> bool {
+    cfg!(target_os = "ferros") || std::env::var_os("MAHERE_TRACE").is_some()
+}
+
+/// One frame's residency, as [`MapCore::trace_frame`] logs it.
+#[derive(Clone, Copy, Default, PartialEq)]
+struct FrameTrace {
+    dem_depth: u8,
+    vec_depth: u8,
+    wanted: u32,
+    terrain: u32,
+    absent: u32,
+    empty: u32,
+    pending: u32,
+    stand_in: u32,
+    stand_in_depth: u8,
+    nothing: u32,
+    pool: u32,
+    pool_terrain: u32,
+    pool_absent: u32,
+}
 const _: () = assert!(TEX == 256);
 
 /// Anti-aliased stroke (screen-space overlay layer: GPS pin etc.).

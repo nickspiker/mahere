@@ -730,7 +730,12 @@ fn load_cell(store: &dyn CellStore, layers: Option<&LayerStores>, want: u8, key:
     // No base, no cell (a published cell always has one, if empty); a failure is tried again.
     let bytes = match store.get(key) {
         Fetch::Bytes(b) => b,
-        Fetch::Absent => return Loaded { key, merge: false, entry: Some(Entry::default()) },
+        Fetch::Absent => {
+            if crate::trace() {
+                eprintln!("cell {} d{}: not in the store, absent", key.name(), key.depth);
+            }
+            return Loaded { key, merge: false, entry: Some(Entry::default()) };
+        }
         Fetch::Failed(e) => {
             eprintln!("cell {} fetch failed: {e}", key.name());
             return Loaded { key, merge: false, entry: None };
@@ -803,6 +808,9 @@ fn load_cell(store: &dyn CellStore, layers: Option<&LayerStores>, want: u8, key:
     }
     let layers_loaded = if layers.is_some() { want } else { u8::MAX };
     if bytes.is_empty() && dem_bytes.is_empty() && img_bytes.0.is_empty() && img_bytes.1.is_empty() {
+        if crate::trace() {
+            eprintln!("cell {} d{}: 0 bytes in the store, an empty cell", key.name(), key.depth);
+        }
         return Loaded { key, merge, entry: Some(Entry { layers: layers_loaded, exists: true, ..Entry::default() }) };
     }
     // Fetched: the decode waits its turn (the fetches above did not).
@@ -823,7 +831,7 @@ fn load_cell(store: &dyn CellStore, layers: Option<&LayerStores>, want: u8, key:
     });
     let dem_q = planes.dem.as_ref().map(DemQ::from_planes);
     let dem = if pack_cpu { planes.dem.map(|d| DemPacked { texel: d.pack_texels(key).into_boxed_slice() }) } else { None };
-    if std::env::var_os("MAHERE_TRACE").is_some() || cfg!(target_os = "android") {
+    if crate::trace() || cfg!(target_os = "android") {
         eprintln!("cell {} d{} loaded: dem={} line={} land={} water={} ({} bytes)", key.name(), key.depth, dem.is_some(), planes.line.is_some(), planes.land.is_some(), planes.water.is_some(), bytes.len());
     }
     let present = (dem_q.is_some() as u8) * PRESENT_DEM
