@@ -173,6 +173,19 @@ fn faces_in_view(cam: &Camera, w: usize, h: usize) -> Vec<ViewFace> {
 
 /// Plan a view for a GPU that projects every pixel itself (`ViewPlan`): the faces in view, each role's boxes and stand-ins, the desired set and the elevation range.
 pub fn plan_view(w: usize, h: usize, cam: &Camera, pool: &Pool, dem_depth: u8, vec_depth: u8) -> ViewPlan {
+    let (mut plan, points) = view_points(w, h, cam, dem_depth, vec_depth);
+    stand_ins(&mut plan, &points, pool);
+    plan
+}
+
+/// The points a view's plan is found from: each its diamond and depth-30 (u, v), the lattice's first.
+pub struct Points {
+    samples: Vec<(u8, u32, u32)>,
+    lattice: usize,
+}
+
+/// A view's plan before any cell: the faces in view, the points and the desired set (`want`), which come from the camera alone. [`stand_ins`] finishes it over the pool; between the two a host says the want to residency, so the cells it lets go are gone before the plan names any (`MapCore::plan_view`).
+pub fn view_points(w: usize, h: usize, cam: &Camera, dem_depth: u8, vec_depth: u8) -> (ViewPlan, Points) {
     let t0 = std::time::Instant::now();
     let r = cam.radius();
     let (cx, cy) = Camera::centre(w, h);
@@ -228,6 +241,15 @@ pub fn plan_view(w: usize, h: usize, cam: &Camera, pool: &Pool, dem_depth: u8, v
     let raw = |&(d, u, v): &(u8, u32, u32)| (d as u64) << 60 | morton_spread(u as u64) << 1 | morton_spread(v as u64);
     plan.want = desired_set(samples.iter().map(raw), dem_depth.max(vec_depth)).into_iter().collect();
     let t2 = std::time::Instant::now();
+    let us = |a: std::time::Instant, b: std::time::Instant| (b - a).as_micros() as u32;
+    plan.us = [us(t0, t1), us(t1, t2), 0, 0];
+    (plan, Points { samples, lattice })
+}
+
+/// A plan from [`view_points`] finished over `pool`: each role's boxes and the cell standing in for each square, and the elevation range. Every cell it names is in `pool` as it is now.
+pub fn stand_ins(plan: &mut ViewPlan, points: &Points, pool: &Pool) {
+    let t2 = std::time::Instant::now();
+    let (samples, lattice) = (&points.samples, points.lattice);
 
     // The depths at which any resident cell carries each role's planes, a bit a depth: a stand-in's search skips the rest.
     let mut held = [0u64; 2];
@@ -242,7 +264,7 @@ pub fn plan_view(w: usize, h: usize, cam: &Camera, pool: &Pool, dem_depth: u8, v
         let s = 30 - t.depth as u32;
         // Each diamond's squares the points fell in, then one more all round (a cell reaching the screen between points lies beside one holding a point: a cell is a hundred pixels or more across, `select_depth`), inside the diamond.
         let mut span: [Option<[u32; 4]>; 10] = [None; 10];
-        for &(d, u, v) in &samples {
+        for &(d, u, v) in samples {
             let (cu, cv) = (u >> s, v >> s);
             let b = span[d as usize].get_or_insert([cu, cv, cu, cv]);
             *b = [b[0].min(cu), b[1].min(cv), b[2].max(cu), b[3].max(cv)];
@@ -287,7 +309,7 @@ pub fn plan_view(w: usize, h: usize, cam: &Camera, pool: &Pool, dem_depth: u8, v
                 }
             }
         }
-        for &(d, u, v) in &samples {
+        for &(d, u, v) in samples {
             let i = t.squares[t.square(d, u, v).expect("a point's own square is in its diamond's box")];
             if i != NONE {
                 t.refs[i as usize].on_screen = true;
@@ -314,8 +336,7 @@ pub fn plan_view(w: usize, h: usize, cam: &Camera, pool: &Pool, dem_depth: u8, v
     plan.range = (lo <= hi).then_some((lo, hi));
     let t4 = std::time::Instant::now();
     let us = |a: std::time::Instant, b: std::time::Instant| (b - a).as_micros() as u32;
-    plan.us = [us(t0, t1), us(t1, t2), us(t2, t3), us(t3, t4)];
-    plan
+    (plan.us[2], plan.us[3]) = (us(t2, t3), us(t3, t4));
 }
 
 fn dot(a: [f64; 3], b: [f64; 3]) -> f64 {

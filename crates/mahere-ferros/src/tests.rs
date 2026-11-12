@@ -511,3 +511,46 @@ fn the_kernel_bakes_as_the_display_does() {
     }
     println!("baked against the f64 bake: the largest difference {worst:.1} of 65472");
 }
+
+/// The eviction race of 2026-11-12 (the 8a, early in a session: "no entry found for key" at the slot write): a pan over a town, a budget's worth of cells and none, every wanted cell arriving after each frame, and each frame written into the arena as the device writes it, the regions alternating. Every cell a plan names is still in the pool when its frame is written: the want lets go of cells out of view (the page table's margin among them) and over the budget before the stand-ins are found (`MapCore::plan_view`).
+#[test]
+fn a_planned_cell_is_in_the_pool_when_its_frame_is_written() {
+    use mahere_engine::MapCore;
+    use mahere_engine::residency::{CellStore, Fetch};
+    use std::sync::Arc;
+    struct Empty;
+    impl CellStore for Empty {
+        fn get(&self, _key: CellKey) -> Fetch {
+            Fetch::Absent
+        }
+    }
+    let (w, h) = (96usize, 80usize);
+    let lay = Layout::new(w, h, BYTES, kernel::Out::Argb8).unwrap();
+    let mut arena = vec![0u32; BYTES / 4];
+    // Unbounded, and a budget of a dozen cells (each about 2 MiB here: the terrain packed, three vector planes).
+    for budget in [usize::MAX, 24 << 20] {
+        let mut map = MapCore::new(Arc::new(Empty), Camera::new(46.2, -121.5, 6000.0, 0.7));
+        map.set_pool_budget(budget);
+        let mut slots = Slots::new(lay.slots);
+        let (mut n, mut written) = (0u32, 0u64);
+        for step in 0..32 {
+            map.cam = Camera::new(46.2 + step as f64 * 0.004, -121.5 + step as f64 * 0.006, 6000.0, 0.7);
+            map.camera_moved(w, h);
+            let plan = map.plan_view(w, h);
+            for t in &plan.roles {
+                for r in &t.refs {
+                    assert!(map.pool().map.contains_key(&r.key), "budget {budget}, step {step}: the plan names {:?}, gone from the pool", r.key);
+                }
+            }
+            arena::view(&mut slots, map.pool(), &plan, map.pool_version(), &lay, step & 1, &mut arena).unwrap();
+            written = slots.written;
+            for k in plan.want.clone() {
+                if !map.pool().map.contains_key(&k) {
+                    n += 1;
+                    map.pool_mut().map.insert(k, cell(n));
+                }
+            }
+        }
+        assert!(written > 0, "budget {budget}: no cell was ever written");
+    }
+}

@@ -348,8 +348,8 @@ pub struct MapCore {
     last_pin: Option<(f32, f32)>,
     /// The last plan and what it was for.
     plan_cache: Option<(PlanKey, Arc<plan::FramePlan>)>,
-    /// The last view plan (`plan_view`) and what it was for.
-    view_plan_cache: Option<(PlanKey, Arc<viewplan::ViewPlan>)>,
+    /// The last view plan (`plan_view`), the view it was for and the pool's version it was found over.
+    view_plan_cache: Option<(ViewKey, u64, Arc<viewplan::ViewPlan>)>,
     /// The current measurement, if a point was tapped.
     measure: Option<Measure>,
     /// The last plan came from the cache: the view and the cells were as before.
@@ -411,6 +411,8 @@ pub struct MapCore {
 }
 
 type PlanKey = (u64, u64, u64, u64, usize, usize, u64, u8, u8);
+/// A view: the camera's latitude, longitude, scale and bearing (their bits), the frame's size, the two depths.
+type ViewKey = (u64, u64, u64, u64, usize, usize, u8, u8);
 
 impl MapCore {
     pub fn new(store: Arc<dyn CellStore>, home: Camera) -> MapCore {
@@ -1541,29 +1543,39 @@ impl MapCore {
     }
 
     /// Plan a view for a GPU that projects every pixel itself (`viewplan`, ferros's GPU map): the same preparation as `plan`, then the faces in view, the page table's boxes and stand-ins, the desired set and the elevation range. Residency is driven from its desired set; the same view over the same cells is the same plan.
+    /// The want is said before the stand-ins are found: it lets go of the cells out of view (a square of the page table's margin among them) and those over the budget, so a plan found first could name a cell gone by the time the host writes the frame (ferros 2026-11-12, on the 8a: the GPU map's slot write found no entry for a planned cell, a panic). Every cell the plan names is in the pool when this returns.
     pub fn plan_view(&mut self, w: usize, h: usize) -> Arc<viewplan::ViewPlan> {
         let t0 = Instant::now();
         self.prepare(w, h);
-        let key = (self.cam.lat().to_bits(), self.cam.lon().to_bits(), self.cam.ppd.to_bits(), self.cam.bearing().to_bits(), w, h, self.res.pool_version, self.dem_depth, self.vec_depth);
+        let view: ViewKey = (self.cam.lat().to_bits(), self.cam.lon().to_bits(), self.cam.ppd.to_bits(), self.cam.bearing().to_bits(), w, h, self.dem_depth, self.vec_depth);
         let center = Coord::from_lat_lon(self.cam.lat(), self.cam.lon());
         let (cu, cv) = center.uv();
         self.plan_cached = false;
-        if let Some((k, p)) = &self.view_plan_cache {
-            if *k == key {
-                self.plan_cached = true;
-                let p = p.clone();
-                // Residency still hears the want: it re-sends an unchanged missing list once a second.
+        // The same view wants the same cells: said again (residency re-sends an unchanged missing list once a second), then the plan kept when the pool is the one it was found over.
+        let mut said = false;
+        if let Some((k, version, p)) = &self.view_plan_cache {
+            if *k == view {
+                let (p, version) = (p.clone(), *version);
                 self.want_cells(self.with_globe(p.want.clone()), (cu, cv));
-                self.last_frame_ms = t0.elapsed().as_secs_f32() * 1000.0;
-                return p;
+                said = true;
+                if self.res.pool_version == version {
+                    self.plan_cached = true;
+                    self.last_frame_ms = t0.elapsed().as_secs_f32() * 1000.0;
+                    return p;
+                }
             }
         }
         let t1 = Instant::now();
-        let p = Arc::new(viewplan::plan_view(w, h, &self.cam, &self.res.pool, self.dem_depth, self.vec_depth));
+        let (mut p, points) = viewplan::view_points(w, h, &self.cam, self.dem_depth, self.vec_depth);
         let t2 = Instant::now();
-        self.want_cells(self.with_globe(p.want.clone()), (cu, cv));
-        self.plan_us = [(t1 - t0).as_micros() as u64, (t2 - t1).as_micros() as u64, t2.elapsed().as_micros() as u64];
-        self.view_plan_cache = Some((key, p.clone()));
+        if !said {
+            self.want_cells(self.with_globe(p.want.clone()), (cu, cv));
+        }
+        let t3 = Instant::now();
+        viewplan::stand_ins(&mut p, &points, &self.res.pool);
+        let p = Arc::new(p);
+        self.plan_us = [(t1 - t0).as_micros() as u64, ((t2 - t1) + t3.elapsed()).as_micros() as u64, (t3 - t2).as_micros() as u64];
+        self.view_plan_cache = Some((view, self.res.pool_version, p.clone()));
         self.last_frame_ms = t0.elapsed().as_secs_f32() * 1000.0;
         p
     }
