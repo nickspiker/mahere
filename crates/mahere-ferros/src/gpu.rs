@@ -1,7 +1,9 @@
 //! The map on ferros's GPU (ferros GPU-KISTS.md; the owner, 2026-11-11: "Obviously get mahere on GPU proper and flawless at 120fps"): each frame the plan's lattice and the cells it draws go to the layer arena (`arena.rs`), the compose kernel (`kernel.rs`) is recorded with the frame's constants and run by the GPU service over every pixel, and fluor's ferros host shows what it wrote (`FluorApp::render_own`).
 //!
 //! The arena (`layers`, slot 10, CPU write-back and GPU coherent: what Mahere writes the GPU reads, and the other way, with no copy and no cache maintenance) holds the tables, the tiles, the blocks, the overlay, the frame, the kernel's words, and the cells' planes in slots of 1 MiB, each written once when its cell is first drawn and kept until a frame needs the slot for a cell it draws and this one it does not.
-//! The GPU service (`gpu`, slot 9) runs a kernel and answers when it is done: one held call a frame, no polling.
+//! The GPU service (`gpu`, slot 9) runs a kernel and answers when it is done: one held call a frame, no polling, made on a thread of its own (`GpuThread`) so the next frame is planned while the GPU draws this one.
+//!
+//! With a second surface (slot 11) the frames are a pipeline over a mailbox (ferros GPU-KISTS.md 1.4): frame K is planned into arena region K mod 2 while the GPU draws frame K − 1 into its buffer, and the display shows each buffer as it is finished; the show answers once the display has taken the frame, so the buffer shown before it, the one frame K + 1 draws into, is no longer read. A frame is on the glass a frame later than it was planned, and the planning, the GPU and the display's publish each get a whole frame's time.
 //!
 //! Until kists have GPU memory of their own (GPU-KISTS.md plan step 1), the arena is the one the system's GPU clients share (the wallpaper's maker uses its first 32 MiB, the attest mark the rest): a development spawn with `--dma layers` takes all 64 MiB, which neither uses once a person is attested, and nothing guards them from each other yet.
 
@@ -18,19 +20,80 @@ const SURFACES_VA: u64 = 0xC000_0000;
 const SURFACES_PA: u64 = 0xCA00_0000;
 
 pub struct GpuMap {
-    gpu: u64,
+    gpu: GpuThread,
     arena: *mut u32,
     bytes: usize,
-    /// The app's surface in the GPU's address space, when the kernel draws into it (`Out::Surface`).
-    surface_va: Option<u64>,
+    /// The app's surfaces, (its `dma` base, its address on the GPU), when the kernel draws into them (`Out::Surface`): the window's own, and with a second surface grant the mailbox's other buffer.
+    surfaces: Option<[(u64, u64); 2]>,
+    /// Two surfaces: the frames pipelined over the mailbox.
+    pipelined: bool,
     lay: Option<Layout>,
     slots: Slots,
-    style: Option<u64>,
-    overlay_key: Option<u64>,
-    marks_key: Option<u64>,
-    overlay_on: bool,
+    /// By frame region: the style its ramp was written for, what its overlay shows (the panel's and the marks' keys) and whether it has any.
+    style: [Option<u64>; 2],
+    overlay_key: [Option<u64>; 2],
+    marks_key: [Option<u64>; 2],
+    overlay_on: [bool; 2],
+    /// The frame planned and recorded by the last draw and not yet run (pipelined).
+    ready: Option<Ready>,
+    /// The region (and buffer) the next frame is planned into, and the one the last finished frame is in.
+    next: usize,
+    shown: usize,
+    /// A frame has been drawn into a buffer since the layout was made: until then a frame runs at once, so nothing unmade is shown.
+    drawn: bool,
     stats: Stats,
     report_at: std::time::Instant,
+}
+
+/// A frame planned and recorded: its region, the service's message, its kernel's size, and what it shows (`view_key`).
+struct Ready {
+    region: usize,
+    msg: Vec<u8>,
+    words: usize,
+    nodes: usize,
+    key: u64,
+}
+
+/// The GPU service's held call on a thread of its own: a job's message in, its answer (the GPU's µs, or why not) out.
+struct GpuThread {
+    jobs: std::sync::mpsc::Sender<Vec<u8>>,
+    done: std::sync::mpsc::Receiver<Result<u64, String>>,
+}
+
+impl GpuThread {
+    fn new(slot: u64) -> GpuThread {
+        let (jobs, rx) = std::sync::mpsc::channel::<Vec<u8>>();
+        let (tx, done) = std::sync::mpsc::channel();
+        std::thread::Builder::new()
+            .name(String::from("mahere-gpu"))
+            .stack_size(1 << 16)
+            .spawn(move || {
+                for msg in rx {
+                    let mut reply = [1u8, 0, 0, 0, 0];
+                    let n = crate::ferros::sys::call(slot, &msg, &mut reply);
+                    let r = if n == crate::ferros::sys::ERR {
+                        Err(String::from("no GPU service receiving"))
+                    } else if reply[0] != 0 {
+                        Err(format!("the GPU service answered {} to the map kernel", reply[0]))
+                    } else {
+                        Ok(u32::from_le_bytes([reply[1], reply[2], reply[3], reply[4]]) as u64)
+                    };
+                    if tx.send(r).is_err() {
+                        return;
+                    }
+                }
+            })
+            .expect("the GPU thread");
+        GpuThread { jobs, done }
+    }
+
+    fn submit(&self, msg: Vec<u8>) -> Result<(), String> {
+        self.jobs.send(msg).map_err(|_| String::from("the GPU thread ended"))
+    }
+
+    fn wait(&self) -> Result<u64, String> {
+        self.done.recv().map_err(|_| String::from("the GPU thread ended"))?
+    }
 }
 
 /// Per report: frames, the GPU's own µs (as the service measures each job), the host's µs by stage, the kernel's size.
@@ -45,6 +108,8 @@ struct Stats {
     overlay_us: u64,
     compile_us: u64,
     call_us: u64,
+    /// Waiting for the GPU's last frame once this one was planned (pipelined; the GPU's share of a frame past the planning's).
+    wait_us: u64,
     words: usize,
     nodes: usize,
     /// Overlays painted (of them the panel painted again, the marks drawn again), and their µs: the panel, the marks, the sum into the arena.
@@ -60,7 +125,7 @@ struct Stats {
 
 impl GpuMap {
     /// The GPU path when both grants are there: the service at `gpu_slot`, the arena at `arena_slot`. None (said) otherwise: the CPU raster then draws.
-    pub fn open(gpu_slot: u64, arena_slot: u64, surface_slot: u64) -> Option<GpuMap> {
+    pub fn open(gpu_slot: u64, arena_slot: u64, surface_slot: u64, second_slot: u64) -> Option<GpuMap> {
         if crate::ferros::sys::grant_count() <= arena_slot {
             println!("mahere: no GPU grants (slots {gpu_slot} gpu and {arena_slot} layers): the map draws on the CPU");
             return None;
@@ -73,9 +138,43 @@ impl GpuMap {
         // The grown arena says the kernel fences the apps' surfaces in for the GPU too: the kernel then writes the surface, no copy.
         let bytes = crate::ferros::sys::dma_size(arena_slot, ARENA_GROWN as u64).map_or(ARENA_BEFORE, |n| n as usize);
         let surface = crate::ferros::sys::dma(surface_slot);
-        let surface_va = (bytes == ARENA_GROWN && surface != 0 && surface != crate::ferros::sys::ERR).then(|| SURFACES_VA + (surface - SURFACES_PA));
-        println!("mahere: the map draws on the GPU (the service at slot {gpu_slot}, the layer arena at slot {arena_slot}, {} MiB), {}", bytes >> 20, if surface_va.is_some() { "straight into the surface" } else { "fluor's pixels in the arena, presented by the CPU" });
-        Some(GpuMap { gpu: gpu_slot, arena: base as *mut u32, bytes, surface_va, lay: None, slots: Slots::new(0), style: None, overlay_key: None, marks_key: None, overlay_on: false, stats: Stats::default(), report_at: std::time::Instant::now() })
+        let usable = |b: u64| b != 0 && b != crate::ferros::sys::ERR && b >= SURFACES_PA;
+        let second = if crate::ferros::sys::grant_count() > second_slot { crate::ferros::sys::dma(second_slot) } else { 0 };
+        let surfaces = (bytes == ARENA_GROWN && usable(surface)).then(|| {
+            let other = if usable(second) { second } else { surface };
+            [(surface, SURFACES_VA + (surface - SURFACES_PA)), (other, SURFACES_VA + (other - SURFACES_PA))]
+        });
+        let pipelined = surfaces.is_some_and(|s| s[0].0 != s[1].0);
+        println!(
+            "mahere: the map draws on the GPU (the service at slot {gpu_slot}, the layer arena at slot {arena_slot}, {} MiB; surfaces G#{surface:X} G#{second:X}), {}",
+            bytes >> 20,
+            if pipelined {
+                "straight into two surfaces, a mailbox, the next frame planned while the GPU draws this one"
+            } else if surfaces.is_some() {
+                "straight into the surface"
+            } else {
+                "fluor's pixels in the arena, presented by the CPU"
+            }
+        );
+        Some(GpuMap {
+            gpu: GpuThread::new(gpu_slot),
+            arena: base as *mut u32,
+            bytes,
+            surfaces,
+            pipelined,
+            lay: None,
+            slots: Slots::new(0),
+            style: [None; 2],
+            overlay_key: [None; 2],
+            marks_key: [None; 2],
+            overlay_on: [false; 2],
+            ready: None,
+            next: 0,
+            shown: 0,
+            drawn: false,
+            stats: Stats::default(),
+            report_at: std::time::Instant::now(),
+        })
     }
 
     fn arena(&mut self) -> &mut [u32] {
@@ -90,20 +189,117 @@ impl GpuMap {
             return None;
         }
         // SAFETY: as `arena`; the GPU wrote it before the service answered.
-        Some(unsafe { core::slice::from_raw_parts(self.arena.add(lay.frame_at / 4), lay.w * lay.h) })
+        Some(unsafe { core::slice::from_raw_parts(self.arena.add((lay.regions[self.shown] + lay.frame_at) / 4), lay.w * lay.h) })
+    }
+
+    /// The buffer the last finished frame is in, when it is the mailbox's other one (fluor's `own_surface`): its `dma` base.
+    pub fn own_surface(&self) -> Option<u64> {
+        if !self.pipelined {
+            return None;
+        }
+        self.surfaces.map(|s| s[self.shown].0)
+    }
+
+    /// A frame planned and not yet drawn (the last draw's, pipelined): the host should draw once more, so it reaches the glass when the map comes to rest.
+    pub fn owes_frame(&self) -> bool {
+        self.ready.is_some()
+    }
+
+    /// What a frame shows, as far as a frame planned again would differ: the view, the cells, the style and layers, the panel.
+    fn view_key(app: &DeviceApp<NoGpu>, w: usize, h: usize) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let map = &app.map;
+        let c = map.cam;
+        let mut hs = std::collections::hash_map::DefaultHasher::new();
+        (w, h, c.lat().to_bits(), c.lon().to_bits(), c.ppd.to_bits(), c.bearing().to_bits(), map.pool_version(), map.style_version(), map.layers().bits()).hash(&mut hs);
+        (app.panel.is_open(), app.panel.ru().to_bits(), map.globe_loading().map(|d| d.to_bits()), map.gps.is_some()).hash(&mut hs);
+        hs.finish()
     }
 
     /// One frame of `app`'s map, `w` × `h`, drawn on the GPU into the arena's frame. Err: the service did not run it.
+    /// Pipelined: the frame planned by the last draw goes to the GPU first (its buffer is free, the show of the frame before it having answered), this frame is planned into the other region meanwhile, and the GPU's frame is waited for: that one is the frame the host shows. When nothing changed since the frame waiting, it is only drawn.
     pub fn draw(&mut self, app: &mut DeviceApp<NoGpu>, w: usize, h: usize) -> Result<(), String> {
         if self.lay.is_none_or(|l| (l.w, l.h) != (w, h)) {
-            let out = if self.surface_va.is_some() { kernel::Out::Surface } else { kernel::Out::Argb8 };
+            let out = if self.surfaces.is_some() { kernel::Out::Surface } else { kernel::Out::Argb8 };
             let l = Layout::new(w, h, self.bytes, out);
-            println!("mahere: GPU layout for {w} x {h}: the overlay at {} MiB, the frame at {} MiB, the code at {} MiB, {} cell slots of 1 MiB from {} MiB", kernel::OVERLAY >> 20, l.frame_at >> 20, l.code_at >> 20, l.slots, l.slots_at >> 20);
+            println!("mahere: GPU layout for {w} x {h}: two frame regions of {} MiB, the overlay at {} MiB in each, the code at {} MiB, {} cell slots of 1 MiB from {} MiB", l.regions[1] >> 20, kernel::OVERLAY >> 20, l.code_at >> 20, l.slots, l.slots_at >> 20);
             self.slots = Slots::new(l.slots);
             self.lay = Some(l);
-            self.overlay_key = None;
-            self.marks_key = None;
+            self.overlay_key = [None; 2];
+            self.marks_key = [None; 2];
+            self.style = [None; 2];
+            self.ready = None;
+            self.drawn = false;
         }
+        let key = Self::view_key(app, w, h);
+        let d = |a: std::time::Instant, b: std::time::Instant| (b - a).as_micros() as u64;
+        let inflight = match self.ready.take() {
+            Some(r) => {
+                self.gpu.submit(r.msg.clone())?;
+                if r.key == key {
+                    let us = self.gpu.wait()?;
+                    self.shown = r.region;
+                    self.count(us, r.words, r.nodes);
+                    return Ok(());
+                }
+                Some(r)
+            }
+            None => None,
+        };
+        let region = self.next;
+        let ready = self.prepare(app, w, h, region, key)?;
+        self.next ^= 1;
+        let t = std::time::Instant::now();
+        match inflight {
+            Some(r) if self.pipelined => {
+                let us = self.gpu.wait()?;
+                self.shown = r.region;
+                self.stats.wait_us += d(t, std::time::Instant::now());
+                self.count(us, r.words, r.nodes);
+                self.ready = Some(ready);
+            }
+            // The first frame of a motion: kept for the next draw, which the host makes at once (`owes_frame`); the glass keeps the last finished frame meanwhile.
+            None if self.pipelined && self.drawn => self.ready = Some(ready),
+            _ => {
+                if let Some(r) = inflight {
+                    self.gpu.wait()?;
+                    self.shown = r.region;
+                }
+                let (words, nodes) = (ready.words, ready.nodes);
+                self.gpu.submit(ready.msg)?;
+                let us = self.gpu.wait()?;
+                self.shown = region;
+                self.stats.call_us += d(t, std::time::Instant::now());
+                self.drawn = true;
+                self.count(us, words, nodes);
+            }
+        }
+        Ok(())
+    }
+
+    /// A frame drawn by the GPU: counted, and the report every ten seconds.
+    fn count(&mut self, us: u64, words: usize, nodes: usize) {
+        let s = &mut self.stats;
+        s.frames += 1;
+        s.gpu_us += us;
+        s.gpu_max = s.gpu_max.max(us);
+        s.words = words;
+        s.nodes = nodes;
+        if self.report_at.elapsed().as_secs() >= 10 {
+            self.report_at = std::time::Instant::now();
+            let s = &self.stats;
+            let n = s.frames.max(1);
+            let lay = self.lay.unwrap();
+            println!(
+                "mahere: GPU {} frames: the kernel {} us a frame on the GPU (longest {}), {} words from {} nodes; host per frame: plan {} us (view {}, plan {} [corners {}, desired {}, blocks {}, refs {}, candidates {}], want {}), cells {} us, blocks {} us, overlay {} us, record and compile {} us, the call {} us, the wait for the GPU's frame {} us; {} overlays painted ({} panels, {} marks; panel {} us, marks {} us, sum {} us each); {} cell planes written so far, {} wanted with no slot free ({} slots)",
+                s.frames, s.gpu_us / n, s.gpu_max, s.words, s.nodes, s.plan_us / n, s.plan_parts[0] / n, s.plan_parts[1] / n, s.plan_inner[0] / n, s.plan_inner[1] / n, s.plan_inner[2] / n, s.plan_inner[3] / n, s.plan_inner[4] / n, s.plan_parts[2] / n, s.cells_us / n, s.blocks_us / n, s.overlay_us / n, s.compile_us / n, s.call_us / n, s.wait_us / n, s.overlays, s.panels, s.marks, s.overlay_parts[0] / s.overlays.max(1), s.overlay_parts[1] / s.overlays.max(1), s.overlay_parts[2] / s.overlays.max(1), self.slots.written, self.slots.starved, lay.slots
+            );
+            self.stats = Stats::default();
+        }
+    }
+
+    /// Frame planning into region `region`: the plan, its cells, blocks and tables, the overlay, the kernel recorded and its words in the region's code; the service's message for it.
+    fn prepare(&mut self, app: &mut DeviceApp<NoGpu>, w: usize, h: usize, region: usize, key: u64) -> Result<Ready, String> {
         let lay = self.lay.unwrap();
         let t0 = std::time::Instant::now();
         let plan = app.map.plan(w, h);
@@ -119,54 +315,42 @@ impl GpuMap {
         let (cand, range) = arena::cells(&mut self.slots, app.map.pool(), &plan, version, &lay, arena);
         app.map.set_drawn_range(range);
         let t2 = std::time::Instant::now();
-        arena::blocks(&plan, &cand, &lay, arena)?;
-        let ramp = self.style != Some(app.map.style_version());
-        self.style = Some(app.map.style_version());
-        arena::tables(app.map.luts(), &plan, ramp, arena);
+        arena::blocks(&plan, &cand, &lay, region, arena)?;
+        let ramp = self.style[region] != Some(app.map.style_version());
+        self.style[region] = Some(app.map.style_version());
+        arena::tables(app.map.luts(), &plan, ramp, &lay, region, arena);
         let t3 = std::time::Instant::now();
-        self.overlay(app, w, h);
+        self.overlay(app, w, h, region);
         let t4 = std::time::Instant::now();
-        let c = arena::consts(app.map.luts(), &plan, &lay, self.overlay_on);
+        let c = arena::consts(app.map.luts(), &plan, &lay, region, self.overlay_on[region]);
         let k = kernel::record(&c);
         if k.words.len() > arena::CODE_WORDS {
             return Err(format!("the map kernel is {} words, more than the GPU service's {}", k.words.len(), arena::CODE_WORDS));
         }
-        let code = &mut self.arena()[lay.code_at / 4..lay.code_at / 4 + 2 * k.words.len()];
+        let code_at = lay.regions[region] + lay.code_at;
+        let code = &mut self.arena()[code_at / 4..code_at / 4 + 2 * k.words.len()];
         for (j, w) in k.words.iter().enumerate() {
             code[2 * j] = *w as u32;
             code[2 * j + 1] = (*w >> 32) as u32;
         }
+        let frame = match self.surfaces {
+            Some(s) => s[region].1,
+            None => ARENA_VA + (lay.regions[region] + lay.frame_at) as u64,
+        };
+        let msg = Self::message(&k, code_at, frame, (w * h).div_ceil(16) as u32);
         let t5 = std::time::Instant::now();
-        let us = self.run(&k, &lay, (w * h).div_ceil(16) as u32)?;
-        let t6 = std::time::Instant::now();
         let s = &mut self.stats;
         let d = |a: std::time::Instant, b: std::time::Instant| (b - a).as_micros() as u64;
-        s.frames += 1;
-        s.gpu_us += us;
-        s.gpu_max = s.gpu_max.max(us);
         s.plan_us += d(t0, t1);
         s.cells_us += d(t1, t2);
         s.blocks_us += d(t2, t3);
         s.overlay_us += d(t3, t4);
         s.compile_us += d(t4, t5);
-        s.call_us += d(t5, t6);
-        s.words = k.words.len();
-        s.nodes = k.kept;
-        if self.report_at.elapsed().as_secs() >= 10 {
-            self.report_at = std::time::Instant::now();
-            let s = &self.stats;
-            let n = s.frames.max(1);
-            println!(
-                "mahere: GPU {} frames: the kernel {} us a frame on the GPU (longest {}), {} words from {} nodes; host per frame: plan {} us (view {}, plan {} [corners {}, desired {}, blocks {}, refs {}, candidates {}], want {}), cells {} us, blocks {} us, overlay {} us, record and compile {} us, the call {} us; {} overlays painted ({} panels, {} marks; panel {} us, marks {} us, sum {} us each); {} cell planes written so far, {} wanted with no slot free ({} slots)",
-                s.frames, s.gpu_us / n, s.gpu_max, s.words, s.nodes, s.plan_us / n, s.plan_parts[0] / n, s.plan_parts[1] / n, s.plan_inner[0] / n, s.plan_inner[1] / n, s.plan_inner[2] / n, s.plan_inner[3] / n, s.plan_inner[4] / n, s.plan_parts[2] / n, s.cells_us / n, s.blocks_us / n, s.overlay_us / n, s.compile_us / n, s.call_us / n, s.overlays, s.panels, s.marks, s.overlay_parts[0] / s.overlays.max(1), s.overlay_parts[1] / s.overlays.max(1), s.overlay_parts[2] / s.overlays.max(1), self.slots.written, self.slots.starved, lay.slots
-            );
-            self.stats = Stats::default();
-        }
-        Ok(())
+        Ok(Ready { region, msg, words: k.words.len(), nodes: k.kept, key })
     }
 
     /// The panel and the screen's marks (compass, pins, the globe's loading ring, the GPS) as the overlay, painted again when what they show changed.
-    fn overlay(&mut self, app: &mut DeviceApp<NoGpu>, w: usize, h: usize) {
+    fn overlay(&mut self, app: &mut DeviceApp<NoGpu>, w: usize, h: usize, region: usize) {
         use std::hash::{Hash, Hasher};
         let map = &app.map;
         let c = map.cam;
@@ -190,12 +374,13 @@ impl GpuMap {
                 (c.lat().to_bits(), c.lon().to_bits(), c.ppd.to_bits(), c.bearing().to_bits()).hash(hs);
             }
         });
-        let (marks_new, panel_new) = (self.marks_key != Some(marks_key), self.overlay_key != Some(panel_key));
+        // Each region's overlay keeps what it showed: a change painted into one region is painted into the other when its next frame comes.
+        let (marks_new, panel_new) = (self.marks_key[region] != Some(marks_key), self.overlay_key[region] != Some(panel_key));
         if !marks_new && !panel_new {
             return;
         }
-        self.marks_key = Some(marks_key);
-        self.overlay_key = Some(panel_key);
+        self.marks_key[region] = Some(marks_key);
+        self.overlay_key[region] = Some(panel_key);
         let t0 = std::time::Instant::now();
         if panel_new {
             app.paint_panel(w, h);
@@ -212,7 +397,8 @@ impl GpuMap {
         // The panel's pixels with the marks under them (`Panel::overlay_rows`' sum, premultiplied RGBA bytes), straight into the arena, bands of rows on every core: one thread over the screen's 4 Mpx was 62 ms of every frame on the Pro (2026-11-11).
         let panel = app.panel.pixels();
         let panel = (panel.len() == w * h).then_some(panel);
-        let out = unsafe { core::slice::from_raw_parts_mut(self.arena.add(kernel::OVERLAY / 4), w * h) };
+        let at = self.lay.unwrap().regions[region] + kernel::OVERLAY;
+        let out = unsafe { core::slice::from_raw_parts_mut(self.arena.add(at / 4), w * h) };
         use rayon::prelude::*;
         let any = out
             .par_chunks_mut(w << 6)
@@ -244,19 +430,18 @@ impl GpuMap {
         self.stats.overlay_parts[1] += us(t1, t2);
         self.stats.overlay_parts[2] += us(t2, t3);
         self.stats.overlays += 1;
-        self.overlay_on = any != 0;
+        self.overlay_on[region] = any != 0;
     }
 
-    /// The kernel run by the GPU service over `groups` workgroups of 16: its words at the arena's code offset, uniform 0 the frame and 1 the arena, then its constants. The GPU's own µs, as the service measures the job.
-    fn run(&mut self, k: &valhall::ssa::Compiled, lay: &Layout, groups: u32) -> Result<u64, String> {
-        let mut msg = Vec::with_capacity(18 + 8 * 16 + 16);
+    /// The GPU service's message for the kernel over `groups` workgroups of 16: its words at the arena offset `code_at`, uniform 0 the frame and 1 the arena, then its constants.
+    fn message(k: &valhall::ssa::Compiled, code_at: usize, frame: u64, groups: u32) -> Vec<u8> {
+        let mut msg = Vec::with_capacity(18 + 8 * 64 + 16);
         msg.push(1u8);
         msg.extend_from_slice(&(0x1000u16 | if k.regs64 { 0x8000 } else { 0 }).to_le_bytes());
-        msg.extend_from_slice(&(lay.code_at as u32).to_le_bytes());
+        msg.extend_from_slice(&(code_at as u32).to_le_bytes());
         msg.extend_from_slice(&(k.words.len() as u16).to_le_bytes());
         msg.extend_from_slice(&groups.to_le_bytes());
         msg.extend_from_slice(&1u32.to_le_bytes());
-        let frame = self.surface_va.unwrap_or(ARENA_VA + lay.frame_at as u64);
         let addrs = [frame, ARENA_VA];
         msg.push((addrs.len() + k.consts.len()) as u8);
         for a in addrs.iter().chain(k.consts.iter()) {
@@ -266,14 +451,6 @@ impl GpuMap {
             msg.push(name.len() as u8);
             msg.extend_from_slice(name);
         }
-        let mut reply = [1u8, 0, 0, 0, 0];
-        let n = crate::ferros::sys::call(self.gpu, &msg, &mut reply);
-        if n == crate::ferros::sys::ERR {
-            return Err(String::from("no GPU service receiving"));
-        }
-        if reply[0] != 0 {
-            return Err(format!("the GPU service answered {} to the map kernel", reply[0]));
-        }
-        Ok(u32::from_le_bytes([reply[1], reply[2], reply[3], reply[4]]) as u64)
+        msg
     }
 }

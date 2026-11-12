@@ -89,9 +89,9 @@ fn both(cam: &Camera, pool: &Pool, mask: LayerMask, w: usize, h: usize, out: ker
     let mut words = vec![0u32; BYTES / 4];
     let mut slots = Slots::new(lay.slots);
     let (cand, _) = arena::cells(&mut slots, pool, &plan, 1, &lay, &mut words);
-    arena::blocks(&plan, &cand, &lay, &mut words).unwrap();
-    arena::tables(&luts, &plan, true, &mut words);
-    let c = arena::consts(&luts, &plan, &lay, false);
+    arena::blocks(&plan, &cand, &lay, 0, &mut words).unwrap();
+    arena::tables(&luts, &plan, true, &lay, 0, &mut words);
+    let c = arena::consts(&luts, &plan, &lay, 0, false);
     let k = kernel::record(&c);
     let imm = k.words.iter().filter(|w| (*w >> 48) & 0x1FF == 0x110).count();
     let loads = k.words.iter().filter(|w| (*w >> 48) & 0x1FF == 0x060).count();

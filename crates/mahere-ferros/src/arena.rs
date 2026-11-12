@@ -12,7 +12,7 @@ pub const SLOT: usize = 1 << 20;
 /// The most words a kernel may have (ferros payloads/gpu: its code region, 32 pages, less its 16 words of padding).
 pub const CODE_WORDS: usize = (32 << 12) / 8 - 16;
 
-/// Where things are for a `w` × `h` frame in an arena of `bytes`: the overlay (at `kernel::OVERLAY`) a screen's words, with a workgroup's slack, and the frame as many when it is the arena's (`Out::Argb8`; the surface is the frame otherwise); the code; then the cells' slots.
+/// Where things are for a `w` × `h` frame in an arena of `bytes`: two frame regions (`regions`, the frames alternating between them, so the host writes the next frame's tables, tiles, blocks, overlay and code while the GPU runs this one's), each its tables and blocks (from 0), the overlay (at `kernel::OVERLAY`) a screen's words with a workgroup's slack, the frame as many when it is the arena's (`Out::Argb8`; the surface is the frame otherwise) and the code; then the cells' slots, which both regions share. `frame_at` and `code_at` are within a region.
 #[derive(Clone, Copy, Debug)]
 pub struct Layout {
     pub w: usize,
@@ -22,6 +22,8 @@ pub struct Layout {
     pub code_at: usize,
     pub slots_at: usize,
     pub slots: usize,
+    /// Each frame region's start, bytes.
+    pub regions: [usize; 2],
 }
 
 impl Layout {
@@ -30,10 +32,11 @@ impl Layout {
         let round = |b: usize| b.next_multiple_of(1 << 20);
         let frame_at = round(kernel::OVERLAY + 4 * px);
         let code_at = if out == kernel::Out::Argb8 { round(frame_at + 4 * px) } else { frame_at };
-        let slots_at = round(code_at + 8 * (CODE_WORDS + 16));
+        let region = round(code_at + 8 * (CODE_WORDS + 16));
+        let slots_at = 2 * region;
         // WHY: the frame's size comes from the display; a screen whose overlay and frame leave no room for cells is one this path cannot draw.
         assert!(slots_at + 4 * SLOT <= bytes, "mahere: a {w} x {h} frame leaves the layer arena no room for cells");
-        Layout { w, h, out, frame_at, code_at, slots_at, slots: (bytes - slots_at) / SLOT }
+        Layout { w, h, out, frame_at, code_at, slots_at, slots: (bytes - slots_at) / SLOT, regions: [0, region] }
     }
 }
 
@@ -82,7 +85,8 @@ impl Slots {
             Some(i) => i,
             None => {
                 let (i, h) = self.held.iter().enumerate().map(|(i, s)| (i, s.unwrap())).min_by_key(|(_, h)| h.frame)?;
-                if h.frame == frame {
+                // Neither this frame's nor the last's: the GPU may still be running the last frame's kernel over its cells while this one is planned.
+                if h.frame + 1 >= frame {
                     return None;
                 }
                 i
@@ -193,14 +197,15 @@ pub fn cells(slots: &mut Slots, pool: &Pool, plan: &FramePlan, version: u64, lay
     (out, (lo <= hi).then_some((lo, hi)))
 }
 
-/// The tiles' words (one row past the screen's, block 0: the last workgroup's invocations past the last pixel read there) and the blocks' records.
-pub fn blocks(plan: &FramePlan, cand: &[[[u32; 10]; 2]], lay: &Layout, arena: &mut [u32]) -> Result<(), String> {
+/// The tiles' words (one row past the screen's, block 0: the last workgroup's invocations past the last pixel read there) and the blocks' records, in frame region `region`.
+pub fn blocks(plan: &FramePlan, cand: &[[[u32; 10]; 2]], lay: &Layout, region: usize, arena: &mut [u32]) -> Result<(), String> {
+    let base = lay.regions[region] / 4;
     if plan.blocks.len() > kernel::MAX_BLOCKS {
         return Err(format!("{} blocks, more than the arena's {}", plan.blocks.len(), kernel::MAX_BLOCKS));
     }
     let bw = lay.w.div_ceil(32);
     let bh = lay.h.div_ceil(32);
-    let tiles = &mut arena[kernel::TILES / 4..kernel::TILES / 4 + bw * (bh + 1)];
+    let tiles = &mut arena[base + kernel::TILES / 4..base + kernel::TILES / 4 + bw * (bh + 1)];
     tiles.fill(0);
     let mut i = 0;
     while i < plan.blocks.len() {
@@ -215,7 +220,7 @@ pub fn blocks(plan: &FramePlan, cand: &[[[u32; 10]; 2]], lay: &Layout, arena: &m
             i += 64;
         }
     }
-    let at = kernel::BLOCKS / 4;
+    let at = base + kernel::BLOCKS / 4;
     for (k, (b, c)) in plan.blocks.iter().zip(cand).enumerate() {
         let r = &mut arena[at + k * kernel::BLOCK_WORDS..at + (k + 1) * kernel::BLOCK_WORDS];
         r[kernel::B_XY] = b.x | b.y << 16;
@@ -238,11 +243,12 @@ pub fn blocks(plan: &FramePlan, cand: &[[[u32; 10]; 2]], lay: &Layout, arena: &m
     Ok(())
 }
 
-/// The line and land tables (the line gates follow the depth and the mask, so every frame), and the hypsometric ramp when `ramp`.
-pub fn tables(luts: &FrameLuts, plan: &FramePlan, ramp: bool, arena: &mut [u32]) {
+/// The line and land tables (the line gates follow the depth and the mask, so every frame), and the hypsometric ramp when `ramp`, in frame region `region`.
+pub fn tables(luts: &FrameLuts, plan: &FramePlan, ramp: bool, lay: &Layout, region: usize, arena: &mut [u32]) {
+    let base = lay.regions[region] / 4;
     let st = &luts.style;
     let mask = luts.mask;
-    let at = kernel::LINE_TAB / 4;
+    let at = base + kernel::LINE_TAB / 4;
     for cls in 0..22 {
         let c = st.line[cls];
         let l = lin(rgb3(c));
@@ -251,7 +257,7 @@ pub fn tables(luts: &FrameLuts, plan: &FramePlan, ramp: bool, arena: &mut [u32])
         let a = if shown { alpha(c) * if is_boundary(cls) { 0.55 } else { 1.0 } } else { 0.0 };
         arena[at + 4 * cls..at + 4 * cls + 4].copy_from_slice(&[l[0].to_bits(), l[1].to_bits(), l[2].to_bits(), a.to_bits()]);
     }
-    let at = kernel::LAND_TAB / 4;
+    let at = base + kernel::LAND_TAB / 4;
     for k in 0..14 {
         let c = st.land[k];
         let l = lin(rgb3(c));
@@ -259,11 +265,11 @@ pub fn tables(luts: &FrameLuts, plan: &FramePlan, ramp: bool, arena: &mut [u32])
     }
     if ramp {
         // The g2t codes' working values, fluor's table for its 8-bit pixels (host/panel.rs `q14_from_g2t8`): the overlay's codes as the surface takes them.
-        let at = kernel::CODE_TAB / 4;
+        let at = base + kernel::CODE_TAB / 4;
         for c in 0..256 {
             arena[at + c] = ((16384.0 * (c as f32 / 256.0).atanh() + 0.5) as u32 as f32).to_bits();
         }
-        let at = kernel::HYPSO_TAB / 4;
+        let at = base + kernel::HYPSO_TAB / 4;
         for (k, c) in luts.hypso.iter().enumerate() {
             let l = lin(*c);
             arena[at + 4 * k..at + 4 * k + 3].copy_from_slice(&[l[0].to_bits(), l[1].to_bits(), l[2].to_bits()]);
@@ -271,8 +277,8 @@ pub fn tables(luts: &FrameLuts, plan: &FramePlan, ramp: bool, arena: &mut [u32])
     }
 }
 
-/// The frame's constants for the kernel.
-pub fn consts(luts: &FrameLuts, plan: &FramePlan, lay: &Layout, overlay: bool) -> Consts {
+/// The frame's constants for the kernel, its tables and overlay in frame region `region`.
+pub fn consts(luts: &FrameLuts, plan: &FramePlan, lay: &Layout, region: usize, overlay: bool) -> Consts {
     let st = &luts.style;
     let l3 = |c: [u8; 4]| lin(rgb3(c));
     let l4 = |c: [u8; 4]| {
@@ -312,7 +318,8 @@ pub fn consts(luts: &FrameLuts, plan: &FramePlan, lay: &Layout, overlay: bool) -
             200
         },
         overlay,
-        overlay_at: (kernel::OVERLAY / 4) as u32,
+        overlay_at: ((lay.regions[region] + kernel::OVERLAY) / 4) as u32,
+        region: (lay.regions[region] / 4) as u32,
         out: lay.out,
     }
 }

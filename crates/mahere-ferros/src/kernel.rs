@@ -8,6 +8,7 @@
 //!
 //! Everything a frame holds still (the light, the sun, the ball's pole and disk, the contour interval, the inks, the layer mask, the depths) is a constant of the recording: the kernel is recorded again for every frame (a few hundred nodes, well under a millisecond), so it carries no loads and no code for what the frame leaves off.
 //! What varies by pixel comes from the layer arena: the 32 px tiles' block index, the blocks (the plan's lattice with each role's 2 × 2 cells), the cells' texels, the tables, the overlay.
+//! The tables, tiles, blocks and overlay are offsets within a frame region (`Consts::region`); the cells' slots are shared by both regions.
 
 use valhall::ssa::{self, F, M, U};
 
@@ -78,6 +79,8 @@ pub struct Consts {
     pub overlay: bool,
     /// The overlay's word offset in the arena.
     pub overlay_at: u32,
+    /// The frame region's word offset in the arena (`arena::Layout::regions`): its tables, tiles and blocks are there, each frame's in the other region from the last's, so the host writes the next frame's while the GPU reads this one's.
+    pub region: u32,
     /// What the kernel writes, and where (uniform 0).
     pub out: Out,
 }
@@ -211,11 +214,11 @@ pub fn record(c: &Consts) -> ssa::Compiled {
     let i = ssa::gid();
     let (x, y) = column_row(F::from_u32(i), c.w);
     let (xi, yi) = (x.to_u32(), y.to_u32());
-    let tile = word(U::splat((TILES / 4) as u32) + (yi >> 5).wrapping_mul(U::splat(c.bw)) + (xi >> 5));
+    let tile = word(U::splat(c.region + (TILES / 4) as u32) + (yi >> 5).wrapping_mul(U::splat(c.bw)) + (xi >> 5));
     let straddle = (tile & U::splat(TILE_STRADDLE)).ne(U::splat(0));
     let sub = (((yi & U::splat(31)) >> 2) << 3) + ((xi & U::splat(31)) >> 2);
     let block = (tile & U::splat(!TILE_STRADDLE)) + U::select(straddle, sub, U::splat(0));
-    let b = U::splat((BLOCKS / 4) as u32) + block.wrapping_mul(U::splat(BLOCK_WORDS as u32));
+    let b = U::splat(c.region + (BLOCKS / 4) as u32) + block.wrapping_mul(U::splat(BLOCK_WORDS as u32));
     let xy = word(b + U::splat(B_XY as u32));
     let fx = x - F::from_u32(xy & U::splat(0xFFFF));
     let fy = y - F::from_u32(xy >> 16);
@@ -278,7 +281,7 @@ pub fn record(c: &Consts) -> ssa::Compiled {
             let kbed = F::splat(1.) - t * SEABED_DARK;
             let bed_rgb = [F::splat(c.sea[0]) * kbed, F::splat(c.sea[1]) * kbed, F::splat(c.sea[2]) * kbed];
             let land_rgb = if mask & HYPSO != 0 {
-                let row = U::splat((HYPSO_TAB / 4) as u32) + ((eq >> 4) << 2);
+                let row = U::splat(c.region + (HYPSO_TAB / 4) as u32) + ((eq >> 4) << 2);
                 [wordf(row), wordf(row + U::splat(1)), wordf(row + U::splat(2))]
             } else {
                 splat3(c.flat)
@@ -314,13 +317,13 @@ pub fn record(c: &Consts) -> ssa::Compiled {
     let mut rgb = tint;
     if mask & LAND != 0 {
         let k = U::select(acls.lt(U::splat(LAND_MAX + 1)), acls, U::splat(LAND_MAX));
-        let row = U::splat((LAND_TAB / 4) as u32) + (k << 2);
+        let row = U::splat(c.region + (LAND_TAB / 4) as u32) + (k << 2);
         let col = [wordf(row), wordf(row + U::splat(1)), wordf(row + U::splat(2))];
         rgb = lerp3(rgb, col, F::from_u32(acov) * (1. / 255.) * wordf(row + U::splat(3)));
     }
     rgb = lerp3(lit(rgb), ink, ink_a);
     let k = U::select(lcls.lt(U::splat(CLASS_MAX + 1)), lcls, U::splat(CLASS_MAX));
-    let row = U::splat((LINE_TAB / 4) as u32) + (k << 2);
+    let row = U::splat(c.region + (LINE_TAB / 4) as u32) + (k << 2);
     let waterway = k.eq(U::splat(WATERWAY));
     let dim = sel(waterway, F::from_u32(lmag).mul_add(F::splat(0.6 / 255.), F::splat(0.4)), one);
     let lcol = [wordf(row) * dim, wordf(row + U::splat(1)) * dim, wordf(row + U::splat(2)) * dim];
@@ -361,7 +364,7 @@ pub fn record(c: &Consts) -> ssa::Compiled {
             // The overlay in front, its premultiplied g2t codes as working values (fluor's table), what it leaves of the map under it: front to back, `under`.
             let o = word(U::splat(c.overlay_at) + i);
             let keep = F::from_u32(U::splat(255) - (o >> 24)) * (1. / 255.);
-            let tab = |k: u32| wordf(U::splat((CODE_TAB / 4) as u32) + byte(o, k));
+            let tab = |k: u32| wordf(U::splat(c.region + (CODE_TAB / 4) as u32) + byte(o, k));
             for (k, x) in v.iter_mut().enumerate() {
                 *x = x.mul_add(keep, tab(k as u32)).min(F::splat(65535.));
             }

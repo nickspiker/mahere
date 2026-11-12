@@ -17,6 +17,8 @@ const UDP: u64 = 8;
 /// The GPU service and the layer arena (`--use gpu --dma layers`), after the network: the map drawn on the GPU (`gpu.rs`).
 const GPU: u64 = 9;
 const LAYERS: u64 = 10;
+/// A second surface (`--dma surface` after the layers): the mailbox's other buffer, so the GPU draws one frame while the display shows the last (`gpu.rs`).
+const SURFACE2: u64 = 11;
 
 type Shell = FerrosShell<App>;
 
@@ -43,6 +45,10 @@ impl FluorApp for App {
         self.inner.on_event(event, ctx)
     }
     fn wake_at(&self) -> Option<std::time::Instant> {
+        // A frame planned and not yet drawn (the GPU pipeline's last): one more draw, now, so it reaches the glass when the map comes to rest.
+        if self.gpu.as_ref().is_some_and(|g| g.owes_frame()) && !self.failed {
+            return Some(std::time::Instant::now());
+        }
         self.inner.wake_at()
     }
     fn tick(&mut self, ctx: &mut Context) -> bool {
@@ -68,6 +74,9 @@ impl FluorApp for App {
     }
     fn own_frame(&self) -> Option<&[u32]> {
         self.gpu.as_ref().and_then(|g| g.frame())
+    }
+    fn own_surface(&self) -> Option<u64> {
+        self.gpu.as_ref().and_then(|g| g.own_surface())
     }
     fn opaque(&self) -> bool {
         self.gpu.is_some()
@@ -180,7 +189,7 @@ pub fn run() {
     // The size comes from the shell at once (`on_resize` as it is made): the panel's, the frame being the whole panel.
     let mut inner: DeviceApp<NoGpu> = DeviceApp::open(0, 0, store, None);
     inner.map.set_pool_budget(POOL_BUDGET);
-    let app = App { inner, gpu: crate::gpu::GpuMap::open(GPU, LAYERS, SURFACE), failed: false };
+    let app = App { inner, gpu: crate::gpu::GpuMap::open(GPU, LAYERS, SURFACE, SURFACE2), failed: false };
     let fixes: Arc<Mutex<Option<GpsFix>>> = Arc::new(Mutex::new(None));
     if sys::grant_count() > GPS {
         let fixes = fixes.clone();
