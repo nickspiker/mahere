@@ -296,6 +296,9 @@ pub struct Residency {
 
 const RETRY_AFTER: std::time::Duration = std::time::Duration::from_secs(3);
 
+/// How often an unchanged missing list is sent to the loaders again.
+const RESEND: std::time::Duration = std::time::Duration::from_secs(1);
+
 /// Cells at this depth and above are never evicted: at most 850 over the whole globe (10 + 40 + 160 + 640). Depth 4 was kept too until 2026-10-19, when a phone that had panned around the planet held over two thousand of them, more than the GPU's 2048 layers per plane, and the cells past them drew as bare ground in cell-shaped patches (South America at z4, Nick); depth 4 now comes and goes with the view, from the device's cell files.
 pub const PIN_DEPTH: u8 = 3;
 
@@ -485,7 +488,7 @@ impl Residency {
             }
         }
         // An unchanged list is still re-sent once a second: a cell the loader skipped as just-done can otherwise be waited on forever after a quick zoom out and back.
-        if list == self.last_sent && self.last_send_at.elapsed() < std::time::Duration::from_secs(1) {
+        if list == self.last_sent && self.last_send_at.elapsed() < RESEND {
             return;
         }
         self.last_send_at = std::time::Instant::now();
@@ -579,6 +582,11 @@ impl Residency {
 
     pub fn converged(&self) -> bool {
         self.pending.is_empty() && self.fill_left == 0
+    }
+
+    /// Whether a want now would reach the loaders though nothing changed: the view unsettled and the last list a [`RESEND`] old (a cell the loaders skipped asked for again, a failed one retried once [`RETRY_AFTER`] has passed).
+    pub fn resend_due(&self) -> bool {
+        !self.converged() && self.last_send_at.elapsed() >= RESEND
     }
 }
 

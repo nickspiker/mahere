@@ -800,6 +800,11 @@ impl Panel {
         self.fonts.as_ref().is_some_and(|f| f.busy() || self.font_cursor.behind(f))
     }
 
+    /// Packs arrived that the panel's text has not loaded: a frame is due for them. Unlike [`Panel::fonts_due`], a fetch still under way is not one: a host that looks every pass sees the arrival without a frame drawn while it waits.
+    pub fn fonts_arrived(&self) -> bool {
+        self.fonts.as_ref().is_some_and(|f| self.font_cursor.behind(f))
+    }
+
     pub fn new() -> Panel {
         let mut hits: HitId = HIT_NONE;
         let checks = LAYERS.iter().map(|&(l, label)| (l, Checkbox::new(&mut hits, label, 0.0, 0.0, 10.0, 10.0, 10.0, false))).collect();

@@ -512,6 +512,16 @@ impl<G: MapGpu> DeviceApp<G> {
         }
     }
 
+    /// Whether the camera has rested a quarter second, when labels are laid out; a camera that moved since the last look starts the quarter second again.
+    fn label_rest(&mut self) -> bool {
+        let c = self.map.cam;
+        let cam_key = (c.lat().to_bits(), c.lon().to_bits(), c.ppd.to_bits(), c.bearing().to_bits());
+        if cam_key != self.label_cam.0 {
+            self.label_cam = (cam_key, Instant::now());
+        }
+        self.label_cam.1.elapsed().as_millis() >= 250
+    }
+
     /// What the cache holds and the most the slider may allow: what is held plus the free space.
     pub fn cache_stats(&self) -> (u64, u64) {
         let used = self.cells_cache.as_ref().map_or(0, |c| c.cached_bytes());
@@ -771,8 +781,11 @@ impl<G: MapGpu> FluorApp for DeviceApp<G> {
         }
     }
 
+    /// The CPU path draws on change only: a cell, the lettering or a font pack arriving, the camera, a touch (`tick` and the input say so).
+    /// A frame every pass while the residency was unsettled redrew the same screen over and over while cells came in tens of seconds apart (ferros, 2026-11-11: frames of seconds, the four cores and the heap's one lock taken from the loaders and the network).
+    /// A GPU host draws while unsettled as before: its frame is cheap.
     fn wake_at(&self) -> Option<Instant> {
-        if self.map.converged() { None } else { Some(Instant::now()) }
+        if self.gpu.is_none() || self.map.converged() { None } else { Some(Instant::now()) }
     }
 
     fn tick(&mut self, ctx: &mut Context) -> bool {
@@ -793,7 +806,7 @@ impl<G: MapGpu> FluorApp for DeviceApp<G> {
         let mut more = false;
         if self.gpu.is_none() {
             let finished = self.areas.poll();
-            if self.panel.fonts_due() {
+            if self.panel.fonts_arrived() {
                 self.panel.invalidate();
             }
             if self.panel.is_open() && (finished || (self.areas.downloading() && self.areas_shown.elapsed().as_millis() >= 250)) {
@@ -804,9 +817,15 @@ impl<G: MapGpu> FluorApp for DeviceApp<G> {
                 let view = self.updates_view();
                 self.panel.set_updates(view);
             }
-            more = self.panel.take_dirty() || self.labeller.poll() || self.labeller.pending(&self.map, self.w, self.h);
+            // The lettering is asked for here as well as in the frame, so a view come to rest (a quarter second after the camera stopped) or cells arrived are lettered without a frame drawn to ask; the layout landing is the frame.
+            if mahere_panel::labels::Labeller::wanted(&self.map) {
+                let at_rest = self.label_rest();
+                self.labeller.ask(&mut self.map, self.w, self.h, self.panel.label_font_px(), at_rest);
+            }
+            more = self.panel.take_dirty() || self.labeller.poll();
         }
-        self.map.tick(self.w, self.h) || found || more || self.search_rx.is_some()
+        // A search under way is no frame: its result landing is (`found`).
+        self.map.tick(self.w, self.h) || found || more
     }
 
     /// The keyboard up while the search page is, down when it goes (fluor's one-shot ask, read after every touch and every frame).
@@ -828,12 +847,8 @@ impl<G: MapGpu> FluorApp for DeviceApp<G> {
         self.frame.clear();
         self.frame.extend_from_slice(&self.map.canvas);
         let c = self.map.cam;
-        let cam_key = (c.lat().to_bits(), c.lon().to_bits(), c.ppd.to_bits(), c.bearing().to_bits());
-        if cam_key != self.label_cam.0 {
-            self.label_cam = (cam_key, Instant::now());
-        }
+        let at_rest = self.label_rest();
         if mahere_panel::labels::Labeller::wanted(&self.map) {
-            let at_rest = self.label_cam.1.elapsed().as_millis() >= 250;
             self.labeller.ask(&mut self.map, w, h, self.panel.label_font_px(), at_rest);
             self.labeller.draw_cpu(&mut self.frame, &self.map.cam, w, h);
         }

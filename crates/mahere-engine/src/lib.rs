@@ -267,6 +267,8 @@ pub struct MapCore {
     pub last_straddle_blocks: usize,
     /// Something changed since the last render (camera, sun, GPS). Reported by `tick` so shells that only draw on demand get a frame.
     dirty: bool,
+    /// The cells the last frame wanted and the view's centre it sorted them by: `tick` says them to the residency again while it is unsettled, so the wants go on (the once-a-second resend, the retry of a failed cell) without a frame drawn for them.
+    want_last: (Vec<mahere_tiles::CellKey>, (u64, u64)),
     /// Elevation range the last frame saw; the next frame's contour interval is fit to it (one loop, a frame late — close enough).
     last_range: ElevRange,
     /// The lighting environment (device frame); folded into `luts.light` with the bearing each time either changes.
@@ -412,6 +414,7 @@ impl MapCore {
             marks_top: 0.0,
             last_straddle_blocks: 0,
             dirty: true,
+            want_last: (Vec::new(), (0, 0)),
             last_range: ElevRange::EMPTY,
             contours_on_screen: 32.0,
             contour_interval: 0.0,
@@ -879,6 +882,14 @@ impl MapCore {
     }
 
     /// A view's wanted cells, with the globe's ten depth-0 cells always: the base set every view falls back to, loaded first on a fresh install with the ring round the globe (Nick 2026-10-22), and the geoid's source at every zoom (2026-10-19).
+    /// A frame's wants to the residency, kept for `tick` to say again while the residency is unsettled.
+    fn want_cells(&mut self, want: Vec<mahere_tiles::CellKey>, center: (u64, u64)) {
+        self.want_last.0.clear();
+        self.want_last.0.extend_from_slice(&want);
+        self.want_last.1 = center;
+        self.res.want(want, center);
+    }
+
     fn with_globe(&self, mut want: Vec<mahere_tiles::CellKey>) -> Vec<mahere_tiles::CellKey> {
         for d in 0..10u8 {
             let k = mahere_tiles::CellKey::from_grid(d, 0, 0, 0);
@@ -1104,8 +1115,16 @@ impl MapCore {
         if arrived > 0 {
             self.refine_due = true;
         }
+        // The last frame's wants said again when the residency would re-send them (once a second while cells are missing): a host that draws only on change (the CPU path) gets them without drawing a frame for them (ferros, 2026-11-11: a frame drawn every pass while cells came in tens of seconds apart kept the four cores busy redrawing the same screen). A want that marks cells absent changed the pool, which is a frame.
+        let mut wanted = false;
+        if self.res.resend_due() && !self.want_last.0.is_empty() {
+            let version = self.res.pool_version;
+            let (list, center) = (self.want_last.0.clone(), self.want_last.1);
+            self.res.want(list, center);
+            wanted = self.res.pool_version != version;
+        }
         self.refine_route();
-        let changed = arrived > 0 || self.dirty || routed;
+        let changed = arrived > 0 || self.dirty || routed || wanted;
         // When the first view and the globe's base set are complete, how long that took and the loaders' share (2026-10-22: ten seconds on a relaunch with every cell on the phone).
         if let Some(t) = self.started.filter(|_| self.res.converged() && !self.res.pool.map.is_empty() && self.globe_loading().is_none()) {
             self.started = None;
@@ -1451,7 +1470,7 @@ impl MapCore {
                 // Residency still hears the want: it re-sends an unchanged missing list once a second.
                 let center = Coord::from_lat_lon(self.cam.lat(), self.cam.lon());
                 let (cu, cv) = center.uv();
-                self.res.want(self.with_globe(p.want.clone()), (cu, cv));
+                self.want_cells(self.with_globe(p.want.clone()), (cu, cv));
                 self.last_frame_ms = t0.elapsed().as_secs_f32() * 1000.0;
                 return p;
             }
@@ -1460,7 +1479,7 @@ impl MapCore {
         self.last_straddle_blocks = p.straddle_blocks;
         let center = Coord::from_lat_lon(self.cam.lat(), self.cam.lon());
         let (cu, cv) = center.uv();
-        self.res.want(self.with_globe(p.want.clone()), (cu, cv));
+        self.want_cells(self.with_globe(p.want.clone()), (cu, cv));
         self.plan_cache = Some((key, p.clone()));
         self.last_frame_ms = t0.elapsed().as_secs_f32() * 1000.0;
         p
@@ -1811,7 +1830,7 @@ impl MapCore {
         if trace() {
             self.trace_frame(&want, w, h);
         }
-        self.res.want(self.with_globe(want), (cu, cv));
+        self.want_cells(self.with_globe(want), (cu, cv));
 
         self.draw_gps(w, h);
         self.draw_compass(w, h);
