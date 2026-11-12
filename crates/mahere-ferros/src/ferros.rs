@@ -15,6 +15,9 @@ const UDP: u64 = 8;
 
 type Shell = FerrosShell<DeviceApp<NoGpu>>;
 
+/// The most the decoded cells may hold on the CPU path, 256 MiB of the heap's 640 (build.rs): a full screen on the Pro's panel wants 130 to 290 cells of about 2 MiB each (the terrain packed for the CPU raster 1 MiB, seven vector planes 128 KiB each), measured on the desktop 2026-11-11 (mahere-device example `ferros_mem`: the globe 134 cells and 252 MiB, a city 283 cells and 592 MiB). Past it the finest cells farthest from the view's centre wait, drawn from their parents (residency `set_budget`); the rest of the heap holds the frames (46 MiB), the glyph atlas (8 to 32 MiB), font packs (up to 65 MiB with five Han faces at the globe), names, the lettering's layout, cells in flight and the thread stacks. A GPU host takes the planes off the CPU, and then they count for nothing here.
+const POOL_BUDGET: usize = 1 << 28;
+
 /// The kernel, as this process reaches it (ferros KERNEL.md, the process ABI): the call, the ira key, the grants page. Inlined as fluor's and kete's are: ferros_sys is no_std and not a published crate.
 pub(crate) mod sys {
     use core::arch::asm;
@@ -97,7 +100,8 @@ pub fn run() {
         println!("mahere: no network grant (slot {UDP}); cells from the vault alone");
     }
     // The size comes from the shell at once (`on_resize` as it is made): the panel's, the frame being the whole panel.
-    let app: DeviceApp<NoGpu> = DeviceApp::open(0, 0, store, None);
+    let mut app: DeviceApp<NoGpu> = DeviceApp::open(0, 0, store, None);
+    app.map.set_pool_budget(POOL_BUDGET);
     let fixes: Arc<Mutex<Option<GpsFix>>> = Arc::new(Mutex::new(None));
     if sys::grant_count() > GPS {
         let fixes = fixes.clone();

@@ -194,8 +194,13 @@ pub fn link_name(base: &[u8], layer: Layer) -> Option<String> {
 
 /// A cell's planes from whichever of its published layers are at hand (the base, the terrain, the image, the infrared), merged.
 pub fn decode_layers(base: Option<&[u8]>, dem: Option<&[u8]>, img: Option<&[u8]>, nir: Option<&[u8]>) -> Result<CellPlanes, String> {
+    decode_layers_with(base, dem, img, nir, &|_| true)
+}
+
+/// [`decode_layers`] with the base's sections `keep` refuses passed over undecoded ([`crate::decode_cell_with`]).
+pub fn decode_layers_with(base: Option<&[u8]>, dem: Option<&[u8]>, img: Option<&[u8]>, nir: Option<&[u8]>, keep: &dyn Fn(&str) -> bool) -> Result<CellPlanes, String> {
     let mut out = match base {
-        Some(b) => decode_cell(b)?,
+        Some(b) => crate::decode_cell_with(b, keep)?,
         None => CellPlanes::default(),
     };
     if let Some(b) = dem {

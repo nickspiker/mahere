@@ -1985,6 +1985,11 @@ fn write_file(path: &Path, bytes: &[u8]) -> Result<(), String> {
 
 /// Decode a cell from raw file bytes (zstd or plain VSF) — the loader thread's entry point; no filesystem coupling. Width-agnostic reads.
 pub fn decode_cell(data: &[u8]) -> Result<CellPlanes, String> {
+    decode_cell_with(data, &|_| true)
+}
+
+/// A cell file decoded as [`decode_cell`], its sections `keep` refuses (by name) passed over undecoded: the map's residency keeps no names and no routing graph (the lettering, the search and the router read those from the device on their own), and decoding them only to drop them cost a loader the time and megabytes of a depth-0 cell's name table (Mahere on ferros, 2026-11-11).
+pub fn decode_cell_with(data: &[u8], keep: &dyn Fn(&str) -> bool) -> Result<CellPlanes, String> {
     let plain: Vec<u8>;
     let data = if data.starts_with(&[0x28, 0xB5, 0x2F, 0xFD]) {
         plain = zstd::decode_all(data).map_err(|e| e.to_string())?;
@@ -1996,6 +2001,9 @@ pub fn decode_cell(data: &[u8]) -> Result<CellPlanes, String> {
     let sections = header.sections(data, end).map_err(|e| e.to_string())?;
     let mut out = CellPlanes::default();
     for s in sections {
+        if !keep(s.name.as_str()) {
+            continue;
+        }
         let fields = uncoded(s.fields.into_iter().map(|f| (f.name, f.values)).collect());
         let first = |name: &str| fields.get(name).and_then(|v| v.first());
         match s.name.as_str() {

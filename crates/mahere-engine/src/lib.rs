@@ -339,7 +339,7 @@ pub struct MapCore {
     /// What the last tap found at its point, for the measurement strip.
     tap_info: Vec<String>,
     /// Cells' names as labels last read them; None for a resident cell with none.
-    names_cache: rustc_hash::FxHashMap<mahere_tiles::CellKey, Option<std::sync::Arc<mahere_tiles::NameCell>>>,
+    names_cache: labels::NamesCache,
     /// The geoid of the depth-2 cell last looked in, centimetres per texel (one cell covers a few hundred kilometres).
     geoid_cell: Option<(mahere_tiles::CellKey, Arc<Vec<i16>>)>,
     /// Cells replaced by a newer copy since a label worker last asked, for it to forget their names.
@@ -943,6 +943,11 @@ impl MapCore {
             }
         }
         None
+    }
+
+    /// The most bytes the resident cells' planes may hold, the coarse cells out of view let go past it, farthest first ([`residency::Residency::set_budget`]).
+    pub fn set_pool_budget(&mut self, bytes: usize) {
+        self.res.set_budget(bytes);
     }
 
     /// A host that draws with the GPU only: the loader stops packing the CPU raster's texels, saving a megabyte and the normal pass per cell.
