@@ -4,6 +4,7 @@
 //! The ip server's TCP since 2026-11-11 (Nick: "sounds like it needs re-engineered"): sixteen connections, a 1 MiB window each, receives of up to 256 KiB; Mahere takes four connections at once and reads each a big reply at a time.
 
 use crate::ferros::sys;
+use crate::names::Names;
 use mahere_engine::plain_http::{Conn, Dial};
 use std::io;
 use std::sync::{Arc, Condvar, Mutex};
@@ -26,10 +27,10 @@ const DNS_REPLY: usize = 1 << 11;
 /// The most of a request one SEND carries: a call carries 4096 bytes (the kernel's limit), less the op and the handle.
 const SEND_MAX: usize = (1 << 12) - 2;
 
-/// The ip server at grant slot `slot`, the address last resolved, and the turn for a connection.
+/// The ip server at grant slot `slot`, the addresses found, and the turn for a connection.
 pub struct IpNet {
     slot: u64,
-    found: Arc<Mutex<Option<(String, u8, [u8; 16])>>>,
+    names: Arc<Names>,
     turn: Arc<(Mutex<usize>, Condvar)>,
 }
 
@@ -44,7 +45,7 @@ impl IpNet {
         if n < INFO_LEN as u64 {
             return Err("the ip server's INFO is short".into());
         }
-        Ok(IpNet { slot, found: Arc::new(Mutex::new(None)), turn: Arc::new((Mutex::new(0), Condvar::new())) })
+        Ok(IpNet { slot, names: Arc::new(Names::new()), turn: Arc::new((Mutex::new(0), Condvar::new())) })
     }
 
     fn call(&self, req: &[u8], reply: &mut [u8]) -> io::Result<usize> {
@@ -52,14 +53,13 @@ impl IpNet {
         if n == sys::ERR { Err(io::Error::other("the ip server refused the call")) } else { Ok(n as usize) }
     }
 
-    /// `host`'s address: the one found last when it is the same host, else asked of DNS (IPv6 first, the device's preference: ferros payloads/ip, owner 2026-10-29; then IPv4, also when the IPv6 question could not be asked), said on the console.
+    /// `host`'s address, shared by every connection ([`Names`]): asked of DNS outside any lock, one lookup at a time, a stale address used while it is asked for again.
     fn address(&self, host: &str) -> io::Result<(u8, [u8; 16])> {
-        let mut found = self.found.lock().unwrap();
-        if let Some((h, fam, a)) = &*found {
-            if h == host {
-                return Ok((*fam, *a));
-            }
-        }
+        self.names.address(host, &|h| self.lookup(h))
+    }
+
+    /// `host` asked of DNS (IPv6 first, the device's preference: ferros payloads/ip, owner 2026-10-29; then IPv4, also when the IPv6 question could not be asked), said on the console: its address, family and the answer's TTL in seconds.
+    fn lookup(&self, host: &str) -> io::Result<(u8, [u8; 16], u32)> {
         let t = std::time::Instant::now();
         let mut info = [0u8; 128];
         let n = self.call(&[3], &mut info)?;
@@ -75,24 +75,23 @@ impl IpNet {
         if flags & 2 != 0 {
             let via = if dns6 != [0; 16] { Some((6, dns6)) } else if has4 { Some((4, dns4)) } else { None };
             if let Some((fam, server)) = via {
-                got = self.query(fam, server, host, 28).ok().flatten().map(|a| (6u8, a));
+                got = self.query(fam, server, host, 28).ok().flatten().map(|(a, ttl)| (6u8, a, ttl));
             }
         }
         if got.is_none() && has4 {
-            got = self.query(4, dns4, host, 1)?.map(|a| (4u8, a));
+            got = self.query(4, dns4, host, 1)?.map(|(a, ttl)| (4u8, a, ttl));
         }
-        let Some((fam, a)) = got else {
+        let Some((fam, a, ttl)) = got else {
             let why = if flags & 3 == 0 { "no address yet" } else { "DNS gave no address" };
             println!("mahere: {host}: {why} ({} ms)", t.elapsed().as_millis());
             return Err(io::Error::new(io::ErrorKind::NotFound, why));
         };
-        println!("mahere: {host} is {} ({} ms)", shown(fam, &a), t.elapsed().as_millis());
-        *found = Some((host.to_string(), fam, a));
-        Ok((fam, a))
+        println!("mahere: {host} is {} for {ttl} s ({} ms)", shown(fam, &a), t.elapsed().as_millis());
+        Ok((fam, a, ttl))
     }
 
-    /// The first record of type `qtype` (1 A, 28 AAAA) for `host` from the DNS server `server` (family `fam`, IPv4 in its first 4 bytes): Some(address), None when the server says there is none or never answers.
-    fn query(&self, fam: u8, server: [u8; 16], host: &str, qtype: u16) -> io::Result<Option<[u8; 16]>> {
+    /// The first record of type `qtype` (1 A, 28 AAAA) for `host` from the DNS server `server` (family `fam`, IPv4 in its first 4 bytes): Some((address, its TTL in seconds)), None when the server says there is none or never answers.
+    fn query(&self, fam: u8, server: [u8; 16], host: &str, qtype: u16) -> io::Result<Option<([u8; 16], u32)>> {
         // WHY: a DNS name is at most 253 bytes in labels of 1 to 63; anything else is not a name to ask for.
         if host.is_empty() || host.len() > 253 || host.split('.').any(|l| l.is_empty() || l.len() > 63) {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "not a host name"));
@@ -139,8 +138,8 @@ impl IpNet {
     }
 }
 
-/// The DNS message `m` read for message `id`: None when it is not that message's answer; Some(None) when it is and has no record of type `qtype` (none, or the name does not exist); Some(Some(address)) with the first one. Every read is checked (WHY: the message is the network's, any length and any content).
-fn answer(m: &[u8], id: u16, qtype: u16) -> Option<Option<[u8; 16]>> {
+/// The DNS message `m` read for message `id`: None when it is not that message's answer; Some(None) when it is and has no record of type `qtype` (none, or the name does not exist); Some(Some((address, TTL in seconds))) with the first one. Every read is checked (WHY: the message is the network's, any length and any content).
+fn answer(m: &[u8], id: u16, qtype: u16) -> Option<Option<([u8; 16], u32)>> {
     if m.len() < 12 || m[0..2] != id.to_be_bytes() || m[2] & 0x80 == 0 {
         return None;
     }
@@ -175,7 +174,7 @@ fn answer(m: &[u8], id: u16, qtype: u16) -> Option<Option<[u8; 16]>> {
         if ty == qtype && (len == 4 || len == 16) {
             let mut a = [0u8; 16];
             a[..len].copy_from_slice(data);
-            return Some(Some(a));
+            return Some(Some((a, u32::from_be_bytes([head[4], head[5], head[6], head[7]]))));
         }
         i += 10 + len;
     }
@@ -194,15 +193,16 @@ fn shown(fam: u8, a: &[u8; 16]) -> String {
 
 impl Dial for IpNet {
     fn dial(&self, host: &str, port: u16) -> io::Result<Box<dyn Conn>> {
-        let turn = Turn::take(self.turn.clone());
+        // The address before the turn: a dialer looking one up holds none of the four connections while it waits.
         let (fam, addr) = self.address(host)?;
+        let turn = Turn::take(self.turn.clone());
         let mut req = vec![4u8, fam];
         req.extend_from_slice(&addr);
         req.extend_from_slice(&port.to_be_bytes());
         let mut r = [0u8; 16];
         let n = self.call(&req, &mut r)?;
         match (n, r[0]) {
-            (2.., 0) => Ok(Box::new(IpConn { slot: self.slot, handle: r[1], rx: vec![0u8; 1 + RECV_MOST], at: 1, len: 1, state: 1, closed: false, found: self.found.clone(), _turn: turn })),
+            (2.., 0) => Ok(Box::new(IpConn { slot: self.slot, handle: r[1], rx: vec![0u8; 1 + RECV_MOST], at: 1, len: 1, state: 1, closed: false, names: self.names.clone(), host: host.to_string(), worked: false, _turn: turn })),
             (_, 2) => Err(io::Error::new(io::ErrorKind::AddrNotAvailable, "no address yet")),
             (_, 4) => Err(io::Error::other("the ip server has no free connection")),
             (_, 6) => Err(io::Error::other("the ip server has no memory for another connection")),
@@ -242,7 +242,11 @@ struct IpConn {
     len: usize,
     state: u8,
     closed: bool,
-    found: Arc<Mutex<Option<(String, u8, [u8; 16])>>>,
+    /// The addresses found and the host this connection is to: a failure counted against its address, a success clearing them.
+    names: Arc<Names>,
+    host: String,
+    /// Whether it brought anything yet (said once).
+    worked: bool,
     /// Dropped after the connection's close (fields drop in order, after `drop`).
     _turn: Turn,
 }
@@ -276,8 +280,8 @@ impl io::Read for IpConn {
             match state {
                 5 => return Err(io::Error::new(io::ErrorKind::NotConnected, "the connection is gone")),
                 4 => {
-                    // Reset, or what was sent went unanswered: the address is asked for again next time.
-                    *self.found.lock().unwrap() = None;
+                    // Reset, or what was sent went unanswered: counted against the address, asked for again only after several in a row.
+                    self.names.failed(&self.host);
                     return Err(io::Error::new(io::ErrorKind::ConnectionReset, "the connection failed (reset, or unanswered)"));
                 }
                 _ => {}
@@ -298,6 +302,11 @@ impl io::Read for IpConn {
                 return Err(io::Error::new(io::ErrorKind::TimedOut, format!("nothing for {STALL_S} s")));
             }
             self.state = state;
+            // Data: the address works.
+            if !self.worked {
+                self.worked = true;
+                self.names.worked(&self.host);
+            }
         }
         let k = (self.len - self.at).min(buf.len());
         buf[..k].copy_from_slice(&self.rx[self.at..self.at + k]);
