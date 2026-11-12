@@ -5,7 +5,7 @@ use crate::arena::{self, Layout, Slots};
 use crate::kernel;
 use mahere_engine::colour::Display;
 use mahere_engine::ink::UserLayer;
-use mahere_engine::plan::plan_frame;
+use mahere_engine::viewplan::{ViewPlan, plan_view};
 use mahere_engine::raster::{Contours, FrameLuts, LayerMask, Style, build_hypso_lut, render_frame, select_depth};
 use mahere_engine::residency::{DemPacked, Entry, Pool, PRESENT_DEM, PRESENT_LAND, PRESENT_LINE, PRESENT_WATER};
 use mahere_engine::Camera;
@@ -64,32 +64,36 @@ fn cell(seed: u32) -> Entry {
     }
 }
 
-/// The frame both ways for `cam` over `pool` with `mask`; the CPU's codes and the kernel's (through the CPU's encode).
-fn both(cam: &Camera, pool: &Pool, mask: LayerMask, w: usize, h: usize, out: kernel::Out) -> (Vec<u32>, Vec<u32>, usize) {
-    let d = select_depth(cam.ppd, 0, 14);
-    let user = UserLayer::default();
-    let plan = plan_frame(w, h, cam, pool, d, d, &user);
-    let luts = FrameLuts {
+/// The frame's tables for a view: the plan's ball, the default style, a fixed sun and sky.
+fn luts(plan: &ViewPlan, cam: &Camera, mask: LayerMask) -> FrameLuts {
+    FrameLuts {
         pole: [plan.pole[0], plan.pole[1], plan.pole[2]],
         disk: [plan.globe[0], plan.globe[1], plan.globe[2]],
         hypso: build_hypso_lut(),
         style: Style::default(),
         sun: [0.3, 0.4, 0.866],
         mask: mask.effective(),
-        dem_depth: d,
+        dem_depth: plan.dem_depth,
         contours: Contours { interval: 2.0, index_every: 5, m_per_px: (111_320.0 / cam.ppd) as f32, lo_m: 0.0, hi_m: 4000.0 },
         light: mahere_engine::sh::Sh9::sun_and_sky(315.0, 40.0).quadratic((0.0, 1.0)),
         display: Display::default(),
         compressed: true,
-    };
+    }
+}
+
+/// The frame both ways for `cam` over `pool` with `mask`; the CPU's codes and the kernel's (through the CPU's encode).
+fn both(cam: &Camera, pool: &Pool, mask: LayerMask, w: usize, h: usize, out: kernel::Out) -> (Vec<u32>, Vec<u32>, usize) {
+    let d = select_depth(cam.ppd, 0, 14);
+    let user = UserLayer::default();
+    let plan = plan_view(w, h, cam, pool, d, d);
+    let luts = luts(&plan, cam, mask);
     let mut cpu = vec![0u32; w * h];
     render_frame(&mut cpu, w, h, cam, pool, &luts, d, d, &user);
 
     let lay = Layout::new(w, h, BYTES, out).unwrap();
     let mut words = vec![0u32; BYTES / 4];
     let mut slots = Slots::new(lay.slots);
-    let (cand, _) = arena::cells(&mut slots, pool, &plan, 1, &lay, &mut words);
-    arena::blocks(&plan, &cand, &lay, 0, &mut words).unwrap();
+    arena::view(&mut slots, pool, &plan, 1, &lay, 0, &mut words).unwrap();
     arena::tables(&luts, &plan, true, &lay, 0, &mut words);
     let c = arena::consts(&luts, &plan, &lay, 0, false);
     let k = kernel::record(&c);
@@ -144,6 +148,91 @@ fn apart(a: &[u32], b: &[u32], tol: i32) -> (i32, usize) {
     (worst, over)
 }
 
+/// Every pixel's depth-30 (u, v) from the kernel's projection (its words in the emulator) against the plan's own (f64) and the encoder's diamond: the most units apart, and the pixels whose (u, v) is further than `tol` units from the plan's.
+fn located(cam: &Camera, pool: &Pool, w: usize, h: usize) -> (i64, usize, usize, usize, usize, bool) {
+    let d = select_depth(cam.ppd, 0, 14);
+    let plan = plan_view(w, h, cam, pool, d, d);
+    let lay = Layout::new(w, h, BYTES, kernel::Out::Surface).unwrap();
+    let mut words = vec![0u32; BYTES / 4];
+    arena::view(&mut Slots::new(lay.slots), pool, &plan, 1, &lay, 0, &mut words).unwrap();
+    let luts = luts(&plan, cam, LayerMask::default());
+    let c = arena::consts(&luts, &plan, &lay, 0, false);
+    let k = kernel::record_locate(&c);
+    let mut bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    bytes.resize(BYTES + 32 * (w * h).next_multiple_of(16), 0);
+    let mut mem = Memory { base: VA, bytes };
+    let frame = VA + BYTES as u64;
+    let mut uniforms = vec![frame, VA];
+    uniforms.extend_from_slice(&k.consts);
+    for g in 0..(w * h).next_multiple_of(16) {
+        run(&k.words, &uniforms, [g as u32, 0], &mut mem);
+    }
+    let (mut worst, mut far, mut wrong, mut seams) = (0i64, 0usize, 0usize, 0usize);
+    // The units a pixel spans here: the kernel's (u, v) need only land within a small part of one.
+    let tol = (((1u64 << 30) as f64 / (cam.radius() * 1.1071)) as i64 >> 4).max(1);
+    for py in 0..h {
+        for px in 0..w {
+            let (sx, sy) = (px as f64, py as f64);
+            if !cam.on_globe(sx, sy, w, h) {
+                continue;
+            }
+            let p = plan.view_dir(sx, sy);
+            let (mut f, mut u, mut v) = plan.locate(p);
+            let i = (py * w + px) as u64;
+            let at = |k: u64| mem.read32(frame + 32 * i + 4 * k);
+            let (gu, gv) = (at(0), at(1));
+            // The diamond the kernel took, from its face's seed; on a seam it can be the other side's (f32 against f64, within rounding of both): there the plan's (u, v) on that diamond's nearer face is the one to compare with.
+            let seed = |d: u8| (d as u32).wrapping_mul(0x27D4_EB2F) ^ (plan.dem_depth as u32).wrapping_mul(0xC2B2_AE3D);
+            if seed(plan.faces[f].diamond) != at(4) {
+                seams += 1;
+                let dot = |a: [f64; 3]| a[0] * p[0] + a[1] * p[1] + a[2] * p[2];
+                f = (0..plan.faces.len()).filter(|&g| seed(plan.faces[g].diamond) == at(4)).max_by(|&a, &b| dot(plan.faces[a].centroid).total_cmp(&dot(plan.faces[b].centroid))).expect("the kernel's face is one of the plan's");
+                (u, v) = plan.faces[f].uv(p);
+            }
+            let e = (gu as i64 - u as i64).abs().max((gv as i64 - v as i64).abs());
+            worst = worst.max(e);
+            far += (e > tol) as usize;
+            // The terrain's square and texel for the kernel's own (u, v), as the host's page table and the CPU's texel index have them.
+            let sq = plan.roles[0].square(plan.faces[f].diamond, gu, gv).map_or(0, |s| words[kernel::SQUARES / 4 + s]);
+            let ts = sq >> kernel::SQUARE_SHIFT;
+            let base = sq & ((1 << kernel::SQUARE_SHIFT) - 1);
+            let m = (1u32 << ts) - 1;
+            let ti = (((gv >> ts) & 255) << 9) | (((gu >> ts) & 255) << 1) | (((gu & m) + (gv & m)) >> ts) & 1;
+            if at(2) != sq || at(3) != base + 2 * ti {
+                if wrong < 4 {
+                    eprintln!("({px}, {py}): the kernel's square G#{:X} texel G#{:X}, the host's G#{sq:X} G#{:X}", at(2), at(3), base + 2 * ti);
+                }
+                wrong += 1;
+            }
+        }
+    }
+    (worst, far, wrong, seams, c.face_count, c.near)
+}
+
+#[test]
+fn the_kernel_locates_every_pixel_as_the_plan_does() {
+    let (w, h) = (96usize, 80usize);
+    // A town; a seam at 72° east; the north pole, five faces; a deep zoom on a corner of the icosahedron (26.57° N 0° E, six faces); the globe with its limb, from two sides.
+    for (lat, lon, ppd, bearing) in [(46.2, -121.5, 6000.0, 0.7), (40.0, 72.0, 600.0, 0.2), (90.0, 0.0, 3000.0, 0.0), (26.565, 0.0, (1 << 20) as f64, 1.1), (10.0, 30.0, 0.4, 0.0), (-30.0, 150.0, 0.6, 2.0)] {
+        let cam = Camera::new(lat, lon, ppd, bearing);
+        // Every cell the view wants, but every third at the view's depth, which its parent stands in for.
+        let d = select_depth(ppd, 0, 14);
+        let mut pool = Pool::default();
+        let mut want = plan_view(w, h, &cam, &pool, d, d).want;
+        want.sort();
+        for (n, k) in want.iter().enumerate() {
+            if k.depth < d || n % 3 != 0 {
+                pool.map.insert(*k, cell(n as u32));
+            }
+        }
+        let (worst, far, wrong, seams, faces, near) = located(&cam, &pool, w, h);
+        println!("view ({lat}, {lon}, ppd {ppd}): {faces} faces, near {near}: the kernel's (u, v) at most {worst} units from the plan's, {far} pixels past a sixteenth of a pixel, {seams} on a seam took the other diamond; {wrong} pixels' squares or texels not the host's");
+        assert!(far * 1000 <= w * h, "view ({lat}, {lon}, {ppd}): {far} pixels located apart from the plan (at most {worst} units)");
+        assert!(seams <= w, "view ({lat}, {lon}, {ppd}): {seams} pixels took another diamond than the plan's, more than a seam's line");
+        assert_eq!(wrong, 0,"view ({lat}, {lon}, {ppd}): {wrong} pixels read another square or texel than the host's page table names");
+    }
+}
+
 #[test]
 fn the_kernel_draws_what_the_cpu_draws() {
     let (w, h) = (96usize, 80usize);
@@ -151,7 +240,7 @@ fn the_kernel_draws_what_the_cpu_draws() {
     let cam = Camera::new(46.2, -121.5, 6000.0, 0.7);
     let d = select_depth(cam.ppd, 0, 14);
     let mut pool = Pool::default();
-    let plan = plan_frame(w, h, &cam, &pool, d, d, &UserLayer::default());
+    let plan = plan_view(w, h, &cam, &pool, d, d);
     let mut wanted: Vec<CellKey> = plan.want.iter().copied().filter(|k| k.depth == d).collect();
     wanted.sort();
     assert!(wanted.len() >= 2, "the view should span cells: {}", wanted.len());
@@ -177,5 +266,39 @@ fn the_kernel_draws_what_the_cpu_draws() {
         let exact = cpu.iter().zip(&gpu).filter(|(a, b)| a == b).count();
         println!("{name}: {words} words; {} colours in the CPU's frame, {exact} pixels the same code; the largest difference {worst} codes, {over} of {} pixels past 4", distinct.len(), w * h);
         assert!(over * 100 <= w * h, "{name}: {over} pixels differ by more than 4 codes (largest {worst})");
+    }
+}
+
+#[test]
+fn the_kernel_draws_what_the_cpu_draws_where_faces_meet() {
+    let (w, h) = (96usize, 80usize);
+    // Across the seam at 72° east, and the north pole where five faces meet: each pixel's face read from the faces' rows. Every cell wanted, but every third at the view's depth, which its parent stands in for.
+    for (lat, lon, ppd, bearing) in [(40.0, 72.0, 600.0, 0.2), (90.0, 0.0, 3000.0, 0.0)] {
+        let cam = Camera::new(lat, lon, ppd, bearing);
+        let d = select_depth(ppd, 0, 14);
+        let mut pool = Pool::default();
+        let mut want = plan_view(w, h, &cam, &pool, d, d).want;
+        want.sort();
+        for (n, k) in want.iter().enumerate() {
+            if k.depth < d || n % 3 != 0 {
+                pool.map.insert(*k, cell(n as u32 * 7919));
+            }
+        }
+        let (cpu, gpu, words) = both(&cam, &pool, LayerMask::default(), w, h, kernel::Out::Surface);
+        // The CPU's tiles whose corners lie in different diamonds: it draws those by its exact fallback at each pixel's centre (raster.rs `render_block_exact`), every other tile at the pixel's corner as the kernel does everywhere, so there the two sample half a pixel apart over these cells' noise of normals. Compared outside them; the seams themselves are checked exactly by `the_kernel_locates_every_pixel_as_the_plan_does`.
+        let plan = plan_view(w, h, &cam, &pool, d, d);
+        let diamond = |x: usize, y: usize| plan.faces[plan.locate(plan.view_dir(x as f64, y as f64)).0].diamond;
+        let straddles = |x: usize, y: usize| {
+            let (x0, y0) = (x & !31, y & !31);
+            let d0 = diamond(x0, y0);
+            [(x0 + 32, y0), (x0, y0 + 32), (x0 + 32, y0 + 32)].iter().any(|&(a, b)| diamond(a, b) != d0)
+        };
+        let keep: Vec<usize> = (0..w * h).filter(|&i| !straddles(i % w, i / w)).collect();
+        let (cpu, gpu): (Vec<u32>, Vec<u32>) = keep.iter().map(|&i| (cpu[i], gpu[i])).unzip();
+        let (worst, over) = apart(&cpu, &gpu, 4);
+        let exact = cpu.iter().zip(&gpu).filter(|(a, b)| a == b).count();
+        println!("({lat}, {lon}, ppd {ppd}): {words} words; {} pixels outside the CPU's straddling tiles, {exact} the same code; the largest difference {worst} codes, {over} past 4", keep.len());
+        assert!(keep.len() >= 1 << 10, "({lat}, {lon}): too few pixels outside the straddling tiles to compare");
+        assert!(over * 100 <= keep.len(), "({lat}, {lon}): {over} pixels differ by more than 4 codes (largest {worst})");
     }
 }

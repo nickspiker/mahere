@@ -1,6 +1,6 @@
-//! The map on ferros's GPU (ferros GPU-KISTS.md; the owner, 2026-11-11: "Obviously get mahere on GPU proper and flawless at 120fps"): each frame the plan's lattice and the cells it draws go to the layer arena (`arena.rs`), the compose kernel (`kernel.rs`) is recorded with the frame's constants and run by the GPU service over every pixel, and fluor's ferros host shows what it wrote (`FluorApp::render_own`).
+//! The map on ferros's GPU (ferros GPU-KISTS.md; the owner, 2026-11-11: "Obviously get mahere on GPU proper and flawless at 120fps"): each frame the view's plan (the faces in view and a page table of the cells standing in, mahere-engine viewplan.rs) and the cells it draws go to the layer arena (`arena.rs`), the compose kernel (`kernel.rs`) is recorded with the frame's constants and run by the GPU service over every pixel, and fluor's ferros host shows what it wrote (`FluorApp::render_own`).
 //!
-//! The arena (`layers`, slot 10, CPU write-back and GPU coherent: what Mahere writes the GPU reads, and the other way, with no copy and no cache maintenance) holds the tables, the tiles, the blocks, the overlay, the frame, the kernel's words, and the cells' planes in slots of 1 MiB, each written once when its cell is first drawn and kept until a frame needs the slot for a cell it draws and this one it does not.
+//! The arena (`layers`, slot 10, CPU write-back and GPU coherent: what Mahere writes the GPU reads, and the other way, with no copy and no cache maintenance) holds the tables, the faces' rows, the page table's squares, the overlay, the frame, the kernel's words, and the cells' planes in slots of 1 MiB, each written once when its cell is first drawn and kept until a frame needs the slot for a cell it draws and this one it does not.
 //! The GPU service (`gpu`, slot 9) runs a kernel and answers when it is done: one held call a frame, no polling, made on a thread of its own (`GpuThread`) so the next frame is planned while the GPU draws this one.
 //!
 //! With a second surface (slot 11) the frames are a pipeline over a mailbox (ferros GPU-KISTS.md 1.4): frame K is planned into arena region K mod 2 while the GPU draws frame K − 1 into its buffer, and the display shows each buffer as it is finished; the show answers once the display has taken the frame, so the buffer shown before it, the one frame K + 1 draws into, is no longer read. A frame is on the glass a frame later than it was planned, and the planning, the GPU and the display's publish each get a whole frame's time.
@@ -110,8 +110,9 @@ struct Stats {
     gpu_us: u64,
     gpu_max: u64,
     plan_us: u64,
-    cells_us: u64,
-    blocks_us: u64,
+    /// The page table (its squares, and the cells first drawn written into their slots), then the line, land and hypsometric tables.
+    table_us: u64,
+    luts_us: u64,
     overlay_us: u64,
     compile_us: u64,
     call_us: u64,
@@ -123,8 +124,13 @@ struct Stats {
     overlays: u64,
     /// The plan's µs: preparing the view, the plan itself, the residency's want (`MapCore::plan_us`).
     plan_parts: [u64; 3],
-    /// Inside the plan (`FramePlan::us`): the corners, the desired set, the blocks, the references and table, the candidates.
-    plan_inner: [u64; 5],
+    /// Inside the plan (`ViewPlan::us`): the faces and the points, the desired set, the boxes and their stand-ins, the elevation range.
+    plan_inner: [u64; 4],
+    /// The last frame's faces in view, whether they were measured from the camera point, its squares and points.
+    faces: usize,
+    near: bool,
+    squares: usize,
+    samples: usize,
     panels: u64,
     marks: u64,
     overlay_parts: [u64; 3],
@@ -299,18 +305,18 @@ impl GpuMap {
             let n = s.frames.max(1);
             let lay = self.lay.unwrap();
             println!(
-                "mahere: GPU {} frames: the kernel {} us a frame on the GPU (longest {}), {} words from {} nodes; host per frame: plan {} us (view {}, plan {} [corners {}, desired {}, blocks {}, refs {}, candidates {}], want {}), cells {} us, blocks {} us, overlay {} us, record and compile {} us, the call {} us, the wait for the GPU's frame {} us; {} overlays painted ({} panels, {} marks; panel {} us, marks {} us, sum {} us each); {} cell planes written so far, {} wanted with no slot free ({} slots)",
-                s.frames, s.gpu_us / n, s.gpu_max, s.words, s.nodes, s.plan_us / n, s.plan_parts[0] / n, s.plan_parts[1] / n, s.plan_inner[0] / n, s.plan_inner[1] / n, s.plan_inner[2] / n, s.plan_inner[3] / n, s.plan_inner[4] / n, s.plan_parts[2] / n, s.cells_us / n, s.blocks_us / n, s.overlay_us / n, s.compile_us / n, s.call_us / n, s.wait_us / n, s.overlays, s.panels, s.marks, s.overlay_parts[0] / s.overlays.max(1), s.overlay_parts[1] / s.overlays.max(1), s.overlay_parts[2] / s.overlays.max(1), self.slots.written, self.slots.starved, lay.slots
+                "mahere: GPU {} frames: the kernel {} us a frame on the GPU (longest {}), {} words from {} nodes, {} faces in view ({}), {} squares, {} points; host per frame: plan {} us (view {}, plan {} [faces and points {}, desired {}, boxes and stand-ins {}, range {}], want {}), page table {} us, tables {} us, overlay {} us, record and compile {} us, the call {} us, the wait for the GPU's frame {} us; {} overlays painted ({} panels, {} marks; panel {} us, marks {} us, sum {} us each); {} cell planes written so far, {} wanted with no slot free ({} slots)",
+                s.frames, s.gpu_us / n, s.gpu_max, s.words, s.nodes, s.faces, if s.near { "near" } else { "far" }, s.squares, s.samples, s.plan_us / n, s.plan_parts[0] / n, s.plan_parts[1] / n, s.plan_inner[0] / n, s.plan_inner[1] / n, s.plan_inner[2] / n, s.plan_inner[3] / n, s.plan_parts[2] / n, s.table_us / n, s.luts_us / n, s.overlay_us / n, s.compile_us / n, s.call_us / n, s.wait_us / n, s.overlays, s.panels, s.marks, s.overlay_parts[0] / s.overlays.max(1), s.overlay_parts[1] / s.overlays.max(1), s.overlay_parts[2] / s.overlays.max(1), self.slots.written, self.slots.starved, lay.slots
             );
             self.stats = Stats::default();
         }
     }
 
-    /// Frame planning into region `region`: the plan, its cells, blocks and tables, the overlay, the kernel recorded and its words in the region's code; the service's message for it.
+    /// Frame planning into region `region`: the plan, its page table and cells, the tables, the overlay, the kernel recorded and its words in the region's code; the service's message for it.
     fn prepare(&mut self, app: &mut DeviceApp<NoGpu>, w: usize, h: usize, region: usize, key: u64) -> Result<Ready, String> {
         let lay = self.lay.unwrap();
         let t0 = std::time::Instant::now();
-        let plan = app.map.plan(w, h);
+        let plan = app.map.plan_view(w, h);
         for (a, b) in self.stats.plan_parts.iter_mut().zip(app.map.plan_us) {
             *a += b;
         }
@@ -320,10 +326,9 @@ impl GpuMap {
         let t1 = std::time::Instant::now();
         let version = app.map.pool_version();
         let arena = unsafe { core::slice::from_raw_parts_mut(self.arena, self.bytes / 4) };
-        let (cand, range) = arena::cells(&mut self.slots, app.map.pool(), &plan, version, &lay, arena);
-        app.map.set_drawn_range(range);
+        arena::view(&mut self.slots, app.map.pool(), &plan, version, &lay, region, arena)?;
+        app.map.set_drawn_range(plan.range);
         let t2 = std::time::Instant::now();
-        arena::blocks(&plan, &cand, &lay, region, arena)?;
         let ramp = self.style[region] != Some(app.map.style_version());
         self.style[region] = Some(app.map.style_version());
         arena::tables(app.map.luts(), &plan, ramp, &lay, region, arena);
@@ -350,10 +355,11 @@ impl GpuMap {
         let s = &mut self.stats;
         let d = |a: std::time::Instant, b: std::time::Instant| (b - a).as_micros() as u64;
         s.plan_us += d(t0, t1);
-        s.cells_us += d(t1, t2);
-        s.blocks_us += d(t2, t3);
+        s.table_us += d(t1, t2);
+        s.luts_us += d(t2, t3);
         s.overlay_us += d(t3, t4);
         s.compile_us += d(t4, t5);
+        (s.faces, s.near, s.squares, s.samples) = (c.face_count, c.near, plan.roles[0].squares.len() + plan.roles[1].squares.len(), plan.samples);
         Ok(Ready { region, msg, words: k.words.len(), nodes: k.kept, key })
     }
 

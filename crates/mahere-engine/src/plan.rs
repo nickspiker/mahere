@@ -161,31 +161,9 @@ pub fn plan_frame(w: usize, h: usize, cam: &Camera, pool: &Pool, dem_depth: u8, 
         .collect();
 
     let t1 = std::time::Instant::now();
-    // Desired set and the elevation range, from the lattice. The corners dedupe to their finest cells first (a few hundred from a few thousand corners), then each walks its parents; at the coarse depths below the view's the ring of neighbours comes too, so a zoom out lands on cells already resident instead of a blank screen (Nick 2026-10-06), and they are small.
+    // The desired set, from the lattice (`desired_set`).
     let fine = dem_depth.max(vec_depth);
-    let mut fine_cells: rustc_hash::FxHashSet<u64> = rustc_hash::FxHashSet::default();
-    for c in &corners {
-        let raw = raw_of(c.diamond, c.u, c.v);
-        fine_cells.insert(raw >> (60 - 2 * fine as u32));
-    }
-    let mut desired: rustc_hash::FxHashSet<CellKey> = rustc_hash::FxHashSet::default();
-    for &fp in &fine_cells {
-        for d in MIN_DEPTH..=fine {
-            let key = CellKey { depth: d, prefix: fp >> (2 * (fine - d) as u32) };
-            desired.insert(key);
-            // Not at the view's own depth, the most cells by far: a zoom out lands on the coarser rings, and a pan's next cells are prefetched into the store (2026-10-24: at the south pole, where five diamonds meet, the ring at the view's depth doubled the resident cells and a Pixel 3a's GPU arrays with them, and it was killed for memory).
-            if d <= PREFETCH_DEPTH && d < fine {
-                let (cu, cv) = key.grid();
-                let n = 1u64 << d;
-                for (du, dv) in [(-1i64, -1i64), (0, -1), (1, -1), (-1, 0), (1, 0), (-1, 1), (0, 1), (1, 1)] {
-                    let (nu, nv) = (cu as i64 + du, cv as i64 + dv);
-                    if nu >= 0 && nv >= 0 && (nu as u64) < n && (nv as u64) < n {
-                        desired.insert(CellKey::from_grid(key.diamond(), d, nu as u64, nv as u64));
-                    }
-                }
-            }
-        }
-    }
+    let desired = desired_set(corners.iter().map(|c| raw_of(c.diamond, c.u, c.v)), fine);
 
     let t2 = std::time::Instant::now();
     // Blocks: whole where the corners share a diamond, 4 px sub-blocks across a seam. Each tile on its own core, in the screen's order (2026-11-11, ferros's GPU host at globe zoom: 426 straddling tiles of 81 exact sub-corners each, one after another, were most of a 70 ms plan on the Pro).
@@ -430,6 +408,33 @@ pub fn plan_frame(w: usize, h: usize, cam: &Camera, pool: &Pool, dem_depth: u8, 
     let us = |a: std::time::Instant, b: std::time::Instant| (b - a).as_micros() as u32;
     let us = [us(t0, t1), us(t1, t2), us(t2, t3), us(t3, t4), us(t4, t5)];
     FramePlan { blocks, refs, table, want: desired.into_iter().collect(), straddle_blocks, dem_depth, vec_depth, magnified, line_mag_hi, globe, pole, us }
+}
+
+/// The desired set from points' raw coordinates: the cells they lie in at the fine depth, deduped first (a few hundred from a few thousand points), then each walks its parents; at the coarse depths below the view's the ring of neighbours comes too, so a zoom out lands on cells already resident instead of a blank screen (Nick 2026-10-06), and they are small.
+pub(crate) fn desired_set(raws: impl Iterator<Item = u64>, fine: u8) -> rustc_hash::FxHashSet<CellKey> {
+    let mut fine_cells: rustc_hash::FxHashSet<u64> = rustc_hash::FxHashSet::default();
+    for raw in raws {
+        fine_cells.insert(raw >> (60 - 2 * fine as u32));
+    }
+    let mut desired: rustc_hash::FxHashSet<CellKey> = rustc_hash::FxHashSet::default();
+    for &fp in &fine_cells {
+        for d in MIN_DEPTH..=fine {
+            let key = CellKey { depth: d, prefix: fp >> (2 * (fine - d) as u32) };
+            desired.insert(key);
+            // Not at the view's own depth, the most cells by far: a zoom out lands on the coarser rings, and a pan's next cells are prefetched into the store (2026-10-24: at the south pole, where five diamonds meet, the ring at the view's depth doubled the resident cells and a Pixel 3a's GPU arrays with them, and it was killed for memory).
+            if d <= PREFETCH_DEPTH && d < fine {
+                let (cu, cv) = key.grid();
+                let n = 1u64 << d;
+                for (du, dv) in [(-1i64, -1i64), (0, -1), (1, -1), (-1, 0), (1, 0), (-1, 1), (0, 1), (1, 1)] {
+                    let (nu, nv) = (cu as i64 + du, cv as i64 + dv);
+                    if nu >= 0 && nv >= 0 && (nu as u64) < n && (nv as u64) < n {
+                        desired.insert(CellKey::from_grid(key.diamond(), d, nu as u64, nv as u64));
+                    }
+                }
+            }
+        }
+    }
+    desired
 }
 
 #[cfg(test)]

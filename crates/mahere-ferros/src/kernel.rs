@@ -7,8 +7,11 @@
 //! The CPU path's encode (the BT.2020 matrix, exposure 2/3 into Opsin's rail, then √) is the Android and Linux surfaces' contract; ferros's panel is VSF RGB in its root space and rolls its own highlights, so the light goes to it unconverted.
 //!
 //! Everything a frame holds still (the light, the sun, the ball's pole and disk, the contour interval, the inks, the layer mask, the depths) is a constant of the recording: the kernel is recorded again for every frame (a few hundred nodes, well under a millisecond), so it carries no loads and no code for what the frame leaves off.
-//! What varies by pixel comes from the layer arena: the 32 px tiles' block index, the blocks (the plan's lattice with each role's 2 × 2 cells), the cells' texels, the tables, the overlay.
-//! The tables, tiles, blocks and overlay are offsets within a frame region (`Consts::region`); the cells' slots are shared by both regions.
+//! Each pixel finds its own place on the ball from the camera (mahere-engine viewplan.rs): its direction in view coordinates, the face in view whose centroid is nearest (the encoder's choice, among the frame's faces), and its depth-30 (u, v) on that face's diamond from the face's projective form, measured from the camera point when every face in view is near it (so a deep zoom keeps its precision in f32), from the origin at the globe.
+//! Its cell then comes from a page table: each role's box of squares for the diamond, each square the slot of the resident cell standing in for it, or none (the loading mesh, its colours from the encoder's hash on the GPU).
+//! No lattice, no blocks, no seam sub-blocks: what the CPU planned for every 32 px tile and every 4 px across a seam (6.5 ms a frame at a town's scale on the Pro, 15.7 at the globe, 2026-11-12) is the kernel's.
+//! What varies by pixel comes from the layer arena: the faces' rows (more than one face in view), the squares, the cells' texels, the tables, the overlay.
+//! The tables, faces, squares and overlay are offsets within a frame region (`Consts::region`); the cells' slots are shared by both regions.
 
 use valhall::ssa::{self, F, M, U};
 
@@ -20,37 +23,52 @@ pub const SLOT_ARENA: u8 = 1;
 pub const LINE_TAB: usize = 0;
 pub const LAND_TAB: usize = 22 * 16;
 pub const HYPSO_TAB: usize = 1 << 10;
-/// The 32 px tiles' word (`TILE_STRADDLE` | the first block's index), row by row.
-pub const TILES: usize = 128 << 10;
-/// The blocks, `BLOCK_WORDS` each.
-pub const BLOCKS: usize = 256 << 10;
-pub const BLOCK_WORDS: usize = 48;
+/// The faces in view, a row of `FACE_WORDS` each (`F_*` below), read by face when there is more than one.
+pub const FACES: usize = 128 << 10;
+pub const FACE_SHIFT: u32 = 5;
+pub const FACE_WORDS: usize = 1 << FACE_SHIFT;
+/// The page table's squares, a word each: the terrain's boxes, then the vector planes'; each the texel base of the cell standing in (its slot's word offset, below 2^27) | its texel shift (22 − its depth) << 27, or 0 for none.
+pub const SQUARES: usize = 256 << 10;
+pub const SQUARE_SHIFT: u32 = 27;
 /// The g2t codes' working values (256 words, 2^14 · atanh(c / 256), fluor's own table for its 8-bit pixels): the overlay's codes into the surface's values.
 pub const CODE_TAB: usize = 120 << 10;
 /// The overlay (premultiplied RGBA bytes, a word a pixel), then (`Out::Argb8`) the frame, a screen's words each; then the code and the cells' slots, placed by the host from the screen's size.
 pub const OVERLAY: usize = 8 << 20;
-pub const MAX_BLOCKS: usize = (OVERLAY - BLOCKS) / (4 * BLOCK_WORDS);
+pub const MAX_SQUARES: usize = (OVERLAY - SQUARES) / 4;
 
-/// A tile of straddle sub-blocks (4 px each, 8 × 8 of them in order) rather than one block.
-pub const TILE_STRADDLE: u32 = 1 << 31;
-/// The block's words: x | y << 16, the diamond, u0, v0 (depth-30 units), du/dx, dv/dx, du/dy, dv/dy, twist u, twist v (f32 bits); then each role (the terrain at `B_DEM`, the vector planes at `B_VEC`): the cell grid's corner (cu0, cv0) at the role's wanted depth, and its 2 × 2 cells (k = Δu + 2 Δv) as four texel bases (the slot's word offset, 0 for none) and four texel shifts (22 − the depth of the cell standing in).
-pub const B_XY: usize = 0;
-pub const B_DIAMOND: usize = 1;
-pub const B_U0: usize = 2;
-pub const B_STEPS: usize = 4;
-pub const B_DEM: usize = 10;
-pub const B_VEC: usize = 20;
-/// The dark loading mesh's colours for the terrain's 2 × 2 cells at the wanted depth, each cell's two triangles (word 2k + half): gamma-2 bytes, red | green << 8 | blue << 16 (raster.rs `loading_noise`, worked out once a block on the CPU).
-pub const B_NOISE: usize = 30;
-pub const ROLE_BASE: usize = 2;
-pub const ROLE_SHIFT: usize = 6;
+/// A face's row: its (u, v) numerators' and its denominator's coefficients on the pixel's direction (f32 bits, (u, v) in depth-30 units), the fractions and whole parts of the camera point's (u, v) when measured from it (else 0), the loading mesh's hash seed for its diamond (raster.rs `loading_noise`'s diamond and depth terms), then each role's box (the terrain's at `F_BOX`, the vector planes' `F_BOX_WORDS` after): its cell grid corner (cu0, cv0), width, height, and the word offset of its squares in the arena.
+pub const F_U: usize = 0;
+pub const F_V: usize = 3;
+pub const F_DEN: usize = 6;
+pub const F_FRAC: usize = 9;
+pub const F_REF: usize = 11;
+pub const F_SEED: usize = 13;
+pub const F_BOX: usize = 14;
+pub const F_BOX_WORDS: usize = 5;
+pub const F_USED: usize = F_BOX + 2 * F_BOX_WORDS;
+
+/// The faces a frame may have in view: every one.
+pub const MAX_FACES: usize = 20;
+
+/// A face as the kernel takes it: its centroid in view coordinates and the score's offset (the argmax over the frame's faces, `score · (x, y, Z) + offset`), and its row.
+#[derive(Clone, Copy, Debug)]
+pub struct FaceConsts {
+    pub score: [f32; 4],
+    pub row: [u32; FACE_WORDS],
+}
 
 /// A frame's constants: the screen, what is drawn and how it is lit.
 #[derive(Clone, Copy, Debug)]
 pub struct Consts {
     pub w: u32,
-    /// Tiles across (the screen's width in 32 px blocks).
-    pub bw: u32,
+    /// Screen to view coordinates: x = sx · k + kx, y = ky − sy · k, for k = 1 / the globe's radius in pixels (`[k, kx, ky]`).
+    pub view: [f32; 3],
+    /// Every face in view is measured from the camera point (`viewplan`'s near form: Z = z − 1, the denominator 1 + …), else from the origin (Z = z).
+    pub near: bool,
+    /// The faces in view, the first `face_count`; their rows at word offset `faces_at` in the arena.
+    pub faces: [FaceConsts; MAX_FACES],
+    pub face_count: usize,
+    pub faces_at: u32,
     pub dem_depth: u32,
     pub vec_depth: u32,
     /// The effective layer mask (`LayerMask::bits`).
@@ -160,21 +178,27 @@ fn column_row(i: F, w: u32) -> (F, F) {
     (i - y * wf, y)
 }
 
-/// One role's cell for the pixel: the block's 2 × 2 cells at the wanted depth (cell grid shift `s`), the pixel's (u, v); its texel's word offset, whether there is a cell at all, and which of the four it is.
-fn role_texel(b: U, at: usize, s: u32, u: U, v: U, texel_words: u32) -> (U, M, U) {
-    let cu0 = word(b + U::splat(at as u32));
-    let cv0 = word(b + U::splat(at as u32 + 1));
-    // WHY the mask: a pixel's (u, v) is rounded from the block's interpolation and can land one unit past the hull of its exact corners, from which the host took the 2 × 2 corner (cu0, cv0); a cell index of −1 there would read a word gigabytes off and fault the GPU's MMU, failing the whole frame. Masked, it reads a neighbouring entry: at worst a one-pixel speck.
-    let k = ((u >> s) - cu0 + ((v >> s) - cv0 << 1)) & U::splat(3);
-    let base = word(b + U::splat((at + ROLE_BASE) as u32) + k);
-    let ts = word(b + U::splat((at + ROLE_SHIFT) as u32) + k);
+/// One role's square for the pixel: its cell at the role's depth (cell grid shift `s`) within the box (`bx`: cu0, cv0, width, height, the squares' word offset), the square's word; 0 outside the box.
+fn square(bx: &[U], s: u32, u: U, v: U) -> U {
+    let du = (u >> s) - bx[0];
+    let dv = (v >> s) - bx[1];
+    // WHY: a pixel's cell can lie outside its diamond's box (off the globe, or a sliver of a diamond at the screen's edge holding no point of the plan's), and its index would then name a word past the squares, up to gigabytes off: the GPU's MMU would fault the whole frame. Outside, it reads the box's first square and takes no cell.
+    let inside = du.lt(bx[2]) & dv.lt(bx[3]);
+    let at = bx[4] + U::select(inside, du + dv.wrapping_mul(bx[2]), U::splat(0));
+    U::select(inside, word(at), U::splat(0))
+}
+
+/// A square's cell for the pixel at (u, v): its texel's word offset and whether there is a cell at all.
+fn role_texel(sq: U, u: U, v: U, texel_words: u32) -> (U, M) {
+    let base = sq & U::splat((1 << SQUARE_SHIFT) - 1);
+    let ts = sq >> SQUARE_SHIFT;
     let one = U::splat(1);
     let m = one.shl_by(ts) - one;
     let tx = u.shr_by(ts) & U::splat(255);
     let ty = v.shr_by(ts) & U::splat(255);
     let half = ((u & m) + (v & m)).shr_by(ts) & one;
     let ti = (ty << 9) | (tx << 1) | half;
-    (base + ti.wrapping_mul(U::splat(texel_words)), base.ne(U::splat(0)), k)
+    (base + ti.wrapping_mul(U::splat(texel_words)), base.ne(U::splat(0)))
 }
 
 /// The pixel's own frame on the ball (raster.rs `view_normal`): the normal (east, north, up) into view coordinates.
@@ -213,31 +237,20 @@ pub fn record(c: &Consts) -> ssa::Compiled {
     ssa::uniform_slots(64);
     let i = ssa::gid();
     let (x, y) = column_row(F::from_u32(i), c.w);
-    let (xi, yi) = (x.to_u32(), y.to_u32());
-    let tile = word(U::splat(c.region + (TILES / 4) as u32) + (yi >> 5).wrapping_mul(U::splat(c.bw)) + (xi >> 5));
-    let straddle = (tile & U::splat(TILE_STRADDLE)).ne(U::splat(0));
-    let sub = (((yi & U::splat(31)) >> 2) << 3) + ((xi & U::splat(31)) >> 2);
-    let block = (tile & U::splat(!TILE_STRADDLE)) + U::select(straddle, sub, U::splat(0));
-    let b = U::splat(c.region + (BLOCKS / 4) as u32) + block.wrapping_mul(U::splat(BLOCK_WORDS as u32));
-    let xy = word(b + U::splat(B_XY as u32));
-    let fx = x - F::from_u32(xy & U::splat(0xFFFF));
-    let fy = y - F::from_u32(xy >> 16);
-    let st = |k: usize| wordf(b + U::splat((B_STEPS + k) as u32));
-    let ou = st(0) * fx + st(2) * fy + st(4) * fx * fy;
-    let ov = st(1) * fx + st(3) * fy + st(5) * fx * fy;
-    let u = word(b + U::splat(B_U0 as u32)) + round(ou).to_i32();
-    let v = word(b + U::splat(B_U0 as u32 + 1)) + round(ov).to_i32();
     let (sx, sy) = (x + 0.5, y + 0.5);
     let mask = c.mask;
     let zero = F::splat(0.);
     let one = F::splat(1.);
     let no = M::splat(false);
+    // The cell and texel at the pixel's corner, where the CPU raster samples them (its lattice steps from a block's corner a whole pixel at a time); the light and the disk at its centre, as there.
+    let (u, v, face) = locate(c, x, y);
+    let bx = |role: usize| &face[F_BOX + role * F_BOX_WORDS..F_BOX + (role + 1) * F_BOX_WORDS];
 
     // The terrain texel: elevation and the snorm16 normal (east, north, up).
     let wants_dem = mask & (DEM | CONTOURS | SLOPE) != 0;
-    let (dem_at, have_dem_cell, dem_k) = if wants_dem { role_texel(b, B_DEM, 30 - c.dem_depth, u, v, 2) } else { (U::splat(0), no, U::splat(0)) };
+    let (dem_at, have_dem_cell) = if wants_dem { role_texel(square(bx(0), 30 - c.dem_depth, u, v), u, v, 2) } else { (U::splat(0), no) };
     // The vector planes, packed a texel in two words: line class, coverage, magnitude and the water's coverage; land class and coverage.
-    let (vec_at, have_vec, _) = role_texel(b, B_VEC, 30 - c.vec_depth, u, v, 2);
+    let (vec_at, have_vec) = role_texel(square(bx(1), 30 - c.vec_depth, u, v), u, v, 2);
     let (w0, w1) = (word(vec_at), word(vec_at + U::splat(1)));
     let byte = |w: U, k: u32| (w >> (8 * k)) & U::splat(255);
     let (lcls, lcov, lmag, wcov) = (byte(w0, 0), byte(w0, 1), byte(w0, 2), w0 >> 24);
@@ -340,14 +353,17 @@ pub fn record(c: &Consts) -> ssa::Compiled {
     rgb = lerp3(rgb, lcol, sel(waterway, zero, la));
     let mut rgb = sel3(have_vec, rgb, plain);
 
-    // No cell at any depth for the terrain: each triangle of the wanted depth's cell grid its own dark colour (raster.rs `loading_noise`, the block's colours).
+    // No cell at any depth for the terrain: each triangle of the wanted depth's cell grid its own dark colour, raster.rs `loading_noise`'s hash here (its diamond and depth terms the face's seed).
     if wants_dem {
         let s = 30 - c.dem_depth;
         let m = U::splat((1u32 << s) - 1);
         let half = ((u & m) + (v & m)) >> s & U::splat(1);
-        let n = word(b + U::splat(B_NOISE as u32) + (dem_k << 1) + half);
-        let noise = [dec(n & U::splat(255)), dec((n >> 8) & U::splat(255)), dec(n >> 16)];
-        rgb = sel3(have_dem_cell, rgb, noise);
+        let h = face[F_SEED] ^ (u >> s).wrapping_mul(U::splat(0x9E37_79B1)) ^ (v >> s).wrapping_mul(U::splat(0x85EB_CA77)) ^ half.wrapping_mul(U::splat(0x1656_67B1));
+        let h = h ^ (h >> 15);
+        let h = h.wrapping_mul(U::splat(0x2C1B_3C6D));
+        let h = h ^ (h >> 12);
+        let ch = |k: u32| dec(((h >> (8 * k)) & U::splat(255)) >> 2);
+        rgb = sel3(have_dem_cell, rgb, [ch(0), ch(1), ch(2)]);
     }
     // Off the globe, where its limb is on the screen: the background.
     if c.limb {
@@ -388,5 +404,64 @@ pub fn record(c: &Consts) -> ssa::Compiled {
     let dark = |c: U| U::splat(255) - c;
     let px = U::splat(0xFF00_0000) | dark(code[0]) << 16 | dark(code[1]) << 8 | dark(code[2]);
     ssa::store_at(SLOT_FRAME, i, 2, 0, px);
+    ssa::compile()
+}
+
+/// The pixel at screen point (sx, sy): its depth-30 (u, v) on its face's diamond, and its face's row.
+fn locate(c: &Consts, sx: F, sy: F) -> (U, U, [U; F_USED]) {
+    let zero = F::splat(0.);
+    let one = F::splat(1.);
+    // The pixel's direction in view coordinates: (x, y) on the screen's plane in the globe's radii, z toward the viewer (0 past the limb, where the background draws), and Z the third coordinate the faces take, z − 1 measured from the camera point (from 1 − x² − y² as −q / (1 + z), with no cancellation at a deep zoom), else z.
+    let [k, kx, ky] = c.view;
+    let px = sx.mul_add(F::splat(k), F::splat(kx));
+    let py = sy.mul_add(F::splat(-k), F::splat(ky));
+    let q = px.mul_add(px, py * py);
+    let z = (one - q).max(zero).sqrt();
+    let pz = if c.near { -(q * (one + z).rcp()) } else { z };
+    // The face: the frame's one, or the nearest centroid of its faces (the first of equals, as the encoder takes it), its row read by the face.
+    let faces = &c.faces[..c.face_count];
+    let face: [U; F_USED] = if faces.len() == 1 {
+        core::array::from_fn(|w| U::splat(faces[0].row[w]))
+    } else {
+        let score = |f: &FaceConsts| F::splat(f.score[0]).mul_add(px, F::splat(f.score[1]).mul_add(py, F::splat(f.score[2]).mul_add(pz, F::splat(f.score[3]))));
+        let mut best = score(&faces[0]);
+        let mut n = U::splat(0);
+        for (j, f) in faces.iter().enumerate().skip(1) {
+            let s = score(f);
+            let more = s.gt(best);
+            best = F::select(more, s, best);
+            n = U::select(more, U::splat(j as u32), n);
+        }
+        let at = U::splat(c.faces_at) + (n << FACE_SHIFT);
+        core::array::from_fn(|w| word(at + U::splat(w as u32)))
+    };
+    let rf = |w: usize| F::from_bits(face[w]);
+    let lin = |o: usize| rf(o).mul_add(px, rf(o + 1).mul_add(py, rf(o + 2) * pz));
+    let den = if c.near { lin(F_DEN) + 1. } else { lin(F_DEN) };
+    let rd = den.rcp();
+    // Depth-30 (u, v): the camera point's whole part plus the floor of the rest. WHY the hold: on a seam the face the f32 search chose can disagree with the exact one by less than a unit, and a coordinate of −1 or 2^30 would name a cell outside the diamond (no square: a speck of the loading mesh along the seam); held inside, it is the edge's own cell, as the encoder holds it.
+    let coord = |o: usize, k: usize| {
+        let t = lin(o).mul_add(rd, rf(F_FRAC + k)).floor().to_i32() + face[F_REF + k];
+        let below = t.ge(U::splat(1 << 31));
+        let over = t.ge(U::splat(1 << 30));
+        U::select(over, U::select(below, U::splat(0), U::splat((1 << 30) - 1)), t)
+    };
+    (coord(F_U, 0), coord(F_V, 1), face)
+}
+
+/// A kernel that stores what each pixel finds and nothing else, eight words a pixel from uniform 0: its depth-30 (u, v), its terrain square and texel address, its face's seed (which face it took). The projection and the page table checked against the host's.
+#[cfg(test)]
+pub fn record_locate(c: &Consts) -> ssa::Compiled {
+    ssa::begin();
+    ssa::reserve(2);
+    ssa::uniform_slots(64);
+    let i = ssa::gid();
+    let (x, y) = column_row(F::from_u32(i), c.w);
+    let (u, v, face) = locate(c, x, y);
+    let sq = square(&face[F_BOX..F_BOX + F_BOX_WORDS], 30 - c.dem_depth, u, v);
+    let (at, _) = role_texel(sq, u, v, 2);
+    for (k, w) in [u, v, sq, at, face[F_SEED]].into_iter().enumerate() {
+        ssa::store_at(SLOT_FRAME, i, 5, 4 * k as i16, w);
+    }
     ssa::compile()
 }

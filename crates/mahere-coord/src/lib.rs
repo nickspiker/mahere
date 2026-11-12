@@ -295,6 +295,48 @@ impl Coord {
     }
 }
 
+/// The icosahedron's faces: [`FaceMap`] numbers them 0 to 19, two a diamond (lower, then upper).
+pub const FACE_COUNT: usize = 20;
+
+/// One face of the icosahedron as the encoder sees it, for a renderer that encodes every pixel itself (Mahere's GPU map on ferros, its kernel's projection).
+/// The encoder's face is the one whose `centroid` has the largest dot product with the direction; on it the gnomonic projection's diamond (u, v) is a ratio of two linear functions of the direction p, of any length: u = gu · p / n · p, v = gv · p / n · p, in diamond units (0 to 1; [`Coord::uv`] is 2^30 times them, toward zero, held inside).
+#[derive(Clone, Copy, Debug)]
+pub struct FaceMap {
+    /// The sum of the face's three vertices: its direction, unnormalised, as the encoder's search compares them (every face's has the same length).
+    pub centroid: [f64; 3],
+    /// The face's three vertices, unit vectors.
+    pub verts: [[f64; 3]; 3],
+    pub diamond: u8,
+    pub upper: bool,
+    pub gu: [f64; 3],
+    pub gv: [f64; 3],
+    /// The face plane's normal (unnormalised): n · p is the denominator.
+    pub n: [f64; 3],
+}
+
+/// Face `f` (0 to 19, [`FACE_COUNT`]): its centroid, diamond and the projective form of the encoder's (u, v) on it (`encode_on_face`'s gnomonic projection and barycentric solve, gathered into three vectors).
+pub fn face_map(f: usize) -> FaceMap {
+    let (verts, diamond, upper) = FACES[f];
+    let (a, b, c) = (VERTICES[verts[0]], VERTICES[verts[1]], VERTICES[verts[2]]);
+    let v0 = sub(b, a);
+    let v1 = sub(c, a);
+    let n = cross(v0, v1);
+    let (d00, d01, d11) = (dot(v0, v0), dot(v0, v1), dot(v1, v1));
+    let denom = d00 * d11 - d01 * d01;
+    // s = (fp − a) · ws and t = (fp − a) · wt (the barycentric solve), fp = p (n · a) / (n · p): so s = gs · p / n · p with gs = (n · a) ws − (a · ws) n, and t likewise.
+    let ws = [(d11 * v0[0] - d01 * v1[0]) / denom, (d11 * v0[1] - d01 * v1[1]) / denom, (d11 * v0[2] - d01 * v1[2]) / denom];
+    let wt = [(d00 * v1[0] - d01 * v0[0]) / denom, (d00 * v1[1] - d01 * v0[1]) / denom, (d00 * v1[2] - d01 * v0[2]) / denom];
+    let k = dot(n, a);
+    let g = |w: [f64; 3]| {
+        let aw = dot(a, w);
+        [k * w[0] - aw * n[0], k * w[1] - aw * n[1], k * w[2] - aw * n[2]]
+    };
+    let (gs, gt) = (g(ws), g(wt));
+    // The upper triangle's (u, v) = (1 − t, 1 − s), as `encode_on_face`: 1 is n · p / n · p.
+    let (gu, gv) = if upper { (sub(n, gt), sub(n, gs)) } else { (gs, gt) };
+    FaceMap { centroid: centroid(&verts), verts: [a, b, c], diamond, upper, gu, gv, n }
+}
+
 /// Bits kept by a cell at `depth`: the diamond ID plus `2·depth` Morton bits.
 fn prefix_mask(depth: u8) -> u64 {
     // depth 30 keeps everything; !0 << 0 would also work but be explicit.
@@ -591,5 +633,30 @@ mod tri_tests {
             let sh = 58 - 2 * depth;
             assert_eq!(code >> sh, near >> sh, "diverged at depth {depth}");
         }
+    }
+
+    #[test]
+    fn face_maps_encode_as_the_encoder_does() {
+        // Directions all over the ball, each through its face's map and through `from_xyz`: the same diamond and (u, v) within a unit (two roundings of one projection).
+        let mut worst = 0i64;
+        let mut lat = -89.9;
+        while lat <= 89.9 {
+            let mut lon = -180.;
+            while lon < 180. {
+                let (phi, lam) = (f64::to_radians(lat), f64::to_radians(lon));
+                let p = [phi.cos() * lam.cos(), phi.cos() * lam.sin(), phi.sin()];
+                let c = Coord::from_xyz(p);
+                // The first face of the largest, as the encoder's search takes it (a point on a seam ties).
+                let f = (1..FACE_COUNT).fold(0, |b, a| if dot(face_map(a).centroid, p) > dot(face_map(b).centroid, p) { a } else { b });
+                let m = face_map(f);
+                assert_eq!(m.diamond, c.diamond());
+                let q = |g: [f64; 3]| ((dot(g, p) / dot(m.n, p) * UV_STEPS as f64) as i64).clamp(0, UV_STEPS as i64 - 1);
+                let (iu, iv) = c.uv();
+                worst = worst.max((q(m.gu) - iu as i64).abs()).max((q(m.gv) - iv as i64).abs());
+                lon += 1.3;
+            }
+            lat += 0.9;
+        }
+        assert!(worst <= 1, "a face map's (u, v) {worst} units from the encoder's");
     }
 }

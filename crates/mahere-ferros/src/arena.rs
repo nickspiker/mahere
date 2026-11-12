@@ -1,9 +1,10 @@
-//! What the map kernel reads, laid out in the layer arena (`kernel.rs` for the layout's offsets): the cells' planes in slots, the tiles and blocks of the frame's plan, the line, land and hypsometric tables, and the frame's constants. Plain words over a slice, so the host tests build the same arena the device does and run the kernel's words over it in valhall's emulator.
+//! What the map kernel reads, laid out in the layer arena (`kernel.rs` for the layout's offsets): the cells' planes in slots, the faces in view and the page table of the frame's plan, the line, land and hypsometric tables, and the frame's constants. Plain words over a slice, so the host tests build the same arena the device does and run the kernel's words over it in valhall's emulator.
 
 use crate::kernel::{self, Consts};
 use mahere_engine::colour::lin;
-use mahere_engine::plan::{FramePlan, NONE};
-use mahere_engine::raster::{FrameLuts, alpha, is_boundary, line_min_depth, loading_noise, rgb3};
+use mahere_engine::plan::NONE;
+use mahere_engine::viewplan::ViewPlan;
+use mahere_engine::raster::{FrameLuts, alpha, is_boundary, line_min_depth, rgb3};
 use mahere_engine::residency::Pool;
 use mahere_tiles::{CellKey, TRI};
 
@@ -12,7 +13,7 @@ pub const SLOT: usize = 1 << 20;
 /// The most words a kernel may have (ferros payloads/gpu: its code region, 32 pages, less its 16 words of padding).
 pub const CODE_WORDS: usize = (32 << 12) / 8 - 16;
 
-/// Where things are for a `w` × `h` frame in an arena of `bytes`: two frame regions (`regions`, the frames alternating between them, so the host writes the next frame's tables, tiles, blocks, overlay and code while the GPU runs this one's), each its tables and blocks (from 0), the overlay (at `kernel::OVERLAY`) a screen's words with a workgroup's slack, the frame as many when it is the arena's (`Out::Argb8`; the surface is the frame otherwise) and the code; then the cells' slots, which both regions share. `frame_at` and `code_at` are within a region.
+/// Where things are for a `w` × `h` frame in an arena of `bytes`: two frame regions (`regions`, the frames alternating between them, so the host writes the next frame's tables, faces, squares, overlay and code while the GPU runs this one's), each its tables, faces and squares (from 0), the overlay (at `kernel::OVERLAY`) a screen's words with a workgroup's slack, the frame as many when it is the arena's (`Out::Argb8`; the surface is the frame otherwise) and the code; then the cells' slots, which both regions share. `frame_at` and `code_at` are within a region.
 #[derive(Clone, Copy, Debug)]
 pub struct Layout {
     pub w: usize,
@@ -129,125 +130,97 @@ impl Slots {
     }
 }
 
-/// Each block's 2 × 2 cells for each role (the terrain, the vector planes), their planes slot-resident; and the elevation range at the blocks' first corners, for the next frame's contour interval.
-/// Per block, the two roles' (cu0, cv0, four texel bases, four texel shifts), as `kernel::B_DEM` and `B_VEC` lay them out.
-pub fn cells(slots: &mut Slots, pool: &Pool, plan: &FramePlan, version: u64, lay: &Layout, arena: &mut [u32]) -> (Vec<[[u32; 10]; 2]>, Option<(u16, u16)>) {
+/// The page table in frame region `region`: each role's squares, each the slot of the cell standing in for it (written into its slot when it is not there yet), and the faces' rows when there is more than one face in view.
+pub fn view(slots: &mut Slots, pool: &Pool, plan: &ViewPlan, version: u64, lay: &Layout, region: usize, arena: &mut [u32]) -> Result<(), String> {
     slots.frame += 1;
-    let depths = [plan.dem_depth as u32, plan.vec_depth as u32];
-    let planes = [Plane::Dem, Plane::Vec];
-    let top = ((1u64 << 30) - 1) as f64;
-    let mut out = Vec::with_capacity(plan.blocks.len());
-    let (mut lo, mut hi) = (u16::MAX, 0u16);
-    // The refs this frame placed (or could not), so each is looked at once a frame.
-    let mut placed: Vec<(u32, u8, Option<usize>)> = Vec::new();
-    for b in &plan.blocks {
-        let n = b.size as f64;
-        let mut corners = [(0u32, 0u32); 4];
-        for (j, (x, y)) in [(0.0, 0.0), (n, 0.0), (0.0, n), (n, n)].into_iter().enumerate() {
-            let u = (b.u0 as f64 + b.du_dx as f64 * x + b.du_dy as f64 * y + b.twist_u as f64 * x * y).clamp(0.0, top);
-            let v = (b.v0 as f64 + b.dv_dx as f64 * x + b.dv_dy as f64 * y + b.twist_v as f64 * x * y).clamp(0.0, top);
-            corners[j] = (u as u32, v as u32);
-        }
-        let mut rec = [[0u32; 10]; 2];
-        for role in 0..2 {
-            let s = 30 - depths[role];
-            let cu0 = corners.iter().map(|c| c.0 >> s).min().unwrap();
-            let cv0 = corners.iter().map(|c| c.1 >> s).min().unwrap();
-            rec[role][0] = cu0;
-            rec[role][1] = cv0;
-            for k in 0..4u32 {
-                let (cu, cv) = (cu0 + (k & 1), cv0 + (k >> 1));
-                // The first (finest) candidate whose cell holds this cell of the wanted depth.
-                let found = b.cand[role].iter().copied().take_while(|&r| r != NONE).find(|&r| {
-                    let rf = &plan.refs[r as usize];
-                    let up = depths[role] - rf.key.depth as u32;
-                    rf.diamond as u32 == b.diamond && cu >> up == rf.cu && cv >> up == rf.cv
-                });
-                let Some(r) = found else { continue };
-                let slot = match placed.iter().find(|e| e.0 == r && e.1 == role as u8) {
-                    Some(e) => e.2,
-                    None => {
-                        let slot = slots.slot_for(pool, plan.refs[r as usize].key, planes[role], version, lay, arena);
-                        if slot.is_none() {
-                            slots.starved += 1;
-                        }
-                        placed.push((r, role as u8, slot));
-                        slot
-                    }
-                };
-                if let Some(i) = slot {
-                    rec[role][2 + k as usize] = ((lay.slots_at + i * SLOT) / 4) as u32;
-                    rec[role][6 + k as usize] = 22 - plan.refs[r as usize].key.depth as u32;
-                }
-            }
-        }
-        // The terrain's elevation at the block's first corner, from its finest candidate.
-        if let Some(&r) = b.cand[0].first().filter(|&&r| r != NONE) {
-            let rf = &plan.refs[r as usize];
-            let ts = 22 - rf.key.depth as u32;
-            let (u, v) = corners[0];
-            let m = (1u32 << ts) - 1;
-            let ti = ((((v >> ts) & 255) << 8 | ((u >> ts) & 255)) << 1 | (((u & m) + (v & m)) >> ts) & 1) as usize;
-            if let Some(q) = pool.map.get(&rf.key).and_then(|e| e.elev_q_at(ti)) {
-                if q != mahere_tiles::ELEV_NODATA {
-                    lo = lo.min(q);
-                    hi = hi.max(q);
-                }
-            }
-        }
-        out.push(rec);
+    let total = plan.roles[0].squares.len() + plan.roles[1].squares.len();
+    if total > kernel::MAX_SQUARES {
+        return Err(format!("{total} squares in the page table, more than the arena's {}", kernel::MAX_SQUARES));
     }
-    (out, (lo <= hi).then_some((lo, hi)))
-}
-
-/// The tiles' words (one row past the screen's, block 0: the last workgroup's invocations past the last pixel read there) and the blocks' records, in frame region `region`.
-pub fn blocks(plan: &FramePlan, cand: &[[[u32; 10]; 2]], lay: &Layout, region: usize, arena: &mut [u32]) -> Result<(), String> {
     let base = lay.regions[region] / 4;
-    if plan.blocks.len() > kernel::MAX_BLOCKS {
-        return Err(format!("{} blocks, more than the arena's {}", plan.blocks.len(), kernel::MAX_BLOCKS));
-    }
-    let bw = lay.w.div_ceil(32);
-    let bh = lay.h.div_ceil(32);
-    let tiles = &mut arena[base + kernel::TILES / 4..base + kernel::TILES / 4 + bw * (bh + 1)];
-    tiles.fill(0);
-    let mut i = 0;
-    while i < plan.blocks.len() {
-        let b = &plan.blocks[i];
-        let t = (b.y as usize / 32) * bw + b.x as usize / 32;
-        if b.size == 32 {
-            tiles[t] = i as u32;
-            i += 1;
-        } else {
-            // A straddling tile: its 64 sub-blocks of 4 px, in rows.
-            tiles[t] = i as u32 | kernel::TILE_STRADDLE;
-            i += 64;
-        }
-    }
-    let at = base + kernel::BLOCKS / 4;
-    for (k, (b, c)) in plan.blocks.iter().zip(cand).enumerate() {
-        let r = &mut arena[at + k * kernel::BLOCK_WORDS..at + (k + 1) * kernel::BLOCK_WORDS];
-        r[kernel::B_XY] = b.x | b.y << 16;
-        r[kernel::B_DIAMOND] = b.diamond;
-        r[kernel::B_U0] = b.u0;
-        r[kernel::B_U0 + 1] = b.v0;
-        for (j, f) in [b.du_dx, b.dv_dx, b.du_dy, b.dv_dy, b.twist_u, b.twist_v].into_iter().enumerate() {
-            r[kernel::B_STEPS + j] = f.to_bits();
-        }
-        r[kernel::B_DEM..kernel::B_DEM + 10].copy_from_slice(&c[0]);
-        r[kernel::B_VEC..kernel::B_VEC + 10].copy_from_slice(&c[1]);
-        // The loading mesh's colours for the terrain's 2 × 2 cells at the wanted depth, each triangle (raster.rs `loading_noise`).
-        for k in 0..4u32 {
-            for half in 0..2u32 {
-                let n = loading_noise(b.diamond, plan.dem_depth as u32, c[0][0] + (k & 1), c[0][1] + (k >> 1), half);
-                r[kernel::B_NOISE + (2 * k + half) as usize] = n[0] as u32 | (n[1] as u32) << 8 | (n[2] as u32) << 16;
+    let mut at = base + kernel::SQUARES / 4;
+    for (t, plane) in plan.roles.iter().zip([Plane::Dem, Plane::Vec]) {
+        // Each stand-in's square word, the cells holding a point of the screen first: a full arena starves a box's margin before what shows.
+        let mut word = vec![0u32; t.refs.len()];
+        for shown in [true, false] {
+            for (i, r) in t.refs.iter().enumerate().filter(|(_, r)| r.on_screen == shown) {
+                match slots.slot_for(pool, r.key, plane, version, lay, arena) {
+                    Some(s) => word[i] = ((lay.slots_at + s * SLOT) / 4) as u32 | (22 - r.key.depth as u32) << kernel::SQUARE_SHIFT,
+                    None => slots.starved += 1,
+                }
             }
+        }
+        for (k, &sq) in t.squares.iter().enumerate() {
+            arena[at + k] = if sq == NONE { 0 } else { word[sq as usize] };
+        }
+        at += t.squares.len();
+    }
+    let (faces, n, _) = faces(plan, lay, region);
+    if n > 1 {
+        let at = base + kernel::FACES / 4;
+        for (j, f) in faces[..n].iter().enumerate() {
+            arena[at + j * kernel::FACE_WORDS..at + (j + 1) * kernel::FACE_WORDS].copy_from_slice(&f.row);
         }
     }
     Ok(())
 }
 
+/// The cosine of the farthest a face's centre may be from the camera point for the near form (50 degrees): there the camera point's (u, v) on the face lies within about half a diamond of it, so its whole part and every pixel's offset from it fit an i32.
+const NEAR_COS: f64 = 0.64;
+
+/// The faces in view as the kernel takes them, how many, and whether in the near form (`kernel::Consts::near`): each face's centroid and score offset, its (u, v) coefficients, its loading-mesh seed and its boxes, for frame region `region`.
+/// A face whose diamond has no box (a sliver of it at the screen's edge holding none of the plan's points) is left out: its pixels take a neighbour's face, held inside that diamond.
+pub fn faces(plan: &ViewPlan, lay: &Layout, region: usize) -> ([kernel::FaceConsts; kernel::MAX_FACES], usize, bool) {
+    let units = (1u64 << 30) as f64;
+    let kept: Vec<_> = plan.faces.iter().filter(|f| plan.roles[0].boxes[f.diamond as usize].is_some()).collect();
+    let len = |v: [f64; 3]| (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+    // The face plane's normal points in or out by the face's winding: its angle to the camera point either way.
+    let near = kept.iter().all(|f| f.n[2].abs() / len(f.n) >= NEAR_COS);
+    let top = kept.iter().map(|f| f.centroid[2]).fold(f64::MIN, f64::max);
+    let squares = lay.regions[region] / 4 + kernel::SQUARES / 4;
+    let starts = [squares, squares + plan.roles[0].squares.len()];
+    let mut out = [kernel::FaceConsts { score: [0.; 4], row: [0; kernel::FACE_WORDS] }; kernel::MAX_FACES];
+    let bits = |x: f64| (x as f32).to_bits();
+    for (f, o) in kept.iter().zip(out.iter_mut()) {
+        let c = f.centroid;
+        if near {
+            // Measured from the camera point C = (0, 0, 1): u(C + δ) − u(C) = (a · δ) / (1 + m · δ), a = (g (n · C) − n (g · C)) / (n · C)², m = n / (n · C); the score less the largest centroid's z, so the faces near C compare small numbers.
+            let d = f.n[2];
+            for (k, (at, g)) in [(kernel::F_U, f.gu), (kernel::F_V, f.gv)].into_iter().enumerate() {
+                let gc = g[2];
+                for j in 0..3 {
+                    o.row[at + j] = bits((g[j] * d - f.n[j] * gc) / (d * d) * units);
+                }
+                let r = gc / d * units;
+                let whole = r.floor();
+                o.row[kernel::F_FRAC + k] = bits(r - whole);
+                o.row[kernel::F_REF + k] = whole as i64 as i32 as u32;
+            }
+            for j in 0..3 {
+                o.row[kernel::F_DEN + j] = bits(f.n[j] / d);
+            }
+            o.score = [c[0] as f32, c[1] as f32, c[2] as f32, (c[2] - top) as f32];
+        } else {
+            for j in 0..3 {
+                o.row[kernel::F_U + j] = bits(f.gu[j] * units);
+                o.row[kernel::F_V + j] = bits(f.gv[j] * units);
+                o.row[kernel::F_DEN + j] = bits(f.n[j]);
+            }
+            o.score = [c[0] as f32, c[1] as f32, c[2] as f32, 0.];
+        }
+        o.row[kernel::F_SEED] = (f.diamond as u32).wrapping_mul(0x27D4_EB2F) ^ (plan.dem_depth as u32).wrapping_mul(0xC2B2_AE3D);
+        for (role, t) in plan.roles.iter().enumerate() {
+            let at = kernel::F_BOX + role * kernel::F_BOX_WORDS;
+            // Both roles' boxes come from the same points, so a diamond with one has both; none, all its pixels outside.
+            let b = t.boxes[f.diamond as usize].unwrap_or_default();
+            o.row[at..at + kernel::F_BOX_WORDS].copy_from_slice(&[b.cu0, b.cv0, b.w, b.h, (starts[role] + b.at as usize) as u32]);
+        }
+    }
+    (out, kept.len(), near)
+}
+
 /// The line and land tables (the line gates follow the depth and the mask, so every frame), and the hypsometric ramp when `ramp`, in frame region `region`.
-pub fn tables(luts: &FrameLuts, plan: &FramePlan, ramp: bool, lay: &Layout, region: usize, arena: &mut [u32]) {
+pub fn tables(luts: &FrameLuts, plan: &ViewPlan, ramp: bool, lay: &Layout, region: usize, arena: &mut [u32]) {
     let base = lay.regions[region] / 4;
     let st = &luts.style;
     let mask = luts.mask;
@@ -281,7 +254,7 @@ pub fn tables(luts: &FrameLuts, plan: &FramePlan, ramp: bool, lay: &Layout, regi
 }
 
 /// The frame's constants for the kernel, its tables and overlay in frame region `region`.
-pub fn consts(luts: &FrameLuts, plan: &FramePlan, lay: &Layout, region: usize, overlay: bool) -> Consts {
+pub fn consts(luts: &FrameLuts, plan: &ViewPlan, lay: &Layout, region: usize, overlay: bool) -> Consts {
     let st = &luts.style;
     let l3 = |c: [u8; 4]| lin(rgb3(c));
     let l4 = |c: [u8; 4]| {
@@ -289,9 +262,15 @@ pub fn consts(luts: &FrameLuts, plan: &FramePlan, lay: &Layout, region: usize, o
         [l[0], l[1], l[2], alpha(c)]
     };
     let d = plan.dem_depth;
+    let (faces, face_count, near) = faces(plan, lay, region);
+    let k = 1. / plan.radius;
     Consts {
         w: lay.w as u32,
-        bw: lay.w.div_ceil(32) as u32,
+        view: [k as f32, (-plan.centre[0] * k) as f32, (plan.centre[1] * k) as f32],
+        near,
+        faces,
+        face_count,
+        faces_at: ((lay.regions[region] + kernel::FACES) / 4) as u32,
         dem_depth: plan.dem_depth as u32,
         vec_depth: plan.vec_depth as u32,
         mask: luts.mask.bits(),
