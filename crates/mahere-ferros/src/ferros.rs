@@ -23,11 +23,10 @@ const SURFACE2: u64 = 11;
 type Shell = FerrosShell<App>;
 
 /// The touch-device app, its map drawn on the GPU when the GPU's grants are there (`FluorApp::render_own`: the kernel's frame, the panel and the marks composed in it, shown as it is), else on the CPU raster as before.
+/// A GPU map that fails (a block of the arena too small for the screen, the service refusing, the kernel faulting) is said on the console and let go, and the CPU raster draws from that frame on: the map is never left black (2026-11-12, the 8a: a 32 MiB block, the circle black).
 pub struct App {
     pub inner: DeviceApp<NoGpu>,
     gpu: Option<crate::gpu::GpuMap>,
-    /// The GPU path failed: said once, and nothing drawn after (no fallback: a map that stops is told, not hidden).
-    failed: bool,
 }
 
 impl FluorApp for App {
@@ -46,7 +45,7 @@ impl FluorApp for App {
     }
     fn wake_at(&self) -> Option<std::time::Instant> {
         // A frame planned and not yet drawn (the GPU pipeline's last): one more draw, now, so it reaches the glass when the map comes to rest.
-        if self.gpu.as_ref().is_some_and(|g| g.owes_frame()) && !self.failed {
+        if self.gpu.as_ref().is_some_and(|g| g.owes_frame()) {
             return Some(std::time::Instant::now());
         }
         self.inner.wake_at()
@@ -62,15 +61,16 @@ impl FluorApp for App {
     }
     fn render_own(&mut self, ctx: &mut Context) -> bool {
         let Some(g) = self.gpu.as_mut() else { return false };
-        if self.failed {
-            return true;
-        }
         let (w, h) = (ctx.viewport.width_px as usize, ctx.viewport.height_px as usize);
-        if let Err(e) = g.draw(&mut self.inner, w, h) {
-            println!("mahere: the GPU map stopped: {e}");
-            self.failed = true;
+        match g.draw(&mut self.inner, w, h) {
+            Ok(()) => true,
+            Err(e) => {
+                // This frame and every one after on the CPU raster (fluor draws the scratch when this answers false, and the whole frame, the app saying no smaller damage).
+                println!("mahere: the GPU map stopped: {e}; the map draws on the CPU from now on");
+                self.gpu = None;
+                false
+            }
         }
-        true
     }
     fn own_frame(&self) -> Option<&[u32]> {
         self.gpu.as_ref().and_then(|g| g.frame())
@@ -221,7 +221,14 @@ pub fn run() {
     place_view();
     let mut inner: DeviceApp<NoGpu> = DeviceApp::open(0, 0, store, None);
     inner.map.set_pool_budget(POOL_BUDGET);
-    let app = App { inner, gpu: crate::gpu::GpuMap::open(GPU, LAYERS, SURFACE, SURFACE2), failed: false };
+    // The development spawn's input byte: bits 0 and 1 the bench (below), bit 2 full screen; bit 3 (8) takes 32 MiB of the GPU's block whatever it is (one frame region at the 8a's or the Pro's screen, the frames not pipelined), bit 4 (16) 16 MiB (no frame region fits: the CPU raster draws), for proving on the device what a small block does.
+    let mut first = [0u8; 1];
+    let byte = if sys::input(0, &mut first) == 1 { first[0] } else { 0 };
+    let most = if byte & 16 != 0 { 16 << 20 } else if byte & 8 != 0 { 32 << 20 } else { usize::MAX };
+    if most != usize::MAX {
+        println!("mahere: the GPU's block taken as {} MiB at most (the spawn's input byte)", most >> 20);
+    }
+    let app = App { inner, gpu: crate::gpu::GpuMap::open(GPU, LAYERS, SURFACE, SURFACE2, most) };
     let fixes: Arc<Mutex<Option<GpsFix>>> = Arc::new(Mutex::new(None));
     if sys::grant_count() > GPS {
         let fixes = fixes.clone();
@@ -231,9 +238,7 @@ pub fn run() {
     }
     let mut touch = Touch { fingers: Vec::with_capacity(16) };
     let caps = Caps { display: DISPLAY, touch: TOUCH, surface: SURFACE };
-    // The development spawn's input byte: the bench, two fingers that pan and pinch the map on their own, a frame a pass (`bench_fingers`), for measuring frames while the map moves with nobody at the panel; 1 where the view is, 2 zoomed in to a town's scale (2^12 pixels a degree) first.
-    let mut first = [0u8; 1];
-    let byte = if sys::input(0, &mut first) == 1 { first[0] } else { 0 };
+    // The bench, two fingers that pan and pinch the map on their own, a frame a pass (`bench_fingers`), for measuring frames while the map moves with nobody at the panel; 1 where the view is, 2 zoomed in to a town's scale (2^12 pixels a degree) first.
     // Bit 2 (4) with either: the window full screen first (the display's op 43, the person's own toggle on the quick row), the glass's circle and bars gone, for measuring the display's publish without them.
     let (mode, full) = (byte & 3, byte & 4 != 0);
     let bench = mode == 1 || mode == 2;

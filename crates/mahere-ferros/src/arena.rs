@@ -15,7 +15,7 @@ pub const SLOT: usize = 1 << 20;
 /// The most words a kernel may have (ferros payloads/gpu: its code region, 32 pages, less its 16 words of padding).
 pub const CODE_WORDS: usize = (32 << 12) / 8 - 16;
 
-/// Where things are for a `w` × `h` frame in an arena of `bytes`: two frame regions (`regions`, the frames alternating between them, so the host writes the next frame's tables, faces, squares, overlay and code while the GPU runs this one's), each its tables, faces and squares (from 0), the overlay (at `kernel::OVERLAY`) a screen's words with a workgroup's slack, the frame as many when it is the arena's (`Out::Argb8`; the surface is the frame otherwise) and the code; then the cells' slots, which both regions share. `frame_at` and `code_at` are within a region.
+/// Where things are for a `w` × `h` frame in an arena of `bytes`: two frame regions (`regions`, the frames alternating between them, so the host writes the next frame's tables, faces, squares, overlay and code while the GPU runs this one's), or one when two leave no room for cells (both `regions` 0, the frames then not pipelined); each its tables, faces and squares (from 0), the overlay (at `kernel::OVERLAY`) a screen's words with a workgroup's slack, the frame as many when it is the arena's (`Out::Argb8`; the surface is the frame otherwise) and the code; then the cells' slots, which the regions share. `frame_at` and `code_at` are within a region.
 #[derive(Clone, Copy, Debug)]
 pub struct Layout {
     pub w: usize,
@@ -25,24 +25,35 @@ pub struct Layout {
     pub code_at: usize,
     pub slots_at: usize,
     pub slots: usize,
-    /// Each frame region's start, bytes.
+    /// Each frame region's start, bytes: the same twice when there is one.
     pub regions: [usize; 2],
 }
 
+/// The fewest cell slots a layout is made with: two cells, each its terrain's slot and its vector planes'.
+pub const MIN_SLOTS: usize = 1 << 2;
+
 impl Layout {
-    /// None when the frame's two regions leave `bytes` no room for four cells' slots: the block the kernel gave is too small for this screen (ferros gives a kist the largest block free, which can be 32 MiB while the system's clients hold theirs).
+    /// Two frame regions when they leave `bytes` room for `MIN_SLOTS` cell slots, else one (the frames not pipelined: ferros gives a kist the largest block free, which can be 32 MiB while the system's clients hold theirs, and at the 8a's 1080 x 2400 a region is 19 MiB); None when even one leaves no room: the block is too small for this screen, and the CPU raster draws.
     pub fn new(w: usize, h: usize, bytes: usize, out: kernel::Out) -> Option<Layout> {
         let px = (w * h).next_multiple_of(16);
         let round = |b: usize| b.next_multiple_of(1 << 20);
         let frame_at = round(kernel::OVERLAY + 4 * px);
         let code_at = if out == kernel::Out::Argb8 { round(frame_at + 4 * px) } else { frame_at };
         let region = round(code_at + 8 * (CODE_WORDS + 16));
-        let slots_at = 2 * region;
-        // WHY: the frame's size comes from the display and the block's from the kernel; a screen whose overlay and frame leave no room for cells is one this path cannot draw.
-        if slots_at + 4 * SLOT > bytes {
+        // WHY: the frame's size comes from the display and the block's from the kernel; a screen whose regions leave no room for cells is one this layout cannot draw.
+        let (slots_at, regions) = if 2 * region + MIN_SLOTS * SLOT <= bytes {
+            (2 * region, [0, region])
+        } else if region + MIN_SLOTS * SLOT <= bytes {
+            (region, [0, 0])
+        } else {
             return None;
-        }
-        Some(Layout { w, h, out, frame_at, code_at, slots_at, slots: (bytes - slots_at) / SLOT, regions: [0, region] })
+        };
+        Some(Layout { w, h, out, frame_at, code_at, slots_at, slots: (bytes - slots_at) / SLOT, regions })
+    }
+
+    /// Two frame regions: a frame can be planned while the GPU draws the last.
+    pub fn two(&self) -> bool {
+        self.regions[1] != self.regions[0]
     }
 }
 

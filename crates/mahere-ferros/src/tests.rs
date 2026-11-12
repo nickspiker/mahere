@@ -554,3 +554,19 @@ fn a_planned_cell_is_in_the_pool_when_its_frame_is_written() {
         assert!(written > 0, "budget {budget}: no cell was ever written");
     }
 }
+
+/// A small block of the arena (2026-11-12, the 8a: 32 MiB, the circle black): at the 8a's 1080 x 2400 a frame region is 19 MiB and two take 38, so 32 MiB lays out one (the frames not pipelined) with thirteen cell slots, and 16 MiB none (the CPU raster draws); the Pro's 1344 x 2992 in 32 MiB one region too. 128 MiB, the whole arena, two.
+#[test]
+fn a_small_block_lays_out_one_region_or_none() {
+    let out = kernel::Out::Surface;
+    let two = Layout::new(1080, 2400, 128 << 20, out).unwrap();
+    assert!(two.two() && two.regions == [0, 19 << 20] && two.slots == 90, "{two:?}");
+    let one = Layout::new(1080, 2400, 32 << 20, out).unwrap();
+    assert!(!one.two() && one.regions == [0, 0] && one.slots_at == 19 << 20 && one.slots == 13, "{one:?}");
+    let pro = Layout::new(1344, 2992, 32 << 20, out).unwrap();
+    assert!(!pro.two() && pro.slots >= arena::MIN_SLOTS, "{pro:?}");
+    assert!(Layout::new(1080, 2400, 16 << 20, out).is_none());
+    // The kernel's frame in the arena too (no surface fenced in): a region of 29 MiB, so 32 MiB has no room for the cells' slots beside one.
+    assert!(Layout::new(1080, 2400, 32 << 20, kernel::Out::Argb8).is_none());
+    assert!(!Layout::new(1080, 2400, 48 << 20, kernel::Out::Argb8).unwrap().two());
+}

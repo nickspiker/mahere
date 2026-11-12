@@ -28,7 +28,7 @@ pub struct GpuMap {
     bytes: usize,
     /// The app's surfaces, (its `dma` base, its address on the GPU), when the kernel draws into them (`Out::Surface`): the window's own, and with a second surface grant the mailbox's other buffer.
     surfaces: Option<[(u64, u64); 2]>,
-    /// Two surfaces: the frames pipelined over the mailbox.
+    /// Two surfaces and two frame regions (`Layout::two`): the frames pipelined over the mailbox.
     pipelined: bool,
     lay: Option<Layout>,
     slots: Slots,
@@ -159,8 +159,8 @@ struct Stats {
 }
 
 impl GpuMap {
-    /// The GPU path when both grants are there: the service at `gpu_slot`, the arena at `arena_slot`. None (said) otherwise: the CPU raster then draws.
-    pub fn open(gpu_slot: u64, arena_slot: u64, surface_slot: u64, second_slot: u64) -> Option<GpuMap> {
+    /// The GPU path when both grants are there: the service at `gpu_slot`, the arena at `arena_slot`, of which it takes at most `most` bytes (a development spawn's test of a small block, `ferros::run`). None (said) otherwise: the CPU raster then draws.
+    pub fn open(gpu_slot: u64, arena_slot: u64, surface_slot: u64, second_slot: u64, most: usize) -> Option<GpuMap> {
         if crate::ferros::sys::grant_count() <= arena_slot {
             println!("mahere: no GPU grants (slots {gpu_slot} gpu and {arena_slot} layers): the map draws on the CPU");
             return None;
@@ -172,7 +172,8 @@ impl GpuMap {
         }
         // A kernel that says the block's size fences the apps' surfaces in for the GPU too (ferros 2026-11-11 on): the kernel then writes the surface, no copy.
         let sized = crate::ferros::sys::dma_size(arena_slot, ARENA_MOST as u64);
-        let bytes = sized.map_or(ARENA_BEFORE, |n| n as usize);
+        // WHY the min: not a guard, the test itself: a development spawn asks for a smaller block than the kernel gave, to see on the device what a small one does (`ferros::run`); usize::MAX otherwise, which leaves the block as it is.
+        let bytes = sized.map_or(ARENA_BEFORE, |n| n as usize).min(most);
         let surface = crate::ferros::sys::dma(surface_slot);
         let usable = |b: u64| b != 0 && b != crate::ferros::sys::ERR && b >= SURFACES_PA;
         let second = if crate::ferros::sys::grant_count() > second_slot { crate::ferros::sys::dma(second_slot) } else { 0 };
@@ -268,8 +269,13 @@ impl GpuMap {
     pub fn draw(&mut self, app: &mut DeviceApp<NoGpu>, w: usize, h: usize) -> Result<(), String> {
         if self.lay.is_none_or(|l| (l.w, l.h) != (w, h)) {
             let out = if self.surfaces.is_some() { kernel::Out::Surface } else { kernel::Out::Argb8 };
-            let l = Layout::new(w, h, self.bytes, out).ok_or_else(|| format!("its block of the layer arena ({} MiB) leaves a {w} x {h} frame's two regions no room for four cells", self.bytes >> 20))?;
-            println!("mahere: GPU layout for {w} x {h}: two frame regions of {} MiB, the overlay at {} MiB in each, the code at {} MiB, {} cell slots of 1 MiB from {} MiB", l.regions[1] >> 20, kernel::OVERLAY >> 20, l.code_at >> 20, l.slots, l.slots_at >> 20);
+            let l = Layout::new(w, h, self.bytes, out).ok_or_else(|| format!("its block of the layer arena ({} MiB) leaves a {w} x {h} frame's region no room for {} cell slots", self.bytes >> 20, arena::MIN_SLOTS))?;
+            self.pipelined = l.two() && self.surfaces.is_some_and(|s| s[0].0 != s[1].0);
+            if l.two() {
+                println!("mahere: GPU layout for {w} x {h}: two frame regions of {} MiB, the overlay at {} MiB in each, the code at {} MiB, {} cell slots of 1 MiB from {} MiB", l.regions[1] >> 20, kernel::OVERLAY >> 20, l.code_at >> 20, l.slots, l.slots_at >> 20);
+            } else {
+                println!("mahere: GPU layout for {w} x {h}: its block of the layer arena ({} MiB) holds one frame region of {} MiB, not two, so the frames are not pipelined (each waits for the GPU's last); the overlay at {} MiB, the code at {} MiB, {} cell slots of 1 MiB from {} MiB", self.bytes >> 20, l.slots_at >> 20, kernel::OVERLAY >> 20, l.code_at >> 20, l.slots, l.slots_at >> 20);
+            }
             self.slots = Slots::new(l.slots);
             self.lay = Some(l);
             // Both regions' overlays made whole once, from the panel and marks painted afresh.
@@ -280,6 +286,8 @@ impl GpuMap {
             self.style = [None; 2];
             self.ready = None;
             self.drawn = false;
+            // Region 0 first, as one region always is (its frame in the window's own surface).
+            (self.next, self.shown) = (0, 0);
         }
         let key = Self::view_key(app, w, h);
         let d = |a: std::time::Instant, b: std::time::Instant| (b - a).as_micros() as u64;
@@ -297,8 +305,20 @@ impl GpuMap {
             None => None,
         };
         let region = self.next;
-        let ready = self.prepare(app, w, h, region, key)?;
-        self.next ^= 1;
+        let ready = match self.prepare(app, w, h, region, key) {
+            Ok(r) => r,
+            Err(e) => {
+                // The frame submitted above still draws into its surface and reads the arena: waited for, so nothing writes either once this says the map stopped.
+                if inflight.is_some() {
+                    let _ = self.gpu.wait();
+                }
+                return Err(e);
+            }
+        };
+        // One region: every frame is planned into it, after the GPU's last.
+        if self.lay.unwrap().two() {
+            self.next ^= 1;
+        }
         let t = std::time::Instant::now();
         match inflight {
             Some(r) if self.pipelined => {
