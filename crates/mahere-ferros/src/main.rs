@@ -6,6 +6,8 @@
 mod ferros;
 #[cfg(target_os = "ferros")]
 mod net;
+#[cfg(any(target_os = "ferros", test))]
+mod names;
 #[cfg(target_os = "ferros")]
 mod gpu;
 #[cfg(any(target_os = "ferros", test))]

@@ -570,3 +570,58 @@ fn a_small_block_lays_out_one_region_or_none() {
     assert!(Layout::new(1080, 2400, 32 << 20, kernel::Out::Argb8).is_none());
     assert!(!Layout::new(1080, 2400, 48 << 20, kernel::Out::Argb8).unwrap().two());
 }
+
+/// The fetch storm of 2026-11-12 (the 8a: about 240 fetches failed "DNS still asking" in Mahere's first second): Mahere's twenty loaders asking for the bucket's address at once against a resolver like the ip server's (each call held until its lookup ends, a lookup a quarter second; sixteen held calls at most, the oldest answered "still asking" when a seventeenth comes). One call is held at a time, the loaders waiting on it all get the address, and none fails; a lookup that gives way ("still asking") is asked again, not failed; a lookup that ends with no address fails every loader waiting on it with one call.
+#[test]
+fn one_lookup_a_host_however_many_loaders_ask() {
+    use crate::names::{Asked, Names};
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+    /// The resolver: calls held now (the most at once), calls made, and the outcome of each lookup in turn (true: found, false: "still asking", then found).
+    struct Resolver {
+        held: AtomicUsize,
+        most: AtomicUsize,
+        calls: AtomicUsize,
+        gives_way: Mutex<bool>,
+    }
+    impl Resolver {
+        fn ask(&self, found: bool) -> Asked {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let held = self.held.fetch_add(1, Ordering::SeqCst) + 1;
+            self.most.fetch_max(held, Ordering::SeqCst);
+            // Sixteen held at once at most, as the ip server's `RQN`: a seventeenth makes the oldest answer "still asking", which is what the loaders' storm was.
+            assert!(held <= 1 << 4, "{held} RESOLVE calls held at once");
+            std::thread::sleep(Duration::from_millis(1 << 8));
+            self.held.fetch_sub(1, Ordering::SeqCst);
+            let mut g = self.gives_way.lock().unwrap();
+            if std::mem::take(&mut *g) {
+                return Asked::Asking;
+            }
+            if found { Asked::Found(4, [93, 184, 216, 34, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]) } else { Asked::Failed(std::io::ErrorKind::NotFound, "DNS gave no address") }
+        }
+    }
+    let loaders = mahere_engine::residency::LOADERS;
+    for (gives_way, found) in [(false, true), (true, true), (false, false)] {
+        let names = Names::new();
+        let r = Resolver { held: AtomicUsize::new(0), most: AtomicUsize::new(0), calls: AtomicUsize::new(0), gives_way: Mutex::new(gives_way) };
+        // All at once, as the loaders start on a fresh want list.
+        let start = std::sync::Barrier::new(loaders);
+        let got: Vec<std::io::Result<(u8, [u8; 16])>> = std::thread::scope(|s| {
+            let hs: Vec<_> = (0..loaders).map(|_| s.spawn(|| {
+                start.wait();
+                names.address("cells.example", || r.ask(found))
+            })).collect();
+            hs.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        let (calls, most) = (r.calls.load(Ordering::SeqCst), r.most.load(Ordering::SeqCst));
+        println!("{loaders} loaders, the lookup giving way first {gives_way}, found {found}: {calls} calls, {most} held at once");
+        assert_eq!(most, 1, "one call held for the host at a time");
+        assert_eq!(calls, 1 + gives_way as usize, "one lookup for every loader (and once more after it gave way)");
+        if found {
+            assert!(got.iter().all(|g| matches!(g, Ok((4, a)) if a[..4] == [93, 184, 216, 34])), "every loader has the address, none failed");
+        } else {
+            assert!(got.iter().all(|g| g.as_ref().is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)), "every loader waiting on a lookup with no address takes its outcome");
+        }
+    }
+}

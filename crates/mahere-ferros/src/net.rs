@@ -3,8 +3,10 @@
 //! Every wait is a call the ip server holds until something comes (the wait byte of its ops 6 and 10), never a poll (Nick 2026-11-10: "No polling!"): a loader thread blocks in the call as it blocks on a socket elsewhere. The one deadline here is a real one: a connection that brings nothing for 32 s is given up (DNS's are the ip server's own).
 //! The ip server's TCP since 2026-11-11 (Nick: "sounds like it needs re-engineered"): sixteen connections, a 1 MiB window each, receives of up to 256 KiB; Mahere takes four connections at once and reads each a big reply at a time.
 //! Names since 2026-11-12: the device's one resolver, in the ip server, in place of the copy Mahere carried (its own questions, port and cache). What Mahere's cache did the device's does for every app: one lookup a name however many loaders ask (the others' calls held on it), the last good address answered at once while it is asked for again and kept when that lookup brings no answer, and asked for again after four failed connections in a row (the ip server counts its own connections).
+//! Mahere holds one of those calls a host, its loaders waiting on it (`names.rs`): the ip server holds sixteen, the oldest giving way to a seventeenth, and Mahere's twenty loaders each holding their own pushed each other out, about 240 fetches failing "DNS still asking" in its first second (the 8a, 2026-11-12).
 
 use crate::ferros::sys;
+use crate::names::{Asked, Names};
 use mahere_engine::plain_http::{Conn, Dial};
 use std::io;
 use std::sync::{Arc, Condvar, Mutex};
@@ -24,10 +26,11 @@ const RECV_MOST: usize = 1 << 18;
 /// The most of a request one SEND carries: a call carries 4096 bytes (the kernel's limit), less the op and the handle.
 const SEND_MAX: usize = (1 << 12) - 2;
 
-/// The ip server at grant slot `slot`, the turn for a connection, and the address said last for each host (a line on the console when it changes, not at every dial).
+/// The ip server at grant slot `slot`, the turn for a connection, the lookups under way (one a host), and the address said last for each host (a line on the console when it changes, not at every dial).
 pub struct IpNet {
     slot: u64,
     turn: Arc<(Mutex<usize>, Condvar)>,
+    names: Names,
     said: Mutex<Vec<(String, u8, [u8; 16])>>,
 }
 
@@ -42,7 +45,7 @@ impl IpNet {
         if n < INFO_LEN as u64 {
             return Err("the ip server's INFO is short".into());
         }
-        Ok(IpNet { slot, turn: Arc::new((Mutex::new(0), Condvar::new())), said: Mutex::new(Vec::new()) })
+        Ok(IpNet { slot, turn: Arc::new((Mutex::new(0), Condvar::new())), names: Names::new(), said: Mutex::new(Vec::new()) })
     }
 
     fn call(&self, req: &[u8], reply: &mut [u8]) -> io::Result<usize> {
@@ -50,23 +53,31 @@ impl IpNet {
         if n == sys::ERR { Err(io::Error::other("the ip server refused the call")) } else { Ok(n as usize) }
     }
 
-    /// `host`'s address from the ip server's resolver (op 10, either family: IPv6 first where it has a route, the device's preference), the call held until its lookup ends; a new or changed address said on the console with its family and TTL.
+    /// `host`'s address from the ip server's resolver (op 10, either family: IPv6 first where it has a route, the device's preference): one call held for it however many loaders ask, the others waiting on it (`Names`), and asked again while the ip server answers "still asking", so a fetch waits for its address and never fails for want of one still coming. A new or changed address said on the console with its family and TTL.
     fn address(&self, host: &str) -> io::Result<(u8, [u8; 16])> {
         // WHY: a DNS name is at most 253 bytes (the ip server refuses a longer one too); not a name to ask for.
         if host.is_empty() || host.len() > 253 {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "not a host name"));
         }
+        self.names.address(host, || self.ask(host))
+    }
+
+    /// One RESOLVE call for `host`, held until its lookup ends (or `RESOLVE_WAIT_S`, or a seventeenth held call makes it give way: "still asking").
+    fn ask(&self, host: &str) -> Asked {
         let t = std::time::Instant::now();
         let mut q = vec![10u8, 0, RESOLVE_WAIT_S];
         q.extend_from_slice(host.as_bytes());
         let mut r = [0u8; RESOLVE_LEN];
-        let n = self.call(&q, &mut r)?;
+        let n = match self.call(&q, &mut r) {
+            Ok(n) => n,
+            Err(_) => return Asked::Failed(io::ErrorKind::Other, "the ip server refused the call"),
+        };
         // Nobody present: the ip server answers an application nothing until someone attests (ferros AUTH.md "Radios while locked"); said as that, not as DNS finding nothing (2026-11-12: "DNS gave no address" all night on a locked Pro).
         if n == 0 {
-            return Err(io::Error::new(io::ErrorKind::PermissionDenied, "nobody present (the ip server serves applications once someone attests)"));
+            return Asked::Failed(io::ErrorKind::PermissionDenied, "nobody present (the ip server serves applications once someone attests)");
         }
         if n < RESOLVE_LEN {
-            return Err(io::Error::other("the ip server has no resolver (op 10)"));
+            return Asked::Failed(io::ErrorKind::Other, "the ip server has no resolver (op 10)");
         }
         let (kind, why) = match r[0] {
             0 => {
@@ -77,17 +88,21 @@ impl IpNet {
                     said.push((host.to_string(), fam, a));
                     println!("mahere: {host} is {} for {ttl} s ({} ms)", shown(fam, &a), t.elapsed().as_millis());
                 }
-                return Ok((fam, a));
+                return Asked::Found(fam, a);
+            }
+            1 => {
+                println!("mahere: {host}: DNS still asking after {} ms; asked again", t.elapsed().as_millis());
+                return Asked::Asking;
             }
             2 => (io::ErrorKind::NotFound, "DNS gave no address"),
             3 => (io::ErrorKind::InvalidInput, "not a host name"),
             4 => (io::ErrorKind::AddrNotAvailable, "no address or DNS server yet"),
             5 => (io::ErrorKind::TimedOut, "DNS gave no answer"),
             6 => (io::ErrorKind::Other, "the ip server's resolver is full"),
-            _ => (io::ErrorKind::TimedOut, "DNS still asking"),
+            _ => (io::ErrorKind::Other, "the ip server's resolver answered a status it does not define"),
         };
         println!("mahere: {host}: {why} ({} ms)", t.elapsed().as_millis());
-        Err(io::Error::new(kind, why))
+        Asked::Failed(kind, why)
     }
 }
 
