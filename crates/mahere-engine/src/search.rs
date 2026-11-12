@@ -2,9 +2,9 @@
 
 use std::sync::Arc;
 
-use mahere_tiles::{CellKey, Named, NameCell, TRI};
+use mahere_tiles::{CellKey, Named};
 
-use crate::labels::NamesCache;
+use crate::labels::{CellNames, NamesCache};
 use crate::residency::{CellStore, Fetch};
 use crate::{Camera, MapCore};
 
@@ -79,12 +79,12 @@ fn meets(cam: &Camera, w: usize, h: usize, key: CellKey) -> bool {
 }
 
 /// A cell's names from the device alone (never the network), through the worker's cache.
-fn names_of(store: &dyn CellStore, cache: &mut NamesCache, key: CellKey) -> Option<Arc<NameCell>> {
+fn names_of(store: &dyn CellStore, cache: &mut NamesCache, key: CellKey) -> Option<Arc<CellNames>> {
     if let Some(n) = cache.get(&key) {
         return n.clone();
     }
     let n = match store.get_local(key) {
-        Fetch::Bytes(b) => mahere_tiles::decode_names(&b).map(Arc::new),
+        Fetch::Bytes(b) => crate::labels::decode_names(&b).map(Arc::new),
         _ => None,
     };
     cache.insert(key, n.clone());
@@ -122,26 +122,18 @@ pub fn run(job: &SearchJob, cache: &mut NamesCache, tier: &dyn Fn(&Named) -> Opt
         }
         // Each fitting entry's texels on the screen: how many, and the one nearest the centre.
         let mut seen: Vec<(usize, u32, f64, (f64, f64))> = fits.iter().map(|&(i, _)| (i, 0, f64::MAX, (0.0, 0.0))).collect();
-        for plane in [&names.line, &names.area] {
-            if plane.len() < TRI {
+        for (t, v) in names.line.iter().map(|&(t, v)| (t as usize, v)).chain(names.area_texels()) {
+            let Some(s) = seen.iter_mut().find(|s| s.0 == v as usize) else { continue };
+            let (lat, lon) = key.texel_lat_lon(t);
+            let (x, y) = job.cam.geo_to_screen(lat, lon, job.w, job.h);
+            if x < 0.0 || y < 0.0 || x > w || y > h {
                 continue;
             }
-            for (t, &v) in plane.iter().enumerate() {
-                if v == 0 {
-                    continue;
-                }
-                let Some(s) = seen.iter_mut().find(|s| s.0 == v as usize) else { continue };
-                let (lat, lon) = key.texel_lat_lon(t);
-                let (x, y) = job.cam.geo_to_screen(lat, lon, job.w, job.h);
-                if x < 0.0 || y < 0.0 || x > w || y > h {
-                    continue;
-                }
-                s.1 += 1;
-                let d = (x - cx).powi(2) + (y - cy).powi(2);
-                if d < s.2 {
-                    s.2 = d;
-                    s.3 = (lat, lon);
-                }
+            s.1 += 1;
+            let d = (x - cx).powi(2) + (y - cy).powi(2);
+            if d < s.2 {
+                s.2 = d;
+                s.3 = (lat, lon);
             }
         }
         for ((i, count, d, (lat, lon)), &(_, f)) in seen.into_iter().zip(&fits) {

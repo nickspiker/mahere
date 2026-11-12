@@ -163,6 +163,9 @@ impl Persist {
 /// A gigabyte of cells until the slider says otherwise.
 pub const DEFAULT_CACHE_BUDGET: u64 = 1 << 30;
 
+/// The most the search's cache of cells' names may hold between searches: 32 MiB.
+const SEARCH_NAMES_BYTES: usize = 1 << 25;
+
 /// Free bytes on the volume holding `dir`, or none if it cannot be asked.
 #[cfg(target_os = "android")]
 fn free_bytes(dir: &str) -> Option<u64> {
@@ -203,11 +206,10 @@ impl<G: MapGpu> DeviceApp<G> {
             // The cells the device keeps, listed on the worker: the index is long on a phone that has looked around.
             job.cached = cells.keys(mahere_tiles::publish::Layer::Base);
             let mut cache = cache.lock().unwrap();
-            // A worker's cache of names: bounded, the phone's memory being what it is.
-            if cache.len() > 1024 {
-                cache.clear();
-            }
-            let _ = tx.send((mahere_engine::search::run(&job, &mut cache, &mahere_panel::labels::tier), addresses));
+            // A worker's cache of names: bounded by its bytes, the cells farthest from the view let go first (it was a thousand cells, whatever each held: half a gigabyte of name planes at the most).
+            let found = mahere_engine::search::run(&job, &mut cache, &mahere_panel::labels::tier);
+            mahere_engine::labels::trim_cache(&mut cache, SEARCH_NAMES_BYTES, job.cam.lat(), job.cam.lon());
+            let _ = tx.send((found, addresses));
         });
         self.search_rx = Some(rx);
     }

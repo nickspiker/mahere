@@ -79,7 +79,8 @@ fn unturn(p: [f32; 2], angle: f32) -> [f32; 2] {
     [p[0] * c + p[1] * s, -p[0] * s + p[1] * c]
 }
 
-/// The glyphs as one texture: two bytes a pixel, the letter's coverage and its halo's, packed in shelves. Grows to 4096 square, then starts again with what the labels in view use.
+/// The glyphs as one texture: two bytes a pixel, the letter's coverage and its halo's, packed in shelves. Grows to 4096 square, then starts again with what the labels in view use. One copy, shared by the letterer and the drawing thread: the letterer writes into it only when no layout on show holds it, else into a copy of its own (Mahere on ferros, 2026-11-11: a master and a copy for the drawing thread were 64 MB at a globe's lettering).
+#[derive(Clone)]
 pub struct Atlas {
     pub side: usize,
     pub rg: Vec<u8>,
@@ -96,8 +97,9 @@ impl Atlas {
         Atlas { side: 2048, rg: vec![0; 2048 * 2048 * 2], version: 1, x: 0, y: 0, row: 0, slots: HashMap::new() }
     }
 
-    fn clear(&mut self, side: usize) {
-        *self = Atlas { side, rg: vec![0; side * side * 2], version: self.version + 1, x: 0, y: 0, row: 0, slots: HashMap::new() };
+    /// An empty atlas of `side` square, the next version.
+    fn cleared(&self, side: usize) -> Atlas {
+        Atlas { side, rg: vec![0; side * side * 2], version: self.version + 1, x: 0, y: 0, row: 0, slots: HashMap::new() }
     }
 
     /// Room for a glyph of this many pixels: the next place on the shelf, or on a new shelf; None when the texture is full.
@@ -235,9 +237,22 @@ pub fn tier(n: &Named) -> Option<u8> {
     })
 }
 
+/// A label's identity (kind, name, ref) as one number, for the set of the last layout's labels: looked up for every name gathered, so without copying its text.
+fn ident(n: &Named) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::hash::DefaultHasher::new();
+    (n.kind, n.name.as_str(), n.reference.as_str()).hash(&mut h);
+    h.finish()
+}
+
 /// The kinds lettered by rank among their own in view: places by population, summits by height, rivers by catchment, lakes by area.
 fn rank_group(n: &Named) -> Option<u8> {
-    match n.kind {
+    rank_group_of(n.kind)
+}
+
+/// [`rank_group`] by kind alone.
+fn rank_group_of(kind: u8) -> Option<u8> {
+    match kind {
         CITY..=HAMLET => Some(0),
         PEAK | VOLCANO => Some(1),
         WATERWAY => Some(2),
@@ -358,16 +373,14 @@ struct Letterer {
     text: TextRenderer,
     w: usize,
     h: usize,
-    atlas: Atlas,
-    /// The atlas version last handed to the drawing thread.
-    sent: u64,
-    shared: std::sync::Arc<Atlas>,
+    atlas: std::sync::Arc<Atlas>,
     advance: HashMap<(char, u8, u16, u32), f32>,
     /// The typeface of the layout being made.
     family: u8,
     look: [f32; 4],
     amount: [f32; 2],
-    previous: HashSet<(u8, String, String)>,
+    /// The last layout's labels, by [`ident`].
+    previous: HashSet<u64>,
     names: mahere_engine::labels::NamesCache,
     /// How far through the font packs' arrivals this renderer has loaded.
     font_cursor: crate::fonts::FontCursor,
@@ -612,7 +625,7 @@ impl Labeller {
                 for data in LABEL_FONT_FILES {
                     text.load_font_data_named(data.to_vec());
                 }
-                let mut l = Letterer { text, family: 0, w: 0, h: 0, atlas: Atlas::new(), sent: 0, shared: std::sync::Arc::new(Atlas::new()), advance: HashMap::new(), look: mahere_engine::theme::LABEL_LOOK, amount: mahere_engine::theme::LABEL_AMOUNT, previous: HashSet::new(), names: Default::default() , font_cursor: Default::default(), han: fluor::packs::Han::Simplified };
+                let mut l = Letterer { text, family: 0, w: 0, h: 0, atlas: std::sync::Arc::new(Atlas::new()), advance: HashMap::new(), look: mahere_engine::theme::LABEL_LOOK, amount: mahere_engine::theme::LABEL_AMOUNT, previous: HashSet::new(), names: Default::default() , font_cursor: Default::default(), han: fluor::packs::Han::Simplified };
                 while let Ok(mut job) = jobs.recv() {
                     // Only the newest job matters: a camera that moved on has made the others stale.
                     while let Ok(newer) = jobs.try_recv() {
@@ -793,27 +806,26 @@ impl Letterer {
         if let Some(f) = &job.fonts {
             if crate::fonts::load_into(&mut self.text, f, &mut self.font_cursor) {
                 self.advance.clear();
-                let side = self.atlas.side;
-                self.atlas.clear(side);
+                self.atlas = std::sync::Arc::new(self.atlas.cleared(self.atlas.side));
             }
         }
         let font = job.font * self.look[0];
+        let previous = std::mem::take(&mut self.previous);
         let texels = match &job.names {
-            Some(n) => mahere_engine::labels::gather(n, &mut self.names),
+            Some(n) => {
+                // Only what the density cut would letter is gathered ([`tier`], as the layout cuts it), in the layout's order: by tier, the last layout's labels first within one.
+                let limit = mahere_engine::theme::label_tier_limit(self.amount[0]);
+                mahere_engine::labels::gather(n, &mut self.names, &|n| tier(n).filter(|&t| t <= limit).map(|t| (t << 1) | !previous.contains(&ident(n)) as u8))
+            }
             None => NamedTexels::default(),
         };
         let han = crate::fonts::han_for(texels.lines.iter().map(|(n, _)| n.name.as_str()).chain(texels.areas.iter().map(|(n, _)| n.name.as_str())).chain(texels.points.iter().map(|(n, _)| n.name.as_str())));
         self.han = han;
         self.text.set_han(han);
         let gathered = t.elapsed();
-        let previous = std::mem::take(&mut self.previous);
         let laid = self.layout(&texels, &job.cam, w, h, font, &previous);
         let kept = self.keep(&laid, &job.cam, w, h);
-        self.previous = kept.iter().map(|k| (k.name.kind, k.name.name.clone(), k.name.reference.clone())).collect();
-        if self.atlas.version != self.sent {
-            self.shared = std::sync::Arc::new(Atlas { side: self.atlas.side, rg: self.atlas.rg.clone(), version: self.atlas.version, x: self.atlas.x, y: self.atlas.y, row: self.atlas.row, slots: self.atlas.slots.clone() });
-            self.sent = self.atlas.version;
-        }
+        self.previous = kept.iter().map(|k| ident(&k.name)).collect();
         // The packs this layout's names needed and lacked, fetched for the next.
         if let Some(f) = &job.fonts {
             crate::fonts::ask(&mut self.text, f, &mut self.font_cursor);
@@ -825,7 +837,7 @@ impl Letterer {
         }
         Lettering {
             kept,
-            atlas: self.shared.clone(),
+            atlas: self.atlas.clone(),
             reference: Some((a, b, job.cam.screen_to_geo(a[0], a[1], w, h), job.cam.screen_to_geo(b[0], b[1], w, h))),
             drawn_for: Some(job.key),
             ppd: job.cam.ppd,
@@ -935,32 +947,33 @@ impl Letterer {
         let (mx, my) = ((cw / 2 - tx0.min(cw / 2)).max(tx1.max(cw / 2) - cw / 2), (chh / 2 - ty0.min(chh / 2)).max(ty1.max(chh / 2) - chh / 2));
         let (ox, oy) = (cw / 2 - mx, chh / 2 - my);
         let (cw2, ch2) = ((2 * mx).min(cw - ox), (2 * my).min(chh - oy));
-        let place = match self.atlas.place(cw2, ch2) {
+        let place = match std::sync::Arc::make_mut(&mut self.atlas).place(cw2, ch2) {
             Some(p) => p,
             None => {
                 // Full: a bigger texture up to 4096, else start again (the labels in view ask for theirs again as they are kept).
                 let side = (self.atlas.side * 2).min(4096);
-                self.atlas.clear(side);
-                self.atlas.place(cw2, ch2).unwrap_or((0, 0))
+                self.atlas = std::sync::Arc::new(self.atlas.cleared(side));
+                std::sync::Arc::make_mut(&mut self.atlas).place(cw2, ch2).unwrap_or((0, 0))
             }
         };
-        let side = self.atlas.side;
+        let atlas = std::sync::Arc::make_mut(&mut self.atlas);
+        let side = atlas.side;
         for y in 0..ch2.min(side - place.1) {
             for x in 0..cw2.min(side - place.0) {
                 let i = (oy + y) * cw + ox + x;
                 let o = ((place.1 + y) * side + place.0 + x) * 2;
                 let c = cover[i];
                 let hv = if r > 0.0 { ((r + 0.5 - d[i]).clamp(0.0, 1.0) * 255.0) as u8 } else { 0 };
-                self.atlas.rg[o] = c;
-                self.atlas.rg[o + 1] = hv.max(if r > 0.0 { c } else { 0 });
+                atlas.rg[o] = c;
+                atlas.rg[o + 1] = hv.max(if r > 0.0 { c } else { 0 });
             }
         }
-        self.atlas.slots.insert(key, [place.0 as u16, place.1 as u16, cw2 as u16, ch2 as u16]);
-        self.atlas.version += 1;
+        atlas.slots.insert(key, [place.0 as u16, place.1 as u16, cw2 as u16, ch2 as u16]);
+        atlas.version += 1;
         key
     }
 
-    fn layout(&mut self, texels: &NamedTexels, cam: &mahere_engine::Camera, w: usize, h: usize, font: f32, previous: &HashSet<(u8, String, String)>) -> Vec<Laid> {
+    fn layout(&mut self, texels: &NamedTexels, cam: &mahere_engine::Camera, w: usize, h: usize, font: f32, previous: &HashSet<u64>) -> Vec<Laid> {
         enum Shape<'a> {
             Point([f32; 2]),
             Area(&'a [[f32; 2]]),
@@ -971,17 +984,17 @@ impl Letterer {
         let mut todo: Vec<(u8, bool, u32, usize, &Named, Shape)> = Vec::new();
         for (n, p) in &texels.points {
             if let Some(t) = tier(n).filter(|&t| t <= limit) {
-                todo.push((t, !previous.contains(&(n.kind, n.name.clone(), n.reference.clone())), n.rank, 1, n, Shape::Point(*p)));
+                todo.push((t, !previous.contains(&ident(n)), n.rank, 1, n, Shape::Point(*p)));
             }
         }
         for (n, pts) in &texels.areas {
             if let Some(t) = tier(n).filter(|&t| t <= limit) {
-                todo.push((t, !previous.contains(&(n.kind, n.name.clone(), n.reference.clone())), n.rank, pts.len(), n, Shape::Area(pts)));
+                todo.push((t, !previous.contains(&ident(n)), n.rank, pts.len(), n, Shape::Area(pts)));
             }
         }
         for (n, pts) in &texels.lines {
             if let Some(t) = tier(n).filter(|&t| t <= limit) {
-                todo.push((t, !previous.contains(&(n.kind, n.name.clone(), n.reference.clone())), n.rank, pts.len(), n, Shape::Line(pts)));
+                todo.push((t, !previous.contains(&ident(n)), n.rank, pts.len(), n, Shape::Line(pts)));
             }
         }
         todo.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)).then(b.2.cmp(&a.2)).then(b.3.cmp(&a.3)));
@@ -992,6 +1005,13 @@ impl Letterer {
                 let r = (n.rank as f32 + 1.0).ln();
                 let e = &mut ranks[g as usize];
                 *e = (e.0.min(r), e.1.max(r));
+            }
+        }
+        // And the points the gather met but did not keep (the best of each patch of the screen are kept): they stand among their kind as they always did.
+        for (kind, &(lo, hi)) in texels.rank_span.iter().enumerate() {
+            if let Some(g) = rank_group_of(kind as u8).filter(|_| lo <= hi) {
+                let e = &mut ranks[g as usize];
+                *e = (e.0.min((lo as f32 + 1.0).ln()), e.1.max((hi as f32 + 1.0).ln()));
             }
         }
         let mut room = Room::new(w, h);
