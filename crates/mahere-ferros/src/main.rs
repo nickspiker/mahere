@@ -6,6 +6,9 @@
 mod ferros;
 #[cfg(target_os = "ferros")]
 mod net;
+// The addresses the connections dial, pure over its lookup: built for the host's tests too.
+#[cfg(any(target_os = "ferros", test))]
+mod names;
 
 #[cfg(target_os = "ferros")]
 fn main() {
