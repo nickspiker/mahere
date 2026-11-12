@@ -23,6 +23,10 @@ repository = "https://github.com/nickspiker/mahere"
 # vsf, fluor and kete (and kete's manifestus and tohu) come from crates.io since the v10 publish (2026-10-20). Until then mahere took them from GitHub at pinned commits, with [patch] blocks redirecting their sibling path dependencies, because a git checkout has no ../vsf next to it.
 
 
+# valhall (ferros's Valhall recorder, mahere-ferros's GPU map) is not published: it comes from the ferros checkout beside this one; the ferros build (its tools/mahere-build.sh) points it at its own.
+[patch.crates-io]
+valhall = { path = "../ferros/valhall" }
+
 # Dev builds keep line tables only: backtraces still name the file and line, and the full debug info that filled Harbor (2026-11-08) is gone.
 [profile.dev]
 debug = "line-tables-only"

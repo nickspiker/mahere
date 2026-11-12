@@ -512,8 +512,24 @@ impl<G: MapGpu> DeviceApp<G> {
         }
     }
 
+    /// The panel painted for a `w` × `h` frame, its readouts from the camera as it stands (what a frame composes in front of the map: the CPU path over its canvas, ferros's GPU kernel from `Panel::overlay_rgba`).
+    pub fn paint_panel(&mut self, w: usize, h: usize) {
+        let c = self.map.cam;
+        let mut heading = c.bearing().to_degrees().rem_euclid(360.0);
+        if heading > 180.0 {
+            heading -= 360.0;
+        }
+        let cache = self.cache_stats();
+        let readouts = Readouts { lat: c.lat(), lon: c.lon(), gps_height: self.map.gps_sea_level(), elev: self.map.elevation_at(c.lat(), c.lon()), heading_deg: heading, m_per_px: 111_320.0 / c.ppd, frame_ms: self.map.last_frame_ms, resident: self.map.pool().map.len(), phone_heading: self.map.have_rotation.then(|| self.map.true_heading()), cache_used: cache.0, cache_max: cache.1, has_fix: self.map.gps.is_some(), contour_major_m: self.map.contour_major() };
+        let measure = self.map.measure_view(w, h, Panel::strip_samples(w));
+        let (mask, ctl, areas) = (self.map.layers(), self.controls(), self.areas.view(self.map.user.has_selection()));
+        let map = &self.map;
+        let orb = |n: usize| map.orb(n);
+        self.panel.paint(w, h, mask, ctl, &readouts, measure.as_ref(), &map.themes, &areas, Some(&orb));
+    }
+
     /// Whether the camera has rested a quarter second, when labels are laid out; a camera that moved since the last look starts the quarter second again.
-    fn label_rest(&mut self) -> bool {
+    pub fn label_rest(&mut self) -> bool {
         let c = self.map.cam;
         let cam_key = (c.lat().to_bits(), c.lon().to_bits(), c.ppd.to_bits(), c.bearing().to_bits());
         if cam_key != self.label_cam.0 {
@@ -846,23 +862,12 @@ impl<G: MapGpu> FluorApp for DeviceApp<G> {
         // The map's frame, then its lettering letter by letter over it (laid out a quarter second after the camera rests), then the panel over both: the desktop's CPU path.
         self.frame.clear();
         self.frame.extend_from_slice(&self.map.canvas);
-        let c = self.map.cam;
         let at_rest = self.label_rest();
         if mahere_panel::labels::Labeller::wanted(&self.map) {
             self.labeller.ask(&mut self.map, w, h, self.panel.label_font_px(), at_rest);
             self.labeller.draw_cpu(&mut self.frame, &self.map.cam, w, h);
         }
-        let mut heading = c.bearing().to_degrees().rem_euclid(360.0);
-        if heading > 180.0 {
-            heading -= 360.0;
-        }
-        let cache = self.cache_stats();
-        let readouts = Readouts { lat: c.lat(), lon: c.lon(), gps_height: self.map.gps_sea_level(), elev: self.map.elevation_at(c.lat(), c.lon()), heading_deg: heading, m_per_px: 111_320.0 / c.ppd, frame_ms: self.map.last_frame_ms, resident: self.map.pool().map.len(), phone_heading: self.map.have_rotation.then(|| self.map.true_heading()), cache_used: cache.0, cache_max: cache.1, has_fix: self.map.gps.is_some(), contour_major_m: self.map.contour_major() };
-        let measure = self.map.measure_view(w, h, Panel::strip_samples(w));
-        let (mask, ctl, areas) = (self.map.layers(), self.controls(), self.areas.view(self.map.user.has_selection()));
-        let map = &self.map;
-        let orb = |n: usize| map.orb(n);
-        self.panel.paint(w, h, mask, ctl, &readouts, measure.as_ref(), &map.themes, &areas, Some(&orb));
+        self.paint_panel(w, h);
         self.panel.composite_rgb(&mut self.frame, w, h);
         // ANativeWindow RGBA_8888 lands R in the low byte: swap R/B vs the desktop path or Puget Sound renders brown and the pin orange. fluor's ferros host takes fluor's own order, as the desktop does.
         let n = (w * h).min(target.len()).min(self.frame.len());

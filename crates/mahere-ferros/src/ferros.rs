@@ -1,5 +1,7 @@
 //! The ferros side of Mahere: the grants, the vault's secret, the GPS fix, and the touch server's contacts into the device app's two-finger solve, the rest going to fluor's ferros shell as its pointer.
 
+use fluor::host::EventResponse;
+use fluor::host::app::{Context, FluorApp};
 use fluor::host::ferros::{Caps, Contact, FerrosShell, run_app_with};
 use mahere_device::{DeviceApp, NoGpu};
 use mahere_engine::GpsFix;
@@ -12,8 +14,68 @@ const SURFACE: u64 = 3;
 const IRA: u64 = 4;
 const GPS: u64 = 7;
 const UDP: u64 = 8;
+/// The GPU service and the layer arena (`--use gpu --dma layers`), after the network: the map drawn on the GPU (`gpu.rs`).
+const GPU: u64 = 9;
+const LAYERS: u64 = 10;
 
-type Shell = FerrosShell<DeviceApp<NoGpu>>;
+type Shell = FerrosShell<App>;
+
+/// The touch-device app, its map drawn on the GPU when the GPU's grants are there (`FluorApp::render_own`: the kernel's frame, the panel and the marks composed in it, shown as it is), else on the CPU raster as before.
+pub struct App {
+    pub inner: DeviceApp<NoGpu>,
+    gpu: Option<crate::gpu::GpuMap>,
+    /// The GPU path failed: said once, and nothing drawn after (no fallback: a map that stops is told, not hidden).
+    failed: bool,
+}
+
+impl FluorApp for App {
+    type UserEvent = ();
+    fn title(&self) -> &str {
+        self.inner.title()
+    }
+    fn init(&mut self, ctx: &mut Context) {
+        self.inner.init(ctx)
+    }
+    fn on_resize(&mut self, width: u32, height: u32, ctx: &mut Context) {
+        self.inner.on_resize(width, height, ctx)
+    }
+    fn on_event(&mut self, event: &fluor::event::Event, ctx: &mut Context) -> EventResponse {
+        self.inner.on_event(event, ctx)
+    }
+    fn wake_at(&self) -> Option<std::time::Instant> {
+        self.inner.wake_at()
+    }
+    fn tick(&mut self, ctx: &mut Context) -> bool {
+        self.inner.tick(ctx)
+    }
+    fn wants_keyboard(&mut self) -> Option<bool> {
+        self.inner.wants_keyboard()
+    }
+    fn render(&mut self, target: &mut [u32], ctx: &mut Context) {
+        self.inner.render(target, ctx)
+    }
+    fn render_own(&mut self, ctx: &mut Context) -> bool {
+        let Some(g) = self.gpu.as_mut() else { return false };
+        if self.failed {
+            return true;
+        }
+        let (w, h) = (ctx.viewport.width_px as usize, ctx.viewport.height_px as usize);
+        if let Err(e) = g.draw(&mut self.inner, w, h) {
+            println!("mahere: the GPU map stopped: {e}");
+            self.failed = true;
+        }
+        true
+    }
+    fn own_frame(&self) -> Option<&[u32]> {
+        self.gpu.as_ref().and_then(|g| g.frame())
+    }
+    fn opaque(&self) -> bool {
+        self.gpu.is_some()
+    }
+    fn cursor_for(&self, x: fluor::coord::Coord, y: fluor::coord::Coord, ctx: &Context) -> fluor::event::CursorIcon {
+        self.inner.cursor_for(x, y, ctx)
+    }
+}
 
 /// The kernel, as this process reaches it (ferros KERNEL.md, the process ABI): the call, the ira key, the grants page. Inlined as fluor's and kete's are: ferros_sys is no_std and not a published crate.
 pub(crate) mod sys {
@@ -54,6 +116,22 @@ pub(crate) mod sys {
 
     pub fn call(slot: u64, msg: &[u8], reply: &mut [u8]) -> u64 {
         svc(CALL, cap(slot), off(msg.as_ptr()), msg.len() as u64, off(reply.as_mut_ptr()), reply.len() as u64)
+    }
+
+    /// The spawn input from byte `start` into `buf`; how many bytes came (0 at its end).
+    pub fn input(start: u64, buf: &mut [u8]) -> u64 {
+        svc(8, start, off(buf.as_mut_ptr()), buf.len() as u64, 0, 0)
+    }
+
+    /// A DMA region's base as this process sees it (the kernel's SYS_DMA, 7): 0 or ERR without one.
+    pub fn dma(slot: u64) -> u64 {
+        svc(7, cap(slot), 0, 0, 0, 0)
+    }
+
+    /// A DMA region's size (SYS_DMA with x1 = 1, ferros since 2026-11-11), or None from a kernel before, which answers its base (past `most`).
+    pub fn dma_size(slot: u64, most: u64) -> Option<u64> {
+        let n = svc(7, cap(slot), 1, 0, 0, 0);
+        (n != ERR && n <= most).then_some(n)
     }
 
     /// A 32-byte key for `domain` rooted in the device's ira (ferros_sys `ira_key`): the same on every boot, never the ira itself; None without an Ira grant or an ira this boot.
@@ -97,7 +175,7 @@ pub fn run() {
         println!("mahere: no network grant (slot {UDP}); cells from the vault alone");
     }
     // The size comes from the shell at once (`on_resize` as it is made): the panel's, the frame being the whole panel.
-    let app: DeviceApp<NoGpu> = DeviceApp::open(0, 0, store, None);
+    let app = App { inner: DeviceApp::open(0, 0, store, None), gpu: crate::gpu::GpuMap::open(GPU, LAYERS, SURFACE), failed: false };
     let fixes: Arc<Mutex<Option<GpsFix>>> = Arc::new(Mutex::new(None));
     if sys::grant_count() > GPS {
         let fixes = fixes.clone();
@@ -107,20 +185,44 @@ pub fn run() {
     }
     let mut touch = Touch { fingers: Vec::with_capacity(16) };
     let caps = Caps { display: DISPLAY, touch: TOUCH, surface: SURFACE };
+    // The development spawn's input byte 1: the bench, two fingers that pan and pinch the map on their own, a frame a pass (`bench_fingers`), for measuring frames while the map moves with nobody at the panel.
+    let mut first = [0u8; 1];
+    let bench = sys::input(0, &mut first) == 1 && first[0] == 1;
+    if bench {
+        println!("mahere: bench: two fingers pan and pinch the map every frame");
+    }
+    let mut pass = 0u64;
     let r = run_app_with(app, caps, 1.0, None, move |shell: &mut Shell, contacts: &[Contact]| {
         let fix = fixes.lock().unwrap().take();
         if let Some(f) = fix {
-            shell.app().on_gps(f);
+            shell.app().inner.on_gps(f);
             shell.request_redraw();
         }
         for c in contacts {
             touch.contact(shell, c);
+        }
+        if bench {
+            let (w, h) = (shell.app().inner.w as f64, shell.app().inner.h as f64);
+            for c in bench_fingers(pass, w, h) {
+                touch.contact(shell, &c);
+            }
+            pass += 1;
         }
     });
     match r {
         Ok(()) => println!("mahere: closed"),
         Err(e) => println!("mahere: {e}"),
     }
+}
+
+/// The bench's two fingers at pass `k`: down at the first, then moving every pass along a closed path (a period of 2^9 passes, about four seconds at 120 frames a second) that pans the map across a quarter of the screen and pinches it between half and one and a half times its scale, as a hand would; up never.
+fn bench_fingers(k: u64, w: f64, h: f64) -> Vec<Contact> {
+    let t = (k % (1 << 9)) as f64 / (1 << 9) as f64 * core::f64::consts::TAU;
+    let (cx, cy) = (w * (0.5 + 0.125 * t.sin()), h * (0.5 + 0.125 * (2.0 * t).sin()));
+    let r = w * (0.25 + 0.125 * t.cos());
+    let at = |id: u8, phase: u8, x: f64, y: f64| Contact { id, phase, x: x as u16, y: y as u16 };
+    let phase = if k == 0 { 0 } else { 1 };
+    vec![at(40, phase, cx - r, cy), at(41, phase, cx + r, cy)]
 }
 
 /// The `gps` endpoint's fix, once a second: op 0 FIX, 33 bytes (ferros payloads/gps): valid, the fix count, its age, latitude and longitude in 2⁻²³ degrees, altitude (m), error (m), speed and track. A new fix (its count moved on) goes to the frame loop. The altitude goes nowhere: its datum (ellipsoid or sea level) is the chip's and not yet known.
@@ -187,7 +289,7 @@ impl Touch {
         if c.phase == 2 {
             self.fingers.retain(|f| f.0 != c.id);
         }
-        let app = shell.app();
+        let app = &mut shell.app().inner;
         if action == Action::Down {
             app.first_down = (x0, y0);
         }

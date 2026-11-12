@@ -15,10 +15,20 @@ path = "src/main.rs"
 mahere-device = { path = "../mahere-device" }
 mahere-engine = { path = "../mahere-engine" }
 mahere-store = { path = "../mahere-store" }
+mahere-tiles = { path = "../mahere-tiles" }
+# The map's compose as a GPU kernel, recorded and compiled on the device (src/kernel.rs, src/gpu.rs): ferros's own Valhall recorder. Not published: the workspace patches it to the ferros checkout beside this one, the ferros build to its own.
+valhall = { version = "0.1.0", features = ["ssa"] }
 # fluor's host-ferros is turned on from the build's command line until a published fluor has it.
 fluor = { version = "0.0.7", default-features = false, features = ["std", "text", "icon", "rayon", "simd"] }
 # rand 0.8 (mahere-store) through getrandom 0.2: its `custom` backend is ferros_rt's, the kernel's entropy (the spawn's --entropy grant).
 getrandom = { version = "0.2", features = ["custom"] }
+
+# The kernel's host tests: its words run in valhall's emulator.
+[dev-dependencies]
+valhall = { version = "0.1.0", features = ["ssa", "sim"] }
+mahere-engine = { path = "../mahere-engine" }
+mahere-tiles = { path = "../mahere-tiles" }
+mahere-coord = { path = "../mahere-coord" }
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_os, values("ferros"))'] }
