@@ -11,7 +11,7 @@ use std::sync::{Arc, Condvar, Mutex};
 
 /// The ip server's INFO reply: 71 bytes (addresses, flags, the DNS servers).
 const INFO_LEN: usize = 71;
-/// The port DNS questions leave from and their answers come to: the ip server hands a port's datagrams to whoever asks for that port, so each process has its own (httptest 53053, fgtw and the kist installer 53054).
+/// The port DNS questions leave from and their answers come to: the ip server hands a port's datagrams to whoever asks for that port, so each process has its own (httptest 53053, fgtw 53054, the kist stower 53056).
 const DNS_PORT: u16 = 53055;
 /// How long one DNS question waits for its answer (WHY a deadline: a datagram lost on the way is never answered), and how many times it is asked.
 const DNS_WAIT_S: u8 = 1;
@@ -67,6 +67,10 @@ impl IpNet {
             return Err(io::Error::other("the ip server's INFO is short"));
         }
         let flags = info[50];
+        // Nobody present (INFO bit 3 clear): the ip server sends nothing for an application until someone attests (ferros AUTH.md "Radios while locked"), so no question would leave; said as that, not as DNS finding nothing (2026-11-12: "DNS gave no address" all night on a locked Pro).
+        if flags & 8 == 0 {
+            return Err(io::Error::new(io::ErrorKind::PermissionDenied, "nobody present (the ip server serves applications once someone attests)"));
+        }
         let mut dns4 = [0u8; 16];
         dns4[..4].copy_from_slice(&info[51..55]);
         let dns6: [u8; 16] = info[55..71].try_into().unwrap();
@@ -128,6 +132,10 @@ impl IpNet {
                 let n = self.call(&hold, &mut out)?;
                 if n == 0 {
                     break;
+                }
+                // WHY the sender's check: the answer is the network's; only the server asked, from port 53, answers this question (anyone on the network can send to the port).
+                if out[0] != fam || out[1..17] != server || out[17..19] != 53u16.to_be_bytes() {
+                    continue;
                 }
                 if let Some(answer) = answer(&out[21..n], id, qtype) {
                     return Ok(answer);
