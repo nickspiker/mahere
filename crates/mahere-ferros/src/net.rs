@@ -1,37 +1,34 @@
-//! Mahere's way to the network on ferros: connections over the ip server's client TCP (ferros payloads/ip, its `udp` endpoint: 1 SEND, 2 RECV, 3 INFO, 4 CONNECT, 5 SEND, 6 RECV, 7 CLOSE), the server's address from the DNS server ip reports, for mahere-engine's plain HTTP ([`Dial`]). Nick 2026-11-11: "we have tcp and http so let's get the full meal deal wired up with mahere".
+//! Mahere's way to the network on ferros: connections over the ip server's client TCP (ferros payloads/ip, its `udp` endpoint: 3 INFO, 4 CONNECT, 5 SEND, 6 RECV, 7 CLOSE), the server's address from the ip server's resolver (10 RESOLVE), for mahere-engine's plain HTTP ([`Dial`]). Nick 2026-11-11: "we have tcp and http so let's get the full meal deal wired up with mahere".
 //!
-//! Every wait is a receive the ip server holds until something comes (the wait byte of its ops 2 and 6), never a poll (Nick 2026-11-10: "No polling!"): a loader thread blocks in the call as it blocks on a socket elsewhere. The two deadlines are real ones: a DNS question lost on the way is asked again after a second, and a connection that brings nothing for 32 s is given up.
+//! Every wait is a call the ip server holds until something comes (the wait byte of its ops 6 and 10), never a poll (Nick 2026-11-10: "No polling!"): a loader thread blocks in the call as it blocks on a socket elsewhere. The one deadline here is a real one: a connection that brings nothing for 32 s is given up (DNS's are the ip server's own).
 //! The ip server's TCP since 2026-11-11 (Nick: "sounds like it needs re-engineered"): sixteen connections, a 1 MiB window each, receives of up to 256 KiB; Mahere takes four connections at once and reads each a big reply at a time.
+//! Names since 2026-11-12: the device's one resolver, in the ip server, in place of the copy Mahere carried (its own questions, port and cache). What Mahere's cache did the device's does for every app: one lookup a name however many loaders ask (the others' calls held on it), the last good address answered at once while it is asked for again and kept when that lookup brings no answer, and asked for again after four failed connections in a row (the ip server counts its own connections).
 
 use crate::ferros::sys;
-use crate::names::Names;
 use mahere_engine::plain_http::{Conn, Dial};
 use std::io;
 use std::sync::{Arc, Condvar, Mutex};
 
 /// The ip server's INFO reply: 71 bytes (addresses, flags, the DNS servers).
 const INFO_LEN: usize = 71;
-/// The port DNS questions leave from and their answers come to: the ip server hands a port's datagrams to whoever asks for that port, so each process has its own (httptest 53053, fgtw 53054, the kist stower 53056).
-const DNS_PORT: u16 = 53055;
-/// How long one DNS question waits for its answer (WHY a deadline: a datagram lost on the way is never answered), and how many times it is asked.
-const DNS_WAIT_S: u8 = 1;
-const DNS_TRIES: usize = 1 << 2;
+/// How long a lookup's call is held at most: 16 s (the ip server asks AAAA then A, four tries a second apart each, 8 s at the worst).
+const RESOLVE_WAIT_S: u8 = 1 << 4;
+/// A RESOLVE answer: status, family, address (16), TTL left in seconds (u32 BE).
+const RESOLVE_LEN: usize = 22;
 /// How long a connection may bring nothing before it is given up: 32 s, the ip server's own idle reaping time (WHY a deadline: ip fails a connection only when what it sent goes unanswered, and a GET's body is all receiving; a server gone silent mid-body would hold a loader for ever).
 const STALL_S: u8 = 1 << 5;
 /// The connections Mahere holds at once: four of the ip server's sixteen, the rest left to the device's own (attest's fgtw, the kist installer) and other apps. The loaders wait their turn, a doorbell (a condition variable), not a poll.
 const CONNECTIONS: usize = 1 << 2;
 /// The most data one TCP receive asks for: 256 KiB, all one reply of the ip server carries (its RECV_MAX, the kernel's largest reply); the buffer holds the state byte ahead of it.
 const RECV_MOST: usize = 1 << 18;
-/// A DNS answer's reply: the datagram's 21 bytes of family, address and ports, then a message of at most 1472 bytes.
-const DNS_REPLY: usize = 1 << 11;
 /// The most of a request one SEND carries: a call carries 4096 bytes (the kernel's limit), less the op and the handle.
 const SEND_MAX: usize = (1 << 12) - 2;
 
-/// The ip server at grant slot `slot`, the addresses found, and the turn for a connection.
+/// The ip server at grant slot `slot`, the turn for a connection, and the address said last for each host (a line on the console when it changes, not at every dial).
 pub struct IpNet {
     slot: u64,
-    names: Arc<Names>,
     turn: Arc<(Mutex<usize>, Condvar)>,
+    said: Mutex<Vec<(String, u8, [u8; 16])>>,
 }
 
 impl IpNet {
@@ -45,7 +42,7 @@ impl IpNet {
         if n < INFO_LEN as u64 {
             return Err("the ip server's INFO is short".into());
         }
-        Ok(IpNet { slot, names: Arc::new(Names::new()), turn: Arc::new((Mutex::new(0), Condvar::new())) })
+        Ok(IpNet { slot, turn: Arc::new((Mutex::new(0), Condvar::new())), said: Mutex::new(Vec::new()) })
     }
 
     fn call(&self, req: &[u8], reply: &mut [u8]) -> io::Result<usize> {
@@ -53,140 +50,45 @@ impl IpNet {
         if n == sys::ERR { Err(io::Error::other("the ip server refused the call")) } else { Ok(n as usize) }
     }
 
-    /// `host`'s address, shared by every connection ([`Names`]): asked of DNS outside any lock, one lookup at a time, a stale address used while it is asked for again.
+    /// `host`'s address from the ip server's resolver (op 10, either family: IPv6 first where it has a route, the device's preference), the call held until its lookup ends; a new or changed address said on the console with its family and TTL.
     fn address(&self, host: &str) -> io::Result<(u8, [u8; 16])> {
-        self.names.address(host, &|h| self.lookup(h))
-    }
-
-    /// `host` asked of DNS (IPv6 first, the device's preference: ferros payloads/ip, owner 2026-10-29; then IPv4, also when the IPv6 question could not be asked), said on the console: its address, family and the answer's TTL in seconds.
-    fn lookup(&self, host: &str) -> io::Result<(u8, [u8; 16], u32)> {
-        let t = std::time::Instant::now();
-        let mut info = [0u8; 128];
-        let n = self.call(&[3], &mut info)?;
-        if n < INFO_LEN {
-            return Err(io::Error::other("the ip server's INFO is short"));
-        }
-        let flags = info[50];
-        // Nobody present (INFO bit 3 clear): the ip server sends nothing for an application until someone attests (ferros AUTH.md "Radios while locked"), so no question would leave; said as that, not as DNS finding nothing (2026-11-12: "DNS gave no address" all night on a locked Pro).
-        if flags & 8 == 0 {
-            return Err(io::Error::new(io::ErrorKind::PermissionDenied, "nobody present (the ip server serves applications once someone attests)"));
-        }
-        let mut dns4 = [0u8; 16];
-        dns4[..4].copy_from_slice(&info[51..55]);
-        let dns6: [u8; 16] = info[55..71].try_into().unwrap();
-        let has4 = flags & 1 != 0 && dns4 != [0; 16];
-        let mut got = None;
-        if flags & 2 != 0 {
-            let via = if dns6 != [0; 16] { Some((6, dns6)) } else if has4 { Some((4, dns4)) } else { None };
-            if let Some((fam, server)) = via {
-                got = self.query(fam, server, host, 28).ok().flatten().map(|(a, ttl)| (6u8, a, ttl));
-            }
-        }
-        if got.is_none() && has4 {
-            got = self.query(4, dns4, host, 1)?.map(|(a, ttl)| (4u8, a, ttl));
-        }
-        let Some((fam, a, ttl)) = got else {
-            let why = if flags & 3 == 0 { "no address yet" } else { "DNS gave no address" };
-            println!("mahere: {host}: {why} ({} ms)", t.elapsed().as_millis());
-            return Err(io::Error::new(io::ErrorKind::NotFound, why));
-        };
-        println!("mahere: {host} is {} for {ttl} s ({} ms)", shown(fam, &a), t.elapsed().as_millis());
-        Ok((fam, a, ttl))
-    }
-
-    /// The first record of type `qtype` (1 A, 28 AAAA) for `host` from the DNS server `server` (family `fam`, IPv4 in its first 4 bytes): Some((address, its TTL in seconds)), None when the server says there is none or never answers.
-    fn query(&self, fam: u8, server: [u8; 16], host: &str, qtype: u16) -> io::Result<Option<([u8; 16], u32)>> {
-        // WHY: a DNS name is at most 253 bytes in labels of 1 to 63; anything else is not a name to ask for.
-        if host.is_empty() || host.len() > 253 || host.split('.').any(|l| l.is_empty() || l.len() > 63) {
+        // WHY: a DNS name is at most 253 bytes (the ip server refuses a longer one too); not a name to ask for.
+        if host.is_empty() || host.len() > 253 {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "not a host name"));
         }
-        // The message's id from the kernel's entropy (the spawn's entropy grant): an answer for another question, or one forged without seeing ours, is passed over.
-        let mut r = [0u8; 2];
-        getrandom::getrandom(&mut r).map_err(|e| io::Error::other(format!("no entropy for a DNS id: {e}")))?;
-        let id = u16::from_le_bytes(r);
-        let mut q = vec![1u8, fam];
-        q.extend_from_slice(&server);
-        q.extend_from_slice(&53u16.to_be_bytes());
-        q.extend_from_slice(&DNS_PORT.to_be_bytes());
-        // The message: id, recursion desired, one question.
-        q.extend_from_slice(&id.to_be_bytes());
-        q.extend_from_slice(&[1, 0, 0, 1, 0, 0, 0, 0, 0, 0]);
-        for label in host.split('.') {
-            q.push(label.len() as u8);
-            q.extend_from_slice(label.as_bytes());
+        let t = std::time::Instant::now();
+        let mut q = vec![10u8, 0, RESOLVE_WAIT_S];
+        q.extend_from_slice(host.as_bytes());
+        let mut r = [0u8; RESOLVE_LEN];
+        let n = self.call(&q, &mut r)?;
+        // Nobody present: the ip server answers an application nothing until someone attests (ferros AUTH.md "Radios while locked"); said as that, not as DNS finding nothing (2026-11-12: "DNS gave no address" all night on a locked Pro).
+        if n == 0 {
+            return Err(io::Error::new(io::ErrorKind::PermissionDenied, "nobody present (the ip server serves applications once someone attests)"));
         }
-        q.push(0);
-        q.extend_from_slice(&qtype.to_be_bytes());
-        q.extend_from_slice(&[0, 1]);
-        let mut status = [0u8; 16];
-        let mut out = vec![0u8; DNS_REPLY];
-        let hold = [2, (DNS_PORT >> 8) as u8, DNS_PORT as u8, DNS_WAIT_S];
-        for _ in 0..DNS_TRIES {
-            // Sent (0), or the next hop still being resolved (1: the question is asked again after its wait); no address (2) or refused (3) end it.
-            let n = self.call(&q, &mut status)?;
-            if n >= 1 && status[0] >= 2 {
-                return Err(io::Error::other(if status[0] == 2 { "no address yet" } else { "the ip server refused the question" }));
-            }
-            // Answers until ours, or the wait runs out (an empty reply). Another's answer on the port (an old try's) is passed over; each is held at most the wait. A datagram's reply is its 21 bytes of family, address and ports, then the message.
-            loop {
-                let n = self.call(&hold, &mut out)?;
-                if n == 0 {
-                    break;
+        if n < RESOLVE_LEN {
+            return Err(io::Error::other("the ip server has no resolver (op 10)"));
+        }
+        let (kind, why) = match r[0] {
+            0 => {
+                let (fam, a, ttl) = (r[1], r[2..18].try_into().unwrap(), u32::from_be_bytes(r[18..22].try_into().unwrap()));
+                let mut said = self.said.lock().unwrap();
+                if !said.iter().any(|(h, f, x)| h == host && *f == fam && *x == a) {
+                    said.retain(|(h, _, _)| h != host);
+                    said.push((host.to_string(), fam, a));
+                    println!("mahere: {host} is {} for {ttl} s ({} ms)", shown(fam, &a), t.elapsed().as_millis());
                 }
-                // WHY the sender's check: the answer is the network's; only the server asked, from port 53, answers this question (anyone on the network can send to the port).
-                if out[0] != fam || out[1..17] != server || out[17..19] != 53u16.to_be_bytes() {
-                    continue;
-                }
-                if let Some(answer) = answer(&out[21..n], id, qtype) {
-                    return Ok(answer);
-                }
+                return Ok((fam, a));
             }
-        }
-        Ok(None)
+            2 => (io::ErrorKind::NotFound, "DNS gave no address"),
+            3 => (io::ErrorKind::InvalidInput, "not a host name"),
+            4 => (io::ErrorKind::AddrNotAvailable, "no address or DNS server yet"),
+            5 => (io::ErrorKind::TimedOut, "DNS gave no answer"),
+            6 => (io::ErrorKind::Other, "the ip server's resolver is full"),
+            _ => (io::ErrorKind::TimedOut, "DNS still asking"),
+        };
+        println!("mahere: {host}: {why} ({} ms)", t.elapsed().as_millis());
+        Err(io::Error::new(kind, why))
     }
-}
-
-/// The DNS message `m` read for message `id`: None when it is not that message's answer; Some(None) when it is and has no record of type `qtype` (none, or the name does not exist); Some(Some((address, TTL in seconds))) with the first one. Every read is checked (WHY: the message is the network's, any length and any content).
-fn answer(m: &[u8], id: u16, qtype: u16) -> Option<Option<([u8; 16], u32)>> {
-    if m.len() < 12 || m[0..2] != id.to_be_bytes() || m[2] & 0x80 == 0 {
-        return None;
-    }
-    if m[3] & 15 != 0 {
-        return Some(None);
-    }
-    let count = |k: usize| u16::from_be_bytes([m[k], m[k + 1]]) as usize;
-    let (questions, answers) = (count(4), count(6));
-    // A name: labels to the zero, or a pointer that ends it.
-    let skip = |mut i: usize| -> Option<usize> {
-        loop {
-            let b = *m.get(i)?;
-            if b == 0 {
-                return Some(i + 1);
-            }
-            if b & 0xC0 == 0xC0 {
-                return Some(i + 2);
-            }
-            i += 1 + b as usize;
-        }
-    };
-    let mut i = 12;
-    for _ in 0..questions {
-        i = skip(i)? + 4;
-    }
-    for _ in 0..answers {
-        i = skip(i)?;
-        let head = m.get(i..i + 10)?;
-        let ty = u16::from_be_bytes([head[0], head[1]]);
-        let len = u16::from_be_bytes([head[8], head[9]]) as usize;
-        let data = m.get(i + 10..i + 10 + len)?;
-        if ty == qtype && (len == 4 || len == 16) {
-            let mut a = [0u8; 16];
-            a[..len].copy_from_slice(data);
-            return Some(Some((a, u32::from_be_bytes([head[4], head[5], head[6], head[7]]))));
-        }
-        i += 10 + len;
-    }
-    Some(None)
 }
 
 /// An address as ferros shows numbers: IPv4 in decimal (A#), IPv6 in hex groups (G#).
@@ -210,7 +112,7 @@ impl Dial for IpNet {
         let mut r = [0u8; 16];
         let n = self.call(&req, &mut r)?;
         match (n, r[0]) {
-            (2.., 0) => Ok(Box::new(IpConn { slot: self.slot, handle: r[1], rx: vec![0u8; 1 + RECV_MOST], at: 1, len: 1, state: 1, closed: false, names: self.names.clone(), host: host.to_string(), worked: false, _turn: turn })),
+            (2.., 0) => Ok(Box::new(IpConn { slot: self.slot, handle: r[1], rx: vec![0u8; 1 + RECV_MOST], at: 1, len: 1, state: 1, closed: false, _turn: turn })),
             (_, 2) => Err(io::Error::new(io::ErrorKind::AddrNotAvailable, "no address yet")),
             (_, 4) => Err(io::Error::other("the ip server has no free connection")),
             (_, 6) => Err(io::Error::other("the ip server has no memory for another connection")),
@@ -250,11 +152,6 @@ struct IpConn {
     len: usize,
     state: u8,
     closed: bool,
-    /// The addresses found and the host this connection is to: a failure counted against its address, a success clearing them.
-    names: Arc<Names>,
-    host: String,
-    /// Whether it brought anything yet (said once).
-    worked: bool,
     /// Dropped after the connection's close (fields drop in order, after `drop`).
     _turn: Turn,
 }
@@ -288,8 +185,7 @@ impl io::Read for IpConn {
             match state {
                 5 => return Err(io::Error::new(io::ErrorKind::NotConnected, "the connection is gone")),
                 4 => {
-                    // Reset, or what was sent went unanswered: counted against the address, asked for again only after several in a row.
-                    self.names.failed(&self.host);
+                    // Reset, or what was sent went unanswered: the ip server counts it against the address (its name asked for again after four in a row).
                     return Err(io::Error::new(io::ErrorKind::ConnectionReset, "the connection failed (reset, or unanswered)"));
                 }
                 _ => {}
@@ -310,11 +206,6 @@ impl io::Read for IpConn {
                 return Err(io::Error::new(io::ErrorKind::TimedOut, format!("nothing for {STALL_S} s")));
             }
             self.state = state;
-            // Data: the address works.
-            if !self.worked {
-                self.worked = true;
-                self.names.worked(&self.host);
-            }
         }
         let k = (self.len - self.at).min(buf.len());
         buf[..k].copy_from_slice(&self.rx[self.at..self.at + k]);
