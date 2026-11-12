@@ -1131,6 +1131,9 @@ mod theme_tests {
 /// Where font packs are served (Nick 2026-10-16), shared with Photon: `<id>.vsf` under each, the bucket first, the GitHub release its mirror.
 pub const FONT_PACK_URLS: [&str; 2] = ["https://brobdingnagian.holdmyoscilloscope.com/fonts", "https://github.com/nickspiker/fluor/releases/download/fonts-v1"];
 
+/// Where a device without TLS fetches them (ferros, 2026-11-11: ureq has no sockets there, "Dns Failed: resolve dns name 'github.com:443'"): the bucket over plain HTTP, as its cells, which serves every pack at `/fonts` on port 80 as on 443, the same bytes as the GitHub release (checked 2026-11-11, all 32). GitHub is not one: it answers HTTPS only, and redirects to its CDN. A pack is checked against its author's signature whichever way it came ([`mahere_panel::fonts::load_into`]).
+pub const FONT_PACK_URLS_PLAIN: [&str; 1] = ["http://brobdingnagian.holdmyoscilloscope.com/fonts"];
+
 fn font_key(id: &str) -> String {
     vault_key(&[name("font"), VsfType::x(id.to_string())])
 }
@@ -1138,18 +1141,51 @@ fn font_key(id: &str) -> String {
 /// Font packs from the vault's copy, else fetched and kept in the vault (one download a device per script); without a vault, fetched each time the app starts.
 pub struct VaultFonts {
     store: Option<Arc<FlatStorage>>,
+    /// Where packs are fetched from, each tried in turn: `<base>/<id>.vsf`.
+    urls: Vec<String>,
+    #[cfg(not(target_os = "ferros"))]
     agent: ureq::Agent,
 }
 
 impl VaultFonts {
+    /// Packs from the platform's sources: [`FONT_PACK_URLS`], or on ferros [`FONT_PACK_URLS_PLAIN`].
     pub fn new(store: Option<Arc<FlatStorage>>) -> Arc<VaultFonts> {
-        let agent = ureq::AgentBuilder::new().timeout_connect(std::time::Duration::from_secs(10)).timeout_read(std::time::Duration::from_secs(120)).build();
-        Arc::new(VaultFonts { store, agent })
+        #[cfg(not(target_os = "ferros"))]
+        let urls = FONT_PACK_URLS;
+        #[cfg(target_os = "ferros")]
+        let urls = FONT_PACK_URLS_PLAIN;
+        VaultFonts::with_urls(store, urls.iter().map(|u| u.to_string()).collect())
     }
 
+    /// Packs from `urls`, each tried in turn (on ferros plain `http://` ones, over the shell's network).
+    pub fn with_urls(store: Option<Arc<FlatStorage>>, urls: Vec<String>) -> Arc<VaultFonts> {
+        Arc::new(VaultFonts {
+            store,
+            urls,
+            #[cfg(not(target_os = "ferros"))]
+            agent: ureq::AgentBuilder::new().timeout_connect(std::time::Duration::from_secs(10)).timeout_read(std::time::Duration::from_secs(120)).build(),
+        })
+    }
+
+    /// A pack over plain HTTP (mahere-engine plain_http, the ferros shell's connections): the body of a 200, whole by its length.
+    #[cfg(target_os = "ferros")]
+    fn fetch(&self, id: &str) -> Result<Vec<u8>, String> {
+        let mut last = String::from("no font pack source");
+        for base in &self.urls {
+            let url = format!("{base}/{id}.vsf");
+            match mahere_engine::plain_http::get(&url, None) {
+                Ok(g) if g.status == 200 => return Ok(g.body),
+                Ok(g) => last = format!("{url}: HTTP {}", g.status),
+                Err(e) => last = format!("{url}: {e}"),
+            }
+        }
+        Err(last)
+    }
+
+    #[cfg(not(target_os = "ferros"))]
     fn fetch(&self, id: &str) -> Result<Vec<u8>, String> {
         let mut last = String::new();
-        for base in FONT_PACK_URLS {
+        for base in &self.urls {
             let url = format!("{base}/{id}.vsf");
             match self.agent.get(&url).call() {
                 Ok(resp) => {
