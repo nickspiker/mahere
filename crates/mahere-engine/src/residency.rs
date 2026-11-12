@@ -165,10 +165,15 @@ impl Entry {
         let q = d.tex[(ty + 1) * DEMQ_W + 2 * (tx + 1) + half];
         Some(if q == 0xFFFF { mahere_tiles::ELEV_NODATA } else { mahere_tiles::quantize_elev(d.base + q as f32 * d.step) })
     }
+    /// The bytes its vector planes hold: lines, land, water, ownership and motor vehicle use.
+    pub fn vec_bytes(&self) -> usize {
+        let class = |c: &Option<mahere_tiles::ClassCell>| c.as_ref().map_or(0, |c| c.class.len() + c.cov.len() + c.mag.len() + c.uses.len());
+        class(&self.line) + class(&self.land) + class(&self.own) + class(&self.mvum) + self.water.as_ref().map_or(0, |w| w.cov.len())
+    }
+
     /// The bytes its planes hold: every decoded plane, both terrain forms, the geoid.
     pub fn bytes(&self) -> usize {
-        let class = |c: &Option<mahere_tiles::ClassCell>| c.as_ref().map_or(0, |c| c.class.len() + c.cov.len() + c.mag.len() + c.uses.len());
-        class(&self.line) + class(&self.land) + class(&self.own) + class(&self.mvum) + self.water.as_ref().map_or(0, |w| w.cov.len()) + self.img.as_ref().map_or(0, |i| i.red.len() + i.green.len() + i.blue.len() + i.nir.len()) + self.dem_q.as_ref().map_or(0, |d| d.tex.len() * 2) + self.dem.as_ref().map_or(0, |d| d.texel.len() * 8) + self.geoid.as_ref().map_or(0, |g| g.len() * 2)
+        self.vec_bytes() + self.img.as_ref().map_or(0, |i| i.red.len() + i.green.len() + i.blue.len() + i.nir.len()) + self.dem_q.as_ref().map_or(0, |d| d.tex.len() * 2) + self.dem.as_ref().map_or(0, |d| d.texel.len() * 8) + self.geoid.as_ref().map_or(0, |g| g.len() * 2)
     }
 
     /// Whether the terrain it holds, if any, is in the form a host packing for the CPU (`pack`) or for a GPU draws from.
@@ -485,7 +490,7 @@ impl Residency {
         }
         list.sort_by_key(|k| near(k, center));
         fill.sort_by_key(|k| near(k, center));
-        self.withhold(&mut list);
+        self.withhold(&mut list, center);
         self.fill_left = fill.len();
         self.bases_left = list.len();
         // Cells baked whole carry everything in one read; cells in layers come base first, the layers after. The globe's depth-0 set before all of it: its bases, then its layers, then the view's bases, then the view's layers.
@@ -535,33 +540,59 @@ impl Residency {
         self.budget = bytes;
     }
 
-    /// Whether a cell has something drawn in its place without it: its parent resident with its base.
-    fn covered_by_parent(&self, k: CellKey) -> bool {
-        k.depth > 0 && self.pool.map.get(&k.ancestor(k.depth - 1)).is_some_and(|e| e.exists)
+    /// Whether a cell has something drawn in its place without it: a coarser cell over it resident with its base, or (`coming`) on its way.
+    fn drawn_from_above(&self, k: CellKey, coming: &FxHashSet<CellKey>) -> bool {
+        (0..k.depth).any(|d| {
+            let a = k.ancestor(d);
+            coming.contains(&a) || self.pool.map.get(&a).is_some_and(|e| e.exists)
+        })
     }
 
-    /// What a cell the view wants holds once its layers are in: the average of the resident cells with every layer the view shows, or two megabytes before one has come.
-    fn cell_estimate(&self) -> usize {
-        let want = self.want_layers;
-        let (n, bytes) = self.pool.map.iter().filter(|(k, e)| k.depth > 0 && e.exists && e.layers & want == want).fold((0usize, 0usize), |(n, b), (_, e)| (n + 1, b + e.bytes()));
-        if n == 0 { 1 << 21 } else { bytes / n }
+    /// What a cell's layers cost, by part: its vector planes (their average over the resident cells that have any; seven planes before one has come), its terrain in the form the host draws from, and its imagery's four bands. The terrain and the imagery are the same size in every cell; an average over whole cells was not (2026-11-11: the coarse cells, a few of them empty, brought it under a megabyte, and the city view asked for 206 bases before their terrain landed and took it 400 MiB past the budget).
+    fn costs(&self) -> (usize, usize, usize) {
+        let tri = mahere_tiles::TRI;
+        let (n, bytes) = self.pool.map.values().filter(|e| e.has_vec()).fold((0usize, 0usize), |(n, b), e| (n + 1, b + e.vec_bytes()));
+        let vec = if n == 0 { 7 * tri } else { bytes / n };
+        let dem = if self.pack_cpu.load(std::sync::atomic::Ordering::Relaxed) { tri * 8 } else { DEMQ_W * DEMQ_H * 2 };
+        (vec, dem, 4 * tri)
     }
 
-    /// Over the budget, the cells the view wants that have their parent to draw from are not asked for once they would pass it, each counted whole, its layers with it (the bases come first, and counted alone they took the budget from the terrain behind them): the list comes nearest first, so the finest cells farthest from the view's centre wait, drawn from their parents, until the view moves or the budget has room. A resident cell's layers are always asked for: its base was counted with them.
-    fn withhold(&self, list: &mut Vec<CellKey>) {
+    /// What the layers in `want` a cell lacks will add: the terrain and the imagery it has not loaded yet, at their costs (`dem`, `img`).
+    fn to_come(want: u8, layers: u8, (dem, img): (usize, usize)) -> usize {
+        let missing = want & !layers;
+        (missing & WANT_DEM != 0) as usize * dem + (missing & (WANT_IMG | WANT_NIR) != 0) as usize * img
+    }
+
+    /// Over the budget, the cells the view wants that have a coarser cell over them to draw from are not asked for once they would pass it, each counted whole, its layers with it (the bases come first, and counted alone they took the budget from the terrain behind them): the list comes nearest first, so the finest cells farthest from the view's centre wait, drawn from their parents, until the view moves or the budget has room. A resident cell's layers are always asked for: its base was counted with them.
+    fn withhold(&self, list: &mut Vec<CellKey>, center: (u64, u64)) {
         if self.budget == usize::MAX {
             return;
         }
-        let each = self.cell_estimate();
         let want = self.want_layers;
-        // A resident cell still waiting on a layer counts as a whole one (WHY the max: what it holds now is its base alone, and the layers on their way are already its).
-        let mut projected: usize = self.pool.map.values().map(|e| if e.exists && e.layers & want != want { e.bytes().max(each) } else { e.bytes() }).sum();
-        list.retain(|&k| {
-            if projected + each > self.budget && self.covered_by_parent(k) {
-                return false;
+        let (vec, dem, img) = self.costs();
+        let each = vec + Self::to_come(want, 0, (dem, img));
+        // A resident cell still waiting on a layer counts with it: what it holds now is its base alone, and the layers on their way are already its.
+        let mut projected: usize = self.pool.map.values().map(|e| e.bytes() + if e.exists { Self::to_come(want, e.layers, (dem, img)) } else { 0 }).sum();
+        // Chosen coarse first, then nearest, so a parent on its way counts as there to draw from (2026-11-11: on a fresh view no parent was resident yet, every cell was asked for, and the city view went 300 MiB past the budget before trimming back); sent in the list's own order.
+        let mut order: Vec<usize> = (0..list.len()).collect();
+        order.sort_by_key(|&i| (list[i].depth, near(&list[i], center)));
+        let mut keep = vec![false; list.len()];
+        let mut coming: FxHashSet<CellKey> = FxHashSet::default();
+        for i in order {
+            let k = list[i];
+            // Over a parent that waits too, the grandparent draws: a cell under a withheld one waits with it (else its children came in whatever the budget, and the pool thrashed).
+            let drawn = self.drawn_from_above(k, &coming);
+            if projected + each > self.budget && drawn {
+                continue;
             }
             projected += each;
-            true
+            keep[i] = true;
+            coming.insert(k);
+        }
+        let mut i = 0;
+        list.retain(|_| {
+            i += 1;
+            keep[i - 1]
         });
     }
 
@@ -589,7 +620,7 @@ impl Residency {
         }
         // Still over: the wanted cells drawn from nothing finer (no child resident) whose parent is there to draw from instead, the finest first, then the farthest; [`Residency::withhold`] keeps them from being asked for again while the budget has no room.
         let leaf = |k: &CellKey| !(0..4).any(|q| self.pool.map.get(&k.child(q)).is_some_and(|c| c.exists));
-        let mut out: Vec<(u8, u64, CellKey, usize)> = self.pool.map.iter().filter(|(k, _)| self.desired.contains(*k) && leaf(k) && self.covered_by_parent(**k)).map(|(k, e)| (k.depth, near(k, center) << (30 - k.depth as u32), *k, e.bytes())).filter(|o| o.3 > 0).collect();
+        let mut out: Vec<(u8, u64, CellKey, usize)> = self.pool.map.iter().filter(|(k, _)| self.desired.contains(*k) && leaf(k) && self.drawn_from_above(**k, &FxHashSet::default())).map(|(k, e)| (k.depth, near(k, center) << (30 - k.depth as u32), *k, e.bytes())).filter(|o| o.3 > 0).collect();
         out.sort_by_key(|o| std::cmp::Reverse((o.0, o.1)));
         for (_, _, k, bytes) in out {
             if held <= self.budget {
@@ -1602,7 +1633,9 @@ mod tests {
         let parent = CellKey::from_grid(3, 11, 8, 8);
         r.pool.map.insert(parent, holding());
         let children: Vec<CellKey> = (0..4).map(|q| parent.child(q)).collect();
-        r.set_budget(2 * holding().bytes());
+        // Room for the parent and one child with its terrain.
+        let (vec, dem, _) = r.costs();
+        r.set_budget(holding().bytes() + vec + dem);
         let mut list = vec![parent];
         list.extend(&children);
         r.want(list, (0, 0));
