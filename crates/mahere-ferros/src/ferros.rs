@@ -185,11 +185,14 @@ pub fn run() {
     }
     let mut touch = Touch { fingers: Vec::with_capacity(16) };
     let caps = Caps { display: DISPLAY, touch: TOUCH, surface: SURFACE };
-    // The development spawn's input byte 1: the bench, two fingers that pan and pinch the map on their own, a frame a pass (`bench_fingers`), for measuring frames while the map moves with nobody at the panel.
+    // The development spawn's input byte: the bench, two fingers that pan and pinch the map on their own, a frame a pass (`bench_fingers`), for measuring frames while the map moves with nobody at the panel; 1 where the view is, 2 zoomed in to a town's scale (2^12 pixels a degree) first.
     let mut first = [0u8; 1];
-    let bench = sys::input(0, &mut first) == 1 && first[0] == 1;
+    let byte = if sys::input(0, &mut first) == 1 { first[0] } else { 0 };
+    // Bit 2 (4) with either: the window full screen first (the display's op 43, the person's own toggle on the quick row), the glass's circle and bars gone, for measuring the display's publish without them.
+    let (mode, full) = (byte & 3, byte & 4 != 0);
+    let bench = mode == 1 || mode == 2;
     if bench {
-        println!("mahere: bench: two fingers pan and pinch the map every frame");
+        println!("mahere: bench: two fingers pan and pinch the map every frame{}", if mode == 2 { ", zoomed in to a town's scale first" } else { "" });
     }
     let mut pass = 0u64;
     let r = run_app_with(app, caps, 1.0, None, move |shell: &mut Shell, contacts: &[Contact]| {
@@ -202,7 +205,18 @@ pub fn run() {
             touch.contact(shell, c);
         }
         if bench {
-            let (w, h) = (shell.app().inner.w as f64, shell.app().inner.h as f64);
+            let app = &mut shell.app().inner;
+            if pass == 1 && full {
+                let mut r = [0u8; 4];
+                sys::call(DISPLAY, &[43], &mut r);
+                println!("mahere: bench: full screen {}", if r[0] == 0 { "toggled" } else { "refused (no app in front)" });
+            }
+            if pass == 0 && mode == 2 {
+                let c = app.map.cam;
+                app.map.cam = mahere_engine::Camera::new(c.lat(), c.lon(), (1u32 << 12) as f64, c.bearing());
+                app.map.camera_moved(app.w, app.h);
+            }
+            let (w, h) = (app.w as f64, app.h as f64);
             for c in bench_fingers(pass, w, h) {
                 touch.contact(shell, &c);
             }

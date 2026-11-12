@@ -16,6 +16,8 @@ mahere-device = { path = "../mahere-device" }
 mahere-engine = { path = "../mahere-engine" }
 mahere-store = { path = "../mahere-store" }
 mahere-tiles = { path = "../mahere-tiles" }
+mahere-panel = { path = "../mahere-panel" }
+rayon = "1"
 # The map's compose as a GPU kernel, recorded and compiled on the device (src/kernel.rs, src/gpu.rs): ferros's own Valhall recorder. Not published: the workspace patches it to the ferros checkout beside this one, the ferros build to its own.
 valhall = { version = "0.1.0", features = ["ssa"] }
 # fluor's host-ferros is turned on from the build's command line until a published fluor has it.
@@ -28,6 +30,8 @@ getrandom = { version = "0.2", features = ["custom"] }
 valhall = { version = "0.1.0", features = ["ssa", "sim"] }
 mahere-engine = { path = "../mahere-engine" }
 mahere-tiles = { path = "../mahere-tiles" }
+mahere-panel = { path = "../mahere-panel" }
+rayon = "1"
 mahere-coord = { path = "../mahere-coord" }
 
 [lints.rust]

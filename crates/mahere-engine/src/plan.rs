@@ -99,6 +99,8 @@ pub struct FramePlan {
     pub globe: [f32; 4],
     /// The world's pole axis in view coordinates, for lighting every fragment from where it stands on the ball.
     pub pole: [f32; 4],
+    /// Where the plan's time went, µs: the corners, the desired set, the blocks, the references and table, each block's candidates.
+    pub us: [u32; 5],
 }
 
 /// The hash every lookup agrees on, CPU and shader.
@@ -147,6 +149,7 @@ fn block_of(x: usize, y: usize, size: usize, c00: CornerPt, c10: CornerPt, c01: 
 
 /// Plan a frame: the lattice, the references, the table and the desired set. The elevation range in view comes from the frame drawn (the GPU's gather, the CPU's compose), not from here.
 pub fn plan_frame(w: usize, h: usize, cam: &Camera, pool: &Pool, dem_depth: u8, vec_depth: u8, user: &crate::ink::UserLayer) -> FramePlan {
+    let t0 = std::time::Instant::now();
     let bw = w.div_ceil(BLOCK);
     let bh = h.div_ceil(BLOCK);
     let corners: Vec<CornerPt> = (0..(bw + 1) * (bh + 1))
@@ -157,6 +160,7 @@ pub fn plan_frame(w: usize, h: usize, cam: &Camera, pool: &Pool, dem_depth: u8, 
         })
         .collect();
 
+    let t1 = std::time::Instant::now();
     // Desired set and the elevation range, from the lattice. The corners dedupe to their finest cells first (a few hundred from a few thousand corners), then each walks its parents; at the coarse depths below the view's the ring of neighbours comes too, so a zoom out lands on cells already resident instead of a blank screen (Nick 2026-10-06), and they are small.
     let fine = dem_depth.max(vec_depth);
     let mut fine_cells: rustc_hash::FxHashSet<u64> = rustc_hash::FxHashSet::default();
@@ -183,21 +187,26 @@ pub fn plan_frame(w: usize, h: usize, cam: &Camera, pool: &Pool, dem_depth: u8, 
         }
     }
 
-    // Blocks: whole where the corners share a diamond, 4 px sub-blocks across a seam.
-    let mut blocks = Vec::with_capacity(bw * bh);
-    let mut straddle_blocks = 0;
-    for by in 0..bh {
-        for bx in 0..bw {
+    let t2 = std::time::Instant::now();
+    // Blocks: whole where the corners share a diamond, 4 px sub-blocks across a seam. Each tile on its own core, in the screen's order (2026-11-11, ferros's GPU host at globe zoom: 426 straddling tiles of 81 exact sub-corners each, one after another, were most of a 70 ms plan on the Pro).
+    // A tile is one block, or a straddling tile's sub-blocks (a list only for those: a list a tile was 4000 allocations a frame).
+    enum Tile {
+        One(PlanBlock),
+        Many(Vec<PlanBlock>),
+    }
+    let tiles: Vec<Tile> = (0..bw * bh)
+        .into_par_iter()
+        .map(|t| {
+            let (bx, by) = (t % bw, t / bw);
             let c00 = corners[by * (bw + 1) + bx];
             let c10 = corners[by * (bw + 1) + bx + 1];
             let c01 = corners[(by + 1) * (bw + 1) + bx];
             let c11 = corners[(by + 1) * (bw + 1) + bx + 1];
             let (x0, y0) = (bx * BLOCK, by * BLOCK);
             if c00.diamond == c10.diamond && c00.diamond == c01.diamond && c00.diamond == c11.diamond {
-                blocks.push(block_of(x0, y0, BLOCK, c00, c10, c01, c11));
-                continue;
+                return Tile::One(block_of(x0, y0, BLOCK, c00, c10, c01, c11));
             }
-            straddle_blocks += 1;
+            let mut blocks = Vec::with_capacity((BLOCK / SUB) * (BLOCK / SUB));
             let mut ds = vec![c00.diamond, c10.diamond, c01.diamond, c11.diamond];
             ds.sort_unstable();
             ds.dedup();
@@ -231,9 +240,19 @@ pub fn plan_frame(w: usize, h: usize, cam: &Camera, pool: &Pool, dem_depth: u8, 
                     blocks.push(block_of(x0 + sx * SUB, y0 + sy * SUB, SUB, s00, s10, s01, s11));
                 }
             }
+            Tile::Many(blocks)
+        })
+        .collect();
+    let straddle_blocks = tiles.iter().filter(|t| matches!(t, Tile::Many(_))).count();
+    let mut blocks: Vec<PlanBlock> = Vec::with_capacity(tiles.len() + straddle_blocks * ((BLOCK / SUB) * (BLOCK / SUB) - 1));
+    for t in tiles {
+        match t {
+            Tile::One(b) => blocks.push(b),
+            Tile::Many(v) => blocks.extend(v),
         }
     }
 
+    let t3 = std::time::Instant::now();
     // References: every resident cell with a plane, and the table over them. The table is a quarter full at most: a resident set past that (a far zoom over the globe) refers the cells this frame wants first and leaves the rest, so the probes stay short and the insert can never spin.
     let mut refs: Vec<PlanRef> = Vec::with_capacity(pool.map.len().min(TABLE_N / 4));
     let mut table = vec![TableSlot { tag: 0, cu: 0, cv: 0, index: NONE }; TABLE_N];
@@ -297,13 +316,26 @@ pub fn plan_frame(w: usize, h: usize, cam: &Camera, pool: &Pool, dem_depth: u8, 
         }
     }
 
+    let t4 = std::time::Instant::now();
     // Each block's candidates, from its four corners: the cell each lies in at the wanted depth, else the nearest coarser one carrying the plane (the shader's own search, done once a block). A block is 32 px and a cell hundreds, so its corners meet at most four cells a depth.
     let index: rustc_hash::FxHashMap<CellKey, u32> = refs.iter().enumerate().map(|(i, r)| (r.key, i as u32)).collect();
+    // The depths any reference carries each plane at, a bit a depth: the search skips the depths with none (2026-11-11, the Pro with no cells over the network: every block's nine points looked up every depth from the view's to the root, most of a 9 ms plan).
+    let mut held = [0u64; 3];
+    for r in &refs {
+        for (k, need) in [FLAG_DEM, FLAG_VEC, FLAG_IMG].into_iter().enumerate() {
+            if r.flags & need != 0 {
+                held[k] |= 1 << r.key.depth;
+            }
+        }
+    }
     let resolve = |raw: u64, want: u8, need: u32| -> u32 {
+        let have = held[if need == FLAG_DEM { 0 } else if need == FLAG_IMG { 2 } else { 1 }];
         let mut d = want;
         loop {
             let key = CellKey { depth: d, prefix: raw >> (60 - 2 * d as u32) };
-            if let Some(&i) = index.get(&key) {
+            if have >> d & 1 == 0 {
+                // No reference carries this plane at this depth.
+            } else if let Some(&i) = index.get(&key) {
                 if refs[i as usize].flags & need != 0 {
                     return i;
                 }
@@ -316,7 +348,7 @@ pub fn plan_frame(w: usize, h: usize, cam: &Camera, pool: &Pool, dem_depth: u8, 
     };
     let roles = [(dem_depth, FLAG_DEM), (vec_depth, FLAG_VEC), (vec_depth, FLAG_IMG)];
     let top = ((1u64 << 30) - 1) as f64;
-    for b in &mut blocks {
+    blocks.par_iter_mut().for_each(|b| {
         let n = b.size as f64;
         // The corners for every role; the edges' midpoints and the centre too for the vector planes, whose cell a block drawn from composites must hold (2026-10-21: the cell grid lies skewed on the screen, and a cell poking in along a block's edge between two corners was missed).
         let h = n / 2.0;
@@ -341,8 +373,9 @@ pub fn plan_frame(w: usize, h: usize, cam: &Camera, pool: &Pool, dem_depth: u8, 
         for c in &mut b.cand {
             c.sort_by_key(|&r| if r == NONE { u32::MAX } else { 64 - refs[r as usize].key.depth as u32 });
         }
-    }
+    });
 
+    let t5 = std::time::Instant::now();
     let magnified = crate::raster::texel_px(cam.ppd, dem_depth) >= 1.5;
     let mut line_mag_hi = [0u8; 32];
     for r in refs.iter().filter(|r| r.key.depth == vec_depth || r.key.depth + 1 == vec_depth) {
@@ -393,7 +426,9 @@ pub fn plan_frame(w: usize, h: usize, cam: &Camera, pool: &Pool, dem_depth: u8, 
     let globe = [w as f32 * 0.5, h as f32 * 0.5, cam.radius() as f32, cam.limb_visible(w, h) as u32 as f32];
     let b = cam.basis();
     let pole = [b[0][2] as f32, b[1][2] as f32, b[2][2] as f32, 0.0];
-    FramePlan { blocks, refs, table, want: desired.into_iter().collect(), straddle_blocks, dem_depth, vec_depth, magnified, line_mag_hi, globe, pole }
+    let us = |a: std::time::Instant, b: std::time::Instant| (b - a).as_micros() as u32;
+    let us = [us(t0, t1), us(t1, t2), us(t2, t3), us(t3, t4), us(t4, t5)];
+    FramePlan { blocks, refs, table, want: desired.into_iter().collect(), straddle_blocks, dem_depth, vec_depth, magnified, line_mag_hi, globe, pole, us }
 }
 
 #[cfg(test)]

@@ -27,6 +27,7 @@ pub struct GpuMap {
     slots: Slots,
     style: Option<u64>,
     overlay_key: Option<u64>,
+    marks_key: Option<u64>,
     overlay_on: bool,
     stats: Stats,
     report_at: std::time::Instant,
@@ -46,6 +47,15 @@ struct Stats {
     call_us: u64,
     words: usize,
     nodes: usize,
+    /// Overlays painted (of them the panel painted again, the marks drawn again), and their µs: the panel, the marks, the sum into the arena.
+    overlays: u64,
+    /// The plan's µs: preparing the view, the plan itself, the residency's want (`MapCore::plan_us`).
+    plan_parts: [u64; 3],
+    /// Inside the plan (`FramePlan::us`): the corners, the desired set, the blocks, the references and table, the candidates.
+    plan_inner: [u64; 5],
+    panels: u64,
+    marks: u64,
+    overlay_parts: [u64; 3],
 }
 
 impl GpuMap {
@@ -65,7 +75,7 @@ impl GpuMap {
         let surface = crate::ferros::sys::dma(surface_slot);
         let surface_va = (bytes == ARENA_GROWN && surface != 0 && surface != crate::ferros::sys::ERR).then(|| SURFACES_VA + (surface - SURFACES_PA));
         println!("mahere: the map draws on the GPU (the service at slot {gpu_slot}, the layer arena at slot {arena_slot}, {} MiB), {}", bytes >> 20, if surface_va.is_some() { "straight into the surface" } else { "fluor's pixels in the arena, presented by the CPU" });
-        Some(GpuMap { gpu: gpu_slot, arena: base as *mut u32, bytes, surface_va, lay: None, slots: Slots::new(0), style: None, overlay_key: None, overlay_on: false, stats: Stats::default(), report_at: std::time::Instant::now() })
+        Some(GpuMap { gpu: gpu_slot, arena: base as *mut u32, bytes, surface_va, lay: None, slots: Slots::new(0), style: None, overlay_key: None, marks_key: None, overlay_on: false, stats: Stats::default(), report_at: std::time::Instant::now() })
     }
 
     fn arena(&mut self) -> &mut [u32] {
@@ -92,10 +102,17 @@ impl GpuMap {
             self.slots = Slots::new(l.slots);
             self.lay = Some(l);
             self.overlay_key = None;
+            self.marks_key = None;
         }
         let lay = self.lay.unwrap();
         let t0 = std::time::Instant::now();
         let plan = app.map.plan(w, h);
+        for (a, b) in self.stats.plan_parts.iter_mut().zip(app.map.plan_us) {
+            *a += b;
+        }
+        for (a, b) in self.stats.plan_inner.iter_mut().zip(plan.us) {
+            *a += b as u64;
+        }
         let t1 = std::time::Instant::now();
         let version = app.map.pool_version();
         let arena = unsafe { core::slice::from_raw_parts_mut(self.arena, self.bytes / 4) };
@@ -140,8 +157,8 @@ impl GpuMap {
             let s = &self.stats;
             let n = s.frames.max(1);
             println!(
-                "mahere: GPU {} frames: the kernel {} us a frame on the GPU (longest {}), {} words from {} nodes; host per frame: plan {} us, cells {} us, blocks {} us, overlay {} us, record and compile {} us, the call {} us; {} cell planes written so far, {} wanted with no slot free ({} slots)",
-                s.frames, s.gpu_us / n, s.gpu_max, s.words, s.nodes, s.plan_us / n, s.cells_us / n, s.blocks_us / n, s.overlay_us / n, s.compile_us / n, s.call_us / n, self.slots.written, self.slots.starved, lay.slots
+                "mahere: GPU {} frames: the kernel {} us a frame on the GPU (longest {}), {} words from {} nodes; host per frame: plan {} us (view {}, plan {} [corners {}, desired {}, blocks {}, refs {}, candidates {}], want {}), cells {} us, blocks {} us, overlay {} us, record and compile {} us, the call {} us; {} overlays painted ({} panels, {} marks; panel {} us, marks {} us, sum {} us each); {} cell planes written so far, {} wanted with no slot free ({} slots)",
+                s.frames, s.gpu_us / n, s.gpu_max, s.words, s.nodes, s.plan_us / n, s.plan_parts[0] / n, s.plan_parts[1] / n, s.plan_inner[0] / n, s.plan_inner[1] / n, s.plan_inner[2] / n, s.plan_inner[3] / n, s.plan_inner[4] / n, s.plan_parts[2] / n, s.cells_us / n, s.blocks_us / n, s.overlay_us / n, s.compile_us / n, s.call_us / n, s.overlays, s.panels, s.marks, s.overlay_parts[0] / s.overlays.max(1), s.overlay_parts[1] / s.overlays.max(1), s.overlay_parts[2] / s.overlays.max(1), self.slots.written, self.slots.starved, lay.slots
             );
             self.stats = Stats::default();
         }
@@ -153,31 +170,80 @@ impl GpuMap {
         use std::hash::{Hash, Hasher};
         let map = &app.map;
         let c = map.cam;
-        let mut hs = std::collections::hash_map::DefaultHasher::new();
-        (w, h, app.panel.is_open(), c.bearing().to_bits(), map.layers().bits(), app.panel.ru().to_bits()).hash(&mut hs);
-        // Open, the panel's readouts follow the camera; closed, the pins and the GPS mark do.
-        if app.panel.is_open() || map.gps.is_some() || [map.pin_a, map.pin_b, map.nav_to, map.found_at].iter().any(|p| p.is_some()) {
-            (c.lat().to_bits(), c.lon().to_bits(), c.ppd.to_bits()).hash(&mut hs);
-        }
-        (map.view_depth(), map.zoom_depth(), map.route_version, map.globe_loading().map(|d| (d * 64.0) as u32), map.contour_major().map(f32::to_bits)).hash(&mut hs);
-        let key = hs.finish();
-        if self.overlay_key == Some(key) {
+        let hash = |f: &dyn Fn(&mut std::collections::hash_map::DefaultHasher)| {
+            let mut hs = std::collections::hash_map::DefaultHasher::new();
+            f(&mut hs);
+            hs.finish()
+        };
+        // What the marks show (`MapCore::overlay`: the compass, the GPS, the pins, the globe's loading ring), and what the panel shows (its rows, its readouts, the zoom and the contours' spacing); each painted again only when its own changed.
+        let pinned = map.gps.is_some() || [map.pin_a, map.pin_b, map.nav_to, map.found_at].iter().any(|p| p.is_some());
+        let marks_key = hash(&|hs| {
+            // The bearing as the compass can show it (2^-8 radians turn its arrow's tip a tenth of a pixel): the two-finger solve moves it by less every frame, and each was a repaint.
+            (w, h, (c.bearing() * (1u32 << 8) as f64).round() as i64, map.globe_loading().map(|d| (d * 64.0) as u32)).hash(hs);
+            if pinned {
+                (c.lat().to_bits(), c.lon().to_bits(), c.ppd.to_bits()).hash(hs);
+            }
+        });
+        let panel_key = hash(&|hs| {
+            (w, h, app.panel.is_open(), map.layers().bits(), app.panel.ru().to_bits(), map.view_depth(), map.zoom_depth(), map.route_version, map.contour_major().map(f32::to_bits)).hash(hs);
+            if app.panel.is_open() {
+                (c.lat().to_bits(), c.lon().to_bits(), c.ppd.to_bits(), c.bearing().to_bits()).hash(hs);
+            }
+        });
+        let (marks_new, panel_new) = (self.marks_key != Some(marks_key), self.overlay_key != Some(panel_key));
+        if !marks_new && !panel_new {
             return;
         }
-        self.overlay_key = Some(key);
-        app.paint_panel(w, h);
-        // The marks on the map's own canvas, the panel's pixels over them, a band of rows at a time straight into the arena (a whole screen's copy at once is 16 MB of heap twice over: the arc's ceiling, 2026-11-11).
-        let marks = app.map.overlay(w, h, true);
-        let out = unsafe { core::slice::from_raw_parts_mut(self.arena.add(kernel::OVERLAY / 4), w * h) };
-        let mut any = 0u32;
-        for y0 in (0..h).step_by(64) {
-            let y1 = (y0 + 64).min(h);
-            let rgba = app.panel.overlay_rows(marks, w, h, y0, y1);
-            for (o, p) in out[y0 * w..y1 * w].iter_mut().zip(rgba.chunks_exact(4)) {
-                *o = u32::from_le_bytes([p[0], p[1], p[2], p[3]]);
-                any |= *o;
-            }
+        self.marks_key = Some(marks_key);
+        self.overlay_key = Some(panel_key);
+        let t0 = std::time::Instant::now();
+        if panel_new {
+            app.paint_panel(w, h);
+            self.stats.panels += 1;
         }
+        let t1 = std::time::Instant::now();
+        let marks = if marks_new {
+            self.stats.marks += 1;
+            app.map.overlay(w, h, true)
+        } else {
+            app.map.marks_canvas()
+        };
+        let t2 = std::time::Instant::now();
+        // The panel's pixels with the marks under them (`Panel::overlay_rows`' sum, premultiplied RGBA bytes), straight into the arena, bands of rows on every core: one thread over the screen's 4 Mpx was 62 ms of every frame on the Pro (2026-11-11).
+        let panel = app.panel.pixels();
+        let panel = (panel.len() == w * h).then_some(panel);
+        let out = unsafe { core::slice::from_raw_parts_mut(self.arena.add(kernel::OVERLAY / 4), w * h) };
+        use rayon::prelude::*;
+        let any = out
+            .par_chunks_mut(w << 6)
+            .enumerate()
+            .map(|(band, rows)| {
+                let at = band * (w << 6);
+                let mut any = 0u32;
+                for (k, o) in rows.iter_mut().enumerate() {
+                    let i = at + k;
+                    let (m, p) = (marks[i], panel.map_or(0, |b| b[i]));
+                    if m == 0 && p >> 24 == 0 {
+                        *o = 0;
+                        continue;
+                    }
+                    let (mr, mg, mb) = ((m >> 16) & 255, (m >> 8) & 255, m & 255);
+                    let ma = mr.max(mg).max(mb);
+                    let (r, g, b, a) = if p >> 24 == 0 { (0, 0, 0, 0) } else { mahere_panel::Panel::premul_pub(p) };
+                    let keep = 255 - a as u32;
+                    let ch = |c: u8, under: u32| c as u32 + under * keep / 255;
+                    *o = ch(r, mr) | ch(g, mg) << 8 | ch(b, mb) << 16 | ch(a, ma) << 24;
+                    any |= *o;
+                }
+                any
+            })
+            .reduce(|| 0, |a, b| a | b);
+        let t3 = std::time::Instant::now();
+        let us = |a: std::time::Instant, b: std::time::Instant| (b - a).as_micros() as u64;
+        self.stats.overlay_parts[0] += us(t0, t1);
+        self.stats.overlay_parts[1] += us(t1, t2);
+        self.stats.overlay_parts[2] += us(t2, t3);
+        self.stats.overlays += 1;
         self.overlay_on = any != 0;
     }
 

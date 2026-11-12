@@ -265,6 +265,8 @@ pub struct MapCore {
     /// Pixels the screen's top-right marks (the compass, the heading and the zoom) move down, below a host's own controls there (the desktop's window buttons, Nick 2026-10-17); 0 on the phone.
     pub marks_top: f32,
     pub last_straddle_blocks: usize,
+    /// The last `plan`'s µs: preparing the view (`prepare`), the plan itself (`plan::plan_frame`), the residency's want; zeros for a plan from the cache.
+    pub plan_us: [u64; 3],
     /// Something changed since the last render (camera, sun, GPS). Reported by `tick` so shells that only draw on demand get a frame.
     dirty: bool,
     /// The cells the last frame wanted and the view's centre it sorted them by: `tick` says them to the residency again while it is unsettled, so the wants go on (the once-a-second resend, the retry of a failed cell) without a frame drawn for them.
@@ -413,6 +415,7 @@ impl MapCore {
             last_trace: None,
             marks_top: 0.0,
             last_straddle_blocks: 0,
+            plan_us: [0; 3],
             dirty: true,
             want_last: (Vec::new(), (0, 0)),
             last_range: ElevRange::EMPTY,
@@ -1475,11 +1478,14 @@ impl MapCore {
                 return p;
             }
         }
+        let t1 = Instant::now();
         let p = Arc::new(plan::plan_frame(w, h, &self.cam, &self.res.pool, self.dem_depth, self.vec_depth, &self.user));
         self.last_straddle_blocks = p.straddle_blocks;
+        let t2 = Instant::now();
         let center = Coord::from_lat_lon(self.cam.lat(), self.cam.lon());
         let (cu, cv) = center.uv();
         self.want_cells(self.with_globe(p.want.clone()), (cu, cv));
+        self.plan_us = [(t1 - t0).as_micros() as u64, (t2 - t1).as_micros() as u64, t2.elapsed().as_micros() as u64];
         self.plan_cache = Some((key, p.clone()));
         self.last_frame_ms = t0.elapsed().as_secs_f32() * 1000.0;
         p
@@ -1633,6 +1639,11 @@ impl MapCore {
         self.draw_compass(w, h);
         self.draw_globe_ring(w, h);
         self.draw_pins(w, h);
+        &self.canvas
+    }
+
+    /// The marks `overlay` drew last, as it left them (empty before the first): for a host that sums them again with a new panel and nothing of theirs changed.
+    pub fn marks_canvas(&self) -> &[u32] {
         &self.canvas
     }
 
