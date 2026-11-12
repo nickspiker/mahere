@@ -81,6 +81,9 @@ impl FluorApp for App {
     fn opaque(&self) -> bool {
         self.gpu.is_some()
     }
+    fn own_baked(&self) -> bool {
+        self.gpu.as_ref().is_some_and(|g| g.baked())
+    }
     fn cursor_for(&self, x: fluor::coord::Coord, y: fluor::coord::Coord, ctx: &Context) -> fluor::event::CursorIcon {
         self.inner.cursor_for(x, y, ctx)
     }

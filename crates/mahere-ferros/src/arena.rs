@@ -347,6 +347,8 @@ pub fn consts(luts: &FrameLuts, plan: &ViewPlan, lay: &Layout, region: usize, ov
         overlay_at: ((lay.regions[region] + kernel::OVERLAY) / 4) as u32,
         region: (lay.regions[region] / 4) as u32,
         out: lay.out,
+        // The display's bake is the frame loop's to set (gpu.rs `prepare`).
+        bake: None,
     }
 }
 

@@ -48,6 +48,8 @@ pub struct GpuMap {
     shown: usize,
     /// A frame has been drawn into a buffer since the layout was made: until then a frame runs at once, so nothing unmade is shown.
     drawn: bool,
+    /// By frame region: whether the frame planned there was made with the display's bake (kernel.rs `Bake`), so the window shows it baked (`baked`).
+    baked: [bool; 2],
     /// The kernels compiled, by their recording's key (valhall `Recording::key`), the most recently used first: a frame of a structure met before binds its params into that one's words (`kernel`).
     kernels: Vec<(u64, valhall::ssa::Compiled)>,
     stats: Stats,
@@ -208,6 +210,7 @@ impl GpuMap {
             next: 0,
             shown: 0,
             drawn: false,
+            baked: [false; 2],
             kernels: Vec::with_capacity(KERNELS),
             stats: Stats::default(),
             report_at: std::time::Instant::now(),
@@ -237,6 +240,11 @@ impl GpuMap {
         self.surfaces.map(|s| s[self.shown].0)
     }
 
+    /// The last finished frame was made with the display's bake (fluor's `own_baked`).
+    pub fn baked(&self) -> bool {
+        self.lay.is_some_and(|l| l.out == kernel::Out::Surface) && self.baked[self.shown]
+    }
+
     /// A frame planned and not yet drawn (the last draw's, pipelined): the host should draw once more, so it reaches the glass when the map comes to rest.
     pub fn owes_frame(&self) -> bool {
         self.ready.is_some()
@@ -250,6 +258,8 @@ impl GpuMap {
         let mut hs = std::collections::hash_map::DefaultHasher::new();
         (w, h, c.lat().to_bits(), c.lon().to_bits(), c.ppd.to_bits(), c.bearing().to_bits(), map.pool_version(), map.style_version(), map.layers().bits()).hash(&mut hs);
         (app.panel.is_open(), app.panel.ru().to_bits(), map.globe_loading().map(|d| d.to_bits()), map.gps.is_some()).hash(&mut hs);
+        // The display's bake: a brightness change plans the frame again with the new one.
+        fluor::host::ferros::bake().map(|b| b.generation).hash(&mut hs);
         hs.finish()
     }
 
@@ -362,7 +372,12 @@ impl GpuMap {
         self.overlay(app, w, h, region);
         let t4 = std::time::Instant::now();
         let ring = app.map.globe_ring(w, h).map(|g| kernel::Ring::from_globe(&g));
-        let c = arena::consts(app.map.luts(), &plan, &lay, region, self.overlay_on, ring);
+        let mut c = arena::consts(app.map.luts(), &plan, &lay, region, self.overlay_on, ring);
+        // Into the surface, the display's bake last when it has one (fluor's ferros host asks it, op 65): the window is then shown baked and the display only dithers it (ferros COMPOSITOR.md "Baked").
+        if lay.out == kernel::Out::Surface {
+            c.bake = fluor::host::ferros::bake().map(|b| kernel::Bake { k: b.k, m: b.m, g: b.g });
+        }
+        self.baked[region] = c.bake.is_some();
         let rec = kernel::recording(&c);
         let t5 = std::time::Instant::now();
         self.kernel(rec);

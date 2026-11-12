@@ -3,7 +3,7 @@
 //! It computes what the CPU raster's `compose_rgb` computes (mahere-engine raster.rs), one sample a pixel at the same place, from the same cells: the terrain's light from its packed normal in the pixel's own frame on the ball, the elevation tint (sea, seabed, hypsometric or flat), land cover, the waterways under the water, the water, the other lines over it, the contours, the dark loading mesh where no cell stands in, the background off the globe; then the globe's loading ring from its numbers (`Ring`) and the panel and the screen's marks in front of it all (a resident layer in the arena, `Panel::overlay_rgba`'s premultiplied sum, updated by the box that changed), composed front to back.
 //! Not yet here (the CPU path still has them): imagery, land ownership and motor vehicle use, the user's ink and selection, slope bands, raw elevation, the detail tint, and a terrain texel with no data climbing to its parent (it draws the background).
 //!
-//! What it writes, either way the light unconverted: the display's own working values straight into the app's surface (`Out::Surface`: gamma 2, white at 2^14, opaque; where the GPU's fence admits the apps' surfaces, ferros since 2026-11-11), the frame then on the panel with no copy on the CPU; or fluor's 8-bit pixels (`Out::Argb8`, α and darkness) in the arena, the light as a VSF `g2t` code (256 · tanh √light), which fluor's ferros host turns into working values exactly as it turns its own.
+//! What it writes: the display's own working values straight into the app's surface (`Out::Surface`: gamma 2, white at 2^14, opaque; where the GPU's fence admits the apps' surfaces, ferros since 2026-11-11), the frame then on the panel with no copy on the CPU, and with the display's bake (`Bake`, ferros COMPOSITOR.md "Baked", since 2026-11-12) those values made the panel's own codes as the last step, so the display only dithers them; or fluor's 8-bit pixels (`Out::Argb8`, α and darkness) in the arena, the light as a VSF `g2t` code (256 · tanh √light), which fluor's ferros host turns into working values exactly as it turns its own.
 //! The CPU path's encode (the BT.2020 matrix, exposure 2/3 into Opsin's rail, then √) is the Android and Linux surfaces' contract; ferros's panel is VSF RGB in its root space and rolls its own highlights, so the light goes to it unconverted.
 //!
 //! What a frame chooses (the layer mask, one face or several, the fold, the ring, the overlay, the output) is the recording's structure: it carries no code for what the frame leaves off. What a frame holds still (the light, the sun, the ball's pole and disk, the camera, the face's row, the contour interval, the inks, the depths, where its tables are) is a param of the recording (valhall `ssa::param`): placed as a constant (a uniform word, or an immediate), never folded into the words, so two frames of one structure have the same words and gpu.rs compiles each structure once and binds each frame's values into it (`record` and `recording`; ferros GPU-KISTS.md, after the fourth pass: recording and compiling every frame was 0.33 to 0.47 ms of Mahere's CPU).
@@ -115,6 +115,8 @@ pub struct Consts {
     pub region: u32,
     /// What the kernel writes, and where (uniform 0).
     pub out: Out,
+    /// Into the surface (`Out::Surface`), the display's bake applied last, so the window is shown baked; None, the working values as before (a display that does not bake).
+    pub bake: Option<Bake>,
 }
 
 /// The globe's loading ring (mahere-engine `GlobeRing`): its centre, radius and half width in screen pixels, the end of its sweep from the top clockwise as (sin, cos), whether the sweep passes half a turn, its colour (gamma-2 bytes, as the marks').
@@ -137,6 +139,14 @@ impl Ring {
     fn alpha(&self) -> f32 {
         self.rgb[0].max(self.rgb[1]).max(self.rgb[2]) as f32 / 255.
     }
+}
+
+/// The ferros display's bake (its op 65 thru fluor's ferros host, `fluor::host::ferros::bake`; ferros COMPOSITOR.md "Baked"): with it the kernel's last step makes the surface's working values the panel's own codes, so the display only dithers the frame (owner, 2026-11-12: Mahere's GPU kernel "ends with the matrix + tanh"). Per channel of a working value v (white 1): l = tanh²(k·v); the panel's light p = m·l (rows its red, green, blue); its code p^g × 65472 in Q16.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Bake {
+    pub k: f32,
+    pub m: [[f32; 3]; 3],
+    pub g: f32,
 }
 
 /// The kernel's output.
@@ -331,6 +341,20 @@ pub fn recording(c: &Consts) -> ssa::Recording {
                     *x = x.mul_add(keep, tab(k as u32)).min(F::splat(65535.));
                 }
                 out
+            });
+        }
+        if let Some(b) = &c.bake {
+            // The bake, last (ferros COMPOSITOR.md "Baked"): the light rolled off as the display's, tanh²(k·v) with tanh s = 1 − 2 / (1 + e^2s) on the special function unit (as `g2t`), the panel's matrix, its code p^g = 2^(g · log₂ p), Q16 of the top code 65472. WHY the max: a channel's light at or under 0 (a colour past the panel's primaries on that channel) has no logarithm, and the special function unit's answer for it is not a promise; at 2^-60 its code is 0 all the same. WHY the min: a code past 65535 would carry into the next channel's bits (a light past the panel's peak, VSF red on the panel's red), the top as the display's own bake holds it.
+            let k = pf(b.k * (1. / 16384.));
+            let l = v.map(|x| {
+                let e = (x * k * (2. * core::f32::consts::LOG2_E)).exp2_hw();
+                let t = F::splat(1.) - F::splat(2.) * (e + 1.).rcp();
+                t * t
+            });
+            let (m, g) = (b.m.map(pf3), pf(b.g));
+            v = core::array::from_fn(|r| {
+                let p = l[0].mul_add(m[r][0], l[1].mul_add(m[r][1], l[2] * m[r][2]));
+                ((p.max(F::splat(1. / (1u64 << 60) as f32)).log2_hw() * g).exp2_hw() * 65472.).min(F::splat(65535.))
             });
         }
         let q = |x: F| x.to_u32();

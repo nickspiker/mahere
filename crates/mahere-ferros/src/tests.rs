@@ -477,3 +477,37 @@ fn issued_a_warp() {
         surface(&kernel::record(&arena::consts(&luts, &plan, &lay, 0, false, None)), &words, w, h);
     }
 }
+
+/// The display's bake as the kernel's last step (ferros COMPOSITOR.md "Baked"): every pixel of a town's view, made baked, is the f64 bake of the same pixel made unbaked (l = tanh²(k·v), p = m·l, p^g × 65472, held at the field's ends), within a sixteenth of a code of the 8-bit link and a 512th of the code, husky's ODT at a white about a ninth of the E peak.
+#[test]
+fn the_kernel_bakes_as_the_display_does() {
+    let (w, h) = (96usize, 80usize);
+    let cam = Camera::new(46.2, -121.5, 6000.0, 0.7);
+    let d = select_depth(6000.0, 0, 14);
+    let mut pool = Pool::default();
+    for (n, k) in plan_view(w, h, &cam, &pool, d, d).want.iter().enumerate() {
+        pool.map.insert(*k, cell(n as u32 * 7919));
+    }
+    let plan = plan_view(w, h, &cam, &pool, d, d);
+    let luts = luts(&plan, &cam, LayerMask::default());
+    let lay = Layout::new(w, h, BYTES, kernel::Out::Surface).unwrap();
+    let mut words = vec![0u32; BYTES / 4];
+    arena::view(&mut Slots::new(lay.slots), &pool, &plan, 1, &lay, 0, &mut words).unwrap();
+    arena::tables(&luts, &plan, true, &lay, 0, &mut words);
+    let plain = arena::consts(&luts, &plan, &lay, 0, false, None);
+    let bake = kernel::Bake { k: 0.113f32.sqrt().atanh(), m: [[1.359550, -0.372458, 0.012909], [-0.098444, 0.863965, -0.026116], [0.001826, -0.001101, 0.816481]], g: 1. / 2.19 };
+    let working = surface(&kernel::record(&plain), &words, w, h);
+    let baked = surface(&kernel::record(&kernel::Consts { bake: Some(bake), ..plain }), &words, w, h);
+    let mut worst = 0f64;
+    for (v, b) in working.iter().zip(&baked) {
+        let l = v.map(|x| ((bake.k as f64) * (x as f64 / 16384.)).tanh().powi(2));
+        for r in 0..3 {
+            let p: f64 = (0..3).map(|j| bake.m[r][j] as f64 * l[j]).sum();
+            let want = if p > 0. { (p.powf(bake.g as f64) * 65472.).min(65535.) } else { 0. };
+            let d = (b[r] as f64 - want).abs();
+            worst = worst.max(d);
+            assert!(d <= 16. + want / 512., "working {v:?} channel {r}: {} against {want:.1}", b[r]);
+        }
+    }
+    println!("baked against the f64 bake: the largest difference {worst:.1} of 65472");
+}
