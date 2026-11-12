@@ -14,6 +14,7 @@ path = "src/main.rs"
 [target.'cfg(target_os = "ferros")'.dependencies]
 mahere-device = { path = "../mahere-device" }
 mahere-engine = { path = "../mahere-engine" }
+mahere-coord = { path = "../mahere-coord" }
 mahere-store = { path = "../mahere-store" }
 mahere-tiles = { path = "../mahere-tiles" }
 mahere-panel = { path = "../mahere-panel" }

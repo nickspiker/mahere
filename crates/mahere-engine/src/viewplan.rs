@@ -103,6 +103,8 @@ pub struct ViewPlan {
     /// The globe's disk (centre x, y, radius in pixels, whether the limb is on the screen) and the world's pole in view coordinates, as `FramePlan` has them.
     pub globe: [f32; 4],
     pub pole: [f32; 4],
+    /// The camera's basis, rows the view's axes in the world (`Camera::basis`): view = basis · world.
+    pub basis: [[f64; 3]; 3],
     /// The points projected: the lattice's, the edges', the corners of faces on the screen.
     pub samples: usize,
     /// Where the plan's time went, µs: the faces and the points, the desired set, the boxes and their stand-ins, the elevation range.
@@ -188,6 +190,7 @@ pub fn plan_view(w: usize, h: usize, cam: &Camera, pool: &Pool, dem_depth: u8, v
             let b = cam.basis();
             [b[0][2] as f32, b[1][2] as f32, b[2][2] as f32, 0.0]
         },
+        basis: cam.basis(),
         samples: 0,
         us: [0; 4],
     };

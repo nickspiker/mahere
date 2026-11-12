@@ -378,6 +378,51 @@ fn centroid(verts: &[usize; 3]) -> [f64; 3] {
     [a[0] + b[0] + c[0], a[1] + b[1] + c[1], a[2] + b[2] + c[2]]
 }
 
+/// The encoder's face found by folding instead of a search over twenty (Mahere's GPU map on ferros: at the globe its kernel compared up to 15 faces a pixel).
+/// Turned so its vertices are (0, ±1, ±φ) and their cyclic turns, the icosahedron's face centres are the dodecahedron (±1, ±1, ±1) and three golden rectangles, a set each axis's reflection keeps: so the centre nearest a direction q has the signs of q and is the nearest of four to |q| (`centres`), and the octant of q and the one of four name the face (`face`).
+#[derive(Clone, Copy, Debug)]
+pub struct FaceFold {
+    /// The encoder's frame into the fold's: a rotation, rows the fold's axes.
+    pub turn: [[f64; 3]; 3],
+    /// The four face centres in the positive octant, unit vectors, in the fold's frame.
+    pub centres: [[f64; 3]; 4],
+    /// The face (0 to 19, [`face_map`]'s) by `octant << 2 | k`: octant bit 0 set for q's x below 0, bit 1 its y, bit 2 its z; k the nearest of `centres` to |q|.
+    pub face: [u8; 32],
+}
+
+/// The fold (`FaceFold`): the rotation taking vertex 0 to (0, 1, φ) and vertex 1 to its neighbour (0, −1, φ) (any directed edge onto any other is one of the solid's rotations), then each face's centre there.
+pub fn face_fold() -> FaceFold {
+    let phi = (1. + 5f64.sqrt()) / 2.;
+    // An orthonormal frame from a vertex and a neighbour: the vertex, the neighbour square to it, their cross.
+    let frame = |a: [f64; 3], b: [f64; 3]| {
+        let d = dot(a, b);
+        let e = normalize([b[0] - d * a[0], b[1] - d * a[1], b[2] - d * a[2]]);
+        [a, e, cross(a, e)]
+    };
+    let from = frame(VERTICES[0], VERTICES[1]);
+    let to = frame(normalize([0., 1., phi]), normalize([0., -1., phi]));
+    // turn = Σ to_k ⊗ from_k: from_k onto to_k.
+    let turn: [[f64; 3]; 3] = core::array::from_fn(|i| core::array::from_fn(|j| (0..3).map(|k| to[k][i] * from[k][j]).sum()));
+    let apply = |p: [f64; 3]| [dot(turn[0], p), dot(turn[1], p), dot(turn[2], p)];
+    let centre = |f: usize| normalize(apply(centroid(&FACES[f].0)));
+    let near = |a: [f64; 3], b: [f64; 3]| (0..3).all(|k| (a[k] - b[k]).abs() < 1e-9);
+    let mut centres: Vec<[f64; 3]> = Vec::with_capacity(4);
+    for f in 0..FACE_COUNT {
+        let a = centre(f).map(f64::abs);
+        if !centres.iter().any(|&c| near(c, a)) {
+            centres.push(a);
+        }
+    }
+    assert_eq!(centres.len(), 4, "the turned icosahedron's face centres fold to four");
+    let centres: [[f64; 3]; 4] = centres.try_into().unwrap();
+    let face = core::array::from_fn(|e| {
+        let (o, k) = (e >> 2, e & 3);
+        let want: [f64; 3] = core::array::from_fn(|i| if o >> i & 1 == 1 { -centres[k][i] } else { centres[k][i] });
+        (0..FACE_COUNT).find(|&f| near(centre(f), want)).expect("every octant's four centres are faces") as u8
+    });
+    FaceFold { turn, centres, face }
+}
+
 /// Gnomonic projection of direction `p` onto the plane of triangle `verts`, returned as barycentric (s, t): fp = A + s·(B−A) + t·(C−A).
 fn gnomonic_barycentric(p: [f64; 3], verts: [usize; 3]) -> (f64, f64) {
     let (a, b, c) = (VERTICES[verts[0]], VERTICES[verts[1]], VERTICES[verts[2]]);
@@ -429,6 +474,38 @@ fn cross(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The fold turns vertices onto the posed icosahedron's, and finds the encoder's face for 2^16 directions all over the ball.
+    #[test]
+    fn the_fold_finds_the_encoders_face() {
+        let fold = face_fold();
+        let phi = (1. + 5f64.sqrt()) / 2.;
+        let apply = |p: [f64; 3]| [dot(fold.turn[0], p), dot(fold.turn[1], p), dot(fold.turn[2], p)];
+        for v in VERTICES {
+            let t = apply(v).map(|x| x * (1. + phi * phi).sqrt());
+            let mut a = t.map(f64::abs);
+            // (0, 1, φ) turned cyclically: its zero, then 1, then φ, in that order round the axes.
+            let z = (0..3).position(|k| a[k] < 1e-9).expect("a vertex has a zero coordinate");
+            a.rotate_left(z);
+            assert!((a[1] - 1.).abs() < 1e-9 && (a[2] - phi).abs() < 1e-9, "vertex {v:?} turned to {t:?}");
+        }
+        let mut h = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = || {
+            h ^= h << 13;
+            h ^= h >> 7;
+            h ^= h << 17;
+            (h >> 11) as f64 / (1u64 << 53) as f64 * 2. - 1.
+        };
+        for _ in 0..1 << 16 {
+            let p = [next(), next(), next()];
+            let best = (0..FACE_COUNT).max_by(|&a, &b| dot(centroid(&FACES[a].0), p).total_cmp(&dot(centroid(&FACES[b].0), p))).unwrap();
+            let q = apply(p);
+            let a = q.map(f64::abs);
+            let k = (0..4).max_by(|&i, &j| dot(fold.centres[i], a).total_cmp(&dot(fold.centres[j], a))).unwrap();
+            let o = (q[0] < 0.) as usize | ((q[1] < 0.) as usize) << 1 | ((q[2] < 0.) as usize) << 2;
+            assert_eq!(fold.face[o << 2 | k] as usize, best, "direction {p:?}");
+        }
+    }
 
     fn ground_error_m(lat: f64, lon: f64, coord: Coord) -> f64 {
         let (phi, lam) = (lat.to_radians(), lon.to_radians());

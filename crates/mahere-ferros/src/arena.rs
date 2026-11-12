@@ -6,6 +6,8 @@ use mahere_engine::plan::NONE;
 use mahere_engine::viewplan::ViewPlan;
 use mahere_engine::raster::{FrameLuts, alpha, is_boundary, line_min_depth, rgb3};
 use mahere_engine::residency::Pool;
+use mahere_engine::PixelBox;
+use mahere_coord::{FACE_COUNT, FaceFold, face_fold, face_map};
 use mahere_tiles::{CellKey, TRI};
 
 /// A cell plane's slot: 131072 texels of 8 bytes.
@@ -155,12 +157,21 @@ pub fn view(slots: &mut Slots, pool: &Pool, plan: &ViewPlan, version: u64, lay: 
         }
         at += t.squares.len();
     }
-    let (faces, n, _) = faces(plan, lay, region);
-    if n > 1 {
-        let at = base + kernel::FACES / 4;
-        for (j, f) in faces[..n].iter().enumerate() {
-            arena[at + j * kernel::FACE_WORDS..at + (j + 1) * kernel::FACE_WORDS].copy_from_slice(&f.row);
+    let (faces, n, _, fold) = faces(plan, lay, region);
+    let at = base + kernel::FACES / 4;
+    match fold {
+        // By fold: a row for each octant and centre, its face's.
+        Some((_, rows)) => {
+            for (e, &j) in rows.iter().enumerate() {
+                arena[at + e * kernel::FACE_WORDS..at + (e + 1) * kernel::FACE_WORDS].copy_from_slice(&faces[j as usize].row);
+            }
         }
+        None if n > 1 => {
+            for (j, f) in faces[..n].iter().enumerate() {
+                arena[at + j * kernel::FACE_WORDS..at + (j + 1) * kernel::FACE_WORDS].copy_from_slice(&f.row);
+            }
+        }
+        None => {}
     }
     Ok(())
 }
@@ -170,7 +181,8 @@ const NEAR_COS: f64 = 0.64;
 
 /// The faces in view as the kernel takes them, how many, and whether in the near form (`kernel::Consts::near`): each face's centroid and score offset, its (u, v) coefficients, its loading-mesh seed and its boxes, for frame region `region`.
 /// A face whose diamond has no box (a sliver of it at the screen's edge holding none of the plan's points) is left out: its pixels take a neighbour's face, held inside that diamond.
-pub fn faces(plan: &ViewPlan, lay: &Layout, region: usize) -> ([kernel::FaceConsts; kernel::MAX_FACES], usize, bool) {
+/// Far from the camera point with more than `FOLD_FROM` faces, the fold too: its constants and each of its rows' face (an index into the faces).
+pub fn faces(plan: &ViewPlan, lay: &Layout, region: usize) -> ([kernel::FaceConsts; kernel::MAX_FACES], usize, bool, Option<(kernel::Fold, [u8; kernel::FOLD_ROWS])>) {
     let units = (1u64 << 30) as f64;
     let kept: Vec<_> = plan.faces.iter().filter(|f| plan.roles[0].boxes[f.diamond as usize].is_some()).collect();
     let len = |v: [f64; 3]| (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
@@ -216,8 +228,30 @@ pub fn faces(plan: &ViewPlan, lay: &Layout, region: usize) -> ([kernel::FaceCons
             o.row[at..at + kernel::F_BOX_WORDS].copy_from_slice(&[b.cu0, b.cv0, b.w, b.h, (starts[role] + b.at as usize) as u32]);
         }
     }
-    (out, kept.len(), near)
+    let fold = (!near && kept.len() > FOLD_FROM).then(|| {
+        // The fold's frame on view coordinates: view = basis · world, so world = basisᵀ · view, and the fold's turn after it.
+        // The fold and the faces' centres in the world, made once (each frame's twice was 115 us of the 8a's planning at the globe).
+        static FOLD: std::sync::OnceLock<(FaceFold, [[f64; 3]; FACE_COUNT])> = std::sync::OnceLock::new();
+        let (fd, world) = FOLD.get_or_init(|| (face_fold(), core::array::from_fn(|f| face_map(f).centroid)));
+        let b = plan.basis;
+        let turn = core::array::from_fn(|i| core::array::from_fn(|j| (0..3).map(|k| fd.turn[i][k] * b[j][k]).sum::<f64>() as f32));
+        let centres = fd.centres.map(|c| c.map(|x| x as f32));
+        // Each row's face, or for a face out of view (or a sliver with no box) the face in view whose centre is nearest its centre: a neighbour across the edge its pixels lie along.
+        let rows = fd.face.map(|f| {
+            let c = world[f as usize];
+            let dot = |j: usize| {
+                let k = world[kept[j].face as usize];
+                c[0] * k[0] + c[1] * k[1] + c[2] * k[2]
+            };
+            (0..kept.len()).max_by(|&a, &b| dot(a).total_cmp(&dot(b))).unwrap() as u8
+        });
+        (kernel::Fold { turn, centres }, rows)
+    });
+    (out, kept.len(), near, fold)
 }
+
+/// More faces in view than this, far from the camera point: the faces are found by fold (`kernel::Fold`: about 35 instructions a pixel, the search about six a face).
+const FOLD_FROM: usize = 1 << 2;
 
 /// The line and land tables (the line gates follow the depth and the mask, so every frame), and the hypsometric ramp when `ramp`, in frame region `region`.
 pub fn tables(luts: &FrameLuts, plan: &ViewPlan, ramp: bool, lay: &Layout, region: usize, arena: &mut [u32]) {
@@ -254,7 +288,7 @@ pub fn tables(luts: &FrameLuts, plan: &ViewPlan, ramp: bool, lay: &Layout, regio
 }
 
 /// The frame's constants for the kernel, its tables and overlay in frame region `region`.
-pub fn consts(luts: &FrameLuts, plan: &ViewPlan, lay: &Layout, region: usize, overlay: bool) -> Consts {
+pub fn consts(luts: &FrameLuts, plan: &ViewPlan, lay: &Layout, region: usize, overlay: bool, ring: Option<kernel::Ring>) -> Consts {
     let st = &luts.style;
     let l3 = |c: [u8; 4]| lin(rgb3(c));
     let l4 = |c: [u8; 4]| {
@@ -262,7 +296,8 @@ pub fn consts(luts: &FrameLuts, plan: &ViewPlan, lay: &Layout, region: usize, ov
         [l[0], l[1], l[2], alpha(c)]
     };
     let d = plan.dem_depth;
-    let (faces, face_count, near) = faces(plan, lay, region);
+    let (faces, face_count, near, fold) = faces(plan, lay, region);
+    let fold = fold.map(|f| f.0);
     let k = 1. / plan.radius;
     Consts {
         w: lay.w as u32,
@@ -271,6 +306,7 @@ pub fn consts(luts: &FrameLuts, plan: &ViewPlan, lay: &Layout, region: usize, ov
         faces,
         face_count,
         faces_at: ((lay.regions[region] + kernel::FACES) / 4) as u32,
+        fold,
         dem_depth: plan.dem_depth as u32,
         vec_depth: plan.vec_depth as u32,
         mask: luts.mask.bits(),
@@ -299,9 +335,60 @@ pub fn consts(luts: &FrameLuts, plan: &ViewPlan, lay: &Layout, region: usize, ov
         } else {
             200
         },
+        ring,
         overlay,
         overlay_at: ((lay.regions[region] + kernel::OVERLAY) / 4) as u32,
         region: (lay.regions[region] / 4) as u32,
         out: lay.out,
     }
+}
+
+/// The overlay's words over box `b` of a `w`-wide screen, the rest of `out` (a screen's words) untouched: the panel's pixels (fluor's; None when it has none) in front of the marks (0xRRGGBB over black, a mark's brightest channel its opacity), premultiplied RGBA bytes, the box's rows in bands on every core.
+pub fn overlay_sum(marks: &[u32], panel: Option<&[u32]>, w: usize, b: PixelBox, out: &mut [u32]) {
+    use rayon::prelude::*;
+    if b.is_empty() {
+        return;
+    }
+    out[b.y0 * w..b.y1 * w].par_chunks_mut(w << 4).enumerate().for_each(|(band, rows)| {
+        for (k, row) in rows.chunks_mut(w).enumerate() {
+            let at = (b.y0 + (band << 4) + k) * w;
+            for x in b.x0..b.x1 {
+                let i = at + x;
+                let (m, p) = (marks[i], panel.map_or(0, |p| p[i]));
+                if m == 0 && p >> 24 == 0 {
+                    row[x] = 0;
+                    continue;
+                }
+                let (mr, mg, mb) = ((m >> 16) & 255, (m >> 8) & 255, m & 255);
+                let ma = mr.max(mg).max(mb);
+                let (r, g, bl, a) = if p >> 24 == 0 { (0, 0, 0, 0) } else { mahere_panel::Panel::premul_pub(p) };
+                let keep = 255 - a as u32;
+                let ch = |c: u8, under: u32| c as u32 + under * keep / 255;
+                row[x] = ch(r, mr) | ch(g, mg) << 8 | ch(bl, mb) << 16 | ch(a, ma) << 24;
+            }
+        }
+    });
+}
+
+/// The box of the panel's pixels that show anything (opacity above zero), rows in bands on every core: what a repainted panel can have changed, with the box it had before.
+pub fn panel_box(panel: &[u32], w: usize) -> PixelBox {
+    use rayon::prelude::*;
+    panel
+        .par_chunks(w << 4)
+        .enumerate()
+        .map(|(band, rows)| {
+            let mut b = PixelBox::EMPTY;
+            for (k, row) in rows.chunks(w).enumerate() {
+                // Most rows show nothing: the row's words or'd together (vectorised) say so before any search.
+                if row.iter().fold(0, |a, p| a | p) >> 24 == 0 {
+                    continue;
+                }
+                let x0 = row.iter().position(|p| p >> 24 != 0).unwrap();
+                let x1 = row.iter().rposition(|p| p >> 24 != 0).unwrap() + 1;
+                let y = (band << 4) + k;
+                b = b.union(PixelBox { x0, y0: y, x1, y1: y + 1 });
+            }
+            b
+        })
+        .reduce(|| PixelBox::EMPTY, PixelBox::union)
 }

@@ -12,6 +12,7 @@
 use crate::arena::{self, Layout, Slots};
 use crate::kernel;
 use mahere_device::{DeviceApp, NoGpu};
+use mahere_engine::PixelBox;
 
 /// Mahere's block of the arena in the GPU's address space (ferros_sys::gpu `ARENA_VA`), and the most it can be: 128 MiB, the whole arena. A kernel that cannot say a region's size (before ferros 2026-11-11) gave the whole 64 MiB arena and fenced no surface in for the GPU.
 const ARENA_VA: u64 = 0x8000_0000;
@@ -31,11 +32,15 @@ pub struct GpuMap {
     pipelined: bool,
     lay: Option<Layout>,
     slots: Slots,
-    /// By frame region: the style its ramp was written for, what its overlay shows (the panel's and the marks' keys) and whether it has any.
+    /// By frame region: the style its ramp was written for.
     style: [Option<u64>; 2],
-    overlay_key: [Option<u64>; 2],
-    marks_key: [Option<u64>; 2],
-    overlay_on: [bool; 2],
+    /// What the overlay shows (the panel's and the marks' keys), the box the panel's pixels cover, and whether the overlay holds anything.
+    panel_key: Option<u64>,
+    marks_key: Option<u64>,
+    panel_box: PixelBox,
+    overlay_on: bool,
+    /// By frame region: the box of the overlay that changed since that region's copy was last summed (each region's copy is a resident layer in the arena, updated by this box alone).
+    stale: [PixelBox; 2],
     /// The frame planned and recorded by the last draw and not yet run (pipelined).
     ready: Option<Ready>,
     /// The region (and buffer) the next frame is planned into, and the one the last finished frame is in.
@@ -120,7 +125,7 @@ struct Stats {
     wait_us: u64,
     words: usize,
     nodes: usize,
-    /// Overlays painted (of them the panel painted again, the marks drawn again), and their µs: the panel, the marks, the sum into the arena.
+    /// Overlay boxes summed into the arena, the panels and the marks painted again, and their µs over the report: the panel (painted, its box found), the marks, the sums.
     overlays: u64,
     /// The plan's µs: preparing the view, the plan itself, the residency's want (`MapCore::plan_us`).
     plan_parts: [u64; 3],
@@ -134,6 +139,10 @@ struct Stats {
     panels: u64,
     marks: u64,
     overlay_parts: [u64; 3],
+    /// Overlay pixels summed into the arena, all the sums together.
+    summed: u64,
+    /// Of the panel's µs, finding the box its pixels cover.
+    panel_box_us: u64,
 }
 
 impl GpuMap {
@@ -179,9 +188,11 @@ impl GpuMap {
             lay: None,
             slots: Slots::new(0),
             style: [None; 2],
-            overlay_key: [None; 2],
-            marks_key: [None; 2],
-            overlay_on: [false; 2],
+            panel_key: None,
+            marks_key: None,
+            panel_box: PixelBox::EMPTY,
+            overlay_on: false,
+            stale: [PixelBox::EMPTY; 2],
             ready: None,
             next: 0,
             shown: 0,
@@ -239,8 +250,11 @@ impl GpuMap {
             println!("mahere: GPU layout for {w} x {h}: two frame regions of {} MiB, the overlay at {} MiB in each, the code at {} MiB, {} cell slots of 1 MiB from {} MiB", l.regions[1] >> 20, kernel::OVERLAY >> 20, l.code_at >> 20, l.slots, l.slots_at >> 20);
             self.slots = Slots::new(l.slots);
             self.lay = Some(l);
-            self.overlay_key = [None; 2];
-            self.marks_key = [None; 2];
+            // Both regions' overlays made whole once, from the panel and marks painted afresh.
+            self.panel_key = None;
+            self.marks_key = None;
+            self.panel_box = PixelBox::EMPTY;
+            self.stale = [PixelBox::screen(w, h); 2];
             self.style = [None; 2];
             self.ready = None;
             self.drawn = false;
@@ -305,8 +319,8 @@ impl GpuMap {
             let n = s.frames.max(1);
             let lay = self.lay.unwrap();
             println!(
-                "mahere: GPU {} frames: the kernel {} us a frame on the GPU (longest {}), {} words from {} nodes, {} faces in view ({}), {} squares, {} points; host per frame: plan {} us (view {}, plan {} [faces and points {}, desired {}, boxes and stand-ins {}, range {}], want {}), page table {} us, tables {} us, overlay {} us, record and compile {} us, the call {} us, the wait for the GPU's frame {} us; {} overlays painted ({} panels, {} marks; panel {} us, marks {} us, sum {} us each); {} cell planes written so far, {} wanted with no slot free ({} slots)",
-                s.frames, s.gpu_us / n, s.gpu_max, s.words, s.nodes, s.faces, if s.near { "near" } else { "far" }, s.squares, s.samples, s.plan_us / n, s.plan_parts[0] / n, s.plan_parts[1] / n, s.plan_inner[0] / n, s.plan_inner[1] / n, s.plan_inner[2] / n, s.plan_inner[3] / n, s.plan_parts[2] / n, s.table_us / n, s.luts_us / n, s.overlay_us / n, s.compile_us / n, s.call_us / n, s.wait_us / n, s.overlays, s.panels, s.marks, s.overlay_parts[0] / s.overlays.max(1), s.overlay_parts[1] / s.overlays.max(1), s.overlay_parts[2] / s.overlays.max(1), self.slots.written, self.slots.starved, lay.slots
+                "mahere: GPU {} frames: the kernel {} us a frame on the GPU (longest {}), {} words from {} nodes, {} faces in view ({}), {} squares, {} points; host per frame: plan {} us (view {}, plan {} [faces and points {}, desired {}, boxes and stand-ins {}, range {}], want {}), page table {} us, tables {} us, overlay {} us, record and compile {} us, the call {} us, the wait for the GPU's frame {} us; the overlay a frame: panel {} us, marks {} us, sum {} us; {} panels painted ({} us each, {} of it finding its box), {} marks ({} us each), {} boxes summed ({} pixels and {} us each); {} cell planes written so far, {} wanted with no slot free ({} slots)",
+                s.frames, s.gpu_us / n, s.gpu_max, s.words, s.nodes, s.faces, if s.near { "near" } else { "far" }, s.squares, s.samples, s.plan_us / n, s.plan_parts[0] / n, s.plan_parts[1] / n, s.plan_inner[0] / n, s.plan_inner[1] / n, s.plan_inner[2] / n, s.plan_inner[3] / n, s.plan_parts[2] / n, s.table_us / n, s.luts_us / n, s.overlay_us / n, s.compile_us / n, s.call_us / n, s.wait_us / n, s.overlay_parts[0] / n, s.overlay_parts[1] / n, s.overlay_parts[2] / n, s.panels, s.overlay_parts[0] / s.panels.max(1), s.panel_box_us / s.panels.max(1), s.marks, s.overlay_parts[1] / s.marks.max(1), s.overlays, s.summed / s.overlays.max(1), s.overlay_parts[2] / s.overlays.max(1), self.slots.written, self.slots.starved, lay.slots
             );
             self.stats = Stats::default();
         }
@@ -335,7 +349,8 @@ impl GpuMap {
         let t3 = std::time::Instant::now();
         self.overlay(app, w, h, region);
         let t4 = std::time::Instant::now();
-        let c = arena::consts(app.map.luts(), &plan, &lay, region, self.overlay_on[region]);
+        let ring = app.map.globe_ring(w, h).map(|g| kernel::Ring::from_globe(&g));
+        let c = arena::consts(app.map.luts(), &plan, &lay, region, self.overlay_on, ring);
         let k = kernel::record(&c);
         if k.words.len() > arena::CODE_WORDS {
             return Err(format!("the map kernel is {} words, more than the GPU service's {}", k.words.len(), arena::CODE_WORDS));
@@ -363,7 +378,7 @@ impl GpuMap {
         Ok(Ready { region, msg, words: k.words.len(), nodes: k.kept, key })
     }
 
-    /// The panel and the screen's marks (compass, pins, the globe's loading ring, the GPS) as the overlay, painted again when what they show changed.
+    /// The panel and the screen's marks (compass, pins, the GPS) as the overlay, a resident layer in each frame region: painted again only when what they show changed, and only the box that changed summed into the region's copy. The globe's loading ring is the kernel's own (`kernel::Ring`), so it is not here.
     fn overlay(&mut self, app: &mut DeviceApp<NoGpu>, w: usize, h: usize, region: usize) {
         use std::hash::{Hash, Hasher};
         let map = &app.map;
@@ -373,11 +388,11 @@ impl GpuMap {
             f(&mut hs);
             hs.finish()
         };
-        // What the marks show (`MapCore::overlay`: the compass, the GPS, the pins, the globe's loading ring), and what the panel shows (its rows, its readouts, the zoom and the contours' spacing); each painted again only when its own changed.
+        // What the marks show (`MapCore::overlay_marks`: the compass with its heading and zoom, the GPS, the pins), and what the panel shows (its rows, its readouts, the zoom and the contours' spacing); each painted again only when its own changed.
         let pinned = map.gps.is_some() || [map.pin_a, map.pin_b, map.nav_to, map.found_at].iter().any(|p| p.is_some());
         let marks_key = hash(&|hs| {
             // The bearing as the compass can show it (2^-8 radians turn its arrow's tip a tenth of a pixel): the two-finger solve moves it by less every frame, and each was a repaint.
-            (w, h, (c.bearing() * (1u32 << 8) as f64).round() as i64, map.globe_loading().map(|d| (d * 64.0) as u32)).hash(hs);
+            (w, h, (c.bearing() * (1u32 << 8) as f64).round() as i64, map.zoom_depth(), map.past_data(), map.layers().bits()).hash(hs);
             if pinned {
                 (c.lat().to_bits(), c.lon().to_bits(), c.ppd.to_bits()).hash(hs);
             }
@@ -388,63 +403,49 @@ impl GpuMap {
                 (c.lat().to_bits(), c.lon().to_bits(), c.ppd.to_bits(), c.bearing().to_bits()).hash(hs);
             }
         });
-        // Each region's overlay keeps what it showed: a change painted into one region is painted into the other when its next frame comes.
-        let (marks_new, panel_new) = (self.marks_key[region] != Some(marks_key), self.overlay_key[region] != Some(panel_key));
-        if !marks_new && !panel_new {
-            return;
-        }
-        self.marks_key[region] = Some(marks_key);
-        self.overlay_key[region] = Some(panel_key);
         let t0 = std::time::Instant::now();
-        if panel_new {
+        // A change goes into both regions' stale boxes: this region's copy is brought up to date now, the other's when its next frame comes.
+        let mut changed = PixelBox::EMPTY;
+        if self.panel_key != Some(panel_key) {
+            self.panel_key = Some(panel_key);
             app.paint_panel(w, h);
+            let p = app.panel.pixels();
+            let tb = std::time::Instant::now();
+            let b = if p.len() == w * h { arena::panel_box(p, w) } else { PixelBox::EMPTY };
+            self.stats.panel_box_us += tb.elapsed().as_micros() as u64;
+            changed = changed.union(self.panel_box).union(b);
+            self.panel_box = b;
             self.stats.panels += 1;
         }
         let t1 = std::time::Instant::now();
-        let marks = if marks_new {
+        if self.marks_key != Some(marks_key) {
+            self.marks_key = Some(marks_key);
+            changed = changed.union(app.map.overlay_marks(w, h, true, false).1);
             self.stats.marks += 1;
-            app.map.overlay(w, h, true)
-        } else {
-            app.map.marks_canvas()
-        };
+        }
         let t2 = std::time::Instant::now();
-        // The panel's pixels with the marks under them (`Panel::overlay_rows`' sum, premultiplied RGBA bytes), straight into the arena, bands of rows on every core: one thread over the screen's 4 Mpx was 62 ms of every frame on the Pro (2026-11-11).
-        let panel = app.panel.pixels();
-        let panel = (panel.len() == w * h).then_some(panel);
-        let at = self.lay.unwrap().regions[region] + kernel::OVERLAY;
-        let out = unsafe { core::slice::from_raw_parts_mut(self.arena.add(at / 4), w * h) };
-        use rayon::prelude::*;
-        let any = out
-            .par_chunks_mut(w << 6)
-            .enumerate()
-            .map(|(band, rows)| {
-                let at = band * (w << 6);
-                let mut any = 0u32;
-                for (k, o) in rows.iter_mut().enumerate() {
-                    let i = at + k;
-                    let (m, p) = (marks[i], panel.map_or(0, |b| b[i]));
-                    if m == 0 && p >> 24 == 0 {
-                        *o = 0;
-                        continue;
-                    }
-                    let (mr, mg, mb) = ((m >> 16) & 255, (m >> 8) & 255, m & 255);
-                    let ma = mr.max(mg).max(mb);
-                    let (r, g, b, a) = if p >> 24 == 0 { (0, 0, 0, 0) } else { mahere_panel::Panel::premul_pub(p) };
-                    let keep = 255 - a as u32;
-                    let ch = |c: u8, under: u32| c as u32 + under * keep / 255;
-                    *o = ch(r, mr) | ch(g, mg) << 8 | ch(b, mb) << 16 | ch(a, ma) << 24;
-                    any |= *o;
-                }
-                any
-            })
-            .reduce(|| 0, |a, b| a | b);
-        let t3 = std::time::Instant::now();
         let us = |a: std::time::Instant, b: std::time::Instant| (b - a).as_micros() as u64;
         self.stats.overlay_parts[0] += us(t0, t1);
         self.stats.overlay_parts[1] += us(t1, t2);
-        self.stats.overlay_parts[2] += us(t2, t3);
+        for s in &mut self.stale {
+            *s = s.union(changed);
+        }
+        self.overlay_on = !(self.panel_box.is_empty() && app.map.marks_box().is_empty());
+        let b = std::mem::replace(&mut self.stale[region], PixelBox::EMPTY);
+        if b.is_empty() {
+            return;
+        }
+        // The panel's pixels with the marks under them (premultiplied RGBA bytes), straight into the arena over the stale box alone. The marks are a screen's (both keys are new together after a layout, so the marks are drawn before any sum).
+        let marks = app.map.marks_canvas();
+        let panel = app.panel.pixels();
+        let panel = (panel.len() == w * h).then_some(panel);
+        let at = self.lay.unwrap().regions[region] + kernel::OVERLAY;
+        // SAFETY: as `arena`: the region's overlay, a screen's words inside the block (`Layout::new`); the GPU reads this region only in the frame planned here, run after this returns.
+        let out = unsafe { core::slice::from_raw_parts_mut(self.arena.add(at / 4), w * h) };
+        arena::overlay_sum(marks, panel, w, b, out);
+        self.stats.overlay_parts[2] += us(t2, std::time::Instant::now());
         self.stats.overlays += 1;
-        self.overlay_on[region] = any != 0;
+        self.stats.summed += b.area() as u64;
     }
 
     /// The GPU service's message for the kernel over `groups` workgroups of 16: its words at the arena offset `code_at`, uniform 0 the frame and 1 the arena, then its constants.

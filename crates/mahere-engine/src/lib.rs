@@ -287,6 +287,10 @@ pub struct MapCore {
     pub canvas: Vec<u32>,
     canvas_w: usize,
     canvas_h: usize,
+    /// What the canvas holds when `overlay_marks` drew it last and nothing else has since: its size and the box its marks cover, so the next clears that box alone; None when it holds anything else (a CPU frame, nothing yet).
+    marks_at: Option<(usize, usize, PixelBox)>,
+    /// The box the marks being drawn have touched so far (each stroke's own box, as `draw_segment` answers it).
+    ink: PixelBox,
     vec_depth: u8,
     dem_depth: u8,
     home: Camera,
@@ -442,6 +446,8 @@ impl MapCore {
             canvas: Vec::new(),
             canvas_w: 0,
             canvas_h: 0,
+            marks_at: None,
+            ink: PixelBox::EMPTY,
             vec_depth: VEC_BASE_DEPTH,
             dem_depth: DEM_BASE_DEPTH,
             home,
@@ -1700,22 +1706,59 @@ impl MapCore {
 
     /// The screen-space marks (GPS pin, compass) on a cleared canvas, for a renderer that composites them itself. 0xRRGGBB over black; the ink's brightness is its coverage. `with_pin` false leaves the pin out for a renderer that draws it itself (the GPU, where the pin would otherwise force a full overlay upload on every pan).
     pub fn overlay(&mut self, w: usize, h: usize, with_pin: bool) -> &[u32] {
-        let mut scratch = std::mem::take(&mut self.canvas);
-        scratch.clear();
-        scratch.resize(w * h, 0);
-        self.canvas = scratch;
+        self.overlay_marks(w, h, with_pin, true).0
+    }
+
+    /// `overlay`, for a host that keeps the marks resident and sends only what changed (ferros's GPU map): the canvas, and the box of pixels that may differ from what the last call left there (the marks it cleared and the marks it drew; the whole screen when the canvas held anything else). Only that box is cleared, so marks that cover a corner of the screen cost a corner. `with_ring` false leaves the globe's loading ring out for a renderer that draws it from `globe_ring` itself.
+    pub fn overlay_marks(&mut self, w: usize, h: usize, with_pin: bool, with_ring: bool) -> (&[u32], PixelBox) {
+        let cleared = match self.marks_at {
+            Some((mw, mh, b)) if (mw, mh) == (w, h) => {
+                for y in b.y0..b.y1 {
+                    self.canvas[y * w + b.x0..y * w + b.x1].fill(0);
+                }
+                b
+            }
+            _ => {
+                self.canvas.clear();
+                self.canvas.resize(w * h, 0);
+                PixelBox::screen(w, h)
+            }
+        };
+        self.ink = PixelBox::EMPTY;
         if with_pin {
             self.draw_gps(w, h);
         }
         self.draw_compass(w, h);
-        self.draw_globe_ring(w, h);
+        if with_ring {
+            self.draw_globe_ring(w, h);
+        }
         self.draw_pins(w, h);
-        &self.canvas
+        self.marks_at = Some((w, h, self.ink));
+        (&self.canvas, cleared.union(self.ink))
+    }
+
+    /// The box the marks `overlay_marks` drew last cover (empty when none, or when the canvas holds something else).
+    pub fn marks_box(&self) -> PixelBox {
+        self.marks_at.map_or(PixelBox::EMPTY, |m| m.2)
     }
 
     /// The marks `overlay` drew last, as it left them (empty before the first): for a host that sums them again with a new panel and nothing of theirs changed.
     pub fn marks_canvas(&self) -> &[u32] {
         &self.canvas
+    }
+
+    /// A stroke into the canvas (`draw_segment`), its box added to the marks'.
+    #[allow(clippy::too_many_arguments)]
+    fn seg(&mut self, w: usize, h: usize, x0: f32, y0: f32, x1: f32, y1: f32, half_w: f32, rgb: [u8; 3]) {
+        let b = draw_segment(&mut self.canvas, w, h, x0, y0, x1, y1, half_w, rgb);
+        self.ink = self.ink.union(b);
+    }
+
+    /// Seven-segment text into the canvas (`draw_seven_seg`), its box added to the marks'.
+    #[allow(clippy::too_many_arguments)]
+    fn seven(&mut self, w: usize, h: usize, text: &str, x: f32, y: f32, size: f32, rgb: [u8; 3]) {
+        let b = draw_seven_seg(&mut self.canvas, w, h, text, x, y, size, rgb);
+        self.ink = self.ink.union(b);
     }
 
     /// The route pins: the start green, the end and the destination red, the search's place blue, each a disc in a white ring.
@@ -1725,31 +1768,39 @@ impl MapCore {
             let Some((lat, lon)) = at else { continue };
             let (x, y) = self.cam.geo_to_screen(lat, lon, w, h);
             let (x, y) = (x as f32, y as f32);
-            draw_segment(&mut self.canvas, w, h, x, y, x, y, r, [255, 255, 255]);
-            draw_segment(&mut self.canvas, w, h, x, y, x, y, r * 0.72, colour);
+            self.seg(w, h, x, y, x, y, r, [255, 255, 255]);
+            self.seg(w, h, x, y, x, y, r * 0.72, colour);
         }
     }
 
     /// The ring round the globe while its base set loads: from the top, clockwise, closing as the ten depth-0 cells arrive, gone when they are all in (Nick 2026-10-22).
     fn draw_globe_ring(&mut self, w: usize, h: usize) {
-        let Some(done) = self.globe_loading() else { return };
-        if !self.cam.limb_visible(w, h) {
-            return;
-        }
-        const RING: [u8; 3] = [232, 232, 236];
-        let (cx, cy) = Camera::centre(w, h);
-        let (cx, cy) = (cx as f32, cy as f32);
-        let r = self.cam.radius() as f32 + 0.015 * w.min(h) as f32;
-        let half_w = (0.004 * w.min(h) as f32).max(1.5);
-        let sweep = done.max(0.01) * core::f32::consts::TAU;
-        let steps = ((r * sweep) as usize / 3).clamp(8, 1440);
-        let at = |a: f32| (cx + r * a.sin(), cy - r * a.cos());
+        let Some(g) = self.globe_ring(w, h) else { return };
+        let [cx, cy] = g.centre;
+        let steps = ((g.radius * g.sweep) as usize / 3).clamp(8, 1440);
+        let at = |a: f32| (cx + g.radius * a.sin(), cy - g.radius * a.cos());
         let mut prev = at(0.0);
         for i in 1..=steps {
-            let p = at(i as f32 / steps as f32 * sweep);
-            draw_segment(&mut self.canvas, w, h, prev.0, prev.1, p.0, p.1, half_w, RING);
+            let p = at(i as f32 / steps as f32 * g.sweep);
+            self.seg(w, h, prev.0, prev.1, p.0, p.1, g.half_w, g.rgb);
             prev = p;
         }
+    }
+
+    /// The globe's loading ring as it stands (`draw_globe_ring` draws it as strokes; ferros's GPU map from these few numbers in its kernel, so a ring that follows the globe's every pinch costs no pixels sent): None when it does not show (the base set in, or the limb off the screen).
+    pub fn globe_ring(&self, w: usize, h: usize) -> Option<GlobeRing> {
+        let done = self.globe_loading()?;
+        if !self.cam.limb_visible(w, h) {
+            return None;
+        }
+        let (cx, cy) = Camera::centre(w, h);
+        Some(GlobeRing {
+            centre: [cx as f32, cy as f32],
+            radius: self.cam.radius() as f32 + 0.015 * w.min(h) as f32,
+            half_w: (0.004 * w.min(h) as f32).max(1.5),
+            sweep: done.max(0.01) * core::f32::consts::TAU,
+            rgb: [232, 232, 236],
+        })
     }
 
     /// The GPS pin on screen: centre and accuracy radius in pixels, for a renderer that draws it itself.
@@ -1862,6 +1913,7 @@ impl MapCore {
     pub fn render(&mut self, w: usize, h: usize) {
         let t0 = Instant::now();
         self.prepare(w, h);
+        self.marks_at = None;
         self.canvas.resize(w * h, BG_RGB);
         if w == 0 || h == 0 {
             return;
@@ -1967,9 +2019,9 @@ impl MapCore {
         const INK: [u8; 3] = [255, 196, 64];
         let (ox, oy) = m.origin_px;
         let (tx, ty) = m.target_px;
-        draw_segment(&mut self.canvas, w, h, ox, oy, tx, ty, 1.3, INK);
+        self.seg(w, h, ox, oy, tx, ty, 1.3, INK);
         for (dx0, dy0, dx1, dy1) in [(-12., 0., 12., 0.), (0., -12., 0., 12.)] {
-            draw_segment(&mut self.canvas, w, h, tx + dx0, ty + dy0, tx + dx1, ty + dy1, 1.6, INK);
+            self.seg(w, h, tx + dx0, ty + dy0, tx + dx1, ty + dy1, 1.6, INK);
         }
     }
 
@@ -2001,34 +2053,34 @@ impl MapCore {
         let len = 26.0;
         let (tx, ty) = (cx + nx * len, cy + ny * len);
         let (bx, by) = (cx - nx * len * 0.6, cy - ny * len * 0.6);
-        draw_segment(&mut self.canvas, w, h, bx, by, tx, ty, 1.4, INK);
+        self.seg(w, h, bx, by, tx, ty, 1.4, INK);
         // Arrow head: two barbs back from the tip.
         let (px, py) = (-ny, nx);
         for sgn in [-1.0f32, 1.0] {
             let hx = tx - nx * 9.0 + px * sgn * 6.0;
             let hy = ty - ny * 9.0 + py * sgn * 6.0;
-            draw_segment(&mut self.canvas, w, h, tx, ty, hx, hy, 1.4, INK);
+            self.seg(w, h, tx, ty, hx, hy, 1.4, INK);
         }
         let mut deg = self.cam.bearing().to_degrees().rem_euclid(360.0);
         if deg > 180.0 {
             deg -= 360.0;
         }
         let text = format!("{}", deg.round() as i64);
-        draw_seven_seg(&mut self.canvas, w, h, &text, cx, cy + len + 30.0, 18.0, INK);
+        self.seven(w, h, &text, cx, cy + len + 30.0, 18.0, INK);
         // The zoom: the depth of the cells the view is drawn from, under the heading (Nick 2026-10-10: to see the level and when it changes).
         // Amber past the data (Nick 2026-10-16): the cell under the crosshair at this depth is known not to exist, on the device or in the bucket; white while it is there or still on its way.
         const AMBER: [u8; 3] = [255, 168, 0];
         let zoom_ink = if self.past_data() { AMBER } else { INK };
         let zoom = format!("z{}", self.zoom_depth());
-        draw_seven_seg(&mut self.canvas, w, h, &zoom, cx, cy + len + 58.0, 18.0, zoom_ink);
+        self.seven(w, h, &zoom, cx, cy + len + 58.0, 18.0, zoom_ink);
         // With Detail on, its legend under the zoom: a bar in each depth's colour, the depth beside it, finest at the top.
         if self.luts.mask.debug {
             let n = raster::DETAIL_COLOURS.len();
             for (k, col) in raster::DETAIL_COLOURS.iter().enumerate().rev() {
                 let y = cy + len + 84.0 + (n - 1 - k) as f32 * 22.0;
-                draw_segment(&mut self.canvas, w, h, cx - 22.0, y, cx - 8.0, y, 5.0, *col);
+                self.seg(w, h, cx - 22.0, y, cx - 8.0, y, 5.0, *col);
                 let d = raster::DETAIL_FIRST as usize + k;
-                draw_seven_seg(&mut self.canvas, w, h, &format!("{d}"), cx + 14.0, y + 7.0, 14.0, INK);
+                self.seven(w, h, &format!("{d}"), cx + 14.0, y + 7.0, 14.0, INK);
             }
         }
     }
@@ -2051,15 +2103,15 @@ impl MapCore {
         for i in 1..=steps {
             let a = i as f32 / steps as f32 * core::f32::consts::TAU;
             let p = (x + r * a.cos(), y + r * a.sin());
-            draw_segment(&mut self.canvas, w, h, prev.0, prev.1, p.0, p.1, 0.9, PIN);
+            self.seg(w, h, prev.0, prev.1, p.0, p.1, 0.9, PIN);
             prev = p;
         }
         for (dx0, dy0, dx1, dy1) in [(-9., 0., 9., 0.), (0., -9., 0., 9.)] {
-            draw_segment(&mut self.canvas, w, h, x + dx0, y + dy0, x + dx1, y + dy1, 1.6, PIN);
+            self.seg(w, h, x + dx0, y + dy0, x + dx1, y + dy1, 1.6, PIN);
         }
         if let Some(elev) = self.elevation_at(g.lat, g.lon) {
             let text = format!("{}", elev.round() as i64);
-            draw_seven_seg(&mut self.canvas, w, h, &text, x, y - r.min(60.0) - 44.0, 26.0, PIN);
+            self.seven(w, h, &text, x, y - r.min(60.0) - 44.0, 26.0, PIN);
         }
     }
 }
@@ -2091,7 +2143,54 @@ struct FrameTrace {
 }
 const _: () = assert!(TEX == 256);
 
-/// Anti-aliased stroke (screen-space overlay layer: GPS pin etc.).
+/// A box of screen pixels, columns `x0..x1` of rows `y0..y1`; empty when either range is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PixelBox {
+    pub x0: usize,
+    pub y0: usize,
+    pub x1: usize,
+    pub y1: usize,
+}
+
+impl PixelBox {
+    pub const EMPTY: PixelBox = PixelBox { x0: 0, y0: 0, x1: 0, y1: 0 };
+
+    /// The whole `w` × `h` screen.
+    pub fn screen(w: usize, h: usize) -> PixelBox {
+        PixelBox { x0: 0, y0: 0, x1: w, y1: h }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.x0 >= self.x1 || self.y0 >= self.y1
+    }
+
+    /// The least box holding both.
+    pub fn union(self, o: PixelBox) -> PixelBox {
+        if self.is_empty() {
+            return o;
+        }
+        if o.is_empty() {
+            return self;
+        }
+        PixelBox { x0: self.x0.min(o.x0), y0: self.y0.min(o.y0), x1: self.x1.max(o.x1), y1: self.y1.max(o.y1) }
+    }
+
+    pub fn area(&self) -> usize {
+        if self.is_empty() { 0 } else { (self.x1 - self.x0) * (self.y1 - self.y0) }
+    }
+}
+
+/// The globe's loading ring (`MapCore::globe_ring`): an arc about `centre` of `radius` pixels from the top clockwise thru `sweep` radians, `half_w` either side of it, in `rgb` (gamma-2 bytes, as every mark).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct GlobeRing {
+    pub centre: [f32; 2],
+    pub radius: f32,
+    pub half_w: f32,
+    pub sweep: f32,
+    pub rgb: [u8; 3],
+}
+
+/// Anti-aliased stroke (screen-space overlay layer: GPS pin etc.); the box of pixels it may have touched (empty when it is off the canvas).
 #[allow(clippy::too_many_arguments)]
 pub fn draw_segment(
     canvas: &mut [u32],
@@ -2103,7 +2202,7 @@ pub fn draw_segment(
     y1: f32,
     half_w: f32,
     rgb: [u8; 3],
-) {
+) -> PixelBox {
     let pad = half_w + 1.0;
     let bx0 = (x0.min(x1) - pad).floor().max(0.) as usize;
     let by0 = (y0.min(y1) - pad).floor().max(0.) as usize;
@@ -2111,7 +2210,7 @@ pub fn draw_segment(
     let bx1 = ((x0.max(x1) + pad).ceil() as isize).clamp(0, w as isize) as usize;
     let by1 = ((y0.max(y1) + pad).ceil() as isize).clamp(0, h as isize) as usize;
     if bx0 >= bx1 || by0 >= by1 {
-        return;
+        return PixelBox::EMPTY;
     }
     let dx = x1 - x0;
     let dy = y1 - y0;
@@ -2140,9 +2239,11 @@ pub fn draw_segment(
             }
         }
     }
+    PixelBox { x0: bx0, y0: by0, x1: bx1, y1: by1 }
 }
 
-/// Seven-segment digits via strokes: field-readable numerals, zero font deps.
+/// Seven-segment digits via strokes: field-readable numerals, zero font deps. The box of pixels its strokes may have touched.
+#[allow(clippy::too_many_arguments)]
 pub fn draw_seven_seg(
     canvas: &mut [u32],
     w: usize,
@@ -2152,7 +2253,8 @@ pub fn draw_seven_seg(
     y: f32,
     size: f32,
     rgb: [u8; 3],
-) {
+) -> PixelBox {
+    let mut touched = PixelBox::EMPTY;
     const GLYPHS: [u8; 10] = [
         0b0111111, 0b0000110, 0b1011011, 0b1001111, 0b1100110, 0b1101101, 0b1111101, 0b0000111,
         0b1111111, 0b1101111,
@@ -2172,7 +2274,7 @@ pub fn draw_seven_seg(
         let (x0, x1) = (cx, cx + sw);
         let (y0, ym, y1) = (y - size, y - size * 0.5, y);
         if ch == 'z' {
-            draw_segment(canvas, w, h, x1, y0, x0, y1, hw, rgb);
+            touched = touched.union(draw_segment(canvas, w, h, x1, y0, x0, y1, hw, rgb));
         }
         let lines = [
             (x0, y0, x1, y0),
@@ -2185,11 +2287,12 @@ pub fn draw_seven_seg(
         ];
         for (i, &(ax, ay, bx, by)) in lines.iter().enumerate() {
             if segs >> i & 1 == 1 {
-                draw_segment(canvas, w, h, ax, ay, bx, by, hw, rgb);
+                touched = touched.union(draw_segment(canvas, w, h, ax, ay, bx, by, hw, rgb));
             }
         }
         cx += sw + size * 0.28;
     }
+    touched
 }
 
 #[cfg(test)]
@@ -2201,6 +2304,38 @@ mod tests {
         fn get(&self, _key: mahere_tiles::CellKey) -> residency::Fetch {
             residency::Fetch::Absent
         }
+    }
+
+    /// Marks kept on the canvas and cleared by their own box are what a cleared canvas draws, and the box `overlay_marks` answers holds every pixel that changed: a host that sends only that box keeps a resident copy right.
+    #[test]
+    fn marks_redrawn_in_their_box_are_a_clean_canvas() {
+        let (w, h) = (320, 480);
+        let mut kept = MapCore::new(Arc::new(Empty), Camera::new(10.0, 20.0, 1.0, 0.0));
+        let mut changed = 0;
+        for k in 0..12u32 {
+            // The globe turning, zooming and coming in close (the ring shows, then not), the ring left to the host on every other.
+            let cam = Camera::new(10.0 + k as f64 * 3.0, 20.0 - k as f64, (1u64 << (k / 2)) as f64, k as f64 * 0.4);
+            let ring = k % 2 == 0;
+            kept.cam = cam;
+            let before = kept.marks_canvas().to_vec();
+            let (now, dirty) = kept.overlay_marks(w, h, true, ring);
+            let now = now.to_vec();
+            let mut fresh = MapCore::new(Arc::new(Empty), cam);
+            let clean = fresh.overlay_marks(w, h, true, ring).0.to_vec();
+            assert!(now == clean, "pass {k}: the kept canvas is not a clean one's");
+            assert_eq!(kept.marks_box(), fresh.marks_box());
+            if before.len() == now.len() {
+                for (i, (a, b)) in before.iter().zip(&now).enumerate() {
+                    if a != b {
+                        changed += 1;
+                        let (x, y) = (i % w, i / w);
+                        assert!(x >= dirty.x0 && x < dirty.x1 && y >= dirty.y0 && y < dirty.y1, "pass {k}: ({x}, {y}) changed outside {dirty:?}");
+                    }
+                }
+                assert!(dirty.area() < w * h, "pass {k}: the whole screen sent for marks in a corner");
+            }
+        }
+        assert!(changed > 0);
     }
 
     /// The zoom turns amber past the data: where no cell exists under the crosshair once the view has looked, and past the finest depth any cell is baked to, where it keeps counting.

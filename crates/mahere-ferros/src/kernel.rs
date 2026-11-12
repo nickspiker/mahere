@@ -1,13 +1,13 @@
 //! The map's compose as a ferros GPU kernel: one invocation a screen pixel, recorded from Rust through valhall's SSA recorder and compiled to Mali-G715 words on the device (ferros GPU-KISTS.md: compute only, no triangle raster; the owner, 2026-11-11: "it'd be a 1:1 per px", "no tilting or 3Dness").
 //!
-//! It computes what the CPU raster's `compose_rgb` computes (mahere-engine raster.rs), one sample a pixel at the same place, from the same cells: the terrain's light from its packed normal in the pixel's own frame on the ball, the elevation tint (sea, seabed, hypsometric or flat), land cover, the waterways under the water, the water, the other lines over it, the contours, the dark loading mesh where no cell stands in, the background off the globe; then the panel and the screen's marks in front of it (`Panel::overlay_rgba`, premultiplied), composed front to back.
+//! It computes what the CPU raster's `compose_rgb` computes (mahere-engine raster.rs), one sample a pixel at the same place, from the same cells: the terrain's light from its packed normal in the pixel's own frame on the ball, the elevation tint (sea, seabed, hypsometric or flat), land cover, the waterways under the water, the water, the other lines over it, the contours, the dark loading mesh where no cell stands in, the background off the globe; then the globe's loading ring from its numbers (`Ring`) and the panel and the screen's marks in front of it all (a resident layer in the arena, `Panel::overlay_rgba`'s premultiplied sum, updated by the box that changed), composed front to back.
 //! Not yet here (the CPU path still has them): imagery, land ownership and motor vehicle use, the user's ink and selection, slope bands, raw elevation, the detail tint, and a terrain texel with no data climbing to its parent (it draws the background).
 //!
 //! What it writes, either way the light unconverted: the display's own working values straight into the app's surface (`Out::Surface`: gamma 2, white at 2^14, opaque; where the GPU's fence admits the apps' surfaces, ferros since 2026-11-11), the frame then on the panel with no copy on the CPU; or fluor's 8-bit pixels (`Out::Argb8`, α and darkness) in the arena, the light as a VSF `g2t` code (256 · tanh √light), which fluor's ferros host turns into working values exactly as it turns its own.
 //! The CPU path's encode (the BT.2020 matrix, exposure 2/3 into Opsin's rail, then √) is the Android and Linux surfaces' contract; ferros's panel is VSF RGB in its root space and rolls its own highlights, so the light goes to it unconverted.
 //!
 //! Everything a frame holds still (the light, the sun, the ball's pole and disk, the contour interval, the inks, the layer mask, the depths) is a constant of the recording: the kernel is recorded again for every frame (a few hundred nodes, well under a millisecond), so it carries no loads and no code for what the frame leaves off.
-//! Each pixel finds its own place on the ball from the camera (mahere-engine viewplan.rs): its direction in view coordinates, the face in view whose centroid is nearest (the encoder's choice, among the frame's faces), and its depth-30 (u, v) on that face's diamond from the face's projective form, measured from the camera point when every face in view is near it (so a deep zoom keeps its precision in f32), from the origin at the globe.
+//! Each pixel finds its own place on the ball from the camera (mahere-engine viewplan.rs): its direction in view coordinates, the face in view whose centroid is nearest (the encoder's choice, among the frame's faces), and its depth-30 (u, v) on that face's diamond from the face's projective form, measured from the camera point when every face in view is near it (so a deep zoom keeps its precision in f32), from the origin at the globe, where the face comes from a fold instead of the search (`Fold`: the octant of the direction in the icosahedron's standard pose and the nearest of four centres, about 80 words fewer than comparing 15 faces).
 //! Its cell then comes from a page table: each role's box of squares for the diamond, each square the slot of the resident cell standing in for it, or none (the loading mesh, its colours from the encoder's hash on the GPU).
 //! No lattice, no blocks, no seam sub-blocks: what the CPU planned for every 32 px tile and every 4 px across a seam (6.5 ms a frame at a town's scale on the Pro, 15.7 at the globe, 2026-11-12) is the kernel's.
 //! What varies by pixel comes from the layer arena: the faces' rows (more than one face in view), the squares, the cells' texels, the tables, the overlay.
@@ -57,6 +57,14 @@ pub struct FaceConsts {
     pub row: [u32; FACE_WORDS],
 }
 
+/// The faces found by folding rather than searched (mahere-coord `FaceFold`), at the globe, where the search compared up to 15 faces a pixel: the view's axes into the fold's frame (`turn`, rows, on the pixel's (x, y, z)), the four face centres in its positive octant; the faces' rows at `faces_at` by `octant << 2 | k` (`FOLD_ROWS` of them), a face out of view there as the nearest face in view.
+#[derive(Clone, Copy, Debug)]
+pub struct Fold {
+    pub turn: [[f32; 3]; 3],
+    pub centres: [[f32; 3]; 4],
+}
+pub const FOLD_ROWS: usize = 32;
+
 /// A frame's constants: the screen, what is drawn and how it is lit.
 #[derive(Clone, Copy, Debug)]
 pub struct Consts {
@@ -69,6 +77,8 @@ pub struct Consts {
     pub faces: [FaceConsts; MAX_FACES],
     pub face_count: usize,
     pub faces_at: u32,
+    /// The faces' rows by fold, not by search (far from the camera point, more than `FOLD_FROM` faces in view).
+    pub fold: Option<Fold>,
     pub dem_depth: u32,
     pub vec_depth: u32,
     /// The effective layer mask (`LayerMask::bits`).
@@ -93,6 +103,8 @@ pub struct Consts {
     pub index_every: u32,
     /// The smallest magnitude a waterway draws at, at this terrain depth (`line_min_depth`'s class 12 rows); 256 when none does.
     pub waterway_mag: u32,
+    /// The globe's loading ring, drawn here from its numbers under the overlay and over the map: a ring that follows every pinch of the globe costs no pixels sent (it was the whole overlay painted and summed every frame of a pan at the globe, 7.3 of Mahere's 9.3 ms on the 8a, 2026-11-12).
+    pub ring: Option<Ring>,
     /// An overlay to compose in front (the panel or a mark is up somewhere).
     pub overlay: bool,
     /// The overlay's word offset in the arena.
@@ -101,6 +113,48 @@ pub struct Consts {
     pub region: u32,
     /// What the kernel writes, and where (uniform 0).
     pub out: Out,
+}
+
+/// The globe's loading ring (mahere-engine `GlobeRing`): its centre, radius and half width in screen pixels, the end of its sweep from the top clockwise as (sin, cos), whether the sweep passes half a turn, its colour (gamma-2 bytes, as the marks').
+#[derive(Clone, Copy, Debug)]
+pub struct Ring {
+    pub centre: [f32; 2],
+    pub radius: f32,
+    pub half_w: f32,
+    pub end: [f32; 2],
+    pub long: bool,
+    pub rgb: [u8; 3],
+}
+
+impl Ring {
+    pub fn from_globe(g: &mahere_engine::GlobeRing) -> Ring {
+        Ring { centre: g.centre, radius: g.radius, half_w: g.half_w, end: [g.sweep.sin(), g.sweep.cos()], long: g.sweep > core::f32::consts::PI, rgb: g.rgb }
+    }
+
+    /// Its opacity at full coverage: the marks' sum takes a mark's brightest channel as its opacity.
+    fn alpha(&self) -> f32 {
+        self.rgb[0].max(self.rgb[1]).max(self.rgb[2]) as f32 / 255.
+    }
+}
+
+/// The ring's coverage of the pixel centred at (sx, sy): within its half width (and half a pixel) of the arc, the arc's ends round; the edge's ramp smoothstepped, so the coverage has no kink as the ring grows with a pinch.
+fn ring_cover(r: &Ring, sx: F, sy: F) -> F {
+    // (x, y) from the centre, y up: the arc's point at turn a is radius · (sin a, cos a).
+    let x = sx - r.centre[0];
+    let y = F::splat(r.centre[1]) - sy;
+    let d = x.mul_add(x, y * y).sqrt();
+    // Within the sweep: past the start (x ≥ 0 covers the first half turn), not past the end (sin(a − sweep) ≤ 0).
+    let [s, c] = r.end;
+    let first = x.ge(F::splat(0.));
+    let before_end = (y * s).ge(x * c);
+    let inside = if r.long { first | before_end } else { first & before_end };
+    // Outside it, the nearer end: the start (0, radius) or the end radius · (sin, cos).
+    let ys = y - r.radius;
+    let (ex, ey) = (x - r.radius * s, y - r.radius * c);
+    let cap = x.mul_add(x, ys * ys).min(ex.mul_add(ex, ey * ey)).sqrt();
+    let dist = F::select(inside, (d - r.radius).abs(), cap);
+    let t = unit(F::splat(r.half_w + 0.5) - dist);
+    t * t * (F::splat(3.) - t * 2.)
 }
 
 /// The kernel's output.
@@ -376,6 +430,25 @@ pub fn record(c: &Consts) -> ssa::Compiled {
         // The working value, 2^14 · √light. WHY the min: a channel past 65535 would carry into the next one's bits (into green, or past blue into the see-through bit) where the light runs past 16 times white, which the SH light's sky can reach at a glint; the display takes up to four times white, so nothing that shows is cut.
         let wv = |l: F| (l.max(F::splat(0.)).sqrt() * 16384.).min(F::splat(65535.));
         let mut v = [wv(rgb[0]), wv(rgb[1]), wv(rgb[2])];
+        if let Some(r) = &c.ring {
+            // The ring under the overlay, as a mark summed into it was: its code premultiplied by its coverage, then that code's working value (fluor's table's, 2^14 · atanh(c / 256), here 2^13 ln 2 · log₂((1 + c) / (1 − c)) on the special function unit, once for each distinct channel), and what it leaves of the map under it.
+            let cov = ring_cover(r, sx, sy);
+            let keep = F::splat(1.) - cov * r.alpha();
+            let mut done: Vec<(u8, F)> = Vec::with_capacity(3);
+            for (k, x) in v.iter_mut().enumerate() {
+                let b = r.rgb[k];
+                let wv = match done.iter().find(|d| d.0 == b) {
+                    Some(d) => d.1,
+                    None => {
+                        let o = cov * (b as f32 / 256.);
+                        let wv = ((o + 1.) * (F::splat(1.) - o).rcp()).log2_hw() * (8192. * core::f32::consts::LN_2);
+                        done.push((b, wv));
+                        wv
+                    }
+                };
+                *x = x.mul_add(keep, wv);
+            }
+        }
         if c.overlay {
             // The overlay in front, its premultiplied g2t codes as working values (fluor's table), what it leaves of the map under it: front to back, `under`.
             let o = word(U::splat(c.overlay_at) + i);
@@ -391,6 +464,16 @@ pub fn record(c: &Consts) -> ssa::Compiled {
         return ssa::compile();
     }
     let code = [g2t(rgb[0]), g2t(rgb[1]), g2t(rgb[2])];
+    // The ring under the overlay, its codes premultiplied by its coverage.
+    let code = match &c.ring {
+        Some(r) => {
+            let cov = ring_cover(r, sx, sy);
+            let keep = F::splat(1.) - cov * r.alpha();
+            let mix = |k: usize| F::from_u32(code[k]).mul_add(keep, cov * r.rgb[k] as f32).to_u32();
+            [mix(0), mix(1), mix(2)]
+        }
+        None => code,
+    };
     // The overlay in front (premultiplied, its codes as the CPU's `composite_rgb` mixes them): what it leaves of the map comes through under it.
     let code = if c.overlay {
         let o = word(U::splat(c.overlay_at) + i);
@@ -420,7 +503,27 @@ fn locate(c: &Consts, sx: F, sy: F) -> (U, U, [U; F_USED]) {
     let pz = if c.near { -(q * (one + z).rcp()) } else { z };
     // The face: the frame's one, or the nearest centroid of its faces (the first of equals, as the encoder takes it), its row read by the face.
     let faces = &c.faces[..c.face_count];
-    let face: [U; F_USED] = if faces.len() == 1 {
+    let face: [U; F_USED] = if let Some(fold) = &c.fold {
+        // Into the fold's frame, the nearest of its four centres to |q| (the first of equals), and q's octant from its signs: the face's row, `octant << 2 | k`, a row of 2^FACE_SHIFT words.
+        let q: [F; 3] = core::array::from_fn(|i| F::splat(fold.turn[i][0]).mul_add(px, F::splat(fold.turn[i][1]).mul_add(py, pz * fold.turn[i][2])));
+        let a = q.map(F::abs);
+        let score = |k: usize| {
+            let terms: Vec<usize> = (0..3).filter(|&i| fold.centres[k][i] != 0.).collect();
+            terms[1..].iter().fold(a[terms[0]] * fold.centres[k][terms[0]], |s, &i| F::splat(fold.centres[k][i]).mul_add(a[i], s))
+        };
+        let mut best = score(0);
+        let mut n = U::splat(0);
+        for k in 1..4 {
+            let s = score(k);
+            let more = s.gt(best);
+            best = F::select(more, s, best);
+            n = U::select(more, U::splat(k as u32), n);
+        }
+        // Each sign bit (31) to its octant bit's place in the row's offset: x's at FACE_SHIFT + 2, y's at + 3, z's at + 4.
+        let sign = |i: usize| (q[i].to_bits() >> (31 - FACE_SHIFT - 2 - i as u32)) & U::splat(1 << (FACE_SHIFT + 2 + i as u32));
+        let at = U::splat(c.faces_at) + (sign(0) | sign(1) | sign(2) | n << FACE_SHIFT);
+        core::array::from_fn(|w| word(at + U::splat(w as u32)))
+    } else if faces.len() == 1 {
         core::array::from_fn(|w| U::splat(faces[0].row[w]))
     } else {
         let score = |f: &FaceConsts| F::splat(f.score[0]).mul_add(px, F::splat(f.score[1]).mul_add(py, F::splat(f.score[2]).mul_add(pz, F::splat(f.score[3]))));

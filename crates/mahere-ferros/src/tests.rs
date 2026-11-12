@@ -95,7 +95,7 @@ fn both(cam: &Camera, pool: &Pool, mask: LayerMask, w: usize, h: usize, out: ker
     let mut slots = Slots::new(lay.slots);
     arena::view(&mut slots, pool, &plan, 1, &lay, 0, &mut words).unwrap();
     arena::tables(&luts, &plan, true, &lay, 0, &mut words);
-    let c = arena::consts(&luts, &plan, &lay, 0, false);
+    let c = arena::consts(&luts, &plan, &lay, 0, false, None);
     let k = kernel::record(&c);
     let imm = k.words.iter().filter(|w| (*w >> 48) & 0x1FF == 0x110).count();
     let loads = k.words.iter().filter(|w| (*w >> 48) & 0x1FF == 0x060).count();
@@ -156,7 +156,7 @@ fn located(cam: &Camera, pool: &Pool, w: usize, h: usize) -> (i64, usize, usize,
     let mut words = vec![0u32; BYTES / 4];
     arena::view(&mut Slots::new(lay.slots), pool, &plan, 1, &lay, 0, &mut words).unwrap();
     let luts = luts(&plan, cam, LayerMask::default());
-    let c = arena::consts(&luts, &plan, &lay, 0, false);
+    let c = arena::consts(&luts, &plan, &lay, 0, false, None);
     let k = kernel::record_locate(&c);
     let mut bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
     bytes.resize(BYTES + 32 * (w * h).next_multiple_of(16), 0);
@@ -300,5 +300,115 @@ fn the_kernel_draws_what_the_cpu_draws_where_faces_meet() {
         println!("({lat}, {lon}, ppd {ppd}): {words} words; {} pixels outside the CPU's straddling tiles, {exact} the same code; the largest difference {worst} codes, {over} past 4", keep.len());
         assert!(keep.len() >= 1 << 10, "({lat}, {lon}): too few pixels outside the straddling tiles to compare");
         assert!(over * 100 <= keep.len(), "({lat}, {lon}): {over} pixels differ by more than 4 codes (largest {worst})");
+    }
+}
+
+/// The kernel's words over the arena `words`, its working values a pixel (`Out::Surface`).
+fn surface(k: &valhall::ssa::Compiled, words: &[u32], w: usize, h: usize) -> Vec<[u32; 3]> {
+    let mut bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    bytes.resize(BYTES + 8 * (w * h).next_multiple_of(16), 0);
+    let mut mem = Memory { base: VA, bytes };
+    let frame = VA + BYTES as u64;
+    let mut uniforms = vec![frame, VA];
+    uniforms.extend_from_slice(&k.consts);
+    for g in 0..(w * h).next_multiple_of(16) {
+        run(&k.words, &uniforms, [g as u32, 0], &mut mem);
+    }
+    (0..w * h)
+        .map(|i| {
+            let (lo, hi) = (mem.read32(frame + 8 * i as u64), mem.read32(frame + 8 * i as u64 + 4));
+            [lo & 0xFFFF, lo >> 16, hi & 0xFFFF]
+        })
+        .collect()
+}
+
+/// The globe's loading ring drawn by the kernel from its numbers looks as the CPU's strokes of it do, summed into the overlay as every mark was: the same inside the ring, apart only along its anti-aliased edges (the kernel's edge smoothstepped and premultiplied in working values, the strokes' linear in codes), the same on the map beside it; at every sweep, short and past half a turn.
+#[test]
+fn the_kernel_draws_the_loading_ring_as_the_marks_did() {
+    use mahere_engine::{GlobeRing, PixelBox, draw_segment};
+    let (w, h) = (160usize, 120usize);
+    let cam = Camera::new(10.0, 30.0, 0.5, 0.0);
+    let pool = Pool::default();
+    let d = select_depth(cam.ppd, 0, 14);
+    let plan = plan_view(w, h, &cam, &pool, d, d);
+    let luts = luts(&plan, &cam, LayerMask::default());
+    let lay = Layout::new(w, h, BYTES, kernel::Out::Surface).unwrap();
+    let mut words = vec![0u32; BYTES / 4];
+    arena::view(&mut Slots::new(lay.slots), &pool, &plan, 1, &lay, 0, &mut words).unwrap();
+    arena::tables(&luts, &plan, true, &lay, 0, &mut words);
+    let (cx, cy) = Camera::centre(w, h);
+    for turn in [0.01f32, 0.3, 0.5, 0.7, 1.0] {
+        let g = GlobeRing { centre: [cx as f32, cy as f32], radius: cam.radius() as f32 + 0.015 * h as f32, half_w: 1.5, sweep: turn * core::f32::consts::TAU, rgb: [232, 232, 236] };
+        // The CPU's strokes (`MapCore::draw_globe_ring`), summed into the overlay.
+        let mut marks = vec![0u32; w * h];
+        let steps = ((g.radius * g.sweep) as usize / 3).clamp(8, 1440);
+        let at = |a: f32| (g.centre[0] + g.radius * a.sin(), g.centre[1] - g.radius * a.cos());
+        let mut prev = at(0.0);
+        let mut b = PixelBox::EMPTY;
+        for i in 1..=steps {
+            let p = at(i as f32 / steps as f32 * g.sweep);
+            b = b.union(draw_segment(&mut marks, w, h, prev.0, prev.1, p.0, p.1, g.half_w, g.rgb));
+            prev = p;
+        }
+        let mut cpu_words = words.clone();
+        arena::overlay_sum(&marks, None, w, b, &mut cpu_words[kernel::OVERLAY / 4..kernel::OVERLAY / 4 + w * h]);
+        let cpu = surface(&kernel::record(&arena::consts(&luts, &plan, &lay, 0, true, None)), &cpu_words, w, h);
+        let k = kernel::record(&arena::consts(&luts, &plan, &lay, 0, false, Some(kernel::Ring::from_globe(&g))));
+        let gpu = surface(&k, &words, w, h);
+        let bare = surface(&kernel::record(&arena::consts(&luts, &plan, &lay, 0, false, None)), &words, w, h);
+        // Working values (white 2^14): 2^6 is about a quarter of an 8-bit code near white.
+        let apart = |i: usize| (0..3).map(|c| (cpu[i][c] as i32 - gpu[i][c] as i32).abs()).max().unwrap();
+        let ring = (0..w * h).filter(|&i| marks[i] != 0).count();
+        let inside = (0..w * h).filter(|&i| marks[i] >> 16 == 232).count();
+        let inside_apart = (0..w * h).filter(|&i| marks[i] >> 16 == 232 && apart(i) > 1 << 6).count();
+        let beside = (0..w * h).filter(|&i| marks[i] == 0).map(|i| (gpu[i][0] as i32 - bare[i][0] as i32).abs()).max().unwrap();
+        // On the edge: the strokes overlap (3 px apart, 4 wide), each lerping its coverage over the last's, so their edge is bolder than one stroke's; the kernel's is one stroke's with its ramp smoothstepped. Each edge pixel within half of white of theirs (the most where the ring is a dot, eight strokes over two pixels), and the ring's ink in all within a quarter of theirs.
+        let edge = (0..w * h).filter(|&i| marks[i] != 0).map(apart).max().unwrap();
+        let ink = |f: &[[u32; 3]]| (0..w * h).map(|i| f[i][0] as i64 - bare[i][0] as i64).sum::<i64>();
+        let (ink_cpu, ink_gpu) = (ink(&cpu), ink(&gpu));
+        println!("sweep {turn} of a turn: {} words; {ring} pixels of ring ({inside} fully), {inside_apart} of them apart inside, the edge at most {edge} apart, beside it at most {beside}; the ring's ink {ink_gpu}, the strokes' {ink_cpu}", k.words.len());
+        assert!(inside > 0 && inside_apart == 0, "sweep {turn}: {inside_apart} of {inside} pixels inside the ring apart");
+        assert!(edge <= 1 << 13, "sweep {turn}: an edge pixel {edge} apart");
+        assert!(beside <= 1 << 6, "sweep {turn}: a pixel beside the strokes {beside} apart");
+        assert!((ink_gpu - ink_cpu).abs() * 4 <= ink_cpu, "sweep {turn}: the ring's ink {ink_gpu}, the strokes' {ink_cpu}");
+    }
+}
+
+/// At the globe the faces found by fold draw the frame the search over them drew: the same face for every pixel but a few on a seam (f32 either way), so the same pixels, in fewer words.
+#[test]
+fn the_fold_draws_what_the_search_drew() {
+    let (w, h) = (96usize, 80usize);
+    for (lat, lon, ppd, bearing) in [(10.0, 30.0, 0.4, 0.0), (-30.0, 150.0, 0.6, 2.0), (60.0, -100.0, 0.5, 1.0)] {
+        let cam = Camera::new(lat, lon, ppd, bearing);
+        let d = select_depth(ppd, 0, 14);
+        let mut pool = Pool::default();
+        let mut want = plan_view(w, h, &cam, &pool, d, d).want;
+        want.sort();
+        for (n, k) in want.iter().enumerate() {
+            if k.depth < d || n % 3 != 0 {
+                pool.map.insert(*k, cell(n as u32 * 7919));
+            }
+        }
+        let plan = plan_view(w, h, &cam, &pool, d, d);
+        let luts = luts(&plan, &cam, LayerMask::default());
+        let lay = Layout::new(w, h, BYTES, kernel::Out::Surface).unwrap();
+        let mut words = vec![0u32; BYTES / 4];
+        arena::view(&mut Slots::new(lay.slots), &pool, &plan, 1, &lay, 0, &mut words).unwrap();
+        arena::tables(&luts, &plan, true, &lay, 0, &mut words);
+        let c = arena::consts(&luts, &plan, &lay, 0, false, None);
+        assert!(c.fold.is_some(), "({lat}, {lon}): {} faces, near {}: no fold", c.face_count, c.near);
+        let folded = kernel::record(&c);
+        let by_fold = surface(&folded, &words, w, h);
+        // The search: its rows, a face each, where the fold's were.
+        let (faces, n, _, _) = arena::faces(&plan, &lay, 0);
+        for (j, f) in faces[..n].iter().enumerate() {
+            words[kernel::FACES / 4 + j * kernel::FACE_WORDS..kernel::FACES / 4 + (j + 1) * kernel::FACE_WORDS].copy_from_slice(&f.row);
+        }
+        let searched = kernel::record(&kernel::Consts { fold: None, ..c });
+        let by_search = surface(&searched, &words, w, h);
+        let apart = (0..w * h).filter(|&i| by_fold[i] != by_search[i]).count();
+        println!("({lat}, {lon}, ppd {ppd}): {n} faces, the fold {} words, the search {}; {apart} of {} pixels apart", folded.words.len(), searched.words.len(), w * h);
+        assert!(apart <= w, "({lat}, {lon}): {apart} pixels apart, more than a seam's line");
+        assert!(folded.words.len() < searched.words.len());
     }
 }
