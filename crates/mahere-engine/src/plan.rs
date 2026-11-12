@@ -423,7 +423,8 @@ pub fn plan_frame(w: usize, h: usize, cam: &Camera, pool: &Pool, dem_depth: u8, 
             b.ink.sort_by_key(|&r| if r == NONE { u32::MAX } else { 64 - refs[r as usize].key.depth as u32 });
         }
     }
-    let globe = [w as f32 * 0.5, h as f32 * 0.5, cam.radius() as f32, cam.limb_visible(w, h) as u32 as f32];
+    let (cx, cy) = crate::Camera::centre(w, h);
+    let globe = [cx as f32, cy as f32, cam.radius() as f32, cam.limb_visible(w, h) as u32 as f32];
     let b = cam.basis();
     let pole = [b[0][2] as f32, b[1][2] as f32, b[2][2] as f32, 0.0];
     let us = |a: std::time::Instant, b: std::time::Instant| (b - a).as_micros() as u32;

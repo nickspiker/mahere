@@ -89,6 +89,27 @@ impl FluorApp for App {
 /// The most the decoded cells may hold on the CPU path, 192 MiB of the heap's 640 (build.rs): a full screen on the Pro's panel wants 130 to 290 cells of about 2 MiB each (the terrain packed for the CPU raster 1 MiB, seven vector planes 128 KiB each), measured on the desktop 2026-11-11 (mahere-device example `ferros_mem`: the globe 134 cells and 252 MiB, a city 283 cells and 592 MiB). Past it the finest cells farthest from the view's centre wait, drawn from their parents (residency `set_budget`): 100 cells at the globe, 89 at the city. The rest of the heap is the rest of the app, and at the globe it is most of it: the frames (46 MiB), the glyph atlas (32 MiB, 64 while a layout copies it), font packs (60 to 100 MiB with five Han faces and their vault writes), names, the lettering, cells in flight, the thread stacks; 600 MiB in all at the globe on the desktop with this budget (750 at its peak), 340 at the city (385). A GPU host takes the planes off the CPU, and then they count for nothing here.
 const POOL_BUDGET: usize = (1 << 27) + (1 << 26);
 
+/// The bottom of the camera cutout in panel rows, husky's then akita's: ferros_sys `CUTOUT_BOTTOM` and `CUTOUT_BOTTOM_AKITA`, measured on the glass (2026-11-08), copied as `sys` is because ferros_sys is not a published crate.
+const CUTOUT_BOTTOM: f64 = 118.5610;
+const CUTOUT_BOTTOM_AKITA: f64 = 101.8303;
+
+/// The map's view in the circle an app lives in (owner, 2026-11-12, on the Pro: "the earth isn't centered in the app circle"): the circle is tangent to the bottom of the camera cutout and the bottom of the screen (ferros WINDOWS.md), while this app's frame is the whole panel, so its centre is half the cutout's height below the frame's middle.
+/// No display op answers the circle (the display computes it for its clip and its hairline from the board's cutout, ferros_sys `active_circle`), so it is computed here the same way: the panel's size from op 5, the board from the kernel's facts.
+fn place_view() {
+    let mut r = [0u8; 16];
+    if sys::call(DISPLAY, &[5], &mut r) < 4 {
+        println!("mahere: the display did not say its size; the view stays at the frame's middle");
+        return;
+    }
+    let (w, h) = (u16::from_le_bytes([r[0], r[1]]) as f64, u16::from_le_bytes([r[2], r[3]]) as f64);
+    let board = sys::board();
+    let cut = if board == 2 { CUTOUT_BOTTOM_AKITA } else { CUTOUT_BOTTOM };
+    let radius = (h - cut) * 0.5;
+    let (cx, cy) = (w * 0.5, cut + radius);
+    mahere_engine::set_view(mahere_engine::View { dx: cx - w * 0.5, dy: cy - h * 0.5, radius });
+    println!("mahere: the view in the app's circle on the {w} x {h} panel (board {board}): centre ({cx}, {cy}), radius {radius}");
+}
+
 /// The kernel, as this process reaches it (ferros KERNEL.md, the process ABI): the call, the ira key, the grants page. Inlined as fluor's and kete's are: ferros_sys is no_std and not a published crate.
 pub(crate) mod sys {
     use core::arch::asm;
@@ -146,6 +167,13 @@ pub(crate) mod sys {
         (n != ERR && n <= most).then_some(n)
     }
 
+    /// The board (the kernel's SYS_FACTS, 12, fact 84: 1 husky, 2 akita), read as ferros_sys `akita` reads it: no capability, and the facts cost an I2C read of the battery gauge, so once.
+    pub fn board() -> u64 {
+        let mut b = [0u8; 85 * 8];
+        svc(12, off(b.as_mut_ptr()), b.len() as u64, 0, 0, 0);
+        u64::from_le_bytes(b[84 * 8..85 * 8].try_into().unwrap())
+    }
+
     /// A 32-byte key for `domain` rooted in the device's ira (ferros_sys `ira_key`): the same on every boot, never the ira itself; None without an Ira grant or an ira this boot.
     pub fn ira_key(slot: u64, domain: &str) -> Option<[u8; 32]> {
         let mut out = [0u8; 32];
@@ -186,7 +214,8 @@ pub fn run() {
     } else {
         println!("mahere: no network grant (slot {UDP}); cells from the vault alone");
     }
-    // The size comes from the shell at once (`on_resize` as it is made): the panel's, the frame being the whole panel.
+    // The size comes from the shell at once (`on_resize` as it is made): the panel's, the frame being the whole panel; the view's centre, the app circle's, before any frame.
+    place_view();
     let mut inner: DeviceApp<NoGpu> = DeviceApp::open(0, 0, store, None);
     inner.map.set_pool_budget(POOL_BUDGET);
     let app = App { inner, gpu: crate::gpu::GpuMap::open(GPU, LAYERS, SURFACE, SURFACE2), failed: false };
