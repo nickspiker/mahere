@@ -6,21 +6,23 @@
 //! What it writes, either way the light unconverted: the display's own working values straight into the app's surface (`Out::Surface`: gamma 2, white at 2^14, opaque; where the GPU's fence admits the apps' surfaces, ferros since 2026-11-11), the frame then on the panel with no copy on the CPU; or fluor's 8-bit pixels (`Out::Argb8`, α and darkness) in the arena, the light as a VSF `g2t` code (256 · tanh √light), which fluor's ferros host turns into working values exactly as it turns its own.
 //! The CPU path's encode (the BT.2020 matrix, exposure 2/3 into Opsin's rail, then √) is the Android and Linux surfaces' contract; ferros's panel is VSF RGB in its root space and rolls its own highlights, so the light goes to it unconverted.
 //!
-//! Everything a frame holds still (the light, the sun, the ball's pole and disk, the contour interval, the inks, the layer mask, the depths) is a constant of the recording: the kernel is recorded again for every frame (a few hundred nodes, well under a millisecond), so it carries no loads and no code for what the frame leaves off.
+//! What a frame chooses (the layer mask, one face or several, the fold, the ring, the overlay, the output) is the recording's structure: it carries no code for what the frame leaves off. What a frame holds still (the light, the sun, the ball's pole and disk, the camera, the face's row, the contour interval, the inks, the depths, where its tables are) is a param of the recording (valhall `ssa::param`): placed as a constant (a uniform word, or an immediate), never folded into the words, so two frames of one structure have the same words and gpu.rs compiles each structure once and binds each frame's values into it (`record` and `recording`; ferros GPU-KISTS.md, after the fourth pass: recording and compiling every frame was 0.33 to 0.47 ms of Mahere's CPU).
+//! Where a warp has no use for a stretch of the work, it branches over it (valhall `ssa::when`): off the globe and under an opaque overlay the whole map, where no cell stands in the terrain's shading (and where one does the loading mesh), a pixel without vector planes their tables, beside the ring its coverage, under no overlay its codes.
 //! Each pixel finds its own place on the ball from the camera (mahere-engine viewplan.rs): its direction in view coordinates, the face in view whose centroid is nearest (the encoder's choice, among the frame's faces), and its depth-30 (u, v) on that face's diamond from the face's projective form, measured from the camera point when every face in view is near it (so a deep zoom keeps its precision in f32), from the origin at the globe, where the face comes from a fold instead of the search (`Fold`: the octant of the direction in the icosahedron's standard pose and the nearest of four centres, about 80 words fewer than comparing 15 faces).
 //! Its cell then comes from a page table: each role's box of squares for the diamond, each square the slot of the resident cell standing in for it, or none (the loading mesh, its colours from the encoder's hash on the GPU).
 //! No lattice, no blocks, no seam sub-blocks: what the CPU planned for every 32 px tile and every 4 px across a seam (6.5 ms a frame at a town's scale on the Pro, 15.7 at the globe, 2026-11-12) is the kernel's.
 //! What varies by pixel comes from the layer arena: the faces' rows (more than one face in view), the squares, the cells' texels, the tables, the overlay.
 //! The tables, faces, squares and overlay are offsets within a frame region (`Consts::region`); the cells' slots are shared by both regions.
 
-use valhall::ssa::{self, F, M, U};
+use valhall::ssa::{self, F, H, M, U};
 
 /// Uniform slots: 0 the frame the kernel writes, 1 the arena's start (every table, block, tile, cell and the overlay are word offsets from it).
 pub const SLOT_FRAME: u8 = 0;
 pub const SLOT_ARENA: u8 = 1;
 
-/// The arena's layout, bytes from its start. The tables first: each line class (22) and land class (14) as four f32 (linear red, green, blue, opacity), then the hypsometric ramp (4096 rows of linear red, green, blue and a pad).
+/// The arena's layout, bytes from its start. The tables first: each line class (22) and land class (14) a row of `ROW` words, f16 pairs (linear red and green, then blue and the opacity over 255), then the hypsometric ramp (4096 rows: red and green, blue twice).
 pub const LINE_TAB: usize = 0;
+pub const ROW: usize = 2;
 pub const LAND_TAB: usize = 22 * 16;
 pub const HYPSO_TAB: usize = 1 << 10;
 /// The faces in view, a row of `FACE_WORDS` each (`F_*` below), read by face when there is more than one.
@@ -137,26 +139,6 @@ impl Ring {
     }
 }
 
-/// The ring's coverage of the pixel centred at (sx, sy): within its half width (and half a pixel) of the arc, the arc's ends round; the edge's ramp smoothstepped, so the coverage has no kink as the ring grows with a pinch.
-fn ring_cover(r: &Ring, sx: F, sy: F) -> F {
-    // (x, y) from the centre, y up: the arc's point at turn a is radius · (sin a, cos a).
-    let x = sx - r.centre[0];
-    let y = F::splat(r.centre[1]) - sy;
-    let d = x.mul_add(x, y * y).sqrt();
-    // Within the sweep: past the start (x ≥ 0 covers the first half turn), not past the end (sin(a − sweep) ≤ 0).
-    let [s, c] = r.end;
-    let first = x.ge(F::splat(0.));
-    let before_end = (y * s).ge(x * c);
-    let inside = if r.long { first | before_end } else { first & before_end };
-    // Outside it, the nearer end: the start (0, radius) or the end radius · (sin, cos).
-    let ys = y - r.radius;
-    let (ex, ey) = (x - r.radius * s, y - r.radius * c);
-    let cap = x.mul_add(x, ys * ys).min(ex.mul_add(ex, ey * ey)).sqrt();
-    let dist = F::select(inside, (d - r.radius).abs(), cap);
-    let t = unit(F::splat(r.half_w + 0.5) - dist);
-    t * t * (F::splat(3.) - t * 2.)
-}
-
 /// The kernel's output.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Out {
@@ -192,14 +174,15 @@ const N1: f32 = 32767.;
 fn sel(m: M, a: F, b: F) -> F {
     F::select(m, a, b)
 }
-fn sel3(m: M, a: [F; 3], b: [F; 3]) -> [F; 3] {
-    [sel(m, a[0], b[0]), sel(m, a[1], b[1]), sel(m, a[2], b[2])]
+/// A frame's value: a param of the recording (valhall `ssa::param`), so the words do not depend on it and one compiled kernel serves every frame of this structure (gpu.rs). Made once and its handle used wherever the value is.
+fn pf(v: f32) -> F {
+    F::from_bits(ssa::param(v.to_bits()))
 }
-fn splat3(c: [f32; 3]) -> [F; 3] {
-    [F::splat(c[0]), F::splat(c[1]), F::splat(c[2])]
+fn pf3(c: [f32; 3]) -> [F; 3] {
+    c.map(pf)
 }
-fn lerp3(a: [F; 3], b: [F; 3], t: F) -> [F; 3] {
-    [(b[0] - a[0]).mul_add(t, a[0]), (b[1] - a[1]).mul_add(t, a[1]), (b[2] - a[2]).mul_add(t, a[2])]
+fn pu(v: u32) -> U {
+    ssa::param(v)
 }
 /// A word of the arena at word index `w`.
 fn word(w: U) -> U {
@@ -208,12 +191,7 @@ fn word(w: U) -> U {
 fn wordf(w: U) -> F {
     F::from_bits(word(w))
 }
-/// A gamma-2 byte's light, (b / 256)².
-fn dec(b: U) -> F {
-    let x = F::from_u32(b) * (1. / 256.);
-    x * x
-}
-/// x clamped to [0, 1], as the CPU's `clamp(0.0, 1.0)`.
+/// x clamped to [0, 1], as the CPU's `clamp(0.0, 1.0)` (valhall folds it into the instruction that makes x, Valhall's destination clamp, where nothing else reads x).
 fn unit(x: F) -> F {
     x.max(F::splat(0.)).min(F::splat(1.))
 }
@@ -232,18 +210,18 @@ fn column_row(i: F, w: u32) -> (F, F) {
     (i - y * wf, y)
 }
 
-/// One role's square for the pixel: its cell at the role's depth (cell grid shift `s`) within the box (`bx`: cu0, cv0, width, height, the squares' word offset), the square's word; 0 outside the box.
-fn square(bx: &[U], s: u32, u: U, v: U) -> U {
-    let du = (u >> s) - bx[0];
-    let dv = (v >> s) - bx[1];
+/// One role's square for the pixel: its cell at the role's depth (the pixel's cell-grid coordinates `cu`, `cv`, its (u, v) shifted by the role's cell shift) within the box (`bx`: cu0, cv0, width, height, the squares' word offset), the square's word; 0 outside the box.
+fn square(bx: &[U], cu: U, cv: U) -> U {
+    let du = cu - bx[0];
+    let dv = cv - bx[1];
     // WHY: a pixel's cell can lie outside its diamond's box (off the globe, or a sliver of a diamond at the screen's edge holding no point of the plan's), and its index would then name a word past the squares, up to gigabytes off: the GPU's MMU would fault the whole frame. Outside, it reads the box's first square and takes no cell.
     let inside = du.lt(bx[2]) & dv.lt(bx[3]);
     let at = bx[4] + U::select(inside, du + dv.wrapping_mul(bx[2]), U::splat(0));
     U::select(inside, word(at), U::splat(0))
 }
 
-/// A square's cell for the pixel at (u, v): its texel's word offset and whether there is a cell at all.
-fn role_texel(sq: U, u: U, v: U, texel_words: u32) -> (U, M) {
+/// A square's cell for the pixel at (u, v): its texel's word offset, and the cell's base (0: no cell).
+fn role_texel(sq: U, u: U, v: U, texel_words: u32) -> (U, U) {
     let base = sq & U::splat((1 << SQUARE_SHIFT) - 1);
     let ts = sq >> SQUARE_SHIFT;
     let one = U::splat(1);
@@ -252,16 +230,15 @@ fn role_texel(sq: U, u: U, v: U, texel_words: u32) -> (U, M) {
     let ty = v.shr_by(ts) & U::splat(255);
     let half = ((u & m) + (v & m)).shr_by(ts) & one;
     let ti = (ty << 9) | (tx << 1) | half;
-    (base + ti.wrapping_mul(U::splat(texel_words)), base.ne(U::splat(0)))
+    (base + ti.wrapping_mul(U::splat(texel_words)), base)
 }
 
-/// The pixel's own frame on the ball (raster.rs `view_normal`): the normal (east, north, up) into view coordinates.
-fn view_normal(c: &Consts, sx: F, sy: F, n: [F; 3]) -> [F; 3] {
-    let [cx, cy, r] = c.disk;
-    let x = (sx - cx) * (1. / r);
-    let y = (F::splat(cy) - sy) * (1. / r);
+/// The pixel's own frame on the ball (raster.rs `view_normal`): the normal (east, north, up) into view coordinates. `disk`: the disk's centre (x, y) and 1 / its radius; `pole` the world's pole in view coordinates.
+fn view_normal(disk: [F; 3], pole: [F; 3], sx: F, sy: F, n: [F; 3]) -> [F; 3] {
+    let x = (sx - disk[0]) * disk[2];
+    let y = (disk[1] - sy) * disk[2];
     let up = [x, y, (F::splat(1.) - x * x - y * y).max(F::splat(0.)).sqrt()];
-    let p = c.pole;
+    let p = pole;
     let e = [up[2] * p[1] - up[1] * p[2], up[0] * p[2] - up[2] * p[0], up[1] * p[0] - up[0] * p[1]];
     let len2 = e[0] * e[0] + e[1] * e[1] + e[2] * e[2];
     // Where the pole is the pixel's up (len below 1e-6): east is the screen's right.
@@ -284,210 +261,348 @@ fn g2t(l: F) -> U {
     (t * 256.).min(F::splat(255.)).to_u32()
 }
 
-/// Record the kernel for a frame with these constants: invocation g draws pixel g.
+/// The kernel for a frame with these constants, compiled: invocation g draws pixel g.
 pub fn record(c: &Consts) -> ssa::Compiled {
+    recording(c).compile()
+}
+
+/// The kernel for a frame with these constants, recorded and not compiled: its key says its structure, its params this frame's values (gpu.rs compiles each structure once).
+pub fn recording(c: &Consts) -> ssa::Recording {
     ssa::begin();
     ssa::reserve(2);
     ssa::uniform_slots(64);
     let i = ssa::gid();
     let (x, y) = column_row(F::from_u32(i), c.w);
     let (sx, sy) = (x + 0.5, y + 0.5);
+    let bg = C::param(c.bg);
+    let disk = [pf(c.disk[0]), pf(c.disk[1]), pf(1. / c.disk[2])];
+    // The overlay's word, read first: where it is opaque (the panel) nothing behind it is read.
+    let o = c.overlay.then(|| word(pu(c.overlay_at) + i));
+    // Where the map shows: on the disk where its limb is on the screen, and not under an opaque overlay. Elsewhere the whole map is branched over (off the globe it is the background).
+    let on = c.limb.then(|| {
+        let (dx, dy) = (sx - disk[0], sy - disk[1]);
+        pf(c.disk[2] * c.disk[2]).ge(dx.mul_add(dx, dy * dy))
+    });
+    let seen = o.map(|o| (o >> 24).ne(U::splat(255)));
+    let need = match (on, seen) {
+        (Some(a), Some(b)) => a & b,
+        (Some(a), None) | (None, Some(a)) => a,
+        (None, None) => M::splat(true),
+    };
+    let rgb = ssa::when(need, bg, || map(c, x, y, sx, sy, disk, bg)).f32();
+
+    if c.out == Out::Surface {
+        // The working value, 2^14 · √light, as x · 1/√x with x held off 0 (2^-40, whose working value 2^-6 truncates to 0 as the light 0's does). WHY the min: a channel past 65535 would carry into the next one's bits (into green, or past blue into the see-through bit) where the light runs past 16 times white, which the SH light's sky can reach at a glint; the display takes up to four times white, so nothing that shows is cut.
+        let wv = |l: F| {
+            let x = l.max(F::splat(1. / (1u64 << 40) as f32));
+            (x * x.rsq_estimate() * 16384.).min(F::splat(65535.))
+        };
+        let mut v = [wv(rgb[0]), wv(rgb[1]), wv(rgb[2])];
+        if let Some(r) = &c.ring {
+            // The ring under the overlay, as a mark summed into it was: its code premultiplied by its coverage, then that code's working value (fluor's table's, 2^14 · atanh(c / 256), here 2^13 ln 2 · log₂((1 + c) / (1 − c)) on the special function unit, once for each distinct channel), and what it leaves of the map under it.
+            v = ring(r, sx, sy, v, |cov, v| {
+                let keep = F::splat(1.) - cov * pf(r.alpha());
+                let mut done: Vec<(u8, F)> = Vec::with_capacity(3);
+                let mut out = v;
+                for (k, x) in out.iter_mut().enumerate() {
+                    let b = r.rgb[k];
+                    let wv = match done.iter().find(|d| d.0 == b) {
+                        Some(d) => d.1,
+                        None => {
+                            let o = cov * pf(b as f32 / 256.);
+                            let wv = ((o + 1.) * (F::splat(1.) - o).rcp()).log2_hw() * (8192. * core::f32::consts::LN_2);
+                            done.push((b, wv));
+                            wv
+                        }
+                    };
+                    *x = x.mul_add(keep, wv);
+                }
+                out
+            });
+        }
+        if let Some(o) = o {
+            // The overlay in front, its premultiplied g2t codes as working values (fluor's table), what it leaves of the map under it: front to back, `under`. Where it is clear (its codes 0, premultiplied) the map is all there is, and the table is not read.
+            let code_tab = pu(c.region + (CODE_TAB / 4) as u32);
+            v = ssa::when((o >> 24).ne(U::splat(0)), v, || {
+                let keep = F::from_u32(U::splat(255) - (o >> 24)) * (1. / 255.);
+                let tab = |k: u32| wordf(code_tab + ((o >> (8 * k)) & U::splat(255)));
+                let mut out = v;
+                for (k, x) in out.iter_mut().enumerate() {
+                    *x = x.mul_add(keep, tab(k as u32)).min(F::splat(65535.));
+                }
+                out
+            });
+        }
+        let q = |x: F| x.to_u32();
+        ssa::store_at(SLOT_FRAME, i, 3, 0, q(v[0]) | q(v[1]) << 16);
+        ssa::store_at(SLOT_FRAME, i, 3, 4, q(v[2]));
+        return ssa::finish();
+    }
+    let code = [g2t(rgb[0]), g2t(rgb[1]), g2t(rgb[2])];
+    // The ring under the overlay, its codes premultiplied by its coverage.
+    let code = match &c.ring {
+        Some(r) => {
+            let codes = [F::from_u32(code[0]), F::from_u32(code[1]), F::from_u32(code[2])];
+            let mixed = ring(r, sx, sy, codes, |cov, codes| {
+                let keep = F::splat(1.) - cov * pf(r.alpha());
+                core::array::from_fn(|k| codes[k].mul_add(keep, cov * pf(r.rgb[k] as f32)))
+            });
+            mixed.map(|m| m.to_u32())
+        }
+        None => code,
+    };
+    // The overlay in front (premultiplied, its codes as the CPU's `composite_rgb` mixes them): what it leaves of the map comes through under it.
+    let code = match o {
+        Some(o) => {
+            let keep = F::from_u32(U::splat(255) - (o >> 24)) * (1. / 255.);
+            let mix = |k: u32, m: U| (F::from_u32(m).mul_add(keep, F::from_u32((o >> (8 * k)) & U::splat(255)))).min(F::splat(255.)).to_u32();
+            [mix(0, code[0]), mix(1, code[1]), mix(2, code[2])]
+        }
+        None => code,
+    };
+    // fluor's Argb8: α 255, each channel's darkness 255 − its code.
+    let dark = |c: U| U::splat(255) - c;
+    let px = U::splat(0xFF00_0000) | dark(code[0]) << 16 | dark(code[1]) << 8 | dark(code[2]);
+    ssa::store_at(SLOT_FRAME, i, 2, 0, px);
+    ssa::finish()
+}
+
+/// The ring over `v` at the pixel centred at (sx, sy): `mix(coverage, v)` where the pixel is within the ring's reach of its circle, `v` elsewhere, the work branched over by every warp beside it (most of the screen).
+fn ring(r: &Ring, sx: F, sy: F, v: [F; 3], mix: impl FnOnce(F, [F; 3]) -> [F; 3]) -> [F; 3] {
+    // (x, y) from the centre, y up: the arc's point at turn a is radius · (sin a, cos a).
+    let x = sx - pf(r.centre[0]);
+    let y = pf(r.centre[1]) - sy;
+    let d = x.mul_add(x, y * y).sqrt();
+    let radius = pf(r.radius);
+    let reach = pf(r.half_w + 0.5);
+    // Further than its reach from the circle a pixel is further from the arc and its ends too (each end is on the circle): no coverage.
+    let near = (d - radius).abs().lt(reach);
+    ssa::when(near, v, || {
+        // Within the sweep: past the start (x ≥ 0 covers the first half turn), not past the end (sin(a − sweep) ≤ 0).
+        let [s, c] = r.end;
+        let first = x.ge(F::splat(0.));
+        let before_end = (y * pf(s)).ge(x * pf(c));
+        let inside = if r.long { first | before_end } else { first & before_end };
+        // Outside it, the nearer end: the start (0, radius) or the end radius · (sin, cos).
+        let ys = y - radius;
+        let (ex, ey) = (x - pf(r.radius * s), y - pf(r.radius * c));
+        let cap = x.mul_add(x, ys * ys).min(ex.mul_add(ex, ey * ey)).sqrt();
+        let dist = F::select(inside, (d - radius).abs(), cap);
+        let t = unit(reach - dist);
+        mix(t * t * (F::splat(3.) - t * 2.), v)
+    })
+}
+
+/// A colour in light, f16 (valhall's v2f16: one instruction for two channels, ferros GPU-KISTS.md, the owner on f16: "most of the mahere composite work can either be done in integer or f16"): red and green in one register's halves, blue in both halves of the other. 11 bits of mantissa: a light of 1 is within 2^-11 of its f32, a fifth of an 8-bit code.
+#[derive(Clone, Copy)]
+struct C {
+    rg: H,
+    b: H,
+}
+
+impl C {
+    fn param(c: [f32; 3]) -> C {
+        C { rg: H::param2(c[0], c[1]), b: H::param2(c[2], c[2]) }
+    }
+    /// A table row (`ROW` words from `row`): its colour, and its second word's high half (a line's or a land class's opacity over 255).
+    fn row(row: U) -> (C, H) {
+        let b = H::from_bits(word(row + U::splat(1)));
+        (C { rg: H::from_bits(word(row)), b: b.lo() }, b.hi())
+    }
+    fn sel(m: M, a: C, b: C) -> C {
+        C { rg: H::select(m, a.rg, b.rg), b: H::select(m, a.b, b.b) }
+    }
+    fn mul(self, o: C) -> C {
+        C { rg: self.rg * o.rg, b: self.b * o.b }
+    }
+    fn scale(self, s: H) -> C {
+        C { rg: self.rg * s, b: self.b * s }
+    }
+    fn lerp(self, o: C, t: H) -> C {
+        C { rg: (o.rg - self.rg).mul_add(t, self.rg), b: (o.b - self.b).mul_add(t, self.b) }
+    }
+    /// As f32, each channel widened by the instruction that reads it.
+    fn f32(self) -> [F; 3] {
+        [self.rg.lo_f(), self.rg.hi_f(), self.b.lo_f()]
+    }
+}
+
+/// A byte's value as an f16 in both lanes (exact: bytes are whole numbers below 2^11).
+fn byte_h(b: U) -> H {
+    H::splat_f(F::from_u32(b))
+}
+
+/// The map's light at the pixel (sx, sy), corner (x, y): raster.rs `compose_rgb`, in f16 (`C`) from the terrain's light on, its stretches branched over where a warp has none of them.
+fn map(c: &Consts, x: F, y: F, sx: F, sy: F, disk: [F; 3], bg: C) -> C {
     let mask = c.mask;
     let zero = F::splat(0.);
     let one = F::splat(1.);
+    let (zero_h, one_h) = (H::splat(0.), H::splat(1.));
     let no = M::splat(false);
     // The cell and texel at the pixel's corner, where the CPU raster samples them (its lattice steps from a block's corner a whole pixel at a time); the light and the disk at its centre, as there.
     let (u, v, face) = locate(c, x, y);
     let bx = |role: usize| &face[F_BOX + role * F_BOX_WORDS..F_BOX + (role + 1) * F_BOX_WORDS];
+    // Each role's cell-grid coordinates, the shift a param (the depth changes with the zoom); one shift where both roles are at one depth.
+    let grid = |depth: u32| {
+        let s = pu(30 - depth);
+        (s, u.shr_by(s), v.shr_by(s))
+    };
+    let dem_grid = grid(c.dem_depth);
+    let vec_grid = if c.vec_depth == c.dem_depth { dem_grid } else { grid(c.vec_depth) };
 
     // The terrain texel: elevation and the snorm16 normal (east, north, up).
     let wants_dem = mask & (DEM | CONTOURS | SLOPE) != 0;
-    let (dem_at, have_dem_cell) = if wants_dem { role_texel(square(bx(0), 30 - c.dem_depth, u, v), u, v, 2) } else { (U::splat(0), no) };
+    let (dem_at, dem_base) = if wants_dem { role_texel(square(bx(0), dem_grid.1, dem_grid.2), u, v, 2) } else { (U::splat(0), U::splat(0)) };
+    let have_dem_cell = if wants_dem { dem_base.ne(U::splat(0)) } else { no };
     // The vector planes, packed a texel in two words: line class, coverage, magnitude and the water's coverage; land class and coverage.
-    let (vec_at, have_vec) = role_texel(square(bx(1), 30 - c.vec_depth, u, v), u, v, 2);
+    let (vec_at, vec_base) = role_texel(square(bx(1), vec_grid.1, vec_grid.2), u, v, 2);
+    let have_vec = vec_base.ne(U::splat(0));
     let (w0, w1) = (word(vec_at), word(vec_at + U::splat(1)));
     let byte = |w: U, k: u32| (w >> (8 * k)) & U::splat(255);
     let (lcls, lcov, lmag, wcov) = (byte(w0, 0), byte(w0, 1), byte(w0, 2), w0 >> 24);
     let (acls, acov) = (byte(w1, 0), byte(w1, 1));
     let wet = U::select(have_vec, wcov, U::splat(0)).ne(U::splat(0));
 
-    let mut tint = splat3(c.no_dem);
-    let mut diffuse = one;
-    let mut light = [one; 3];
-    let mut ground = no;
-    let mut seabed = no;
-    let mut contour = zero;
-    let mut contour_index = no;
-    if wants_dem {
-        let lo = word(dem_at);
-        let hi = word(dem_at + U::splat(1));
-        let eq = lo & U::splat(0xFFFF);
-        let texel = have_dem_cell & eq.ne(U::splat(NODATA));
-        // snorm16 halves: the high half read as the top of a signed word, the low one shifted there first.
-        let k16 = 1. / 65536.;
-        let n = [F::from_i32(lo & U::splat(0xFFFF_0000)) * k16, F::from_i32(hi << 16) * k16, F::from_i32(hi & U::splat(0xFFFF_0000)) * k16];
-        let elev = F::from_u32(eq).mul_add(F::splat(ELEV_STEP), F::splat(-ELEV_OFFSET));
-        if mask & DEM != 0 {
-            let vn = view_normal(c, sx, sy, n);
-            let d = (vn[0] * c.sun[0] + vn[1] * c.sun[1] + vn[2] * c.sun[2]) * (1. / N1);
-            diffuse = sel(texel, d.max(zero), one);
-            let q = [vn[0] * (1. / N1), vn[1] * (1. / N1), vn[2] * (1. / N1)];
-            let m = [q[0] * q[0], q[1] * q[1], q[2] * q[2], q[0] * q[1], q[0] * q[2], q[1] * q[2], q[0], q[1], q[2]];
-            for (ch, l) in light.iter_mut().enumerate() {
-                let k = &c.light[ch];
-                let mut e = F::splat(k[9]);
-                for (t, &mt) in m.iter().enumerate() {
-                    e = mt.mul_add(F::splat(k[t]), e);
+    // The terrain's shading, where a cell stands in: its light ((red, green) and (blue, the sun's diffuse)), its tint, the contours. Without a cell, what a pixel takes is what the CPU's does where no texel is (the background's tint, unlit), and the loading mesh goes over it below.
+    let tint0 = if mask & DEM != 0 { bg } else { C::param(c.no_dem) };
+    let shaded0 = (tint0, one_h, one_h, no, no, zero, no);
+    let (tint, light_rg, light_bd, ground, seabed, contour, contour_index) = if wants_dem {
+        ssa::when(have_dem_cell, shaded0, || {
+            let lo = word(dem_at);
+            let hi = word(dem_at + U::splat(1));
+            let eq = lo & U::splat(0xFFFF);
+            let texel = eq.ne(U::splat(NODATA));
+            // snorm16 halves as the unit normal: the high half read as the top of a signed word, the low one shifted there first.
+            let k16 = 1. / (65536. * N1);
+            let n = [F::from_i32(lo & U::splat(0xFFFF_0000)) * k16, F::from_i32(hi << 16) * k16, F::from_i32(hi & U::splat(0xFFFF_0000)) * k16];
+            let elev = F::from_u32(eq).mul_add(F::splat(ELEV_STEP), F::splat(-ELEV_OFFSET));
+            let (mut tint, mut light_rg, mut light_bd, mut ground, mut seabed, mut contour, mut contour_index) = shaded0;
+            if mask & DEM != 0 {
+                let q = view_normal(disk, pf3(c.pole), sx, sy, n);
+                // The lighting environment's quadratic form (`sh::Quad`, k₉ + Σ kₜ mₜ over q², the cross terms and q), red and green in one f16 pair, blue in the other with the sun's diffuse (q · sun) beside it: 18 paired FMAs for the CPU's 30 and its 3-term dot. Each term a lane of three products.
+                let a = H::pack(q[0], q[1]);
+                let b = H::pack(q[2], q[0] * q[1]);
+                let sq = a * a;
+                let xz = a * b.lo();
+                let zz = b * b.lo();
+                let terms = [sq.lo(), sq.hi(), zz.lo(), b.hi(), xz.lo(), xz.hi(), a.lo(), a.hi(), b.lo()];
+                let k = &c.light;
+                let mut e_rg = H::param2(k[0][9], k[1][9]);
+                let mut e_bd = H::param2(k[2][9], 0.);
+                for (t, &m) in terms.iter().enumerate() {
+                    e_rg = m.mul_add(H::param2(k[0][t], k[1][t]), e_rg);
+                    let sun = if t >= 6 { c.sun[t - 6] } else { 0. };
+                    e_bd = m.mul_add(H::param2(k[2][t], sun), e_bd);
                 }
-                *l = sel(texel, e.max(zero), one);
+                light_rg = H::select(texel, e_rg.max(zero_h), one_h);
+                light_bd = H::select(texel, e_bd.max(zero_h), one_h);
+                let sea = elev.abs().lt(F::splat(0.75)) & n[2].gt(F::splat(0.9995));
+                let bed = !sea & elev.lt(zero) & wet;
+                seabed = texel & bed;
+                let t = unit(elev * (-1. / SEABED_FULL_DEPTH));
+                let kbed = F::splat(1.) - t * SEABED_DARK;
+                let sea_rgb = C::param(c.sea);
+                let bed_rgb = sea_rgb.scale(H::splat_f(kbed));
+                let land_rgb = if mask & HYPSO != 0 {
+                    let row = pu(c.region + (HYPSO_TAB / 4) as u32) + ((eq >> 4) << 1);
+                    C { rg: H::from_bits(word(row)), b: H::from_bits(word(row + U::splat(1))) }
+                } else {
+                    C::param(c.flat)
+                };
+                let ground_rgb = C::sel(sea, sea_rgb, C::sel(bed, bed_rgb, land_rgb));
+                tint = C::sel(texel, ground_rgb, bg);
+                ground = texel;
             }
-            let sea = elev.abs().lt(F::splat(0.75)) & n[2].gt(F::splat(0.9995 * N1));
-            let bed = !sea & elev.lt(zero) & wet;
-            seabed = texel & bed;
-            let t = unit(elev * (-1. / SEABED_FULL_DEPTH));
-            let kbed = F::splat(1.) - t * SEABED_DARK;
-            let bed_rgb = [F::splat(c.sea[0]) * kbed, F::splat(c.sea[1]) * kbed, F::splat(c.sea[2]) * kbed];
-            let land_rgb = if mask & HYPSO != 0 {
-                let row = U::splat(c.region + (HYPSO_TAB / 4) as u32) + ((eq >> 4) << 2);
-                [wordf(row), wordf(row + U::splat(1)), wordf(row + U::splat(2))]
-            } else {
-                splat3(c.flat)
-            };
-            let ground_rgb = sel3(sea, splat3(c.sea), sel3(bed, bed_rgb, land_rgb));
-            tint = sel3(texel, ground_rgb, splat3(c.bg));
-            ground = texel;
-        }
-        if mask & CONTOURS != 0 && c.interval > 0. {
-            let nzn = (n[2] * (1. / N1)).max(F::splat(1e-4));
-            let slope = (one - nzn * nzn).max(zero).sqrt() * nzn.rcp();
-            let level = round(elev * (1. / c.interval));
-            let d_m = (elev - level * c.interval).abs();
-            let d_px = d_m * (slope * c.m_per_px).rcp();
-            let ie = c.index_every as f32;
-            // level is a whole number: it is a multiple of n exactly when ⌊(level + ½) / n⌋ · n is level (the half keeps the reciprocal's rounding off the floor's edge).
-            let index = ((level + 0.5) * (1. / ie)).floor().mul_add(F::splat(ie), -level).abs().lt(F::splat(0.5));
-            let w = sel(index, F::splat(0.9), F::splat(0.55));
-            contour = sel(texel & slope.ge(F::splat(CONTOUR_MIN_SLOPE)), unit(w + 0.5 - d_px), zero);
-            contour_index = index;
-        }
-    }
-    let ink = sel3(contour_index, [F::splat(c.contour_index[0]), F::splat(c.contour_index[1]), F::splat(c.contour_index[2])], [F::splat(c.contour[0]), F::splat(c.contour[1]), F::splat(c.contour[2])]);
-    let ink_a = contour * sel(contour_index, F::splat(c.contour_index[3]), F::splat(c.contour[3]));
-
-    let lit = |rgb: [F; 3]| -> [F; 3] {
-        let l = [rgb[0] * light[0], rgb[1] * light[1], rgb[2] * light[2]];
-        sel3(ground, l, rgb)
+            if mask & CONTOURS != 0 && c.interval > 0. {
+                let nzn = n[2].max(F::splat(1e-4));
+                let slope = (one - nzn * nzn).max(zero).sqrt() * nzn.rcp();
+                let level = round(elev * pf(1. / c.interval));
+                let d_m = (elev - level * pf(c.interval)).abs();
+                let d_px = d_m * (slope * pf(c.m_per_px)).rcp();
+                let ie = c.index_every as f32;
+                // level is a whole number: it is a multiple of n exactly when ⌊(level + ½) / n⌋ · n is level (the half keeps the reciprocal's rounding off the floor's edge).
+                let index = ((level + 0.5) * pf(1. / ie)).floor().mul_add(pf(ie), -level).abs().lt(F::splat(0.5));
+                let w = sel(index, F::splat(0.9), F::splat(0.55));
+                contour = sel(texel & slope.ge(F::splat(CONTOUR_MIN_SLOPE)), unit(w + 0.5 - d_px), zero);
+                contour_index = index;
+            }
+            (tint, light_rg, light_bd, ground, seabed, contour, contour_index)
+        })
+    } else {
+        shaded0
     };
+    let light = C { rg: light_rg, b: light_bd.lo() };
+    let diffuse = light_bd.hi();
+    let ink = C::sel(contour_index, C::param([c.contour_index[0], c.contour_index[1], c.contour_index[2]]), C::param([c.contour[0], c.contour[1], c.contour[2]]));
+    let ink_a = H::splat_f(contour) * H::select(contour_index, H::param2(c.contour_index[3], c.contour_index[3]), H::param2(c.contour[3], c.contour[3]));
+
+    let lit = |rgb: C| C::sel(ground, rgb.mul(light), rgb);
     // Without vector planes: the light, then the contours.
-    let plain = lerp3(lit(tint), ink, ink_a);
+    let plain = lit(tint).lerp(ink, ink_a);
     // With them: land cover, the light, the contours, the waterways, the water, the other lines (raster.rs `compose_rgb`).
-    let mut rgb = tint;
-    if mask & LAND != 0 {
-        let k = U::select(acls.lt(U::splat(LAND_MAX + 1)), acls, U::splat(LAND_MAX));
-        let row = U::splat(c.region + (LAND_TAB / 4) as u32) + (k << 2);
-        let col = [wordf(row), wordf(row + U::splat(1)), wordf(row + U::splat(2))];
-        rgb = lerp3(rgb, col, F::from_u32(acov) * (1. / 255.) * wordf(row + U::splat(3)));
-    }
-    rgb = lerp3(lit(rgb), ink, ink_a);
-    let k = U::select(lcls.lt(U::splat(CLASS_MAX + 1)), lcls, U::splat(CLASS_MAX));
-    let row = U::splat(c.region + (LINE_TAB / 4) as u32) + (k << 2);
-    let waterway = k.eq(U::splat(WATERWAY));
-    let dim = sel(waterway, F::from_u32(lmag).mul_add(F::splat(0.6 / 255.), F::splat(0.4)), one);
-    let lcol = [wordf(row) * dim, wordf(row + U::splat(1)) * dim, wordf(row + U::splat(2)) * dim];
-    // The class's opacity (the host folds in whether the class draws at this depth and the boundaries' 0.55), a waterway's also gated by its magnitude.
-    let gate = !waterway | lmag.ge(U::splat(c.waterway_mag));
-    let la = sel(gate, F::from_u32(lcov) * (1. / 255.) * wordf(row + U::splat(3)), zero);
-    rgb = lerp3(rgb, lcol, sel(waterway, la, zero));
-    if mask & WATER != 0 {
-        let s = diffuse.mul_add(F::splat(0.15), F::splat(0.85));
-        let wr = [F::splat(c.water[0]) * s, F::splat(c.water[1]) * s, F::splat(c.water[2]) * s];
-        let t = F::from_u32(wcov) * (c.water[3] / 255.) * sel(seabed, F::splat(SEABED_GLAZE), one);
-        rgb = lerp3(rgb, wr, t);
-    }
-    rgb = lerp3(rgb, lcol, sel(waterway, zero, la));
-    let mut rgb = sel3(have_vec, rgb, plain);
+    let water = mask & WATER != 0;
+    let water_rgb = C::param([c.water[0], c.water[1], c.water[2]]);
+    let water_a = H::param2(c.water[3] / 255., c.water[3] / 255.);
+    let land_tab = pu(c.region + (LAND_TAB / 4) as u32);
+    let line_tab = pu(c.region + (LINE_TAB / 4) as u32);
+    let waterway_mag = pu(c.waterway_mag);
+    let rgb = ssa::when(have_vec, plain, || {
+        let mut rgb = tint;
+        if mask & LAND != 0 {
+            // Land cover where there is any: the lerp by 0 is the tint itself, so a warp with none (the sea) skips its table.
+            rgb = ssa::when(acov.ne(U::splat(0)), rgb, || {
+                let k = U::select(acls.lt(U::splat(LAND_MAX + 1)), acls, U::splat(LAND_MAX));
+                let (col, a) = C::row(land_tab + (k << 1));
+                rgb.lerp(col, byte_h(acov) * a)
+            });
+        }
+        rgb = lit(rgb).lerp(ink, ink_a);
+        // The water over what is under it, where there is any.
+        let over_water = |rgb: C| -> C {
+            if !water {
+                return rgb;
+            }
+            ssa::when(wcov.ne(U::splat(0)), rgb, || {
+                let s = diffuse.mul_add(H::splat(0.15), H::splat(0.85));
+                let t = byte_h(wcov) * water_a * H::select(seabed, H::splat(SEABED_GLAZE), one_h);
+                rgb.lerp(water_rgb.scale(s), t)
+            })
+        };
+        // A line, where there is one that draws: a waterway under the water, any other over it; elsewhere the water alone.
+        let k = U::select(lcls.lt(U::splat(CLASS_MAX + 1)), lcls, U::splat(CLASS_MAX));
+        let waterway = k.eq(U::splat(WATERWAY));
+        // The class's opacity (the host folds in whether the class draws at this depth and the boundaries' 0.55), a waterway's also gated by its magnitude.
+        let gate = !waterway | lmag.ge(waterway_mag);
+        let line = gate & lcov.ne(U::splat(0));
+        ssa::when(line, over_water(rgb), || {
+            let (col, a) = C::row(line_tab + (k << 1));
+            let dim = sel(waterway, F::from_u32(lmag).mul_add(F::splat(0.6 / 255.), F::splat(0.4)), one);
+            let lcol = col.scale(H::splat_f(dim));
+            let la = byte_h(lcov) * a;
+            let rgb = rgb.lerp(lcol, H::select(waterway, la, zero_h));
+            let rgb = over_water(rgb);
+            rgb.lerp(lcol, H::select(waterway, zero_h, la))
+        })
+    });
 
     // No cell at any depth for the terrain: each triangle of the wanted depth's cell grid its own dark colour, raster.rs `loading_noise`'s hash here (its diamond and depth terms the face's seed).
-    if wants_dem {
-        let s = 30 - c.dem_depth;
-        let m = U::splat((1u32 << s) - 1);
-        let half = ((u & m) + (v & m)) >> s & U::splat(1);
-        let h = face[F_SEED] ^ (u >> s).wrapping_mul(U::splat(0x9E37_79B1)) ^ (v >> s).wrapping_mul(U::splat(0x85EB_CA77)) ^ half.wrapping_mul(U::splat(0x1656_67B1));
+    if !wants_dem {
+        return rgb;
+    }
+    ssa::when(dem_base.eq(U::splat(0)), rgb, || {
+        let (s, cu, cv) = dem_grid;
+        let one = U::splat(1);
+        let m = one.shl_by(s) - one;
+        let half = ((u & m) + (v & m)).shr_by(s) & one;
+        let h = face[F_SEED] ^ cu.wrapping_mul(U::splat(0x9E37_79B1)) ^ cv.wrapping_mul(U::splat(0x85EB_CA77)) ^ half.wrapping_mul(U::splat(0x1656_67B1));
         let h = h ^ (h >> 15);
         let h = h.wrapping_mul(U::splat(0x2C1B_3C6D));
         let h = h ^ (h >> 12);
-        let ch = |k: u32| dec(((h >> (8 * k)) & U::splat(255)) >> 2);
-        rgb = sel3(have_dem_cell, rgb, [ch(0), ch(1), ch(2)]);
-    }
-    // Off the globe, where its limb is on the screen: the background.
-    if c.limb {
-        let (dx, dy) = (sx - c.disk[0], sy - c.disk[1]);
-        let off = (dx * dx + dy * dy).gt(F::splat(c.disk[2] * c.disk[2]));
-        rgb = sel3(off, splat3(c.bg), rgb);
-    }
-
-    if c.out == Out::Surface {
-        // The working value, 2^14 · √light. WHY the min: a channel past 65535 would carry into the next one's bits (into green, or past blue into the see-through bit) where the light runs past 16 times white, which the SH light's sky can reach at a glint; the display takes up to four times white, so nothing that shows is cut.
-        let wv = |l: F| (l.max(F::splat(0.)).sqrt() * 16384.).min(F::splat(65535.));
-        let mut v = [wv(rgb[0]), wv(rgb[1]), wv(rgb[2])];
-        if let Some(r) = &c.ring {
-            // The ring under the overlay, as a mark summed into it was: its code premultiplied by its coverage, then that code's working value (fluor's table's, 2^14 · atanh(c / 256), here 2^13 ln 2 · log₂((1 + c) / (1 − c)) on the special function unit, once for each distinct channel), and what it leaves of the map under it.
-            let cov = ring_cover(r, sx, sy);
-            let keep = F::splat(1.) - cov * r.alpha();
-            let mut done: Vec<(u8, F)> = Vec::with_capacity(3);
-            for (k, x) in v.iter_mut().enumerate() {
-                let b = r.rgb[k];
-                let wv = match done.iter().find(|d| d.0 == b) {
-                    Some(d) => d.1,
-                    None => {
-                        let o = cov * (b as f32 / 256.);
-                        let wv = ((o + 1.) * (F::splat(1.) - o).rcp()).log2_hw() * (8192. * core::f32::consts::LN_2);
-                        done.push((b, wv));
-                        wv
-                    }
-                };
-                *x = x.mul_add(keep, wv);
-            }
-        }
-        if c.overlay {
-            // The overlay in front, its premultiplied g2t codes as working values (fluor's table), what it leaves of the map under it: front to back, `under`.
-            let o = word(U::splat(c.overlay_at) + i);
-            let keep = F::from_u32(U::splat(255) - (o >> 24)) * (1. / 255.);
-            let tab = |k: u32| wordf(U::splat(c.region + (CODE_TAB / 4) as u32) + byte(o, k));
-            for (k, x) in v.iter_mut().enumerate() {
-                *x = x.mul_add(keep, tab(k as u32)).min(F::splat(65535.));
-            }
-        }
-        let q = |x: F| x.to_u32();
-        ssa::store_at(SLOT_FRAME, i, 3, 0, q(v[0]) | q(v[1]) << 16);
-        ssa::store_at(SLOT_FRAME, i, 3, 4, q(v[2]));
-        return ssa::compile();
-    }
-    let code = [g2t(rgb[0]), g2t(rgb[1]), g2t(rgb[2])];
-    // The ring under the overlay, its codes premultiplied by its coverage.
-    let code = match &c.ring {
-        Some(r) => {
-            let cov = ring_cover(r, sx, sy);
-            let keep = F::splat(1.) - cov * r.alpha();
-            let mix = |k: usize| F::from_u32(code[k]).mul_add(keep, cov * r.rgb[k] as f32).to_u32();
-            [mix(0), mix(1), mix(2)]
-        }
-        None => code,
-    };
-    // The overlay in front (premultiplied, its codes as the CPU's `composite_rgb` mixes them): what it leaves of the map comes through under it.
-    let code = if c.overlay {
-        let o = word(U::splat(c.overlay_at) + i);
-        let keep = F::from_u32(U::splat(255) - (o >> 24)) * (1. / 255.);
-        let mix = |k: u32, m: U| (F::from_u32(m).mul_add(keep, F::from_u32(byte(o, k)))).min(F::splat(255.)).to_u32();
-        [mix(0, code[0]), mix(1, code[1]), mix(2, code[2])]
-    } else {
-        code
-    };
-    // fluor's Argb8: α 255, each channel's darkness 255 − its code.
-    let dark = |c: U| U::splat(255) - c;
-    let px = U::splat(0xFF00_0000) | dark(code[0]) << 16 | dark(code[1]) << 8 | dark(code[2]);
-    ssa::store_at(SLOT_FRAME, i, 2, 0, px);
-    ssa::compile()
+        // Each channel a gamma-2 byte's light, (b / 256)²: the byte over 256 in f16, squared there.
+        let ch = |k: u32| F::from_u32(((h >> (8 * k)) & U::splat(255)) >> 2) * (1. / 256.);
+        let g = C { rg: H::pack(ch(0), ch(1)), b: H::splat_f(ch(2)) };
+        g.mul(g)
+    })
 }
 
 /// The pixel at screen point (sx, sy): its depth-30 (u, v) on its face's diamond, and its face's row.
@@ -496,8 +611,9 @@ fn locate(c: &Consts, sx: F, sy: F) -> (U, U, [U; F_USED]) {
     let one = F::splat(1.);
     // The pixel's direction in view coordinates: (x, y) on the screen's plane in the globe's radii, z toward the viewer (0 past the limb, where the background draws), and Z the third coordinate the faces take, z − 1 measured from the camera point (from 1 − x² − y² as −q / (1 + z), with no cancellation at a deep zoom), else z.
     let [k, kx, ky] = c.view;
-    let px = sx.mul_add(F::splat(k), F::splat(kx));
-    let py = sy.mul_add(F::splat(-k), F::splat(ky));
+    let k = pf(k);
+    let px = sx.mul_add(k, pf(kx));
+    let py = sy.mul_add(-k, pf(ky));
     let q = px.mul_add(px, py * py);
     let z = (one - q).max(zero).sqrt();
     let pz = if c.near { -(q * (one + z).rcp()) } else { z };
@@ -505,8 +621,9 @@ fn locate(c: &Consts, sx: F, sy: F) -> (U, U, [U; F_USED]) {
     let faces = &c.faces[..c.face_count];
     let face: [U; F_USED] = if let Some(fold) = &c.fold {
         // Into the fold's frame, the nearest of its four centres to |q| (the first of equals), and q's octant from its signs: the face's row, `octant << 2 | k`, a row of 2^FACE_SHIFT words.
-        let q: [F; 3] = core::array::from_fn(|i| F::splat(fold.turn[i][0]).mul_add(px, F::splat(fold.turn[i][1]).mul_add(py, pz * fold.turn[i][2])));
+        let q: [F; 3] = core::array::from_fn(|i| pf(fold.turn[i][0]).mul_add(px, pf(fold.turn[i][1]).mul_add(py, pz * pf(fold.turn[i][2]))));
         let a = q.map(F::abs);
+        // The four centres are the fold's own, the same every frame (constants of the recording, their zeros its structure).
         let score = |k: usize| {
             let terms: Vec<usize> = (0..3).filter(|&i| fold.centres[k][i] != 0.).collect();
             terms[1..].iter().fold(a[terms[0]] * fold.centres[k][terms[0]], |s, &i| F::splat(fold.centres[k][i]).mul_add(a[i], s))
@@ -521,12 +638,12 @@ fn locate(c: &Consts, sx: F, sy: F) -> (U, U, [U; F_USED]) {
         }
         // Each sign bit (31) to its octant bit's place in the row's offset: x's at FACE_SHIFT + 2, y's at + 3, z's at + 4.
         let sign = |i: usize| (q[i].to_bits() >> (31 - FACE_SHIFT - 2 - i as u32)) & U::splat(1 << (FACE_SHIFT + 2 + i as u32));
-        let at = U::splat(c.faces_at) + (sign(0) | sign(1) | sign(2) | n << FACE_SHIFT);
+        let at = pu(c.faces_at) + (sign(0) | sign(1) | sign(2) | n << FACE_SHIFT);
         core::array::from_fn(|w| word(at + U::splat(w as u32)))
     } else if faces.len() == 1 {
-        core::array::from_fn(|w| U::splat(faces[0].row[w]))
+        core::array::from_fn(|w| pu(faces[0].row[w]))
     } else {
-        let score = |f: &FaceConsts| F::splat(f.score[0]).mul_add(px, F::splat(f.score[1]).mul_add(py, F::splat(f.score[2]).mul_add(pz, F::splat(f.score[3]))));
+        let score = |f: &FaceConsts| pf(f.score[0]).mul_add(px, pf(f.score[1]).mul_add(py, pf(f.score[2]).mul_add(pz, pf(f.score[3]))));
         let mut best = score(&faces[0]);
         let mut n = U::splat(0);
         for (j, f) in faces.iter().enumerate().skip(1) {
@@ -535,7 +652,7 @@ fn locate(c: &Consts, sx: F, sy: F) -> (U, U, [U; F_USED]) {
             best = F::select(more, s, best);
             n = U::select(more, U::splat(j as u32), n);
         }
-        let at = U::splat(c.faces_at) + (n << FACE_SHIFT);
+        let at = pu(c.faces_at) + (n << FACE_SHIFT);
         core::array::from_fn(|w| word(at + U::splat(w as u32)))
     };
     let rf = |w: usize| F::from_bits(face[w]);
@@ -561,7 +678,8 @@ pub fn record_locate(c: &Consts) -> ssa::Compiled {
     let i = ssa::gid();
     let (x, y) = column_row(F::from_u32(i), c.w);
     let (u, v, face) = locate(c, x, y);
-    let sq = square(&face[F_BOX..F_BOX + F_BOX_WORDS], 30 - c.dem_depth, u, v);
+    let s = pu(30 - c.dem_depth);
+    let sq = square(&face[F_BOX..F_BOX + F_BOX_WORDS], u.shr_by(s), v.shr_by(s));
     let (at, _) = role_texel(sq, u, v, 2);
     for (k, w) in [u, v, sq, at, face[F_SEED]].into_iter().enumerate() {
         ssa::store_at(SLOT_FRAME, i, 5, 4 * k as i16, w);

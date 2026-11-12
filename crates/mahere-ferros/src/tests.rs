@@ -10,7 +10,20 @@ use mahere_engine::raster::{Contours, FrameLuts, LayerMask, Style, build_hypso_l
 use mahere_engine::residency::{DemPacked, Entry, Pool, PRESENT_DEM, PRESENT_LAND, PRESENT_LINE, PRESENT_WATER};
 use mahere_engine::Camera;
 use mahere_tiles::{CellKey, ClassCell, CovCell, TRI};
-use valhall::sim::{Memory, run};
+use valhall::sim::{Memory, run, run_marked};
+
+/// The kernel over `n` invocations as the device issues it: a warp (16 invocations, a workgroup) runs every instruction any of its invocations runs, a block skipped only where all sixteen skip it. The mean instructions a warp.
+fn run_frame(k: &valhall::ssa::Compiled, uniforms: &[u64], n: usize, mem: &mut Memory) -> f64 {
+    let mut total = 0usize;
+    for w0 in (0..n.next_multiple_of(16)).step_by(16) {
+        let mut ran = vec![false; k.words.len()];
+        for g in w0..w0 + 16 {
+            run_marked(&k.words, uniforms, [g as u32, 0], mem, &mut ran);
+        }
+        total += ran.iter().filter(|&&r| r).count();
+    }
+    total as f64 / (n.next_multiple_of(16) / 16) as f64
+}
 
 const VA: u64 = 0x8000_0000;
 const BYTES: usize = 64 << 20;
@@ -107,9 +120,8 @@ fn both(cam: &Camera, pool: &Pool, mask: LayerMask, w: usize, h: usize, out: ker
     let frame = if out == kernel::Out::Surface { VA + BYTES as u64 } else { VA + lay.frame_at as u64 };
     let mut uniforms = vec![frame, VA];
     uniforms.extend_from_slice(&k.consts);
-    for g in 0..(w * h).next_multiple_of(16) {
-        run(&k.words, &uniforms, [g as u32, 0], &mut mem);
-    }
+    let issued = run_frame(&k, &uniforms, w * h, &mut mem);
+    println!("issued: {issued:.1} instructions a warp of {} words", k.words.len());
     let display = Display::default();
     let gpu = (0..w * h)
         .map(|i| {
@@ -311,9 +323,8 @@ fn surface(k: &valhall::ssa::Compiled, words: &[u32], w: usize, h: usize) -> Vec
     let frame = VA + BYTES as u64;
     let mut uniforms = vec![frame, VA];
     uniforms.extend_from_slice(&k.consts);
-    for g in 0..(w * h).next_multiple_of(16) {
-        run(&k.words, &uniforms, [g as u32, 0], &mut mem);
-    }
+    let issued = run_frame(k, &uniforms, w * h, &mut mem);
+    println!("surface: {} words, {issued:.1} issued a warp", k.words.len());
     (0..w * h)
         .map(|i| {
             let (lo, hi) = (mem.read32(frame + 8 * i as u64), mem.read32(frame + 8 * i as u64 + 4));
@@ -410,5 +421,59 @@ fn the_fold_draws_what_the_search_drew() {
         println!("({lat}, {lon}, ppd {ppd}): {n} faces, the fold {} words, the search {}; {apart} of {} pixels apart", folded.words.len(), searched.words.len(), w * h);
         assert!(apart <= w, "({lat}, {lon}): {apart} pixels apart, more than a seam's line");
         assert!(folded.words.len() < searched.words.len());
+    }
+}
+
+/// A frame of a structure met before takes the kernel compiled for it with its own params bound in (gpu.rs's cache): the same words and uniforms as compiling it afresh, for a pan and a pinch of the same view; and a frame with another structure (the ring on) has another key.
+#[test]
+fn a_bound_kernel_is_the_compiled_one() {
+    let (w, h) = (96usize, 80usize);
+    let frame = |lat: f64, lon: f64, ppd: f64, ring: bool| {
+        let cam = Camera::new(lat, lon, ppd, 0.7);
+        let d = select_depth(ppd, 0, 14);
+        let pool = Pool::default();
+        let plan = plan_view(w, h, &cam, &pool, d, d);
+        let luts = luts(&plan, &cam, LayerMask::default());
+        let lay = Layout::new(w, h, BYTES, kernel::Out::Surface).unwrap();
+        let ring = ring.then(|| kernel::Ring { centre: [48., 40.], radius: 30., half_w: 1.5, end: [0.5, 0.8], long: false, rgb: [232, 232, 236] });
+        kernel::recording(&arena::consts(&luts, &plan, &lay, 0, false, ring))
+    };
+    let first = frame(46.2, -121.5, 6000.0, false);
+    let key = first.key();
+    let mut k = first.compile();
+    for (lat, lon, ppd) in [(46.21, -121.48, 6100.0), (46.3, -121.2, 5400.0)] {
+        let next = frame(lat, lon, ppd, false);
+        assert_eq!(next.key(), key, "a pan to ({lat}, {lon}) changed the kernel's structure");
+        let params = next.params().to_vec();
+        let fresh = next.compile();
+        k.bind(&params);
+        assert_eq!(k.words, fresh.words, "({lat}, {lon}): the bound words");
+        assert_eq!(k.consts, fresh.consts, "({lat}, {lon}): the bound uniforms");
+    }
+    assert_ne!(frame(46.2, -121.5, 6000.0, true).key(), key);
+    println!("bound: {} words, {} params", k.words.len(), k.params.len());
+}
+
+/// What a warp issues (`run_frame`) at a town's scale with every cell there and with none (the loading mesh, as the 8a draws without the network), and at the globe with none: the measure the kernel's branches are judged by on the host, the device's time a frame following it (ferros GPU-KISTS.md, the fifth pass).
+#[test]
+fn issued_a_warp() {
+    let (w, h) = (96usize, 80usize);
+    for (name, lat, lon, ppd, full) in [("town, every cell", 46.2, -121.5, 6000.0, true), ("town, no cells", 46.2, -121.5, 6000.0, false), ("globe, no cells", 10.0, 30.0, 0.4, false)] {
+        let cam = Camera::new(lat, lon, ppd, 0.7);
+        let d = select_depth(ppd, 0, 14);
+        let mut pool = Pool::default();
+        if full {
+            for (n, k) in plan_view(w, h, &cam, &pool, d, d).want.iter().enumerate() {
+                pool.map.insert(*k, cell(n as u32 * 7919));
+            }
+        }
+        let plan = plan_view(w, h, &cam, &pool, d, d);
+        let luts = luts(&plan, &cam, LayerMask::default());
+        let lay = Layout::new(w, h, BYTES, kernel::Out::Surface).unwrap();
+        let mut words = vec![0u32; BYTES / 4];
+        arena::view(&mut Slots::new(lay.slots), &pool, &plan, 1, &lay, 0, &mut words).unwrap();
+        arena::tables(&luts, &plan, true, &lay, 0, &mut words);
+        print!("{name}: ");
+        surface(&kernel::record(&arena::consts(&luts, &plan, &lay, 0, false, None)), &words, w, h);
     }
 }

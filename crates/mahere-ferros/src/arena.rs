@@ -258,6 +258,8 @@ pub fn tables(luts: &FrameLuts, plan: &ViewPlan, ramp: bool, lay: &Layout, regio
     let base = lay.regions[region] / 4;
     let st = &luts.style;
     let mask = luts.mask;
+    // A row in f16 pairs, as the kernel's colours are (`kernel::C`): (red, green), then (blue, the opacity over 255, which a coverage byte multiplies).
+    let row = |l: [f32; 3], a: f32| [h2(l[0], l[1]), h2(l[2], a / 255.)];
     let at = base + kernel::LINE_TAB / 4;
     for cls in 0..22 {
         let c = st.line[cls];
@@ -265,13 +267,12 @@ pub fn tables(luts: &FrameLuts, plan: &ViewPlan, ramp: bool, lay: &Layout, regio
         // The class's opacity where it draws (raster.rs `compose_rgb`'s gate: lines on, boundaries on or not one, the depth past the class's least; a waterway's magnitude the kernel's to gate), a boundary's at 0.55.
         let shown = mask.line && (mask.boundaries || !is_boundary(cls)) && (cls == 12 || plan.dem_depth >= line_min_depth(cls, 0));
         let a = if shown { alpha(c) * if is_boundary(cls) { 0.55 } else { 1.0 } } else { 0.0 };
-        arena[at + 4 * cls..at + 4 * cls + 4].copy_from_slice(&[l[0].to_bits(), l[1].to_bits(), l[2].to_bits(), a.to_bits()]);
+        arena[at + kernel::ROW * cls..at + kernel::ROW * (cls + 1)].copy_from_slice(&row(l, a));
     }
     let at = base + kernel::LAND_TAB / 4;
     for k in 0..14 {
         let c = st.land[k];
-        let l = lin(rgb3(c));
-        arena[at + 4 * k..at + 4 * k + 4].copy_from_slice(&[l[0].to_bits(), l[1].to_bits(), l[2].to_bits(), alpha(c).to_bits()]);
+        arena[at + kernel::ROW * k..at + kernel::ROW * (k + 1)].copy_from_slice(&row(lin(rgb3(c)), alpha(c)));
     }
     if ramp {
         // The g2t codes' working values, fluor's table for its 8-bit pixels (host/panel.rs `q14_from_g2t8`): the overlay's codes as the surface takes them.
@@ -279,12 +280,18 @@ pub fn tables(luts: &FrameLuts, plan: &ViewPlan, ramp: bool, lay: &Layout, regio
         for c in 0..256 {
             arena[at + c] = ((16384.0 * (c as f32 / 256.0).atanh() + 0.5) as u32 as f32).to_bits();
         }
+        // The ramp's rows (red, green), (blue, blue): the kernel's colours as they are, no swizzle.
         let at = base + kernel::HYPSO_TAB / 4;
         for (k, c) in luts.hypso.iter().enumerate() {
             let l = lin(*c);
-            arena[at + 4 * k..at + 4 * k + 3].copy_from_slice(&[l[0].to_bits(), l[1].to_bits(), l[2].to_bits()]);
+            arena[at + kernel::ROW * k..at + kernel::ROW * (k + 1)].copy_from_slice(&[h2(l[0], l[1]), h2(l[2], l[2])]);
         }
     }
+}
+
+/// Two f16 in a word, `lo` in its low half: a v2f16 the kernel reads as it is.
+fn h2(lo: f32, hi: f32) -> u32 {
+    valhall::f32_to_f16(lo) as u32 | (valhall::f32_to_f16(hi) as u32) << 16
 }
 
 /// The frame's constants for the kernel, its tables and overlay in frame region `region`.

@@ -48,9 +48,14 @@ pub struct GpuMap {
     shown: usize,
     /// A frame has been drawn into a buffer since the layout was made: until then a frame runs at once, so nothing unmade is shown.
     drawn: bool,
+    /// The kernels compiled, by their recording's key (valhall `Recording::key`), the most recently used first: a frame of a structure met before binds its params into that one's words (`kernel`).
+    kernels: Vec<(u64, valhall::ssa::Compiled)>,
     stats: Stats,
     report_at: std::time::Instant,
 }
+
+/// The compiled kernels kept: a handful of structures in a session (the layers, one face or several or the fold, the ring, the overlay), each about 4 KiB of words; a linear search over these few.
+const KERNELS: usize = 1 << 3;
 
 /// A frame planned and recorded: its region, the service's message, its kernel's size, and what it shows (`view_key`).
 struct Ready {
@@ -119,7 +124,13 @@ struct Stats {
     table_us: u64,
     luts_us: u64,
     overlay_us: u64,
+    /// Recording the kernel, finding it among those compiled (and binding its params) or compiling it, writing its words; compiles and binds over the report.
+    record_us: u64,
+    kernel_us: u64,
     compile_us: u64,
+    code_us: u64,
+    compiled: u64,
+    bound: u64,
     call_us: u64,
     /// Waiting for the GPU's last frame once this one was planned (pipelined; the GPU's share of a frame past the planning's).
     wait_us: u64,
@@ -197,6 +208,7 @@ impl GpuMap {
             next: 0,
             shown: 0,
             drawn: false,
+            kernels: Vec::with_capacity(KERNELS),
             stats: Stats::default(),
             report_at: std::time::Instant::now(),
         })
@@ -319,8 +331,8 @@ impl GpuMap {
             let n = s.frames.max(1);
             let lay = self.lay.unwrap();
             println!(
-                "mahere: GPU {} frames: the kernel {} us a frame on the GPU (longest {}), {} words from {} nodes, {} faces in view ({}), {} squares, {} points; host per frame: plan {} us (view {}, plan {} [faces and points {}, desired {}, boxes and stand-ins {}, range {}], want {}), page table {} us, tables {} us, overlay {} us, record and compile {} us, the call {} us, the wait for the GPU's frame {} us; the overlay a frame: panel {} us, marks {} us, sum {} us; {} panels painted ({} us each, {} of it finding its box), {} marks ({} us each), {} boxes summed ({} pixels and {} us each); {} cell planes written so far, {} wanted with no slot free ({} slots)",
-                s.frames, s.gpu_us / n, s.gpu_max, s.words, s.nodes, s.faces, if s.near { "near" } else { "far" }, s.squares, s.samples, s.plan_us / n, s.plan_parts[0] / n, s.plan_parts[1] / n, s.plan_inner[0] / n, s.plan_inner[1] / n, s.plan_inner[2] / n, s.plan_inner[3] / n, s.plan_parts[2] / n, s.table_us / n, s.luts_us / n, s.overlay_us / n, s.compile_us / n, s.call_us / n, s.wait_us / n, s.overlay_parts[0] / n, s.overlay_parts[1] / n, s.overlay_parts[2] / n, s.panels, s.overlay_parts[0] / s.panels.max(1), s.panel_box_us / s.panels.max(1), s.marks, s.overlay_parts[1] / s.marks.max(1), s.overlays, s.summed / s.overlays.max(1), s.overlay_parts[2] / s.overlays.max(1), self.slots.written, self.slots.starved, lay.slots
+                "mahere: GPU {} frames: the kernel {} us a frame on the GPU (longest {}), {} words from {} nodes, {} faces in view ({}), {} squares, {} points; host per frame: plan {} us (view {}, plan {} [faces and points {}, desired {}, boxes and stand-ins {}, range {}], want {}), page table {} us, tables {} us, overlay {} us, record {} us, the kernel {} us ({} compiled at {} us each, {} bound), its words {} us, the call {} us, the wait for the GPU's frame {} us; the overlay a frame: panel {} us, marks {} us, sum {} us; {} panels painted ({} us each, {} of it finding its box), {} marks ({} us each), {} boxes summed ({} pixels and {} us each); {} cell planes written so far, {} wanted with no slot free ({} slots)",
+                s.frames, s.gpu_us / n, s.gpu_max, s.words, s.nodes, s.faces, if s.near { "near" } else { "far" }, s.squares, s.samples, s.plan_us / n, s.plan_parts[0] / n, s.plan_parts[1] / n, s.plan_inner[0] / n, s.plan_inner[1] / n, s.plan_inner[2] / n, s.plan_inner[3] / n, s.plan_parts[2] / n, s.table_us / n, s.luts_us / n, s.overlay_us / n, s.record_us / n, s.kernel_us / n, s.compiled, s.compile_us / s.compiled.max(1), s.bound, s.code_us / n, s.call_us / n, s.wait_us / n, s.overlay_parts[0] / n, s.overlay_parts[1] / n, s.overlay_parts[2] / n, s.panels, s.overlay_parts[0] / s.panels.max(1), s.panel_box_us / s.panels.max(1), s.marks, s.overlay_parts[1] / s.marks.max(1), s.overlays, s.summed / s.overlays.max(1), s.overlay_parts[2] / s.overlays.max(1), self.slots.written, self.slots.starved, lay.slots
             );
             self.stats = Stats::default();
         }
@@ -351,12 +363,17 @@ impl GpuMap {
         let t4 = std::time::Instant::now();
         let ring = app.map.globe_ring(w, h).map(|g| kernel::Ring::from_globe(&g));
         let c = arena::consts(app.map.luts(), &plan, &lay, region, self.overlay_on, ring);
-        let k = kernel::record(&c);
+        let rec = kernel::recording(&c);
+        let t5 = std::time::Instant::now();
+        self.kernel(rec);
+        let t6 = std::time::Instant::now();
+        let k = &self.kernels[0].1;
         if k.words.len() > arena::CODE_WORDS {
             return Err(format!("the map kernel is {} words, more than the GPU service's {}", k.words.len(), arena::CODE_WORDS));
         }
         let code_at = lay.regions[region] + lay.code_at;
-        let code = &mut self.arena()[code_at / 4..code_at / 4 + 2 * k.words.len()];
+        // SAFETY: as `arena`: the region's code, inside the block (`Layout::new`), read by the GPU only in the frame planned here.
+        let code = unsafe { core::slice::from_raw_parts_mut(self.arena.add(code_at / 4), 2 * k.words.len()) };
         for (j, w) in k.words.iter().enumerate() {
             code[2 * j] = *w as u32;
             code[2 * j + 1] = (*w >> 32) as u32;
@@ -365,17 +382,41 @@ impl GpuMap {
             Some(s) => s[region].1,
             None => ARENA_VA + (lay.regions[region] + lay.frame_at) as u64,
         };
-        let msg = Self::message(&k, code_at, frame, (w * h).div_ceil(16) as u32);
-        let t5 = std::time::Instant::now();
+        let msg = Self::message(k, code_at, frame, (w * h).div_ceil(16) as u32);
+        let (words, nodes) = (k.words.len(), k.kept);
+        let t7 = std::time::Instant::now();
         let s = &mut self.stats;
         let d = |a: std::time::Instant, b: std::time::Instant| (b - a).as_micros() as u64;
         s.plan_us += d(t0, t1);
         s.table_us += d(t1, t2);
         s.luts_us += d(t2, t3);
         s.overlay_us += d(t3, t4);
-        s.compile_us += d(t4, t5);
+        s.record_us += d(t4, t5);
+        s.kernel_us += d(t5, t6);
+        s.code_us += d(t6, t7);
         (s.faces, s.near, s.squares, s.samples) = (c.face_count, c.near, plan.roles[0].squares.len() + plan.roles[1].squares.len(), plan.samples);
-        Ok(Ready { region, msg, words: k.words.len(), nodes: k.kept, key })
+        Ok(Ready { region, msg, words, nodes, key })
+    }
+
+    /// The compiled kernel for this frame's recording, at `kernels[0]`: the one of its key with this frame's params bound into it (valhall `Compiled::bind`: no compile), else compiled now and kept. The most recently used first; past `KERNELS` the least recently used goes (a frame's structure is its layers, one face or several or the fold, the ring and the overlay: a handful in a session).
+    fn kernel(&mut self, rec: valhall::ssa::Recording) {
+        let key = rec.key();
+        match self.kernels.iter().position(|e| e.0 == key) {
+            Some(j) => {
+                let mut e = self.kernels.remove(j);
+                e.1.bind(rec.params());
+                self.kernels.insert(0, e);
+                self.stats.bound += 1;
+            }
+            None => {
+                let t = std::time::Instant::now();
+                let k = rec.compile();
+                self.stats.compile_us += t.elapsed().as_micros() as u64;
+                self.stats.compiled += 1;
+                self.kernels.truncate(KERNELS - 1);
+                self.kernels.insert(0, (key, k));
+            }
+        }
     }
 
     /// The panel and the screen's marks (compass, pins, the GPS) as the overlay, a resident layer in each frame region: painted again only when what they show changed, and only the box that changed summed into the region's copy. The globe's loading ring is the kernel's own (`kernel::Ring`), so it is not here.
