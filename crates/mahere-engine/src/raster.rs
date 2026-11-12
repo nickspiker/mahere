@@ -533,7 +533,7 @@ pub fn render_frame(
     if cam.limb_visible(w, h) {
         let bg = pack(luts, lin(rgb3(luts.style.bg)));
         let r2 = cam.radius() * cam.radius();
-        let (cx, cy) = (w as f64 * 0.5, h as f64 * 0.5);
+        let (cx, cy) = crate::Camera::centre(w, h);
         canvas.par_chunks_mut(w).enumerate().for_each(|(y, row)| {
             let dy = y as f64 + 0.5 - cy;
             for (x, px) in row.iter_mut().enumerate() {

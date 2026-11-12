@@ -27,6 +27,27 @@ use residency::{CellStore, Residency};
 pub const PPD_REF: f64 = 6000.;
 pub const BG_RGB: u32 = 0x12141A;
 
+/// Where the view stands in the frame, for a host whose frame is not all on show: its centre's offset from the frame's middle (x right, y down, pixels) and the radius about that centre the host shows, which the globe's fit keeps inside (`MapCore::ppd_floor`).
+/// On ferros an app lives in a circle on the glass, tangent to the bottom of the camera cutout and the bottom of the screen, while its frame is the whole panel, so the circle's centre is half the cutout's height below the frame's middle (owner, 2026-11-12: "the earth isn't centered in the app circle").
+/// Unset (desktop, Android) the view is the frame's middle and the whole frame, as it always was.
+#[derive(Clone, Copy, Debug)]
+pub struct View {
+    pub dx: f64,
+    pub dy: f64,
+    pub radius: f64,
+}
+
+static VIEW: std::sync::OnceLock<View> = std::sync::OnceLock::new();
+
+/// The view's place in the frame, set once by the host before its first frame; false (nothing changed) for a second call.
+pub fn set_view(v: View) -> bool {
+    VIEW.set(v).is_ok()
+}
+
+fn view() -> View {
+    VIEW.get().copied().unwrap_or(View { dx: 0., dy: 0., radius: f64::INFINITY })
+}
+
 /// View state: the globe seen from far off, orthographically. The view is a rotation of the ball, kept as its basis in world coordinates (the unit sphere, x toward 0°N 0°E, z toward the north pole): screen right, screen up, and the axis toward the viewer, which is the camera point at the screen's centre. Latitude, longitude and bearing are read off it, never stored, so no pole is special: an unmarked ball (Nick 2026-10-10). ppd = pixels per degree of arc at the centre, so the whole globe is a disk of radius ppd·180/π pixels.
 #[derive(Clone, Copy)]
 pub struct Camera {
@@ -118,11 +139,18 @@ impl Camera {
         [cl * co, cl * so, sl]
     }
 
+    /// The screen point the view looks along, where the camera point lands: the frame's middle, or where the host put it (`set_view`).
+    pub fn centre(w: usize, h: usize) -> (f64, f64) {
+        let v = view();
+        (w as f64 * 0.5 + v.dx, h as f64 * 0.5 + v.dy)
+    }
+
     /// The view-space direction of a screen point on the globe, the limb for a point past it.
     pub fn view_dir(&self, px: f64, py: f64, w: usize, h: usize) -> [f64; 3] {
         let r = self.radius();
-        let mut x = (px - w as f64 * 0.5) / r;
-        let mut y = (h as f64 * 0.5 - py) / r;
+        let (cx, cy) = Camera::centre(w, h);
+        let mut x = (px - cx) / r;
+        let mut y = (cy - py) / r;
         let rho2 = x * x + y * y;
         if rho2 >= 1.0 {
             let k = (1.0 - 1e-9) / rho2.sqrt();
@@ -150,7 +178,8 @@ impl Camera {
                 y *= k;
             }
         }
-        (w as f64 * 0.5 + x, h as f64 * 0.5 - y)
+        let (cx, cy) = Camera::centre(w, h);
+        (cx + x, cy - y)
     }
 
     /// The ground under a screen point. Past the limb the point is taken at the limb, so a corner off the globe still names ground (the renderers paint the background there).
@@ -167,16 +196,18 @@ impl Camera {
 
     /// Whether a screen point lies on the globe.
     pub fn on_globe(&self, px: f64, py: f64, w: usize, h: usize) -> bool {
-        let sx = px - w as f64 * 0.5;
-        let sy = py - h as f64 * 0.5;
+        let (cx, cy) = Camera::centre(w, h);
+        let (sx, sy) = (px - cx, py - cy);
         let r = self.radius();
         sx * sx + sy * sy <= r * r
     }
 
-    /// Whether any of the screen lies off the globe.
+    /// Whether any of the screen lies off the globe: the frame's corner farthest from the view's centre is past the limb.
     pub fn limb_visible(&self, w: usize, h: usize) -> bool {
         let r = self.radius();
-        (w * w + h * h) as f64 * 0.25 > r * r
+        let v = view();
+        let (fx, fy) = (w as f64 * 0.5 + v.dx.abs(), h as f64 * 0.5 + v.dy.abs());
+        fx * fx + fy * fy > r * r
     }
 }
 
@@ -486,7 +517,7 @@ impl MapCore {
 
     /// Pan by a screen-pixel delta: the ground at the centre goes that far across the screen, the globe turning under the camera.
     pub fn pan(&mut self, dx: f64, dy: f64, w: usize, h: usize) {
-        let (cx, cy) = (w as f64 * 0.5, h as f64 * 0.5);
+        let (cx, cy) = Camera::centre(w, h);
         let (lat, lon) = self.cam.screen_to_geo(cx, cy, w, h);
         self.place_anchor(lat, lon, cx + dx, cy + dy, w, h);
     }
@@ -522,9 +553,12 @@ impl MapCore {
         (n < 10).then_some(n as f32 / 10.0)
     }
 
-    /// The least pixels per degree a screen may show: the whole globe as a disk filling 94% of the shorter side.
+    /// The least pixels per degree a screen may show: the whole globe as a disk filling 94% of the largest disk about the view's centre that shows, inside the frame and the host's radius (`set_view`); unset, the shorter side.
+    /// The mins are that disk's geometry, the nearest of the frame's four edges and the host's circle, not a guard: with no view set they are the shorter side's half, as before.
     pub fn ppd_floor(w: usize, h: usize) -> f64 {
-        (0.47 * w.min(h) as f64 * core::f64::consts::PI / 180.0).max(1.0)
+        let v = view();
+        let fit = (w as f64 * 0.5 - v.dx.abs()).min(h as f64 * 0.5 - v.dy.abs()).min(v.radius);
+        (0.94 * fit * core::f64::consts::PI / 180.0).max(1.0)
     }
 
     /// Exact geo-anchored zoom: the geography under (ax, ay) stays there.
@@ -1671,7 +1705,8 @@ impl MapCore {
             return;
         }
         const RING: [u8; 3] = [232, 232, 236];
-        let (cx, cy) = (w as f32 * 0.5, h as f32 * 0.5);
+        let (cx, cy) = Camera::centre(w, h);
+        let (cx, cy) = (cx as f32, cy as f32);
         let r = self.cam.radius() as f32 + 0.015 * w.min(h) as f32;
         let half_w = (0.004 * w.min(h) as f32).max(1.5);
         let sweep = done.max(0.01) * core::f32::consts::TAU;
@@ -1803,7 +1838,8 @@ impl MapCore {
             // Every pixel's own frame: the pole in view coordinates and the disk, for the ball's lighting.
             let b = self.cam.basis();
             self.luts.pole = [b[0][2] as f32, b[1][2] as f32, b[2][2] as f32];
-            self.luts.disk = [w as f32 * 0.5, h as f32 * 0.5, self.cam.radius() as f32];
+            let (cx, cy) = Camera::centre(w, h);
+            self.luts.disk = [cx as f32, cy as f32, self.cam.radius() as f32];
         }
         let (stats, want) = raster::render_frame(
             &mut self.canvas,
@@ -2630,7 +2666,8 @@ impl MapCore {
                 return Some((g.lat, g.lon));
             }
         }
-        Some(self.cam.screen_to_geo(w as f64 * 0.5, h as f64 * 0.5, w, h))
+        let (cx, cy) = Camera::centre(w, h);
+        Some(self.cam.screen_to_geo(cx, cy, w, h))
     }
 
     /// The measurement for a `w × h` screen with a profile of `samples` points, if one is set.

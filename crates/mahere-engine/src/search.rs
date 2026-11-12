@@ -98,7 +98,7 @@ pub fn run(job: &SearchJob, cache: &mut NamesCache, tier: &dyn Fn(&Named) -> Opt
         return Vec::new();
     }
     let (w, h) = (job.w as f64, job.h as f64);
-    let (cx, cy) = (w / 2.0, h / 2.0);
+    let (cx, cy) = Camera::centre(job.w, job.h);
     // Merged by (kind, name, reference): the best fit, the position and size at the finest depth seen (a coarse texel is hundreds of metres wide: a trailhead placed from a depth-5 cell stood a kilometre from where the map letters it), nearest the centre among that depth's.
     let mut found: Vec<(Found, u8, f64)> = Vec::new();
     for &key in &job.cached {
