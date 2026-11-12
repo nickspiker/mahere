@@ -85,7 +85,7 @@ fn both(cam: &Camera, pool: &Pool, mask: LayerMask, w: usize, h: usize, out: ker
     let mut cpu = vec![0u32; w * h];
     render_frame(&mut cpu, w, h, cam, pool, &luts, d, d, &user);
 
-    let lay = Layout::new(w, h, BYTES, out);
+    let lay = Layout::new(w, h, BYTES, out).unwrap();
     let mut words = vec![0u32; BYTES / 4];
     let mut slots = Slots::new(lay.slots);
     let (cand, _) = arena::cells(&mut slots, pool, &plan, 1, &lay, &mut words);

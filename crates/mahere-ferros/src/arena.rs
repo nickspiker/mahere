@@ -27,16 +27,19 @@ pub struct Layout {
 }
 
 impl Layout {
-    pub fn new(w: usize, h: usize, bytes: usize, out: kernel::Out) -> Layout {
+    /// None when the frame's two regions leave `bytes` no room for four cells' slots: the block the kernel gave is too small for this screen (ferros gives a kist the largest block free, which can be 32 MiB while the system's clients hold theirs).
+    pub fn new(w: usize, h: usize, bytes: usize, out: kernel::Out) -> Option<Layout> {
         let px = (w * h).next_multiple_of(16);
         let round = |b: usize| b.next_multiple_of(1 << 20);
         let frame_at = round(kernel::OVERLAY + 4 * px);
         let code_at = if out == kernel::Out::Argb8 { round(frame_at + 4 * px) } else { frame_at };
         let region = round(code_at + 8 * (CODE_WORDS + 16));
         let slots_at = 2 * region;
-        // WHY: the frame's size comes from the display; a screen whose overlay and frame leave no room for cells is one this path cannot draw.
-        assert!(slots_at + 4 * SLOT <= bytes, "mahere: a {w} x {h} frame leaves the layer arena no room for cells");
-        Layout { w, h, out, frame_at, code_at, slots_at, slots: (bytes - slots_at) / SLOT, regions: [0, region] }
+        // WHY: the frame's size comes from the display and the block's from the kernel; a screen whose overlay and frame leave no room for cells is one this path cannot draw.
+        if slots_at + 4 * SLOT > bytes {
+            return None;
+        }
+        Some(Layout { w, h, out, frame_at, code_at, slots_at, slots: (bytes - slots_at) / SLOT, regions: [0, region] })
     }
 }
 

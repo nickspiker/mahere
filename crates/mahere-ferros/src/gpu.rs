@@ -5,15 +5,17 @@
 //!
 //! With a second surface (slot 11) the frames are a pipeline over a mailbox (ferros GPU-KISTS.md 1.4): frame K is planned into arena region K mod 2 while the GPU draws frame K − 1 into its buffer, and the display shows each buffer as it is finished; the show answers once the display has taken the frame, so the buffer shown before it, the one frame K + 1 draws into, is no longer read. A frame is on the glass a frame later than it was planned, and the planning, the GPU and the display's publish each get a whole frame's time.
 //!
-//! Until kists have GPU memory of their own (GPU-KISTS.md plan step 1), the arena is the one the system's GPU clients share (the wallpaper's maker uses its first 32 MiB, the attest mark the rest): a development spawn with `--dma layers` takes all 64 MiB, which neither uses once a person is attested, and nothing guards them from each other yet.
+//! The arena is Mahere's own block of ferros's layer arena (ferros GPU-KISTS.md plan step 1, 2026-11-12): the kernel gives every kist the largest block free at its launch (128 MiB when nothing else holds one, 64 or 32 when the wallpaper's maker or the attest mark holds theirs), and a development spawn's `--dma layers` the same. The GPU service runs Mahere's kernel in an address space of Mahere's alone, which maps that block at `ARENA_VA` and Mahere's surfaces where they lie from `SURFACES_VA`, nothing else: an address outside them faults Mahere's job, never another app's memory.
+//!
+//! As a kist the GPU is handed, not asked for (the owner, 2026-11-12: "I feel like GPU should be implicit"): the kernel's three slots after its eight wants (ferros_sys::gpu `kist_slots`), 9 the service, 10 its block, 11 a second surface, the same slots a development spawn gives. On a production build they are empty slots until ferros checks GPU code, and the map draws on the CPU.
 
 use crate::arena::{self, Layout, Slots};
 use crate::kernel;
 use mahere_device::{DeviceApp, NoGpu};
 
-/// The arena in the GPU's address space (ferros payloads/gpu `ARENA_VA`), and its size: 128 MiB from a kernel that also fences the apps' surfaces in for the GPU (ferros 2026-11-11), 64 MiB before.
+/// Mahere's block of the arena in the GPU's address space (ferros_sys::gpu `ARENA_VA`), and the most it can be: 128 MiB, the whole arena. A kernel that cannot say a region's size (before ferros 2026-11-11) gave the whole 64 MiB arena and fenced no surface in for the GPU.
 const ARENA_VA: u64 = 0x8000_0000;
-const ARENA_GROWN: usize = 128 << 20;
+const ARENA_MOST: usize = 128 << 20;
 const ARENA_BEFORE: usize = 64 << 20;
 /// The apps' surfaces in the GPU's address space (payloads/gpu `SURFACES_VA`) and where they start in memory (ferros cachemap SURFACES): an app's surface is its physical base's offset from there.
 const SURFACES_VA: u64 = 0xC000_0000;
@@ -69,10 +71,15 @@ impl GpuThread {
             .stack_size(1 << 16)
             .spawn(move || {
                 for msg in rx {
-                    let mut reply = [1u8, 0, 0, 0, 0];
+                    let mut reply = [1u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
                     let n = crate::ferros::sys::call(slot, &msg, &mut reply);
                     let r = if n == crate::ferros::sys::ERR {
                         Err(String::from("no GPU service receiving"))
+                    } else if reply[0] == 4 {
+                        // ferros_sys::gpu::OUTSIDE: the kernel reached outside Mahere's own memory, and the GPU MMU stopped it in Mahere's own address space.
+                        Err(format!("the map kernel reached outside Mahere's memory, at GPU address {:#X} (fault status {:#X})", u64::from_le_bytes(reply[5..13].try_into().unwrap()), u32::from_le_bytes(reply[13..17].try_into().unwrap())))
+                    } else if reply[0] == 5 {
+                        Err(String::from("a production build runs no unchecked GPU code"))
                     } else if reply[0] != 0 {
                         Err(format!("the GPU service answered {} to the map kernel", reply[0]))
                     } else {
@@ -135,12 +142,13 @@ impl GpuMap {
             println!("mahere: no layer arena at slot {arena_slot}: the map draws on the CPU");
             return None;
         }
-        // The grown arena says the kernel fences the apps' surfaces in for the GPU too: the kernel then writes the surface, no copy.
-        let bytes = crate::ferros::sys::dma_size(arena_slot, ARENA_GROWN as u64).map_or(ARENA_BEFORE, |n| n as usize);
+        // A kernel that says the block's size fences the apps' surfaces in for the GPU too (ferros 2026-11-11 on): the kernel then writes the surface, no copy.
+        let sized = crate::ferros::sys::dma_size(arena_slot, ARENA_MOST as u64);
+        let bytes = sized.map_or(ARENA_BEFORE, |n| n as usize);
         let surface = crate::ferros::sys::dma(surface_slot);
         let usable = |b: u64| b != 0 && b != crate::ferros::sys::ERR && b >= SURFACES_PA;
         let second = if crate::ferros::sys::grant_count() > second_slot { crate::ferros::sys::dma(second_slot) } else { 0 };
-        let surfaces = (bytes == ARENA_GROWN && usable(surface)).then(|| {
+        let surfaces = (sized.is_some() && usable(surface)).then(|| {
             let other = if usable(second) { second } else { surface };
             [(surface, SURFACES_VA + (surface - SURFACES_PA)), (other, SURFACES_VA + (other - SURFACES_PA))]
         });
@@ -221,7 +229,7 @@ impl GpuMap {
     pub fn draw(&mut self, app: &mut DeviceApp<NoGpu>, w: usize, h: usize) -> Result<(), String> {
         if self.lay.is_none_or(|l| (l.w, l.h) != (w, h)) {
             let out = if self.surfaces.is_some() { kernel::Out::Surface } else { kernel::Out::Argb8 };
-            let l = Layout::new(w, h, self.bytes, out);
+            let l = Layout::new(w, h, self.bytes, out).ok_or_else(|| format!("its block of the layer arena ({} MiB) leaves a {w} x {h} frame's two regions no room for four cells", self.bytes >> 20))?;
             println!("mahere: GPU layout for {w} x {h}: two frame regions of {} MiB, the overlay at {} MiB in each, the code at {} MiB, {} cell slots of 1 MiB from {} MiB", l.regions[1] >> 20, kernel::OVERLAY >> 20, l.code_at >> 20, l.slots, l.slots_at >> 20);
             self.slots = Slots::new(l.slots);
             self.lay = Some(l);

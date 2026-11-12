@@ -14,10 +14,10 @@ const SURFACE: u64 = 3;
 const IRA: u64 = 4;
 const GPS: u64 = 7;
 const UDP: u64 = 8;
-/// The GPU service and the layer arena (`--use gpu --dma layers`), after the network: the map drawn on the GPU (`gpu.rs`).
+/// The GPU service and Mahere's block of the layer arena, after the network: the map drawn on the GPU (`gpu.rs`). As a kist these are the kernel's to hand every kist, the slots after its eight wants (ferros_sys::gpu `kist_slots(8)`, ferros GPU-KISTS.md plan step 1, 2026-11-12); a development spawn gives them with `--use gpu --dma layers`.
 const GPU: u64 = 9;
 const LAYERS: u64 = 10;
-/// A second surface (`--dma surface` after the layers): the mailbox's other buffer, so the GPU draws one frame while the display shows the last (`gpu.rs`).
+/// A second surface (the kernel's third GPU slot for a kist; `--dma surface` after the layers in a development spawn): the mailbox's other buffer, so the GPU draws one frame while the display shows the last (`gpu.rs`).
 const SURFACE2: u64 = 11;
 
 type Shell = FerrosShell<App>;
