@@ -157,6 +157,11 @@ pub fn read_response(r: &mut impl BufRead) -> Result<Got, String> {
     match body {
         Body::Empty => {}
         Body::Length(n) => {
+            // The body's length known: its buffer made that size at once (ferros, 2026-11-12: `read_to_end` doubled its way up, a 17 MB font pack asking for 2^25 bytes beside the 2^24 it had, and Mahere on the Pro ended "memory allocation of 33554432 bytes failed").
+            // WHY the bound: the length is the server's word, external input; a header past 2^26 (more than any document Mahere fetches, a font pack 17 MB, a cell 2) is read as before, growing as it comes, so a bad header cannot ask for an allocation of any size up front.
+            if n <= 1 << 26 {
+                out.reserve_exact(n as usize);
+            }
             let got = r.by_ref().take(n).read_to_end(&mut out).map_err(|e| e.to_string())?;
             if got as u64 != n {
                 return Err(format!("short body: {got} of {n} bytes"));

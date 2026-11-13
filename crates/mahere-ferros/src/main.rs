@@ -17,6 +17,61 @@ mod arena;
 #[cfg(test)]
 mod tests;
 
+/// The heap as Mahere uses it, counted at every allocation (two atomics on top of the runtime's allocator): the bytes held now and the most held, said on the console beside the arc's size so what fills the arc can be told from what the allocator keeps (ferros, 2026-11-12: the arc reached 538 MiB at the globe with the pool's cells at 190, and an 11.9 MB allocation failed at the 640 MiB ceiling on the 8a).
+#[cfg(target_os = "ferros")]
+pub mod heap {
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+
+    pub struct Counting;
+    static HELD: AtomicUsize = AtomicUsize::new(0);
+    static MOST: AtomicUsize = AtomicUsize::new(0);
+
+    fn grew(n: usize) {
+        let now = HELD.fetch_add(n, Relaxed) + n;
+        MOST.fetch_max(now, Relaxed);
+    }
+
+    unsafe impl GlobalAlloc for Counting {
+        unsafe fn alloc(&self, l: Layout) -> *mut u8 {
+            let p = unsafe { System.alloc(l) };
+            if !p.is_null() {
+                grew(l.size());
+            }
+            p
+        }
+        unsafe fn alloc_zeroed(&self, l: Layout) -> *mut u8 {
+            let p = unsafe { System.alloc_zeroed(l) };
+            if !p.is_null() {
+                grew(l.size());
+            }
+            p
+        }
+        unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
+            unsafe { System.dealloc(p, l) };
+            HELD.fetch_sub(l.size(), Relaxed);
+        }
+        unsafe fn realloc(&self, p: *mut u8, l: Layout, n: usize) -> *mut u8 {
+            let q = unsafe { System.realloc(p, l, n) };
+            if !q.is_null() {
+                HELD.fetch_sub(l.size(), Relaxed);
+                grew(n);
+            }
+            q
+        }
+    }
+
+    /// The bytes held now and the most held since the last call (the most then starts again from now).
+    pub fn take() -> (usize, usize) {
+        let now = HELD.load(Relaxed);
+        (now, MOST.swap(now, Relaxed))
+    }
+}
+
+#[cfg(target_os = "ferros")]
+#[global_allocator]
+static HEAP: heap::Counting = heap::Counting;
+
 #[cfg(target_os = "ferros")]
 fn main() {
     ferros::run();

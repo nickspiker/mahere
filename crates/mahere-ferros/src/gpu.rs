@@ -261,6 +261,8 @@ impl GpuMap {
         let mut hs = std::collections::hash_map::DefaultHasher::new();
         (w, h, c.lat().to_bits(), c.lon().to_bits(), c.ppd.to_bits(), c.bearing().to_bits(), map.pool_version(), map.style_version(), map.layers().bits()).hash(&mut hs);
         (app.panel.is_open(), app.panel.ru().to_bits(), map.globe_loading().map(|d| d.to_bits()), map.gps.is_some()).hash(&mut hs);
+        // The panel asking to be painted again: a frame waiting is not drawn as it is, its overlay predates the change.
+        app.panel_changed.hash(&mut hs);
         // The display's bake: a brightness change plans the frame again with the new one.
         fluor::host::ferros::bake().map(|b| b.generation).hash(&mut hs);
         hs.finish()
@@ -485,7 +487,8 @@ impl GpuMap {
         let t0 = std::time::Instant::now();
         // A change goes into both regions' stale boxes: this region's copy is brought up to date now, the other's when its next frame comes.
         let mut changed = PixelBox::EMPTY;
-        if self.panel_key != Some(panel_key) {
+        // Its key moved, or the panel asked (`DeviceApp::panel_changed`: a font pack loaded, a press, a card's text; the key holds none of them).
+        if self.panel_key != Some(panel_key) || std::mem::take(&mut app.panel_changed) {
             self.panel_key = Some(panel_key);
             app.paint_panel(w, h);
             let p = app.panel.pixels();

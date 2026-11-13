@@ -2034,8 +2034,10 @@ dependencies = [
  "mahere-coord",
  "mahere-device",
  "mahere-engine",
+ "mahere-panel",
  "mahere-store",
  "mahere-tiles",
+ "rayon",
  "valhall",
 ]
 

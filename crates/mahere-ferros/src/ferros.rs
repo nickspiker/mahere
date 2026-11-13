@@ -27,6 +27,11 @@ type Shell = FerrosShell<App>;
 pub struct App {
     pub inner: DeviceApp<NoGpu>,
     gpu: Option<crate::gpu::GpuMap>,
+    /// The ticks that asked for a frame and all of them since the last line, and when that line was said (`tick`): what keeps a still map drawing, on the console every ten seconds while it does.
+    ticks: [u64; 2],
+    ticks_said: std::time::Instant,
+    /// The heap's most in MiB at the last line (a still map says it again only when it moved).
+    heap_said: usize,
 }
 
 impl FluorApp for App {
@@ -51,7 +56,26 @@ impl FluorApp for App {
         self.inner.wake_at()
     }
     fn tick(&mut self, ctx: &mut Context) -> bool {
-        self.inner.tick(ctx)
+        let more = self.inner.tick(ctx);
+        self.ticks[0] += more as u64;
+        self.ticks[1] += 1;
+        if self.ticks_said.elapsed().as_secs() >= 10 {
+            let (held, most) = crate::heap::take();
+            let pool: usize = self.inner.map.pool().map.values().map(|e| e.bytes()).sum();
+            let heap = format!("the heap {} MiB held, {} at most since the last line; the pool's cells {} MiB", held >> 20, most >> 20, pool >> 20);
+            if self.ticks[0] > 0 {
+                let (m, d) = (self.inner.map.tick_why, self.inner.tick_why);
+                println!("mahere: {} of {} ticks asked for a frame in {} s (cells arrived {}, the map dirty {}, a route {}, the wants said again {}; a search {}, the panel {}, the lettering {}); {heap}", self.ticks[0], self.ticks[1], self.ticks_said.elapsed().as_secs(), m[0], m[1], m[2], m[3], d[0], d[1], d[2]);
+            } else if most >> 20 != self.heap_said {
+                println!("mahere: {heap}");
+            }
+            self.heap_said = most >> 20;
+            self.ticks = [0; 2];
+            self.inner.map.tick_why = [0; 4];
+            self.inner.tick_why = [0; 3];
+            self.ticks_said = std::time::Instant::now();
+        }
+        more
     }
     fn wants_keyboard(&mut self) -> Option<bool> {
         self.inner.wants_keyboard()
@@ -228,7 +252,7 @@ pub fn run() {
     if most != usize::MAX {
         println!("mahere: the GPU's block taken as {} MiB at most (the spawn's input byte)", most >> 20);
     }
-    let app = App { inner, gpu: crate::gpu::GpuMap::open(GPU, LAYERS, SURFACE, SURFACE2, most) };
+    let app = App { inner, gpu: crate::gpu::GpuMap::open(GPU, LAYERS, SURFACE, SURFACE2, most), ticks: [0; 2], ticks_said: std::time::Instant::now(), heap_said: 0 };
     let fixes: Arc<Mutex<Option<GpsFix>>> = Arc::new(Mutex::new(None));
     if sys::grant_count() > GPS {
         let fixes = fixes.clone();

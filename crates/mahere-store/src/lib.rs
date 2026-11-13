@@ -1139,6 +1139,7 @@ fn font_key(id: &str) -> String {
 }
 
 /// Font packs from the vault's copy, else fetched and kept in the vault (one download a device per script); without a vault, fetched each time the app starts.
+/// Read and written as BULK values (kete's `read_device_bulk`, `write_device_bulk`), kept out of kete's read cache as the map's cells are: the panel's `FontPacks` holds each pack once it came, and the cache held a second copy of every one (up to its 64 MiB), the Chinese, Korean and Japanese packs alone 37 MiB (ferros, 2026-11-12: Mahere's heap at its ceiling on the 8a, an 11.9 MB allocation failing, and on the Pro a 32 MiB one).
 pub struct VaultFonts {
     store: Option<Arc<FlatStorage>>,
     /// Where packs are fetched from, each tried in turn: `<base>/<id>.vsf`.
@@ -1212,7 +1213,7 @@ impl mahere_panel::fonts::PackSource for VaultFonts {
     fn get(&self, id: &str) -> Result<Vec<u8>, String> {
         let t = std::time::Instant::now();
         if let Some(s) = &self.store {
-            if let Ok(Some(b)) = s.read_device(&font_key(id)) {
+            if let Ok(Some(b)) = s.read_device_bulk(&font_key(id)) {
                 if !b.is_empty() {
                     eprintln!("font pack {id}: {} KB from the vault in {} ms", b.len() / 1024, t.elapsed().as_millis());
                     return Ok(b);
@@ -1222,14 +1223,14 @@ impl mahere_panel::fonts::PackSource for VaultFonts {
         let doc = self.fetch(id)?;
         eprintln!("font pack {id}: {} KB from the bucket in {} ms", doc.len() / 1024, t.elapsed().as_millis());
         if let Some(s) = &self.store {
-            let _ = s.write_device(&font_key(id), &doc);
+            let _ = s.write_device_bulk(&[(font_key(id), doc.clone())]);
         }
         Ok(doc)
     }
 
     fn forget(&self, id: &str) {
         if let Some(s) = &self.store {
-            let _ = s.write_device(&font_key(id), &[]);
+            let _ = s.write_device_bulk(&[(font_key(id), Vec::new())]);
         }
     }
 }

@@ -238,6 +238,9 @@ fn cross(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
     [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]]
 }
 
+/// Which way [`MapCore::turn_about`] turns the screen for a positive angle against the screen's own angles (y down): the sign that makes `hold_two`'s error shrink.
+const TURN_SIGN: f64 = -1.0;
+
 /// `v` turned about the unit axis `k` by `angle` (Rodrigues).
 fn rotate(v: [f64; 3], k: [f64; 3], angle: f64) -> [f64; 3] {
     let (s, c) = angle.sin_cos();
@@ -303,6 +306,8 @@ pub struct MapCore {
     pub last_straddle_blocks: usize,
     /// The last `plan`'s µs: preparing the view (`prepare`), the plan itself (`plan::plan_frame`), the residency's want; zeros for a plan from the cache.
     pub plan_us: [u64; 3],
+    /// Why `tick` asked for a frame, counted: cells arrived, the map marked dirty, a route or its refinement landed, the wants said again changed the pool (a host says them on its console to find what keeps a still map drawing).
+    pub tick_why: [u64; 4],
     /// Something changed since the last render (camera, sun, GPS). Reported by `tick` so shells that only draw on demand get a frame.
     dirty: bool,
     /// The cells the last frame wanted and the view's centre it sorted them by: `tick` says them to the residency again while it is unsettled, so the wants go on (the once-a-second resend, the retry of a failed cell) without a frame drawn for them.
@@ -458,6 +463,7 @@ impl MapCore {
             marks_top: 0.0,
             last_straddle_blocks: 0,
             plan_us: [0; 3],
+            tick_why: [0; 4],
             dirty: true,
             want_last: (Vec::new(), (0, 0)),
             last_range: ElevRange::EMPTY,
@@ -612,6 +618,53 @@ impl MapCore {
         self.cam = Camera::from_basis(nb, self.cam.ppd);
         self.clamp_camera();
         self.camera_moved(w, h);
+    }
+
+    /// Turn the ball by `angle` radians about the view direction of screen point (ax, ay): the ground there stays there and everything turns about it, as a twist of two fingers turns the map about their midpoint.
+    /// `rotate_view` turns about the camera point instead; a turn there followed by `place_anchor` leaves a twist off the camera point (2026-11-12: fingers turned 45 degrees about a point a third of the screen from the view's centre at a region's scale ended 5 pixels from their ground).
+    pub fn turn_about(&mut self, angle: f64, ax: f64, ay: f64, w: usize, h: usize) {
+        let b = self.cam.basis();
+        let axis = self.cam.view_dir(ax, ay, w, h);
+        let e = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+        let cols = [rotate(e[0], axis, angle), rotate(e[1], axis, angle), rotate(e[2], axis, angle)];
+        let mut nb = [[0.0; 3]; 3];
+        for i in 0..3 {
+            for k in 0..3 {
+                nb[i][k] = cols[0][i] * b[0][k] + cols[1][i] * b[1][k] + cols[2][i] * b[2][k];
+            }
+        }
+        self.cam = Camera::from_basis(nb, self.cam.ppd);
+        self.unlock_measure();
+        self.camera_moved(w, h);
+    }
+
+    /// Two fingers holding the ground they came down on: the ground under their midpoint at the start (`mid`) put under their midpoint now, then the ball turned about it until the line from finger a's ground to finger b's runs as the fingers do (`ga`, `gb`: the ground each came down on). The scale is the caller's (the fingers' distance against their first).
+    /// Two passes of the turn and the scale: off the camera point the ball's turn about the midpoint and the scale's ratio are not quite the screen's (the orthographic view foreshortens them), the second pass takes what the first left.
+    #[allow(clippy::too_many_arguments)]
+    pub fn hold_two(&mut self, mid: (f64, f64), ga: (f64, f64), gb: (f64, f64), a: (f64, f64), b: (f64, f64), w: usize, h: usize) {
+        let (mx, my) = ((a.0 + b.0) * 0.5, (a.1 + b.1) * 0.5);
+        let want = (b.1 - a.1).atan2(b.0 - a.0);
+        let want_d = (b.0 - a.0).hypot(b.1 - a.1);
+        for _ in 0..2 {
+            self.place_anchor(mid.0, mid.1, mx, my, w, h);
+            let (pa, pb) = (self.cam.geo_to_screen(ga.0, ga.1, w, h), self.cam.geo_to_screen(gb.0, gb.1, w, h));
+            let now = (pb.1 - pa.1).atan2(pb.0 - pa.0);
+            // The error the short way round, in (-pi, pi].
+            let err = (want - now + core::f64::consts::PI).rem_euclid(core::f64::consts::TAU) - core::f64::consts::PI;
+            self.turn_about(TURN_SIGN * err, mx, my, w, h);
+            // The scale too: off the camera point the screen's distance between the two grounds is foreshortened from the scale's ratio.
+            let (pa, pb) = (self.cam.geo_to_screen(ga.0, ga.1, w, h), self.cam.geo_to_screen(gb.0, gb.1, w, h));
+            let now_d = (pb.0 - pa.0).hypot(pb.1 - pa.1);
+            // WHY: two fingers past the limb take their ground at the limb, both at the same point when they lie on one ray from the ball's centre: no distance to scale by (a ppd of infinity or NaN would lose the camera).
+            if now_d > 0.0 {
+                self.set_ppd(self.cam.ppd * want_d / now_d);
+            }
+        }
+        self.place_anchor(mid.0, mid.1, mx, my, w, h);
+        // The two grounds' own midpoint on the screen onto the fingers' (on the ball the ground under their midpoint is not the midpoint of theirs: a pixel or so at a region's scale).
+        let (pa, pb) = (self.cam.geo_to_screen(ga.0, ga.1, w, h), self.cam.geo_to_screen(gb.0, gb.1, w, h));
+        let c = self.cam.screen_to_geo((pa.0 + pb.0) * 0.5, (pa.1 + pb.1) * 0.5, w, h);
+        self.place_anchor(c.0, c.1, mx, my, w, h);
     }
 
     /// Turn the view by `delta` radians clockwise.
@@ -1179,6 +1232,9 @@ impl MapCore {
         }
         self.refine_route();
         let changed = arrived > 0 || self.dirty || routed || wanted;
+        for (n, why) in self.tick_why.iter_mut().zip([arrived > 0, self.dirty, routed, wanted]) {
+            *n += why as u64;
+        }
         // When the first view and the globe's base set are complete, how long that took and the loaders' share (2026-10-22: ten seconds on a relaunch with every cell on the phone).
         if let Some(t) = self.started.filter(|_| self.res.converged() && !self.res.pool.map.is_empty() && self.globe_loading().is_none()) {
             self.started = None;
@@ -2315,6 +2371,34 @@ mod tests {
     impl CellStore for Empty {
         fn get(&self, _key: mahere_tiles::CellKey) -> residency::Fetch {
             residency::Fetch::Absent
+        }
+    }
+
+    /// Two fingers twisted and pinched away from the camera point hold the ground each came down on (`hold_two`), at a town's scale, a region's and the globe's; the turn about the camera point and the midpoint put back (the device app's solve until 2026-11-12) left them pixels off at a region's.
+    #[test]
+    fn two_fingers_hold_their_ground() {
+        let (w, h) = (1080usize, 2400usize);
+        for &(lat, lon, ppd) in &[(46.2, -121.5, 6000.0), (46.2, -121.5, 60.0), (20.0, -150.0, 6.0)] {
+            for &(cx, cy, r, turn, spread) in &[(300.0, 1800.0, 250.0, 45.0f64, 1.0f64), (800.0, 1000.0, 150.0, -60.0, 1.5), (540.0, 1200.0, 200.0, 90.0, 1.25)] {
+                let cam0 = Camera::new(lat, lon, ppd, 0.3);
+                let mut map = MapCore::new(Arc::new(Empty), cam0);
+                // At the globe only a gesture on the ball: off it, a finger's ground is the limb's.
+                if ppd < 10.0 && (cx - 540.0f64).hypot(cy - 1200.0) + r > 0.9 * map.cam.radius() {
+                    continue;
+                }
+                let (a, b) = ((cx - r, cy), (cx + r, cy));
+                let (ga, gb) = (map.cam.screen_to_geo(a.0, a.1, w, h), map.cam.screen_to_geo(b.0, b.1, w, h));
+                let mid = map.cam.screen_to_geo(cx, cy, w, h);
+                let t = turn.to_radians();
+                let (na, nb) = ((cx - r * spread * t.cos(), cy - r * spread * t.sin()), (cx + r * spread * t.cos(), cy + r * spread * t.sin()));
+                map.set_ppd(cam0.ppd * spread);
+                map.rotate_view(-t);
+                map.hold_two(mid, ga, gb, na, nb, w, h);
+                for (g, n) in [(ga, na), (gb, nb)] {
+                    let p = map.cam.geo_to_screen(g.0, g.1, w, h);
+                    assert!((p.0 - n.0).hypot(p.1 - n.1) < 0.1, "ppd {ppd}, fingers about ({cx}, {cy}) turned {turn}: a finger's ground at {p:?}, the finger at {n:?}");
+                }
+            }
         }
     }
 

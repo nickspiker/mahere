@@ -38,10 +38,17 @@ pub struct TwoFinger {
     pub cam0: Camera,
     /// Screen angle of the finger vector at capture.
     pub alpha0: f64,
+    /// The ground each finger came down on, which `MapCore::hold_two` keeps under it.
+    pub ga: (f64, f64),
+    pub gb: (f64, f64),
 }
 
 pub struct DeviceApp<G: MapGpu = NoGpu> {
     pub map: MapCore,
+    /// Why `tick` asked for a frame beyond the map's own (`MapCore::tick_why`), counted: a search landed, the panel dirty, the lettering landed.
+    pub tick_why: [u64; 3],
+    /// The panel asked to be painted again since a host that paints it itself last looked (`tick` takes its dirty flag): a GPU host's overlay repaints it on this as well as on its own key (ferros, 2026-11-12: a font pack arriving marked the panel dirty every tick until a paint loaded it, the GPU host never painted it for that, and the still map drew at the panel's rate).
+    pub panel_changed: bool,
     /// The way of travel routes take (1 car, 2 bike, 3 foot), kept while no route mode is on; whether the search card is up, and whether the keyboard was last asked up for it.
     pub travel_pref: u8,
     pub searching: bool,
@@ -562,6 +569,8 @@ impl<G: MapGpu> DeviceApp<G> {
             d0,
             cam0: self.map.cam,
             alpha0: (y1 - y0).atan2(x1 - x0),
+            ga: self.map.cam.screen_to_geo(x0, y0, self.w, self.h),
+            gb: self.map.cam.screen_to_geo(x1, y1, self.w, self.h),
         });
         self.dragging = false;
     }
@@ -572,12 +581,12 @@ impl<G: MapGpu> DeviceApp<G> {
         let d = ((x1 - x0).powi(2) + (y1 - y0).powi(2)).sqrt().max(1.0);
         let alpha = (y1 - y0).atan2(x1 - x0);
         // From the view at the gesture's start every time, so nothing accumulates: the scale, the turn by the fingers' angle (a rotation of the ball about the view axis, never a bearing), then the anchor.
-        let (geo_mid, cam0, d0, alpha0) = (t.geo_mid, t.cam0, t.d0, t.alpha0);
+        let (geo_mid, cam0, d0, alpha0, ga, gb) = (t.geo_mid, t.cam0, t.d0, t.alpha0, t.ga, t.gb);
         self.map.cam = cam0;
         self.map.set_ppd(cam0.ppd * d / d0);
         self.map.rotate_view(alpha0 - alpha);
-        let (mx, my) = ((x0 + x1) * 0.5, (y0 + y1) * 0.5);
-        self.map.place_anchor(geo_mid.0, geo_mid.1, mx, my, self.w, self.h);
+        // Each finger's ground held under it (2026-11-12: a turn about the camera point and the midpoint's ground put back left the fingers 5 pixels off theirs, a 45 degree twist a third of the screen from the view's centre at a region's scale; held, within a fiftieth of a pixel).
+        self.map.hold_two(geo_mid, ga, gb, (x0, y0), (x1, y1), self.w, self.h);
     }
 
     pub fn two_end(&mut self) {
@@ -840,8 +849,13 @@ impl<G: MapGpu> FluorApp for DeviceApp<G> {
                 let at_rest = self.label_rest();
                 self.labeller.ask(&mut self.map, self.w, self.h, self.panel.label_font_px(), at_rest);
             }
-            more = self.panel.take_dirty() || self.labeller.poll();
+            let (dirty, lettered) = (self.panel.take_dirty(), self.labeller.poll());
+            self.tick_why[1] += dirty as u64;
+            self.panel_changed |= dirty;
+            self.tick_why[2] += lettered as u64;
+            more = dirty || lettered;
         }
+        self.tick_why[0] += found as u64;
         // A search under way is no frame: its result landing is (`found`).
         self.map.tick(self.w, self.h) || found || more
     }
@@ -1042,6 +1056,8 @@ impl<G: MapGpu> DeviceApp<G> {
             areas,
             share_file: None,
             areas_shown: Instant::now(),
+            tick_why: [0; 3],
+            panel_changed: false,
             updater: {
                 let mut u = mahere_update::Updater::new(std::path::PathBuf::from(dir.unwrap_or_default()));
                 u.auto = settings.is_none_or(|s| s.auto_update);
