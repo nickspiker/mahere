@@ -441,7 +441,8 @@ fn letters(l: &Letters, x: F, y: F, sx: F, sy: F, m: M) -> (F, [F; 3]) {
             TILE_MOST,
             (zero, [zero; 3], zero),
             |n, (a, v, halo)| {
-                let g = word(list + n.to_u32());
+                // WHY the select: a pass past the tile's count reads the next tile's entries or the words past the lists, a letter's number nothing says is one; held to the first letter, its record is a record (the 8a, 2026-11-13: a GPU fault at G#0C962BC0 with the lettering on, its lanes' addresses not all inside the arena).
+                let g = U::select(n.lt(most), word(list + n.to_u32()), U::splat(0));
                 let at = pu(l.glyphs_at) + (g << crate::letters::GLYPH_SHIFT);
                 let r = |k: u32| word(at + U::splat(k));
                 let (cx, cy, ax, ay) = (F::from_bits(r(0)), F::from_bits(r(1)), F::from_bits(r(2)), F::from_bits(r(3)));
@@ -456,7 +457,8 @@ fn letters(l: &Letters, x: F, y: F, sx: F, sy: F, m: M) -> (F, [F; 3]) {
                 // A letter at rest is level on whole pixels (letters.rs), every pixel a texel's centre: that texel alone, a quarter of the turned letter's reads and none of its blend; the whole warp takes one way or the other (it is the letter's).
                 // The sine squared, not its magnitude: valhall's `abs` of a half widened to f32 takes the whole word as an f32 and drops the widen (found here 2026-11-13: every turned letter was taken as level).
                 let level = (s * s).lt(F::splat(1. / (1u64 << 32) as f32));
-                let (fx, fy) = (ax + lx - 0.5, ay + ly - 0.5);
+                // WHY the selects: every lane forms its read's address whether or not its block runs it (as `square` does for the cells): one outside the letter's reach reads the glyph's centre, so no address leaves the atlas (one far from the letter named texels gigabytes off and the GPU's MMU faulted the frame, the 8a, 2026-11-13).
+                let (fx, fy) = (F::select(inside, ax + lx - 0.5, ax), F::select(inside, ay + ly - 0.5, ay));
                 let at = ssa::when(inside & level, (zero, zero), || texel(pu(l.atlas_at), ATLAS_STRIDE as u32, fx, fy));
                 let (cover, hl) = ssa::when(inside & !level, at, || sample(pu(l.atlas_at), ATLAS_STRIDE as u32, fx, fy));
                 let take = (one - a) * (cover * ba.hi_f());
