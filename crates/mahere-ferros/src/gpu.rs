@@ -14,9 +14,12 @@ use crate::kernel;
 use mahere_device::{DeviceApp, NoGpu};
 use mahere_engine::PixelBox;
 
-/// Mahere's block of the arena in the GPU's address space (ferros_sys::gpu `ARENA_VA`), and the most it can be: 128 MiB, the whole arena. A kernel that cannot say a region's size (before ferros 2026-11-11) gave the whole 64 MiB arena and fenced no surface in for the GPU.
+/// Mahere's block in the GPU's address space (ferros_sys::gpu `ARENA_VA`), and the most it can be: ferros's ceiling a client's GPU block (ferros_sys `GPU_BLOCK_MOST`, 512 MiB since 2026-11-13; 128 MiB, the whole fixed arena, before). A kernel that cannot say a region's size (before ferros 2026-11-11) gave the whole 64 MiB arena and fenced no surface in for the GPU.
 const ARENA_VA: u64 = 0x8000_0000;
-const ARENA_MOST: usize = 128 << 20;
+const ARENA_MOST: usize = 512 << 20;
+/// What Mahere asks for (ferros 2026-11-13, SYS_DMA x1 = 2): 2^29, 512 MiB. The 8a's 1080 x 2400 names 114 to 376 cells' planes of a MiB at the scale's depth (2026-11-12), and its frame regions take 24 MiB more; 256 MiB would hold the plans two or three depths short at a city, 512 the whole of them. Halved while the pool cannot give it, down to `BLOCK_LEAST_LOG` (32 MiB, what a kist holds at launch).
+const ASK_LOG: u32 = 29;
+const BLOCK_LEAST_LOG: u32 = 25;
 const ARENA_BEFORE: usize = 64 << 20;
 /// The apps' surfaces in the GPU's address space (payloads/gpu `SURFACES_VA`) and where they start in memory (ferros cachemap SURFACES): an app's surface is its physical base's offset from there.
 const SURFACES_VA: u64 = 0xC000_0000;
@@ -173,6 +176,12 @@ impl GpuMap {
         if base == 0 || base == crate::ferros::sys::ERR {
             println!("mahere: no layer arena at slot {arena_slot}: the map draws on the CPU");
             return None;
+        }
+        // The block as large as a full-detail screen wants (ferros 2026-11-13: GPU memory is frames of the pool on demand, the kist given 32 MiB at launch and asking for more): `ASK_LOG`, halved while the pool cannot give it, never below what is held; a smaller block is the same map a few depths softer (`arena::shortfall`). Not when a development spawn asked to test a small block.
+        if most == usize::MAX {
+            let had = crate::ferros::sys::dma_size(arena_slot, ARENA_MOST as u64).unwrap_or(0);
+            let got = (BLOCK_LEAST_LOG..=ASK_LOG).rev().find_map(|log| if 1u64 << log <= had { Some(had) } else { crate::ferros::sys::gpu_block_ask(arena_slot, log, ARENA_MOST as u64) });
+            println!("mahere: the GPU block asked for {} MiB: {} MiB (held {} MiB at launch)", (1u64 << ASK_LOG) >> 20, got.unwrap_or(had) >> 20, had >> 20);
         }
         // A kernel that says the block's size fences the apps' surfaces in for the GPU too (ferros 2026-11-11 on): the kernel then writes the surface, no copy.
         let sized = crate::ferros::sys::dma_size(arena_slot, ARENA_MOST as u64);

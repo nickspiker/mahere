@@ -195,6 +195,12 @@ pub(crate) mod sys {
         (n != ERR && n <= most).then_some(n)
     }
 
+    /// Ask the kernel to grow this process's GPU block (the grant at `slot`) to 2^`log` bytes in place, its base and contents kept (SYS_DMA with x1 = 2, ferros since 2026-11-13, ferros_sys `gpu_block_ask`): its size after, or None (more than the frame pool can give or past the kernel's ceiling, said on its console; or a kernel from before, which answers the base, past `most`).
+    pub fn gpu_block_ask(slot: u64, log: u32, most: u64) -> Option<u64> {
+        let n = svc(7, cap(slot), 2, log as u64, 0, 0);
+        (n != ERR && n <= most).then_some(n)
+    }
+
     /// The board (the kernel's SYS_FACTS, 12, fact 84: 1 husky, 2 akita), read as ferros_sys `akita` reads it: no capability, and the facts cost an I2C read of the battery gauge, so once.
     pub fn board() -> u64 {
         let mut b = [0u8; 85 * 8];
