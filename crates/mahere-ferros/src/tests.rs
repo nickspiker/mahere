@@ -555,23 +555,25 @@ fn a_planned_cell_is_in_the_pool_when_its_frame_is_written() {
     }
 }
 
-/// A small block of the arena (2026-11-12, the 8a: 32 MiB, the circle black): at the 8a's 1080 x 2400 a frame region is 19 MiB and two take 38, so 32 MiB lays out one (the frames not pipelined) with thirteen cell slots, and 16 MiB none (the CPU raster draws); the Pro's 1344 x 2992 in 32 MiB one region too. 128 MiB, the whole arena, two.
+/// A small block of the arena (2026-11-12, the 8a: 32 MiB, the circle black; then 32 and 64 MiB, the kists started first holding the rest): at the 8a's 1080 x 2400 a frame region is 12 MiB (19 before the overlay moved to 1 MiB), so 64 MiB lays out two with 40 cell slots (26 before), 32 MiB one (two would leave 8 slots, fewer than the globe's base set takes) with 20 (13 before), and 8 MiB none (the CPU raster draws); the Pro's 1344 x 2992 in 32 MiB one region too. 128 MiB, the whole arena, two.
 #[test]
 fn a_small_block_lays_out_one_region_or_none() {
     let out = kernel::Out::Surface;
     let two = Layout::new(1080, 2400, 128 << 20, out).unwrap();
-    assert!(two.two() && two.regions == [0, 19 << 20] && two.slots == 90, "{two:?}");
+    assert!(two.two() && two.regions == [0, 12 << 20] && two.slots == 104, "{two:?}");
+    let half = Layout::new(1080, 2400, 64 << 20, out).unwrap();
+    assert!(half.two() && half.slots == 40, "{half:?}");
     let one = Layout::new(1080, 2400, 32 << 20, out).unwrap();
-    assert!(!one.two() && one.regions == [0, 0] && one.slots_at == 19 << 20 && one.slots == 13, "{one:?}");
+    assert!(!one.two() && one.regions == [0, 0] && one.slots_at == 12 << 20 && one.slots == arena::GLOBE_SLOTS, "{one:?}");
     let pro = Layout::new(1344, 2992, 32 << 20, out).unwrap();
     assert!(!pro.two() && pro.slots >= arena::MIN_SLOTS, "{pro:?}");
-    assert!(Layout::new(1080, 2400, 16 << 20, out).is_none());
-    // The kernel's frame in the arena too (no surface fenced in): a region of 29 MiB, so 32 MiB has no room for the cells' slots beside one.
-    assert!(Layout::new(1080, 2400, 32 << 20, kernel::Out::Argb8).is_none());
+    assert!(Layout::new(1080, 2400, 8 << 20, out).is_none());
+    // The kernel's frame in the arena too (no surface fenced in): a region of 22 MiB, so 24 MiB has no room for the cells' slots beside one.
+    assert!(Layout::new(1080, 2400, 24 << 20, kernel::Out::Argb8).is_none());
     assert!(!Layout::new(1080, 2400, 48 << 20, kernel::Out::Argb8).unwrap().two());
 }
 
-/// The globe in a block of 26 slots (the 8a, 2026-11-12: 64 MiB at 1080 x 2400, the globe's plan naming hundreds of squares' cells, every frame the first 26 planes placed and the rest the loading mesh): with every cell the plan wants and the globe's depth-0 cells in the pool, the cells are held to a depth that fits, and from the second frame on (the first frame's planes are still the last's) every square holding a point of the screen names a slot.
+/// The globe in a small block (the 8a, 2026-11-12: 64 MiB at 1080 x 2400 held 26 slots, the globe's plan naming hundreds of squares' cells, every frame the first 26 planes placed and the rest the loading mesh; here 32 MiB, 20 slots): with every cell the plan wants and the globe's depth-0 cells in the pool, the cells are held to a depth that fits, and from the second frame on (the first frame's planes are still the last's) every square holding a point of the screen names a slot.
 #[test]
 fn the_globe_fits_a_small_block() {
     use mahere_engine::MapCore;
@@ -584,9 +586,9 @@ fn the_globe_fits_a_small_block() {
         }
     }
     let (w, h) = (1080usize, 2400usize);
-    let bytes = 64 << 20;
+    let bytes = 32 << 20;
     let lay = Layout::new(w, h, bytes, kernel::Out::Surface).unwrap();
-    assert_eq!(lay.slots, 26);
+    assert_eq!(lay.slots, 20);
     let mut arena = vec![0u32; bytes / 4];
     let mut map = MapCore::new(Arc::new(Empty), Camera::new(20.0, -150.0, 9.0, 0.0));
     map.camera_moved(w, h);

@@ -35,7 +35,9 @@ pub const SQUARE_SHIFT: u32 = 27;
 /// The g2t codes' working values (256 words, 2^14 · atanh(c / 256), fluor's own table for its 8-bit pixels): the overlay's codes into the surface's values.
 pub const CODE_TAB: usize = 120 << 10;
 /// The overlay (premultiplied RGBA bytes, a word a pixel), then (`Out::Argb8`) the frame, a screen's words each; then the code and the cells' slots, placed by the host from the screen's size.
-pub const OVERLAY: usize = 8 << 20;
+/// At 1 MiB the squares have 192 Ki words: a box at the role's depth is a cell 115 pixels or more across (`select_depth`), so a 1344 x 2992 screen turned any way meets about 32 x 32 squares a diamond, five diamonds at an icosahedron's corner, two roles: about 10 Ki.
+/// It was 8 MiB until 2026-11-12, 7 of it squares no plan names, in each of the two frame regions: on the 8a a 32 MiB block of the arena then held one region and 13 cell slots, the globe's ten cells of depth 0 needing 20.
+pub const OVERLAY: usize = 1 << 20;
 pub const MAX_SQUARES: usize = (OVERLAY - SQUARES) / 4;
 
 /// A face's row: its (u, v) numerators' and its denominator's coefficients on the pixel's direction (f32 bits, (u, v) in depth-30 units), the fractions and whole parts of the camera point's (u, v) when measured from it (else 0), the loading mesh's hash seed for its diamond (raster.rs `loading_noise`'s diamond and depth terms), then each role's box (the terrain's at `F_BOX`, the vector planes' `F_BOX_WORDS` after): its cell grid corner (cu0, cv0), width, height, and the word offset of its squares in the arena.
