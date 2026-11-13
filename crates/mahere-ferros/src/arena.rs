@@ -3,7 +3,7 @@
 use crate::kernel::{self, Consts};
 use mahere_engine::colour::lin;
 use mahere_engine::plan::NONE;
-use mahere_engine::viewplan::ViewPlan;
+use mahere_engine::viewplan::{ROLE_PLANES, ViewPlan};
 use mahere_engine::raster::{FrameLuts, alpha, is_boundary, line_min_depth, rgb3};
 use mahere_engine::residency::Pool;
 use mahere_engine::PixelBox;
@@ -73,16 +73,30 @@ struct Held {
 }
 
 /// The slots' contents, and what the frames so far wrote and could not place.
+/// `capped` counts the frames whose cells were held to a coarser depth to fit the slots (`fit`), `cap` the last such frame's depth.
 pub struct Slots {
     held: Vec<Option<Held>>,
     pub frame: u64,
     pub written: u64,
     pub starved: u64,
+    pub capped: u64,
+    pub cap: u8,
 }
 
 impl Slots {
     pub fn new(n: usize) -> Slots {
-        Slots { held: vec![None; n], frame: 0, written: 0, starved: 0 }
+        Slots { held: vec![None; n], frame: 0, written: 0, starved: 0, capped: 0, cap: 0 }
+    }
+
+    /// Whether the cells in `want` (each a key and its plane, no repeats) can all be in a slot this frame: those not in one yet against the slots free or neither this frame's nor the last's.
+    fn fits(&self, want: &[(CellKey, Plane)]) -> bool {
+        let frame = self.frame;
+        let new = want.iter().filter(|w| !self.held.iter().any(|s| matches!(s, Some(h) if (h.key, h.plane) == **w))).count();
+        let free = self.held.iter().filter(|s| match s {
+            None => true,
+            Some(h) => h.frame + 1 < frame && !want.contains(&(h.key, h.plane)),
+        });
+        new <= free.count()
     }
 
     /// The slot holding `key`'s `plane`, written now if it is not there (taking a free slot, else the one drawn longest ago); None when every slot is this frame's.
@@ -152,13 +166,15 @@ pub fn view(slots: &mut Slots, pool: &Pool, plan: &ViewPlan, version: u64, lay: 
     }
     let base = lay.regions[region] / 4;
     let mut at = base + kernel::SQUARES / 4;
-    for (t, plane) in plan.roles.iter().zip([Plane::Dem, Plane::Vec]) {
+    let keys = fit(slots, pool, plan);
+    for ((t, plane), keys) in plan.roles.iter().zip([Plane::Dem, Plane::Vec]).zip(&keys) {
         // Each stand-in's square word, the cells holding a point of the screen first: a full arena starves a box's margin before what shows.
         let mut word = vec![0u32; t.refs.len()];
         for shown in [true, false] {
-            for (i, r) in t.refs.iter().enumerate().filter(|(_, r)| r.on_screen == shown) {
-                match slots.slot_for(pool, r.key, plane, version, lay, arena) {
-                    Some(s) => word[i] = ((lay.slots_at + s * SLOT) / 4) as u32 | (22 - r.key.depth as u32) << kernel::SQUARE_SHIFT,
+            for (i, _) in t.refs.iter().enumerate().filter(|(_, r)| r.on_screen == shown) {
+                let key = keys[i];
+                match slots.slot_for(pool, key, plane, version, lay, arena) {
+                    Some(s) => word[i] = ((lay.slots_at + s * SLOT) / 4) as u32 | (22 - key.depth as u32) << kernel::SQUARE_SHIFT,
                     None => slots.starved += 1,
                 }
             }
@@ -185,6 +201,46 @@ pub fn view(slots: &mut Slots, pool: &Pool, plan: &ViewPlan, version: u64, lay: 
         None => {}
     }
     Ok(())
+}
+
+/// Each role's stand-ins as the slots can hold them this frame: the plan's own cells when every one shown fits, else each held to the finest cell the pool has for it at a depth no deeper than a cap, the cap the deepest that fits.
+/// The 8a, 2026-11-12: Mahere's block of the arena held 26 slots (64 MiB, two frame regions of 19 at 1080 x 2400), the globe's plan named 264 squares' cells at depth 1 and 2, and every frame placed the first 26 planes and left the rest to the loading mesh (302111 planes wanted with no slot free in ten seconds): the globe stayed a patchwork of the mesh with a few cells in it, while the 10 cells of depth 0 the pool always holds (residency's `with_globe`) would have drawn all of it.
+/// A coarser cell stands in as the plan's own stand-ins do (its depth in the square's word), so a capped frame is the whole map a little softer, never a hole; the cells the plan wants still load into the pool and draw once the slots hold them (a closer view needs fewer).
+fn fit(slots: &mut Slots, pool: &Pool, plan: &ViewPlan) -> [Vec<CellKey>; 2] {
+    let mut keys = [0, 1].map(|r| plan.roles[r].refs.iter().map(|s| s.key).collect::<Vec<_>>());
+    let shown = |keys: &[Vec<CellKey>; 2]| {
+        let mut w: Vec<(CellKey, Plane)> = Vec::new();
+        for (r, plane) in [Plane::Dem, Plane::Vec].into_iter().enumerate() {
+            for (k, s) in keys[r].iter().zip(&plan.roles[r].refs) {
+                if s.on_screen && !w.contains(&(*k, plane)) {
+                    w.push((*k, plane));
+                }
+            }
+        }
+        w
+    };
+    if slots.fits(&shown(&keys)) {
+        return keys;
+    }
+    let top = keys.iter().flatten().map(|k| k.depth).max().unwrap_or(0);
+    for cap in (0..top).rev() {
+        for (r, k) in keys.iter_mut().enumerate() {
+            let need = ROLE_PLANES[r];
+            for (key, s) in k.iter_mut().zip(&plan.roles[r].refs) {
+                if s.key.depth <= cap {
+                    continue;
+                }
+                // The finest ancestor at or above the cap the pool carries this role's planes for; none, the plan's own cell (it competes for a slot as before).
+                *key = (0..=cap).rev().map(|d| s.key.ancestor(d)).find(|a| pool.map.get(a).is_some_and(|e| e.present & need != 0)).unwrap_or(s.key);
+            }
+        }
+        if slots.fits(&shown(&keys)) {
+            slots.capped += 1;
+            slots.cap = cap;
+            break;
+        }
+    }
+    keys
 }
 
 /// The cosine of the farthest a face's centre may be from the camera point for the near form (50 degrees): there the camera point's (u, v) on the face lies within about half a diamond of it, so its whole part and every pixel's offset from it fit an i32.

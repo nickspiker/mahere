@@ -571,6 +571,59 @@ fn a_small_block_lays_out_one_region_or_none() {
     assert!(!Layout::new(1080, 2400, 48 << 20, kernel::Out::Argb8).unwrap().two());
 }
 
+/// The globe in a block of 26 slots (the 8a, 2026-11-12: 64 MiB at 1080 x 2400, the globe's plan naming hundreds of squares' cells, every frame the first 26 planes placed and the rest the loading mesh): with every cell the plan wants and the globe's depth-0 cells in the pool, the cells are held to a depth that fits, and from the second frame on (the first frame's planes are still the last's) every square holding a point of the screen names a slot.
+#[test]
+fn the_globe_fits_a_small_block() {
+    use mahere_engine::MapCore;
+    use mahere_engine::residency::{CellStore, Fetch};
+    use std::sync::Arc;
+    struct Empty;
+    impl CellStore for Empty {
+        fn get(&self, _key: CellKey) -> Fetch {
+            Fetch::Absent
+        }
+    }
+    let (w, h) = (1080usize, 2400usize);
+    let bytes = 64 << 20;
+    let lay = Layout::new(w, h, bytes, kernel::Out::Surface).unwrap();
+    assert_eq!(lay.slots, 26);
+    let mut arena = vec![0u32; bytes / 4];
+    let mut map = MapCore::new(Arc::new(Empty), Camera::new(20.0, -150.0, 9.0, 0.0));
+    map.camera_moved(w, h);
+    let mut n = 0u32;
+    for d in 0..10u8 {
+        n += 1;
+        map.pool_mut().map.insert(CellKey::from_grid(d, 0, 0, 0), cell(n));
+    }
+    let plan = map.plan_view(w, h);
+    for k in plan.want.clone() {
+        if !map.pool().map.contains_key(&k) {
+            n += 1;
+            map.pool_mut().map.insert(k, cell(n));
+        }
+    }
+    let plan = plan_view(w, h, &map.cam, map.pool(), plan.dem_depth, plan.vec_depth);
+    let planes: usize = plan.roles.iter().map(|t| t.refs.iter().filter(|r| r.on_screen).count()).sum();
+    assert!(planes > lay.slots, "the view's own cells fit the slots ({planes} planes): not the case this checks");
+    let mut slots = Slots::new(lay.slots);
+    for frame in 0..3usize {
+        arena::view(&mut slots, map.pool(), &plan, map.pool_version(), &lay, frame & 1, &mut arena).unwrap();
+        if frame == 0 {
+            continue;
+        }
+        let mut at = lay.regions[frame & 1] / 4 + kernel::SQUARES / 4;
+        for t in &plan.roles {
+            for (k, &sq) in t.squares.iter().enumerate() {
+                if sq != mahere_engine::plan::NONE && t.refs[sq as usize].on_screen {
+                    assert_ne!(arena[at + k], 0, "frame {frame}: a shown square at depth {} with no slot", t.depth);
+                }
+            }
+            at += t.squares.len();
+        }
+    }
+    assert!(slots.capped > 0);
+}
+
 /// The fetch storm of 2026-11-12 (the 8a: about 240 fetches failed "DNS still asking" in Mahere's first second): Mahere's twenty loaders asking for the bucket's address at once against a resolver like the ip server's (each call held until its lookup ends, a lookup a quarter second; sixteen held calls at most, the oldest answered "still asking" when a seventeenth comes). One call is held at a time, the loaders waiting on it all get the address, and none fails; a lookup that gives way ("still asking") is asked again, not failed; a lookup that ends with no address fails every loader waiting on it with one call.
 #[test]
 fn one_lookup_a_host_however_many_loaders_ask() {
