@@ -628,6 +628,38 @@ fn the_globe_fits_a_small_block() {
     assert!(slots.capped > 0);
 }
 
+/// The plans' shortfall settles, a depth a frame, where the screen's cells fit the slots, and stays there while the view does: from the globe to a trail's scale at 1080 x 2400, in the blocks the 8a gave Mahere (20, 40 slots) and the whole arena (104).
+#[test]
+fn the_shortfall_settles_where_the_cells_fit() {
+    use mahere_engine::MapCore;
+    use mahere_engine::residency::{CellStore, Fetch};
+    use std::sync::Arc;
+    struct Empty;
+    impl CellStore for Empty {
+        fn get(&self, _key: CellKey) -> Fetch {
+            Fetch::Absent
+        }
+    }
+    let (w, h) = (1080usize, 2400usize);
+    for slots in [20usize, 40, 104] {
+        for ppd in [6.0, 60.0, 600.0, 6000.0, 60000.0] {
+            let mut map = MapCore::new(Arc::new(Empty), Camera::new(46.2, -121.5, ppd, 0.3));
+            map.camera_moved(w, h);
+            let mut seen = Vec::new();
+            for _ in 0..32 {
+                let plan = map.plan_view(w, h);
+                map.depth_short = arena::shortfall(map.depth_short, &plan, slots);
+                seen.push(map.depth_short);
+            }
+            assert!(seen[16..].iter().all(|&s| s == seen[31]), "{slots} slots at ppd {ppd}: the shortfall still moving {seen:?}");
+            let plan = map.plan_view(w, h);
+            let planes = [plan.dem_depth, plan.vec_depth].iter().map(|&d| plan.want.iter().filter(|k| k.depth == d).count()).sum::<usize>();
+            assert!(planes <= slots || plan.dem_depth == 0, "{slots} slots at ppd {ppd}: settled {} short at depth {} with {planes} planes", seen[31], plan.dem_depth);
+            println!("{slots} slots, ppd {ppd}: {} depths short, depth {}, {planes} planes", seen[31], plan.dem_depth);
+        }
+    }
+}
+
 /// The fetch storm of 2026-11-12 (the 8a: about 240 fetches failed "DNS still asking" in Mahere's first second): Mahere's twenty loaders asking for the bucket's address at once against a resolver like the ip server's (each call held until its lookup ends, a lookup a quarter second; sixteen held calls at most, the oldest answered "still asking" when a seventeenth comes). One call is held at a time, the loaders waiting on it all get the address, and none fails; a lookup that gives way ("still asking") is asked again, not failed; a lookup that ends with no address fails every loader waiting on it with one call.
 #[test]
 fn one_lookup_a_host_however_many_loaders_ask() {

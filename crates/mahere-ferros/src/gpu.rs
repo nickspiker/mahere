@@ -121,6 +121,8 @@ struct Stats {
     frames: u64,
     /// The decoded cells in the pool at the last frame planned, and their bytes (the residency budget's count, `Entry::bytes`).
     pool: (usize, usize),
+    /// How many depths coarser than the scale asks the last plan was made (`MapCore::depth_short`).
+    short: u8,
     gpu_us: u64,
     gpu_max: u64,
     plan_us: u64,
@@ -366,8 +368,8 @@ impl GpuMap {
             let n = s.frames.max(1);
             let lay = self.lay.unwrap();
             println!(
-                "mahere: GPU {} frames: the kernel {} us a frame on the GPU (longest {}), {} words from {} nodes, {} faces in view ({}), {} squares, {} points; host per frame: plan {} us (view {}, plan {} [faces and points {}, desired {}, boxes and stand-ins {}, range {}], want {}), page table {} us, tables {} us, overlay {} us, record {} us, the kernel {} us ({} compiled at {} us each, {} bound), its words {} us, the call {} us, the wait for the GPU's frame {} us; the overlay a frame: panel {} us, marks {} us, sum {} us; {} panels painted ({} us each, {} of it finding its box), {} marks ({} us each), {} boxes summed ({} pixels and {} us each); {} cell planes written so far, {} wanted with no slot free ({} slots), {} frames held to a coarser depth to fit them (the last to depth {}); the pool {} cells, {} MiB",
-                s.frames, s.gpu_us / n, s.gpu_max, s.words, s.nodes, s.faces, if s.near { "near" } else { "far" }, s.squares, s.samples, s.plan_us / n, s.plan_parts[0] / n, s.plan_parts[1] / n, s.plan_inner[0] / n, s.plan_inner[1] / n, s.plan_inner[2] / n, s.plan_inner[3] / n, s.plan_parts[2] / n, s.table_us / n, s.luts_us / n, s.overlay_us / n, s.record_us / n, s.kernel_us / n, s.compiled, s.compile_us / s.compiled.max(1), s.bound, s.code_us / n, s.call_us / n, s.wait_us / n, s.overlay_parts[0] / n, s.overlay_parts[1] / n, s.overlay_parts[2] / n, s.panels, s.overlay_parts[0] / s.panels.max(1), s.panel_box_us / s.panels.max(1), s.marks, s.overlay_parts[1] / s.marks.max(1), s.overlays, s.summed / s.overlays.max(1), s.overlay_parts[2] / s.overlays.max(1), self.slots.written, self.slots.starved, lay.slots, self.slots.capped, self.slots.cap, s.pool.0, s.pool.1 >> 20
+                "mahere: GPU {} frames: the kernel {} us a frame on the GPU (longest {}), {} words from {} nodes, {} faces in view ({}), {} squares, {} points; host per frame: plan {} us (view {}, plan {} [faces and points {}, desired {}, boxes and stand-ins {}, range {}], want {}), page table {} us, tables {} us, overlay {} us, record {} us, the kernel {} us ({} compiled at {} us each, {} bound), its words {} us, the call {} us, the wait for the GPU's frame {} us; the overlay a frame: panel {} us, marks {} us, sum {} us; {} panels painted ({} us each, {} of it finding its box), {} marks ({} us each), {} boxes summed ({} pixels and {} us each); {} cell planes written so far, {} wanted with no slot free ({} slots), {} frames held to a coarser depth to fit them (the last to depth {}); the pool {} cells, {} MiB; the plans {} depths short of the scale's",
+                s.frames, s.gpu_us / n, s.gpu_max, s.words, s.nodes, s.faces, if s.near { "near" } else { "far" }, s.squares, s.samples, s.plan_us / n, s.plan_parts[0] / n, s.plan_parts[1] / n, s.plan_inner[0] / n, s.plan_inner[1] / n, s.plan_inner[2] / n, s.plan_inner[3] / n, s.plan_parts[2] / n, s.table_us / n, s.luts_us / n, s.overlay_us / n, s.record_us / n, s.kernel_us / n, s.compiled, s.compile_us / s.compiled.max(1), s.bound, s.code_us / n, s.call_us / n, s.wait_us / n, s.overlay_parts[0] / n, s.overlay_parts[1] / n, s.overlay_parts[2] / n, s.panels, s.overlay_parts[0] / s.panels.max(1), s.panel_box_us / s.panels.max(1), s.marks, s.overlay_parts[1] / s.marks.max(1), s.overlays, s.summed / s.overlays.max(1), s.overlay_parts[2] / s.overlays.max(1), self.slots.written, self.slots.starved, lay.slots, self.slots.capped, self.slots.cap, s.pool.0, s.pool.1 >> 20, s.short
             );
             self.stats = Stats::default();
         }
@@ -390,6 +392,9 @@ impl GpuMap {
         let arena = unsafe { core::slice::from_raw_parts_mut(self.arena, self.bytes / 4) };
         arena::view(&mut self.slots, app.map.pool(), &plan, version, &lay, region, arena)?;
         app.map.set_drawn_range(plan.range);
+        // The depth the next plans are made at, held to what the slots can draw (`arena::shortfall`).
+        app.map.depth_short = arena::shortfall(app.map.depth_short, &plan, lay.slots);
+        self.stats.short = app.map.depth_short;
         let t2 = std::time::Instant::now();
         let ramp = self.style[region] != Some(app.map.style_version());
         self.style[region] = Some(app.map.style_version());

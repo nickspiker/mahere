@@ -208,6 +208,22 @@ pub fn view(slots: &mut Slots, pool: &Pool, plan: &ViewPlan, version: u64, lay: 
     Ok(())
 }
 
+/// How many depths coarser than the scale asks the next plans are made (`MapCore::depth_short`), from `short` and the plan just made at it: the cells the screen names at the plan's depth, both roles (the plan's own wants at that depth), against the slots, one depth a frame.
+/// A 1080 x 2400 screen names 114 to 376 planes at the scale's depth and a block of the arena holds 20 to 104 (2026-11-12), so without it the cells asked for and kept (190 MiB of them at the globe on the 8a) were ones `fit` could not draw.
+/// Finer again only when the plan's planes, eight times over, still fit the slots: a depth finer names about four times as many, the growth varying about that, and a depth that flipped every few frames would turn the residency's wants over with it.
+pub fn shortfall(short: u8, plan: &ViewPlan, slots: usize) -> u8 {
+    let wanted = |d: u8| plan.want.iter().filter(|k| k.depth == d).count();
+    let planes = wanted(plan.dem_depth) + wanted(plan.vec_depth);
+    // WHY the depth above 0: at depth 0 a plan names the globe's base cells and no coarser exist; a block too small even for them (the Pro's 1344 x 2992 in 32 MiB, 14 slots) would raise the shortfall every frame without end.
+    if planes > slots && plan.dem_depth.max(plan.vec_depth) > 0 {
+        short + 1
+    } else if short > 0 && planes << 3 <= slots {
+        short - 1
+    } else {
+        short
+    }
+}
+
 /// Each role's stand-ins as the slots can hold them this frame: the plan's own cells when every one shown fits, else each held to the finest cell the pool has for it at a depth no deeper than a cap, the cap the deepest that fits.
 /// The 8a, 2026-11-12: Mahere's block of the arena held 26 slots (64 MiB, two frame regions of 19 at 1080 x 2400), the globe's plan named 264 squares' cells at depth 1 and 2, and every frame placed the first 26 planes and left the rest to the loading mesh (302111 planes wanted with no slot free in ten seconds): the globe stayed a patchwork of the mesh with a few cells in it, while the 10 cells of depth 0 the pool always holds (residency's `with_globe`) would have drawn all of it.
 /// A coarser cell stands in as the plan's own stand-ins do (its depth in the square's word), so a capped frame is the whole map a little softer, never a hole; the cells the plan wants still load into the pool and draw once the slots hold them (a closer view needs fewer).

@@ -296,6 +296,11 @@ pub struct MapCore {
     ink: PixelBox,
     vec_depth: u8,
     dem_depth: u8,
+    /// The depths the camera's scale asks for (`select_depth`, its hysteresis kept on these); `vec_depth` and `dem_depth` are them less `depth_short`.
+    vec_ideal: u8,
+    dem_ideal: u8,
+    /// How many depths coarser than the scale asks the plans are made: a host whose GPU holds fewer cells than a screen at the scale's depth names sets it (ferros: a block of the layer arena holds 20 to 104 cell planes, a 1080 x 2400 screen names 114 to 376 at its depth), so the cells asked for and kept are the ones it can draw; 0 by default.
+    pub depth_short: u8,
     home: Camera,
     /// Measured cost of the last `render` call in milliseconds.
     pub last_frame_ms: f32,
@@ -457,6 +462,9 @@ impl MapCore {
             ink: PixelBox::EMPTY,
             vec_depth: VEC_BASE_DEPTH,
             dem_depth: DEM_BASE_DEPTH,
+            vec_ideal: VEC_BASE_DEPTH,
+            dem_ideal: DEM_BASE_DEPTH,
+            depth_short: 0,
             home,
             last_frame_ms: 0.0,
             last_trace: None,
@@ -707,7 +715,7 @@ impl MapCore {
 
     /// The depth a mark is drawn at: one above what the view wants, so a texel is one to two pixels wide (the view's own depth puts texels under a pixel, for the supersampled render, and a mark there would be a sprinkle).
     fn draw_depth(&self) -> u8 {
-        select_depth(self.cam.ppd, self.vec_depth, VEC_BASE_DEPTH).saturating_sub(1)
+        select_depth(self.cam.ppd, self.vec_ideal, VEC_BASE_DEPTH).saturating_sub(1)
     }
 
     pub fn set_tool(&mut self, tool: ink::Tool) {
@@ -1957,8 +1965,11 @@ impl MapCore {
                 self.light_version += 1;
             }
         }
-        self.vec_depth = select_depth(self.cam.ppd, self.vec_depth, VEC_BASE_DEPTH);
-        self.dem_depth = select_depth(self.cam.ppd, self.dem_depth, DEM_BASE_DEPTH);
+        self.vec_ideal = select_depth(self.cam.ppd, self.vec_ideal, VEC_BASE_DEPTH);
+        self.dem_ideal = select_depth(self.cam.ppd, self.dem_ideal, DEM_BASE_DEPTH);
+        // WHY saturating: at the globe the scale asks for depth 1 or 2 and a short host can be shorter than that; there is no depth under 0 (MIN_DEPTH).
+        self.vec_depth = self.vec_ideal.saturating_sub(self.depth_short);
+        self.dem_depth = self.dem_ideal.saturating_sub(self.depth_short);
         self.luts.dem_depth = self.dem_depth;
         // Contours: fit N levels to the previous frame's elevation span.
         let interval = if let Some(held) = self.contour_hold {
@@ -2095,17 +2106,17 @@ impl MapCore {
 
     /// Whether the view is zoomed past the finest data under the crosshair: the cell there at the view's depth is known to be absent (a 404 from the bucket, or under a cell that was). A cell still loading is not past anything.
     pub fn past_data(&self) -> bool {
-        if self.zoom_depth() > self.vec_depth {
+        if self.zoom_depth() > self.vec_ideal {
             return true;
         }
-        let key = mahere_tiles::CellKey::containing(Coord::from_lat_lon(self.cam.lat(), self.cam.lon()), self.vec_depth);
+        let key = mahere_tiles::CellKey::containing(Coord::from_lat_lon(self.cam.lat(), self.cam.lon()), self.vec_ideal);
         self.res.pool.map.get(&key).is_some_and(|e| e.present == 0 && e.is_absent())
     }
 
     /// The depth the zoom asks for: the view's depth, counting on past the finest any cell is baked to (so z keeps climbing as the map magnifies past its detail).
     pub fn zoom_depth(&self) -> u8 {
         let ideal = raster::select_depth(self.cam.ppd, 0, 30);
-        if self.vec_depth == raster::VEC_BASE_DEPTH { ideal.max(self.vec_depth) } else { self.vec_depth }
+        if self.vec_ideal == raster::VEC_BASE_DEPTH { ideal.max(self.vec_ideal) } else { self.vec_ideal }
     }
 
     /// North arrow, top-right, with the view's heading below it: degrees the screen's up is turned from true north, clockwise positive, -180..180. No letters.
