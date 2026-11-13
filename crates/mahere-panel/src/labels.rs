@@ -86,6 +86,8 @@ pub struct Atlas {
     pub rg: Vec<u8>,
     /// Bumped whenever the texture changed, for a host to upload it again.
     pub version: u64,
+    /// Bumped whenever the texture starts again (`cleared`): a glyph keeps its place until then, so a host that copies glyphs out by their place copies them again only when this moves.
+    pub generation: u64,
     x: usize,
     y: usize,
     row: usize,
@@ -94,12 +96,12 @@ pub struct Atlas {
 
 impl Atlas {
     fn new() -> Atlas {
-        Atlas { side: 2048, rg: vec![0; 2048 * 2048 * 2], version: 1, x: 0, y: 0, row: 0, slots: HashMap::new() }
+        Atlas { side: 2048, rg: vec![0; 2048 * 2048 * 2], version: 1, generation: 0, x: 0, y: 0, row: 0, slots: HashMap::new() }
     }
 
     /// An empty atlas of `side` square, the next version.
     fn cleared(&self, side: usize) -> Atlas {
-        Atlas { side, rg: vec![0; side * side * 2], version: self.version + 1, x: 0, y: 0, row: 0, slots: HashMap::new() }
+        Atlas { side, rg: vec![0; side * side * 2], version: self.version + 1, generation: self.generation + 1, x: 0, y: 0, row: 0, slots: HashMap::new() }
     }
 
     /// Room for a glyph of this many pixels: the next place on the shelf, or on a new shelf; None when the texture is full.
@@ -119,13 +121,14 @@ impl Atlas {
     }
 }
 
-/// A label as kept between layouts: where it is on the globe, its letters (atlas glyph, offset from the anchor in pixels, angle as laid out) as laid out, whether it turns with the map, its colour (an index into the theme's) and whether it has a halo.
+/// A label as kept between layouts: where it is on the globe, its letters (atlas glyph, offset from the anchor in pixels, angle as laid out) as laid out, whether it turns with the map and the way it reads as laid out (radians from its first letter to its last, top up so within a quarter turn of level), its colour (an index into the theme's) and whether it has a halo.
 #[derive(Clone)]
 struct Kept {
     name: Named,
     anchor: (f64, f64),
     letters: Vec<(GlyphKey, [f32; 2], f32)>,
     turns: bool,
+    reads: f32,
     colour: usize,
     halo: bool,
 }
@@ -401,6 +404,8 @@ pub struct Labeller {
     fonts_laid: usize,
     /// The text size the last layout was asked at: a new one lays the view out again (2026-10-25: the UI scale changed and the map's lettering stayed at the old size until the camera moved).
     font_asked: f32,
+    /// How many layouts have landed: a host that keeps a frame planned and waiting (ferros's GPU map) plans it again when this moves.
+    landed: u64,
 }
 
 impl Default for Labeller {
@@ -637,7 +642,7 @@ impl Labeller {
                 }
             })
             .expect("labels thread");
-        Labeller { tx, rx, shown: Lettering::default(), busy: false, asked: None, last: std::time::Instant::now(), fonts: None, fonts_laid: 0, font_asked: 0.0 }
+        Labeller { tx, rx, shown: Lettering::default(), busy: false, asked: None, last: std::time::Instant::now(), fonts: None, fonts_laid: 0, font_asked: 0.0, landed: 0 }
     }
 
     /// The font packs to draw names in scripts the binary lacks (Nick 2026-10-16): a layout that needed one asks for it, and one arriving lays the view out again.
@@ -704,8 +709,14 @@ impl Labeller {
         }
         if landed {
             self.busy = false;
+            self.landed += 1;
         }
         landed
+    }
+
+    /// How many layouts have landed so far.
+    pub fn landed(&self) -> u64 {
+        self.landed
     }
 
     /// Lay out the view now and wait for it (a check or a test).
@@ -826,9 +837,10 @@ impl Letterer {
         let laid = self.layout(&texels, &job.cam, w, h, font, &previous);
         let kept = self.keep(&laid, &job.cam, w, h);
         self.previous = kept.iter().map(|k| ident(&k.name)).collect();
-        // The packs this layout's names needed and lacked, fetched for the next.
+        // The packs the names it shows need, fetched for the next layout; never those of names measured and left out.
         if let Some(f) = &job.fonts {
-            crate::fonts::ask(&mut self.text, f, &mut self.font_cursor);
+            let shown: Vec<(String, (f64, f64))> = kept.iter().map(|k| (k.name.label(), k.anchor)).collect();
+            crate::fonts::ask_shown(shown.iter().map(|(s, at)| (s.as_str(), *at)), f, &mut self.font_cursor);
         }
         let route_width = (font * 0.32).max(3.0);
         let (a, b) = ([w as f64 * 0.25, h as f64 * 0.5], [w as f64 * 0.75, h as f64 * 0.5]);
@@ -864,12 +876,17 @@ impl Letterer {
             let letters = l.glyphs.iter().map(|g| (self.glyph(g.ch, l.size, l.weight, l.shear, halo, g.angle), [g.at[0] - centre[0], g.at[1] - centre[1]], g.angle)).collect();
             // A point's name stays level; a line's and an area's turn with the map.
             let turns = !l.name.is_point();
-            kept.push(Kept { name: l.name.clone(), anchor, letters, turns, colour: l.colour, halo: halo > 0 });
+            let reads = match (l.glyphs.first(), l.glyphs.last()) {
+                (Some(a), Some(b)) if l.glyphs.len() > 1 => (b.at[1] - a.at[1]).atan2(b.at[0] - a.at[0]),
+                (Some(a), _) => a.angle,
+                _ => 0.0,
+            };
+            kept.push(Kept { name: l.name.clone(), anchor, letters, turns, reads, colour: l.colour, halo: halo > 0 });
             if let Some((p, kind)) = l.mark {
                 // The kind's symbol, level, no halo.
                 let (ch, colour, scale) = mark_of(kind);
                 let key = self.glyph(ch, l.size * scale, 400, 0.0, 0, 0.0);
-                kept.push(Kept { name: l.name.clone(), anchor: cam.screen_to_geo(p[0] as f64, p[1] as f64, w, h), letters: vec![(key, [0.0, 0.0], 0.0)], turns: false, colour, halo: false });
+                kept.push(Kept { name: l.name.clone(), anchor: cam.screen_to_geo(p[0] as f64, p[1] as f64, w, h), letters: vec![(key, [0.0, 0.0], 0.0)], turns: false, reads: 0.0, colour, halo: false });
             }
         }
         kept
@@ -1392,6 +1409,16 @@ impl Lettering {
         ((by - ay).atan2(bx - ax) - (b[1] - a[1]).atan2(b[0] - a[0])) as f32
     }
 
+    /// How far a label's letters turn about its anchor now, the map having turned `phi` since the layout: none for a level one; for one that turns with the map, `phi`, and half a turn more where that leaves it reading upside down (its way of reading past a quarter turn from level either way), so every name reads top up however the map is turned (2026-11-13, Mahere on the GPU: labels upright regardless of the map's rotation). Turned half a turn about its anchor a straight name lies on its line as before; a curved one bows the other way until the next layout, a quarter second after the map rests.
+    fn turn(k: &Kept, phi: f32) -> f32 {
+        use std::f32::consts::{FRAC_PI_2, PI, TAU};
+        if !k.turns {
+            return 0.0;
+        }
+        let reads = (k.reads + phi + PI).rem_euclid(TAU) - PI;
+        if reads.abs() > FRAC_PI_2 { phi + PI } else { phi }
+    }
+
     /// Whether the map is still near the scale this lettering was laid out at: within twice either way it is drawn as it is while the next layout comes; past that it is a different view's lettering, crowded or sparse, and is not drawn (Nick 2026-10-18: a layout made zoomed in over Siberia stayed on the globe, piled up in one corner, while the globe's own was still coming).
     fn near_scale(&self, cam: &mahere_engine::Camera) -> bool {
         self.ppd <= 0.0 || (0.5..=2.0).contains(&(cam.ppd / self.ppd))
@@ -1403,7 +1430,6 @@ impl Lettering {
             return Vec::new();
         }
         let phi = self.turned(cam, w, h);
-        let (sp, cp) = phi.sin_cos();
         let halo = { let h = stored(self.palette[HALO]); [h[0], h[1], h[2], h[3] * HALO_STRENGTH] };
         let side = self.atlas.side as f32;
         let mut out = Vec::new();
@@ -1415,9 +1441,11 @@ impl Lettering {
             }
             let text = stored(self.palette[k.colour]);
             let halo = if k.halo { halo } else { [0.0; 4] };
+            let t = Self::turn(k, phi);
+            let (sp, cp) = t.sin_cos();
             for (key, off, angle) in &k.letters {
                 let Some(slot) = self.atlas.slots.get(key) else { continue };
-                let (o, a) = if k.turns { ([off[0] * cp - off[1] * sp, off[0] * sp + off[1] * cp], angle + phi) } else { (*off, *angle) };
+                let (o, a) = if k.turns { ([off[0] * cp - off[1] * sp, off[0] * sp + off[1] * cp], angle + t) } else { (*off, *angle) };
                 // The quad turns only by what the glyph's bin left over; with nothing left (at rest) it sits on the pixel grid, texel for pixel.
                 let residual = a - key.bin as f32 * bin_step(key.size as f32 / 16.0);
                 let (sx, sy, sw, sh) = (slot[0] as f32, slot[1] as f32, slot[2] as f32, slot[3] as f32);
@@ -1539,14 +1567,38 @@ impl Lettering {
             return None;
         }
         let phi = self.turned(cam, w, h);
-        let (sp, cp) = phi.sin_cos();
         self.kept.iter().find(|k| {
             let (ax, ay) = cam.geo_to_screen(k.anchor.0, k.anchor.1, w, h);
+            let (sp, cp) = Self::turn(k, phi).sin_cos();
             k.letters.iter().any(|(key, off, _)| {
                 let o = if k.turns { [off[0] * cp - off[1] * sp, off[0] * sp + off[1] * cp] } else { *off };
                 let r = self.atlas.slots.get(key).map_or(8.0, |s| s[3] as f32 / (2.0 * ATLAS_DENSITY));
                 (x - (ax as f32 + o[0])).hypot(y - (ay as f32 + o[1])) <= r
             })
         }).map(|k| &k.name)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::f32::consts::{FRAC_PI_2, PI};
+
+    /// A name that turns with the map reads top up however far the map turns: past a quarter turn from level it turns half a turn more; a point's name never turns.
+    #[test]
+    fn a_turning_name_reads_top_up() {
+        let named = |kind: u8| Named { kind, rank: 0, name: String::from("Rainier Ave"), reference: String::new() };
+        let key = GlyphKey { ch: 'R', family: 0, size: 0, weight: 400, shear: 0, halo: 0, bin: 0 };
+        let kept = |kind: u8, turns: bool, reads: f32| Kept { name: named(kind), anchor: (0., 0.), letters: vec![(key, [0., 0.], reads)], turns, reads, colour: 0, halo: false };
+        let line = kept(RESIDENTIAL, true, 0.3);
+        for phi in [-3.0f32, -2.0, -1.0, 0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 6.0] {
+            let t = Lettering::turn(&line, phi);
+            let reads = (0.3 + t + PI).rem_euclid(2. * PI) - PI;
+            assert!(reads.abs() <= FRAC_PI_2 + 1e-5, "map turned {phi}: the name reads at {reads}");
+            // Turned with the map, or half a turn more: never anything else.
+            let off = (t - phi).rem_euclid(PI);
+            assert!(off < 1e-5 || PI - off < 1e-5, "map turned {phi}: the name turned {t}");
+        }
+        assert_eq!(Lettering::turn(&kept(CITY, false, 0.), 2.5), 0.);
     }
 }

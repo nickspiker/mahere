@@ -14,6 +14,8 @@ mod gpu;
 mod kernel;
 #[cfg(any(target_os = "ferros", test))]
 mod arena;
+#[cfg(any(target_os = "ferros", test))]
+mod letters;
 #[cfg(test)]
 mod tests;
 

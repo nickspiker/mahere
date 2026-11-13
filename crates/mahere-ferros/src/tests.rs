@@ -772,3 +772,235 @@ fn a_written_plane_lives_in_its_slot_alone() {
     let base = (lay.slots_at + at * arena::SLOT) / 4;
     assert_eq!(words[base] & 0xFFFF, 26000);
 }
+
+/// A real view's lettering on the GPU, by hand (it needs the network: the bucket's cells): the view's cells from the bucket as on a device, the labeller's layout at the 8a's text size, the frame planned as gpu.rs plans it with the lettering in, the kernel's words in the emulator, and what the lettering costs (its letters, tiles and atlas). MAHERE_LETTERS_OUT=<dir> writes each frame's working values as 8-bit RGB beside the CPU path's frame (the map, `draw_cpu`'s lettering), raw, for a look.
+#[test]
+#[ignore]
+fn a_real_lettering_on_the_gpu() {
+    use crate::letters::Letters;
+    use mahere_engine::residency::{DEFAULT_CELLS_URL, HttpStore};
+    use mahere_engine::MapCore;
+    use std::sync::Arc;
+    let (w, h) = (540usize, 1200usize);
+    let out = std::env::var("MAHERE_LETTERS_OUT").ok();
+    for (name, lat, lon, ppd, bearing) in [("seattle", 47.61, -122.33, 4096.0, 0.0), ("washington", 47.4, -121.5, 256.0, 0.0), ("seattle-turned", 47.61, -122.33, 4096.0, 2.5), ("tokyo", 35.68, 139.7, 1024.0, 0.0)] {
+        let store: Arc<dyn mahere_engine::residency::CellStore> = Arc::new(HttpStore::layer(DEFAULT_CELLS_URL, mahere_tiles::publish::Layer::Base));
+        let mut map = MapCore::layered(store, None, Camera::new(lat, lon, ppd, 0.0));
+        map.set_themes(mahere_engine::theme::builtin());
+        for _ in 0..12000 {
+            map.render(w, h);
+            if map.converged() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            map.tick(w, h);
+        }
+        let mut labels = mahere_panel::labels::Labeller::new();
+        labels.update(&mut map, w, h, 37.0);
+        // Turned after the layout, as two fingers turn it before the next.
+        if bearing != 0.0 {
+            let c = map.cam;
+            map.cam = Camera::new(c.lat(), c.lon(), c.ppd, bearing);
+            map.camera_moved(w, h);
+            map.render(w, h);
+        }
+        let quads = labels.glyphs(&map.cam, w, h);
+        let lay = Layout::new(w, h, BYTES, kernel::Out::Surface).unwrap();
+        let mut words = vec![0u32; BYTES / 4];
+        let mut slots = Slots::new(lay.slots);
+        let plan = map.plan_view(w, h);
+        arena::view(&mut slots, map.pool_mut(), &plan, &lay, 0, &mut words).unwrap();
+        arena::tables(map.luts(), &plan, true, &lay, 0, &mut words);
+        let mut letters = Letters::new(&lay);
+        let t = std::time::Instant::now();
+        let f = letters.frame(labels.atlas().into(), &quads, &lay, 0, &mut words);
+        let us = t.elapsed().as_micros();
+        let mut c = arena::consts(map.luts(), &plan, &lay, 0, false, None);
+        // Without the lettering first, for what it adds (`surface` says the instructions a warp issues).
+        surface(&kernel::record(&c), &words, w, h);
+        c.letters = f.map(|f| f.consts);
+        let k = kernel::record(&c);
+        let gpu = surface(&k, &words, w, h);
+        let s = letters.take_stats();
+        let (used, most) = letters.atlas_bytes();
+        if let Some(l) = c.letters {
+            // The passes a warp makes of the loop: the most any of its sixteen pixels' tiles holds.
+            let count = |i: usize| words[l.tiles_at as usize + (i / w >> crate::letters::TILE_SHIFT) * l.cols as usize + (i % w >> crate::letters::TILE_SHIFT)] & 255;
+            let warps = (w * h) / 16;
+            let passes: u32 = (0..warps).map(|k| (16 * k..16 * k + 16).map(count).max().unwrap()).sum();
+            let busy = (0..warps).filter(|&k| (16 * k..16 * k + 16).any(|i| count(i) > 0)).count();
+            println!("{name}: the loop {} words ({} of them constants), peak {} registers; {:.2} passes a warp, {busy} of {warps} warps in a tile with letters", k.loop_words, k.loop_consts, k.peak, passes as f64 / warps as f64);
+        }
+        println!("{name}: {} quads, {} letters drawn, {} left out, {} tile entries; {} glyphs into the atlas, {} KiB of {}; the host {us} us (first frame, every glyph averaged); the kernel {} words; the labeller's atlas {} square", quads.len(), s.letters, s.left_out, s.entries, s.glyphs, used >> 10, most >> 10, k.words.len(), labels.atlas().side);
+        if let Some(dir) = &out {
+            let code = |v: u32| ((v as f32 / 16384.) * 255.).round().min(255.) as u8;
+            let rgb: Vec<u8> = gpu.iter().flat_map(|p| [code(p[0]), code(p[1]), code(p[2])]).collect();
+            std::fs::write(format!("{dir}/{name}-gpu.rgb"), rgb).unwrap();
+            map.render(w, h);
+            let mut cpu = map.canvas.clone();
+            labels.draw_cpu(&mut cpu, &map.cam, w, h);
+            let rgb: Vec<u8> = cpu.iter().flat_map(|p| [(p >> 16) as u8, (p >> 8) as u8, *p as u8]).collect();
+            std::fs::write(format!("{dir}/{name}-cpu.rgb"), rgb).unwrap();
+        }
+    }
+}
+
+/// A labeller's atlas made up for the lettering's tests, `side` square, a glyph at each of `rects` (x, y, width, height in its texels): a ring with a dot off its centre (so a turn shows), its halo the disc six texels wider, as the labeller's halo is at least the letter.
+fn glyph_atlas(side: usize, rects: &[[usize; 4]]) -> Vec<u8> {
+    let mut rg = vec![0u8; side * side * 2];
+    // Coverage from a distance inside an edge, over one texel: a smoothstep of it, 0 outside and 1 a texel in.
+    let edge = |d: f32| {
+        let t = (d + 0.5).max(0.).min(1.);
+        t * t * (3. - 2. * t)
+    };
+    for r in rects {
+        let (cx, cy) = (r[2] as f32 / 2., r[3] as f32 / 2.);
+        let rad = cx.min(cy) * 0.5;
+        for y in 0..r[3] {
+            for x in 0..r[2] {
+                let (dx, dy) = (x as f32 + 0.5 - cx, y as f32 + 0.5 - cy);
+                let d = dx.hypot(dy);
+                let ring = edge(2.5 - (d - rad).abs());
+                let dot = edge(2.5 - (dx - rad * 0.4).hypot(dy + rad * 0.3));
+                let c = ring.max(dot);
+                let halo = edge(rad + 6. - d).max(c);
+                let o = ((r[1] + y) * side + r[0] + x) * 2;
+                rg[o] = (c * 255.).round() as u8;
+                rg[o + 1] = (halo * 255.).round() as u8;
+            }
+        }
+    }
+    rg
+}
+
+/// The lettering on the GPU against the same lettering worked out on the host: the kernel's words in the emulator over a frame of made-up glyphs (at rest, turned by their bin's rest, turned half a turn, across tiles and the screen's edge, over each other), every pixel the map under the letters under their halo as the host's own sum of every letter has it, from the same records and atlas (the tiles and their lists checked by leaving them out of the host's sum).
+/// And the atlas against the labeller's: each glyph at rest covers each pixel as the CPU path's draw averages the labeller's 3 x 3 texels under it (labels.rs `draw_cpu`), within a code's rounding.
+#[test]
+fn the_kernel_letters_as_the_host_does() {
+    use crate::letters::{Letters, Source, ATLAS_STRIDE, GLYPH_WORDS};
+    use valhall::f16_to_f32;
+    let (w, h) = (160usize, 120usize);
+    let cam = Camera::new(10.0, 30.0, 0.5, 0.0);
+    let mut pool = Pool::default();
+    let d = select_depth(cam.ppd, 0, 14);
+    let plan = plan_view(w, h, &cam, &pool, d, d);
+    let luts = luts(&plan, &cam, LayerMask::default());
+    let lay = Layout::new(w, h, BYTES, kernel::Out::Surface).unwrap();
+    let mut words = vec![0u32; BYTES / 4];
+    arena::view(&mut Slots::new(lay.slots), &mut pool, &plan, &lay, 0, &mut words).unwrap();
+    arena::tables(&luts, &plan, true, &lay, 0, &mut words);
+    // The labeller's atlas: glyphs of even sizes (its own are, so their centres are a texel's corner), some not a multiple of 3.
+    let side = 256usize;
+    let rects = [[2, 2, 30, 42], [40, 2, 24, 36], [70, 2, 40, 40], [120, 2, 18, 50], [2, 60, 56, 26], [64, 60, 34, 34]];
+    let rg = glyph_atlas(side, &rects);
+    let src = Source { side, rg: &rg, generation: 0, version: 1 };
+    let halo = [0.95f32, 0.93, 0.9, 0.8];
+    let quad = |cx: f32, cy: f32, r: [usize; 4], turn: f32, text: [f32; 4]| -> mahere_panel::labels::GlyphQuad {
+        let (s, k) = (side as f32, mahere_panel::labels::ATLAS_DENSITY);
+        [cx, cy, r[2] as f32 / (2. * k), r[3] as f32 / (2. * k), turn, 0., 0., 0., r[0] as f32 / s, r[1] as f32 / s, (r[0] + r[2]) as f32 / s, (r[1] + r[3]) as f32 / s, text[0], text[1], text[2], text[3], halo[0], halo[1], halo[2], halo[3]]
+    };
+    let ink = [0.2f32, 0.25, 0.3, 1.];
+    let water = [0.1f32, 0.3, 0.6, 0.9];
+    let quads = vec![
+        // At rest, off the pixel grid (placed on it), across tiles.
+        quad(20.3, 20.7, rects[0], 0., ink),
+        quad(31.6, 21.2, rects[1], 0., ink),
+        // A line's letters: the rest of their bins' angles.
+        quad(70.2, 30.9, rects[2], 0.04, water),
+        quad(84.0, 33.3, rects[3], -0.03, water),
+        // Turned with the map, and half a turn more.
+        quad(110.5, 60.5, rects[4], 0.7, ink),
+        quad(40.5, 80.25, rects[5], core::f32::consts::PI + 0.2, water),
+        // Over each other, and across the screen's edges.
+        quad(46.0, 78.0, rects[0], 0., ink),
+        quad(2.0, 100.0, rects[1], 0., water),
+        quad(155.0, 117.0, rects[4], 0.3, ink),
+    ];
+    let mut letters = Letters::new(&lay);
+    let f = letters.frame(src, &quads, &lay, 0, &mut words).expect("lettered");
+    assert_eq!(f.letters, quads.len());
+    let mut c = arena::consts(&luts, &plan, &lay, 0, false, None);
+    let bare = surface(&kernel::record(&c), &words, w, h);
+    c.letters = Some(f.consts);
+    let k = kernel::record(&c);
+    let gpu = surface(&k, &words, w, h);
+    // The host's sum: every record in order, each glyph sampled from the atlas in the region as the kernel samples it.
+    let l = f.consts;
+    let rec = |j: usize, i: usize| words[l.glyphs_at as usize + j * GLYPH_WORDS + i];
+    let half = |x: u32| (f16_to_f32(x as u16), f16_to_f32((x >> 16) as u16));
+    let texel = |x: i64, y: i64| {
+        let wd = words[l.atlas_at as usize + y as usize * ATLAS_STRIDE / 2 + (x as usize >> 1)] >> ((x & 1) << 4);
+        ((wd & 255) as f32, ((wd >> 8) & 255) as f32)
+    };
+    let sample = |fx: f32, fy: f32| {
+        let (x0, y0) = (fx.floor(), fy.floor());
+        let (tx, ty) = (fx - x0, fy - y0);
+        let (x0, y0) = (x0 as i64, y0 as i64);
+        let (p, q, r, t) = (texel(x0, y0), texel(x0 + 1, y0), texel(x0, y0 + 1), texel(x0 + 1, y0 + 1));
+        let lerp = |a: f32, b: f32, k: f32| a + (b - a) * k;
+        (lerp(lerp(p.0, q.0, tx), lerp(r.0, t.0, tx), ty) / 255., lerp(lerp(p.1, q.1, tx), lerp(r.1, t.1, tx), ty) / 255.)
+    };
+    let mut worst = 0f32;
+    let mut lettered = 0usize;
+    for i in 0..w * h {
+        let (sx, sy) = ((i % w) as f32 + 0.5, (i / w) as f32 + 0.5);
+        let (mut a, mut v, mut hl) = (0f32, [0f32; 3], 0f32);
+        for j in 0..f.letters {
+            let (cx, cy, ax, ay) = (f32::from_bits(rec(j, 0)), f32::from_bits(rec(j, 1)), f32::from_bits(rec(j, 2)), f32::from_bits(rec(j, 3)));
+            let ((co, si), (rx, ry), (r, g), (b, op)) = (half(rec(j, 4)), half(rec(j, 5)), half(rec(j, 6)), half(rec(j, 7)));
+            let (dx, dy) = (sx - cx, sy - cy);
+            let (lx, ly) = (dx * co + dy * si, dy * co - dx * si);
+            if lx.abs() >= rx || ly.abs() >= ry {
+                continue;
+            }
+            let (cov, hh) = sample(ax + lx - 0.5, ay + ly - 0.5);
+            let take = (1. - a) * cov * op;
+            v = [v[0] + r * take, v[1] + g * take, v[2] + b * take];
+            a += take;
+            hl = hl.max(hh);
+        }
+        let take = (1. - a) * hl * l.halo[3];
+        v = [v[0] + l.halo[0] * take, v[1] + l.halo[1] * take, v[2] + l.halo[2] * take];
+        a += take;
+        lettered += (a > 0.) as usize;
+        for ch in 0..3 {
+            let want = v[ch] + bare[i][ch] as f32 * (1. - a);
+            worst = worst.max((want - gpu[i][ch] as f32).abs());
+        }
+    }
+    println!("{} words with the lettering, {} without; {lettered} pixels lettered, the kernel at most {worst} working values from the host's sum", k.words.len(), kernel::record(&arena::consts(&luts, &plan, &lay, 0, false, None)).words.len());
+    assert!(lettered > 1 << 9, "only {lettered} pixels lettered");
+    // Working values (white 2^14): 2^3 is a thirtieth of an 8-bit code near white.
+    assert!(worst <= 8., "a pixel {worst} working values from the host's sum");
+    // At rest, against the labeller's own texels: a pixel's coverage the mean of its 3 x 3, as the CPU path draws it.
+    let mut most = 0f32;
+    for (j, g) in quads.iter().enumerate().filter(|(_, g)| g[4] == 0.) {
+        let r = rects.iter().find(|r| (r[0] as f32 / side as f32 - g[8]).abs() < 1e-6 && (r[1] as f32 / side as f32 - g[9]).abs() < 1e-6).unwrap();
+        let (cx, cy) = (f32::from_bits(rec(j, 0)), f32::from_bits(rec(j, 1)));
+        let (hx, hy) = (r[2] as f32 / 6., r[3] as f32 / 6.);
+        // Placed on whole pixels: the glyph's left and top edges are.
+        assert_eq!(((cx - hx) * 4.).round(), ((cx - hx).round() * 4.), "glyph {j} at {cx} not on a pixel");
+        let (left, top) = ((cx - hx).round() as i64, (cy - hy).round() as i64);
+        for py in top..top + r[3].div_ceil(3) as i64 {
+            for px in left..left + r[2].div_ceil(3) as i64 {
+                let mut sum = 0u32;
+                for b in 0..3 {
+                    for a in 0..3 {
+                        let (tx, ty) = (3 * (px - left) as usize + a, 3 * (py - top) as usize + b);
+                        if tx < r[2] && ty < r[3] {
+                            sum += rg[((r[1] + ty) * side + r[0] + tx) * 2] as u32;
+                        }
+                    }
+                }
+                let cpu = sum as f32 / 9. / 255.;
+                let (dx, dy) = (px as f32 + 0.5 - cx, py as f32 + 0.5 - cy);
+                let ax = f32::from_bits(rec(j, 2));
+                let ay = f32::from_bits(rec(j, 3));
+                let ours = sample(ax + dx - 0.5, ay + dy - 0.5).0;
+                most = most.max((cpu - ours).abs());
+            }
+        }
+    }
+    println!("at rest, the atlas's coverage at most {most} from the labeller's 3 x 3 mean");
+    assert!(most <= 1. / 255., "a pixel's coverage {most} from the labeller's mean");
+}

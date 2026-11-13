@@ -157,6 +157,29 @@ pub fn ask(text: &mut TextRenderer, fonts: &Arc<FontPacks>, cursor: &mut FontCur
     fonts.want(packs);
 }
 
+/// The packs these names need, each placed at (latitude, longitude), asked for and remembered as this renderer's own: a script's pack for its letters, and for Chinese, Japanese or Korean the regional face [`han_at`] picks for the name where it lies.
+/// The map's letterer asks this way for the names it shows, never for every name it measured (2026-11-13, ferros: the renderer's own wants held every name gathered, the ones left out for want of room among them, so at the globe the Chinese, Japanese and Korean packs, 37 MiB, came for names the layout never drew).
+pub fn ask_shown<'a>(names: impl Iterator<Item = (&'a str, (f64, f64))>, fonts: &Arc<FontPacks>, cursor: &mut FontCursor) {
+    use fluor::packs::{Need, PACKS, need};
+    let mut want = 0u64;
+    for (name, at) in names {
+        let mut cjk = false;
+        for c in name.chars() {
+            match need(c) {
+                Some(Need::Script(i)) => want |= 1 << i,
+                Some(Need::Kana | Need::Hangul | Need::Shared) => cjk = true,
+                None => {}
+            }
+        }
+        if cjk {
+            want |= 1 << han_at(name, at.0, at.1).pack();
+        }
+    }
+    let packs: Vec<&'static Pack> = (0..PACKS.len()).filter(|&i| want & 1 << i != 0).map(|i| &PACKS[i]).collect();
+    cursor.asked.extend(packs.iter().map(|p| p.id));
+    fonts.want(packs);
+}
+
 /// The packs this renderer's own text wants, of those arrived (each checked against the author's key), loaded; the rest wait until its text needs them (2026-10-25: the panel loaded every script the map's lettering fetched, Arabic, Tibetan and 17 MB of Han included, a parsed copy each, and a Pixel 3a's fresh install was killed for memory). True when a face was added (whatever measured text before measures again).
 pub fn load_into(text: &mut TextRenderer, fonts: &FontPacks, cursor: &mut FontCursor) -> bool {
     let (end, fresh) = fonts.ids_since(cursor.at);

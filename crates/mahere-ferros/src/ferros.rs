@@ -95,7 +95,6 @@ impl FluorApp for App {
                 // The planes that lived only in the GPU's slots are read again for the CPU raster, under its budget.
                 self.inner.map.drop_released();
                 self.inner.map.set_pool_budget(POOL_BUDGET);
-                self.inner.lettering = true;
                 false
             }
         }
@@ -264,9 +263,8 @@ pub fn run() {
     if most != usize::MAX {
         println!("mahere: the GPU's block taken as {} MiB at most (the spawn's input byte)", most >> 20);
     }
+    // The GPU map letters the map from the labeller as the CPU raster does (`letters.rs`).
     let mut app = App { inner, gpu: crate::gpu::GpuMap::open(GPU, LAYERS, SURFACE, SURFACE2, most), ticks: [0; 2], ticks_said: std::time::Instant::now(), heap_said: 0 };
-    // The GPU map has no lettering yet (its overlay is the panel and the marks): none laid out for it, nor its font packs fetched; the CPU raster letters as before.
-    app.inner.lettering = app.gpu.is_none();
     // The GPU map's cells hold their planes in its slots, the CPU only those on their way in (`GPU_POOL_BUDGET`).
     if app.gpu.is_some() {
         app.inner.map.set_pool_budget(GPU_POOL_BUDGET);

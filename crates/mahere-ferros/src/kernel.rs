@@ -38,7 +38,9 @@ pub const CODE_TAB: usize = 120 << 10;
 /// At 1 MiB the squares have 192 Ki words: a box at the role's depth is a cell 115 pixels or more across (`select_depth`), so a 1344 x 2992 screen turned any way meets about 32 x 32 squares a diamond, five diamonds at an icosahedron's corner, two roles: about 10 Ki.
 /// It was 8 MiB until 2026-11-12, 7 of it squares no plan names, in each of the two frame regions: on the 8a a 32 MiB block of the arena then held one region and 13 cell slots, the globe's ten cells of depth 0 needing 20.
 pub const OVERLAY: usize = 1 << 20;
-pub const MAX_SQUARES: usize = (OVERLAY - SQUARES) / 4;
+/// The lettering's tiles, glyphs and lists (`letters.rs`), its last half MiB before the overlay: the squares keep 64 Ki words, six times the most a screen names (2026-11-13, the labels on the GPU; 192 Ki before).
+pub const LETTERS: usize = 1 << 19;
+pub const MAX_SQUARES: usize = (LETTERS - SQUARES) / 4;
 
 /// A face's row: its (u, v) numerators' and its denominator's coefficients on the pixel's direction (f32 bits, (u, v) in depth-30 units), the fractions and whole parts of the camera point's (u, v) when measured from it (else 0), the loading mesh's hash seed for its diamond (raster.rs `loading_noise`'s diamond and depth terms), then each role's box (the terrain's at `F_BOX`, the vector planes' `F_BOX_WORDS` after): its cell grid corner (cu0, cv0), width, height, and the word offset of its squares in the arena.
 pub const F_U: usize = 0;
@@ -119,6 +121,19 @@ pub struct Consts {
     pub out: Out,
     /// Into the surface (`Out::Surface`), the display's bake applied last, so the window is shown baked; None, the working values as before (a display that does not bake).
     pub bake: Option<Bake>,
+    /// The place names (`letters.rs`), under the ring and the overlay and over the map; None when nothing is lettered.
+    pub letters: Option<Letters>,
+}
+
+/// Where the frame's lettering is (`letters.rs`), word offsets in the arena: the tiles (a word each, `cols` a row), the letters' records, their lists and the glyph atlas; the halo's colour (in the kernel's output, as the letters' are) and its opacity.
+#[derive(Clone, Copy, Debug)]
+pub struct Letters {
+    pub tiles_at: u32,
+    pub cols: u32,
+    pub glyphs_at: u32,
+    pub list_at: u32,
+    pub atlas_at: u32,
+    pub halo: [f32; 4],
 }
 
 /// The globe's loading ring (mahere-engine `GlobeRing`): its centre, radius and half width in screen pixels, the end of its sweep from the top clockwise as (sin, cos), whether the sweep passes half a turn, its colour (gamma-2 bytes, as the marks').
@@ -302,6 +317,12 @@ pub fn recording(c: &Consts) -> ssa::Recording {
         (None, None) => M::splat(true),
     };
     let rgb = ssa::when(need, bg, || map(c, x, y, sx, sy, disk, bg)).f32();
+    // The place names wherever the overlay leaves anything to see (a name by the limb runs off the disk, as on the CPU path), as a layer of their own: the map goes under it below, in the output's own values.
+    let lettered = c.letters.as_ref().map(|l| letters(l, x, y, sx, sy, seen.unwrap_or(M::splat(true))));
+    let under = |front: (F, [F; 3]), back: [F; 3]| {
+        let keep = F::splat(1.) - front.0;
+        core::array::from_fn::<F, 3, _>(|k| back[k].mul_add(keep, front.1[k]))
+    };
 
     if c.out == Out::Surface {
         // The working value, 2^14 · √light, as x · 1/√x with x held off 0 (2^-40, whose working value 2^-6 truncates to 0 as the light 0's does). WHY the min: a channel past 65535 would carry into the next one's bits (into green, or past blue into the see-through bit) where the light runs past 16 times white, which the SH light's sky can reach at a glint; the display takes up to four times white, so nothing that shows is cut.
@@ -310,6 +331,9 @@ pub fn recording(c: &Consts) -> ssa::Recording {
             (x * x.rsq_estimate() * 16384.).min(F::splat(65535.))
         };
         let mut v = [wv(rgb[0]), wv(rgb[1]), wv(rgb[2])];
+        if let Some(l) = lettered {
+            v = under(l, v);
+        }
         if let Some(r) = &c.ring {
             // The ring under the overlay, as a mark summed into it was: its code premultiplied by its coverage, then that code's working value (fluor's table's, 2^14 · atanh(c / 256), here 2^13 ln 2 · log₂((1 + c) / (1 − c)) on the special function unit, once for each distinct channel), and what it leaves of the map under it.
             v = ring(r, sx, sy, v, |cov, v| {
@@ -365,6 +389,14 @@ pub fn recording(c: &Consts) -> ssa::Recording {
         return ssa::finish();
     }
     let code = [g2t(rgb[0]), g2t(rgb[1]), g2t(rgb[2])];
+    // The place names over the map, their colours as codes (letters.rs): the codes under them.
+    let code = match lettered {
+        Some(l) => {
+            let v = under(l, code.map(F::from_u32));
+            v.map(F::to_u32)
+        }
+        None => code,
+    };
     // The ring under the overlay, its codes premultiplied by its coverage.
     let code = match &c.ring {
         Some(r) => {
@@ -391,6 +423,80 @@ pub fn recording(c: &Consts) -> ssa::Recording {
     let px = U::splat(0xFF00_0000) | dark(code[0]) << 16 | dark(code[1]) << 8 | dark(code[2]);
     ssa::store_at(SLOT_FRAME, i, 2, 0, px);
     ssa::finish()
+}
+
+/// The place names at the pixel (corner x, y; centre sx, sy), where `m` is set (the map shows there): the lettering's layer there, its opacity and its colour premultiplied by it, in the kernel's output; nothing (all 0) elsewhere, and where the pixel's tile holds no letter (most of the screen), every warp beside the letters branching over all of it.
+/// Front to back, as fluor's `under`: each letter under the letters before it in the tile's list (what a letter adds is its coverage times its opacity, of what the ones before it left), then the halo under all of them (the most any letter's halo covers the pixel, so two letters' halos where they meet are one halo, not one over the other), the map under the whole layer after this (`recording`).
+fn letters(l: &Letters, x: F, y: F, sx: F, sy: F, m: M) -> (F, [F; 3]) {
+    use crate::letters::{ATLAS_STRIDE, TILE_MOST, TILE_SHIFT};
+    let zero = F::splat(0.);
+    let one = F::splat(1.);
+    let tile = (y.to_u32() >> TILE_SHIFT).wrapping_mul(pu(l.cols)) + (x.to_u32() >> TILE_SHIFT);
+    let t = word(pu(l.tiles_at) + tile);
+    let count = t & U::splat(255);
+    ssa::when(m & count.ne(U::splat(0)), (zero, [zero; 3]), || {
+        let list = pu(l.list_at) + (t >> 8);
+        let most = F::from_u32(count);
+        let (a, v, halo) = ssa::iterate(
+            TILE_MOST,
+            (zero, [zero; 3], zero),
+            |n, (a, v, halo)| {
+                // WHY the select: a pass past the tile's count reads the next tile's entries or the words past the lists, a letter's number nothing says is one; held to the first letter, its record is a record (the 8a, 2026-11-13: a GPU fault at G#0C962BC0 with the lettering on, its lanes' addresses not all inside the arena).
+                let g = U::select(n.lt(most), word(list + n.to_u32()), U::splat(0));
+                let at = pu(l.glyphs_at) + (g << crate::letters::GLYPH_SHIFT);
+                let r = |k: u32| word(at + U::splat(k));
+                let (cx, cy, ax, ay) = (F::from_bits(r(0)), F::from_bits(r(1)), F::from_bits(r(2)), F::from_bits(r(3)));
+                let (turn, reach, rg, ba) = (H::from_bits(r(4)), H::from_bits(r(5)), H::from_bits(r(6)), H::from_bits(r(7)));
+                // The pixel's centre in the letter's own frame: from its centre, turned back by its turn.
+                let (dx, dy) = (sx - cx, sy - cy);
+                let (c, s) = (turn.lo_f(), turn.hi_f());
+                let lx = dx.mul_add(c, dy * s);
+                let ly = dy.mul_add(c, -(dx * s));
+                // WHY: a sample past the letter's reach would read its neighbour's texels in the atlas (or past the atlas's last row, outside Mahere's memory: the GPU's MMU faults the frame); within it, only its own texels and its empty border (letters.rs `place`).
+                let inside = lx.abs().lt(reach.lo_f()) & ly.abs().lt(reach.hi_f());
+                // A letter at rest is level on whole pixels (letters.rs), every pixel a texel's centre: that texel alone, a quarter of the turned letter's reads and none of its blend; the whole warp takes one way or the other (it is the letter's).
+                // The sine squared, not its magnitude: valhall's `abs` of a half widened to f32 takes the whole word as an f32 and drops the widen (found here 2026-11-13: every turned letter was taken as level).
+                let level = (s * s).lt(F::splat(1. / (1u64 << 32) as f32));
+                // WHY the selects: every lane forms its read's address whether or not its block runs it (as `square` does for the cells): one outside the letter's reach reads the glyph's centre, so no address leaves the atlas (one far from the letter named texels gigabytes off and the GPU's MMU faulted the frame, the 8a, 2026-11-13).
+                let (fx, fy) = (F::select(inside, ax + lx - 0.5, ax), F::select(inside, ay + ly - 0.5, ay));
+                let at = ssa::when(inside & level, (zero, zero), || texel(pu(l.atlas_at), ATLAS_STRIDE as u32, fx, fy));
+                let (cover, hl) = ssa::when(inside & !level, at, || sample(pu(l.atlas_at), ATLAS_STRIDE as u32, fx, fy));
+                let take = (one - a) * (cover * ba.hi_f());
+                let v = [rg.lo_f().mul_add(take, v[0]), rg.hi_f().mul_add(take, v[1]), ba.lo_f().mul_add(take, v[2])];
+                ((a + take, v, halo.max(hl)), (n + 1.).lt(most))
+            },
+            |_, s| s,
+        );
+        let take = (one - a) * (halo * pf(l.halo[3]));
+        (a + take, [pf(l.halo[0]).mul_add(take, v[0]), pf(l.halo[1]).mul_add(take, v[1]), pf(l.halo[2]).mul_add(take, v[2])])
+    })
+}
+
+/// The glyph atlas's texel nearest (fx, fy) (in texels less half a texel: its centre is a whole number there, and a level letter's pixel lands on one within rounding): the letter's coverage and its halo's, 0 to 1.
+fn texel(atlas: U, stride: u32, fx: F, fy: F) -> (F, F) {
+    let t = round(fy).to_u32().wrapping_mul(U::splat(stride)) + round(fx).to_u32();
+    let v = word(atlas + (t >> 1)).shr_by((t & U::splat(1)) << 4);
+    let k = 1. / 255.;
+    (F::from_u32(v & U::splat(255)) * k, F::from_u32((v >> 8) & U::splat(255)) * k)
+}
+
+/// The glyph atlas at (fx, fy) in texels less half a texel (a texel's centre is a whole number there), between the four texels about it: the letter's coverage and its halo's, 0 to 1. Two texels a word (the letter's byte, then its halo's), `stride` texels a row.
+fn sample(atlas: U, stride: u32, fx: F, fy: F) -> (F, F) {
+    let (x0, y0) = (fx.floor(), fy.floor());
+    let (tx, ty) = (fx - x0, fy - y0);
+    let t0 = y0.to_u32().wrapping_mul(U::splat(stride)) + x0.to_u32();
+    // Every read at one address (the word of the first texel, the next word, and the two below them, by their byte offsets): a row's two texels are that word's from the first texel's half on, run on into the next word's, the second shift past 16 leaving nothing of the next word where the first texel starts its word.
+    let w = atlas + (t0 >> 1);
+    let s = (t0 & U::splat(1)) << 4;
+    let back = U::splat(16) - s;
+    let below = stride >> 1;
+    let pair = |a: U, b: U| word(a).shr_by(s) | (word(b).shl_by(back) << 16);
+    let (top, bottom) = (pair(w, w + U::splat(1)), pair(w + U::splat(below), w + U::splat(below + 1)));
+    let byte = |v: U, k: u32| F::from_u32((v >> (8 * k)) & U::splat(255));
+    let lerp = |a: F, b: F, k: F| (b - a).mul_add(k, a);
+    let k = 1. / 255.;
+    let at = |c: u32| lerp(lerp(byte(top, c), byte(top, c + 2), tx), lerp(byte(bottom, c), byte(bottom, c + 2), tx), ty) * k;
+    (at(0), at(1))
 }
 
 /// The ring over `v` at the pixel centred at (sx, sy): `mix(coverage, v)` where the pixel is within the ring's reach of its circle, `v` elsewhere, the work branched over by every warp beside it (most of the screen).
