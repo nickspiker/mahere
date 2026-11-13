@@ -15,7 +15,7 @@ pub const SLOT: usize = 1 << 20;
 /// The most words a kernel may have (ferros payloads/gpu: its code region, 32 pages, less its 16 words of padding).
 pub const CODE_WORDS: usize = (32 << 12) / 8 - 16;
 
-/// Where things are for a `w` × `h` frame in an arena of `bytes`: two frame regions (`regions`, the frames alternating between them, so the host writes the next frame's tables, faces, squares, overlay and code while the GPU runs this one's), or one when two leave too few cell slots for the globe's base set and two cells more (both `regions` 0, the frames then not pipelined); each its tables, faces and squares (from 0), the overlay (at `kernel::OVERLAY`) a screen's words with a workgroup's slack, the frame as many when it is the arena's (`Out::Argb8`; the surface is the frame otherwise) and the code; then the cells' slots, which the regions share. `frame_at` and `code_at` are within a region.
+/// Where things are for a `w` × `h` frame in an arena of `bytes`: two frame regions (`regions`, the frames alternating between them, so the host writes the next frame's tables, faces, squares, overlay and code while the GPU runs this one's), or one when two leave too few cell slots for the globe's base set and two cells more (both `regions` 0, the frames then not pipelined); each its tables, faces and squares (from 0), the overlay (at `kernel::OVERLAY`) a screen's words with a workgroup's slack, the frame as many when it is the arena's (`Out::Argb8`; the surface is the frame otherwise) and the code, then the lettering's glyph atlas to the region's end (`letters.rs`); then the cells' slots, which the regions share. `frame_at`, `code_at` and `atlas_at` are within a region.
 #[derive(Clone, Copy, Debug)]
 pub struct Layout {
     pub w: usize,
@@ -23,11 +23,17 @@ pub struct Layout {
     pub out: kernel::Out,
     pub frame_at: usize,
     pub code_at: usize,
+    /// The lettering's glyph atlas, and how many of its rows (`letters::ATLAS_ROW` bytes each) fit before the region's end.
+    pub atlas_at: usize,
+    pub atlas_rows: usize,
     pub slots_at: usize,
     pub slots: usize,
     /// Each frame region's start, bytes: the same twice when there is one.
     pub regions: [usize; 2],
 }
+
+/// The least room the glyph atlas has in a region (`Layout::atlas_at`): half a MiB, 2^18 texels, about the lettering of a city at the 8a's text size (a Seattle view at 37 px, 2026-11-13: 535 glyphs, 272547 texels, the atlas's 896 KiB in the region's last MiB holding them with a third to spare).
+pub const ATLAS_LEAST: usize = 1 << 19;
 
 /// The fewest cell slots a layout is made with: two cells, each its terrain's slot and its vector planes'.
 pub const MIN_SLOTS: usize = 1 << 2;
@@ -41,7 +47,10 @@ impl Layout {
         let round = |b: usize| b.next_multiple_of(1 << 20);
         let frame_at = round(kernel::OVERLAY + 4 * px);
         let code_at = if out == kernel::Out::Argb8 { round(frame_at + 4 * px) } else { frame_at };
-        let region = round(code_at + 8 * (CODE_WORDS + 16));
+        // The glyph atlas after the code, in what the region's last MiB leaves (896 KiB): at least `ATLAS_LEAST`, so the lettering never takes a cell slot from the globe's base set in a small block (32 MiB at 1080 x 2400 holds one region of 12 MiB and its 20 slots, 2026-11-12).
+        let atlas_at = code_at + 8 * (CODE_WORDS + 16);
+        let region = round(atlas_at + ATLAS_LEAST);
+        let atlas_rows = (region - atlas_at) / crate::letters::ATLAS_ROW;
         // WHY: the frame's size comes from the display and the block's from the kernel; a screen whose regions leave no room for cells is one this layout cannot draw.
         // Two regions only when they leave the globe's base cells their slots and room for two cells more: a map drawn whole a frame later beats one pipelined with holes (`fit` holds the cells to what the slots hold, down to the globe's depth 0).
         let (slots_at, regions) = if 2 * region + (GLOBE_SLOTS + MIN_SLOTS) * SLOT <= bytes {
@@ -51,7 +60,7 @@ impl Layout {
         } else {
             return None;
         };
-        Some(Layout { w, h, out, frame_at, code_at, slots_at, slots: (bytes - slots_at) / SLOT, regions })
+        Some(Layout { w, h, out, frame_at, code_at, atlas_at, atlas_rows, slots_at, slots: (bytes - slots_at) / SLOT, regions })
     }
 
     /// Two frame regions: a frame can be planned while the GPU draws the last.
@@ -435,8 +444,9 @@ pub fn consts(luts: &FrameLuts, plan: &ViewPlan, lay: &Layout, region: usize, ov
         overlay_at: ((lay.regions[region] + kernel::OVERLAY) / 4) as u32,
         region: (lay.regions[region] / 4) as u32,
         out: lay.out,
-        // The display's bake is the frame loop's to set (gpu.rs `prepare`).
+        // The display's bake and the lettering are the frame loop's to set (gpu.rs `prepare`).
         bake: None,
+        letters: None,
     }
 }
 

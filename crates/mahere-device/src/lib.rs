@@ -735,7 +735,9 @@ impl<G: MapGpu> FluorApp for DeviceApp<G> {
                 // A press and release that never travelled is a tap: a new measurement to that point.
                 if self.dragging && self.two.is_none() && !self.had_two && self.travel < 12.0 {
                     // A label under the finger names what it letters first.
-                    let label = self.gpu.as_ref().and_then(|g| g.labeller().hit(&self.map.cam, self.w, self.h, ctx.cursor_x as f32, ctx.cursor_y as f32).cloned());
+                    // The lettering drawn: the GPU host's where it letters the map, else this app's own (ferros, whose GPU map draws this app's labeller's lettering too).
+                    let labeller = self.gpu.as_ref().map_or(&self.labeller, |g| g.labeller());
+                    let label = labeller.hit(&self.map.cam, self.w, self.h, ctx.cursor_x as f32, ctx.cursor_y as f32).cloned();
                     self.map.tap_label(ctx.cursor_x as f64, ctx.cursor_y as f64, self.w, self.h, label.as_ref());
                 }
                 self.dragging = false;

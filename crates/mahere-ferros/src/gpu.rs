@@ -52,6 +52,8 @@ pub struct GpuMap {
     baked: [bool; 2],
     /// The kernels compiled, by their recording's key (valhall `Recording::key`), the most recently used first: a frame of a structure met before binds its params into that one's words (`kernel`).
     kernels: Vec<(u64, valhall::ssa::Compiled)>,
+    /// The place names' GPU side (`letters.rs`): its atlas and the frame's tiles, made with the layout.
+    letters: Option<crate::letters::Letters>,
     stats: Stats,
     report_at: std::time::Instant,
 }
@@ -160,6 +162,8 @@ struct Stats {
     summed: u64,
     /// Of the panel's µs, finding the box its pixels cover.
     panel_box_us: u64,
+    /// The last frame's letters handed over by the labeller, and the side of the labeller's atlas.
+    lettered: (usize, usize),
 }
 
 impl GpuMap {
@@ -217,6 +221,7 @@ impl GpuMap {
             drawn: false,
             baked: [false; 2],
             kernels: Vec::with_capacity(KERNELS),
+            letters: None,
             stats: Stats::default(),
             report_at: std::time::Instant::now(),
         })
@@ -265,6 +270,8 @@ impl GpuMap {
         (app.panel.is_open(), app.panel.ru().to_bits(), map.globe_loading().map(|d| d.to_bits()), map.gps.is_some()).hash(&mut hs);
         // The panel asking to be painted again: a frame waiting is not drawn as it is, its overlay predates the change.
         app.panel_changed.hash(&mut hs);
+        // A layout of the place names landed: the frame waiting has the last one's.
+        app.labeller.landed().hash(&mut hs);
         // The display's bake: a brightness change plans the frame again with the new one.
         fluor::host::ferros::bake().map(|b| b.generation).hash(&mut hs);
         hs.finish()
@@ -283,6 +290,7 @@ impl GpuMap {
                 println!("mahere: GPU layout for {w} x {h}: its block of the layer arena ({} MiB) holds one frame region of {} MiB, not two, so the frames are not pipelined (each waits for the GPU's last); the overlay at {} MiB, the code at {} MiB, {} cell slots of 1 MiB from {} MiB", self.bytes >> 20, l.slots_at >> 20, kernel::OVERLAY >> 20, l.code_at >> 20, l.slots, l.slots_at >> 20);
             }
             self.slots = Slots::new(l.slots);
+            self.letters = Some(crate::letters::Letters::new(&l));
             self.slots.kept = self.pipelined as u64;
             self.lay = Some(l);
             // Both regions' overlays made whole once, from the panel and marks painted afresh.
@@ -371,6 +379,16 @@ impl GpuMap {
                 "mahere: GPU {} frames: the kernel {} us a frame on the GPU (longest {}), {} words from {} nodes, {} faces in view ({}), {} squares, {} points; host per frame: plan {} us (view {}, plan {} [faces and points {}, desired {}, boxes and stand-ins {}, range {}], want {}), page table {} us, tables {} us, overlay {} us, record {} us, the kernel {} us ({} compiled at {} us each, {} bound), its words {} us, the call {} us, the wait for the GPU's frame {} us; the overlay a frame: panel {} us, marks {} us, sum {} us; {} panels painted ({} us each, {} of it finding its box), {} marks ({} us each), {} boxes summed ({} pixels and {} us each); {} cell planes written so far, {} wanted with no slot free ({} slots), {} frames held to a coarser depth to fit them (the last to depth {}); the pool {} cells, {} MiB; the plans {} depths short of the scale's",
                 s.frames, s.gpu_us / n, s.gpu_max, s.words, s.nodes, s.faces, if s.near { "near" } else { "far" }, s.squares, s.samples, s.plan_us / n, s.plan_parts[0] / n, s.plan_parts[1] / n, s.plan_inner[0] / n, s.plan_inner[1] / n, s.plan_inner[2] / n, s.plan_inner[3] / n, s.plan_parts[2] / n, s.table_us / n, s.luts_us / n, s.overlay_us / n, s.record_us / n, s.kernel_us / n, s.compiled, s.compile_us / s.compiled.max(1), s.bound, s.code_us / n, s.call_us / n, s.wait_us / n, s.overlay_parts[0] / n, s.overlay_parts[1] / n, s.overlay_parts[2] / n, s.panels, s.overlay_parts[0] / s.panels.max(1), s.panel_box_us / s.panels.max(1), s.marks, s.overlay_parts[1] / s.marks.max(1), s.overlays, s.summed / s.overlays.max(1), s.overlay_parts[2] / s.overlays.max(1), self.slots.written, self.slots.starved, lay.slots, self.slots.capped, self.slots.cap, s.pool.0, s.pool.1 >> 20, s.short
             );
+            if let Some(l) = self.letters.as_mut() {
+                let t = l.take_stats();
+                let n = t.frames.max(1);
+                let (used, most) = l.atlas_bytes();
+                let side = s.lettered.1;
+                println!(
+                    "mahere: GPU lettering: {} of {} frames lettered, {} letters a frame ({} left out in all), {} tile entries a frame, the host's {} us a frame; its atlas {} KiB of the {} a region holds ({} glyphs averaged into it, started again {} times, copied into a region {} times, {} us each); the labeller's atlas {side} x {side}, {} MiB; {} letters handed over the last frame",
+                    t.frames, s.frames, t.letters / n, t.left_out, t.entries / n, t.us / n, used >> 10, most >> 10, t.glyphs, t.resets, t.copies, t.copy_us / t.copies.max(1), (side * side * 2) >> 20, s.lettered.0
+                );
+            }
             self.stats = Stats::default();
         }
     }
@@ -401,6 +419,10 @@ impl GpuMap {
         arena::tables(app.map.luts(), &plan, ramp, &lay, region, arena);
         let t3 = std::time::Instant::now();
         self.overlay(app, w, h, region);
+        // The place names as the labeller laid them out, where the camera has them now.
+        let quads = app.labeller.glyphs(&app.map.cam, w, h);
+        let lettered = self.letters.as_mut().unwrap().frame(app.labeller.atlas().into(), &quads, &lay, region, arena);
+        self.stats.lettered = (quads.len(), app.labeller.atlas().side);
         let t4 = std::time::Instant::now();
         let ring = app.map.globe_ring(w, h).map(|g| kernel::Ring::from_globe(&g));
         let mut c = arena::consts(app.map.luts(), &plan, &lay, region, self.overlay_on, ring);
@@ -409,6 +431,7 @@ impl GpuMap {
             c.bake = fluor::host::ferros::bake().map(|b| kernel::Bake { k: b.k, m: b.m, g: b.g });
         }
         self.baked[region] = c.bake.is_some();
+        c.letters = lettered.map(|f| f.consts);
         let rec = kernel::recording(&c);
         let t5 = std::time::Instant::now();
         self.kernel(rec);
