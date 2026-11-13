@@ -453,7 +453,12 @@ fn letters(l: &Letters, x: F, y: F, sx: F, sy: F, m: M) -> (F, [F; 3]) {
                 let ly = dy.mul_add(c, -(dx * s));
                 // WHY: a sample past the letter's reach would read its neighbour's texels in the atlas (or past the atlas's last row, outside Mahere's memory: the GPU's MMU faults the frame); within it, only its own texels and its empty border (letters.rs `place`).
                 let inside = lx.abs().lt(reach.lo_f()) & ly.abs().lt(reach.hi_f());
-                let (cover, hl) = ssa::when(inside, (zero, zero), || sample(pu(l.atlas_at), ATLAS_STRIDE as u32, ax + lx - 0.5, ay + ly - 0.5));
+                // A letter at rest is level on whole pixels (letters.rs), every pixel a texel's centre: that texel alone, a quarter of the turned letter's reads and none of its blend; the whole warp takes one way or the other (it is the letter's).
+                // The sine squared, not its magnitude: valhall's `abs` of a half widened to f32 takes the whole word as an f32 and drops the widen (found here 2026-11-13: every turned letter was taken as level).
+                let level = (s * s).lt(F::splat(1. / (1u64 << 32) as f32));
+                let (fx, fy) = (ax + lx - 0.5, ay + ly - 0.5);
+                let at = ssa::when(inside & level, (zero, zero), || texel(pu(l.atlas_at), ATLAS_STRIDE as u32, fx, fy));
+                let (cover, hl) = ssa::when(inside & !level, at, || sample(pu(l.atlas_at), ATLAS_STRIDE as u32, fx, fy));
                 let take = (one - a) * (cover * ba.hi_f());
                 let v = [rg.lo_f().mul_add(take, v[0]), rg.hi_f().mul_add(take, v[1]), ba.lo_f().mul_add(take, v[2])];
                 ((a + take, v, halo.max(hl)), (n + 1.).lt(most))
@@ -465,24 +470,31 @@ fn letters(l: &Letters, x: F, y: F, sx: F, sy: F, m: M) -> (F, [F; 3]) {
     })
 }
 
+/// The glyph atlas's texel nearest (fx, fy) (in texels less half a texel: its centre is a whole number there, and a level letter's pixel lands on one within rounding): the letter's coverage and its halo's, 0 to 1.
+fn texel(atlas: U, stride: u32, fx: F, fy: F) -> (F, F) {
+    let t = round(fy).to_u32().wrapping_mul(U::splat(stride)) + round(fx).to_u32();
+    let v = word(atlas + (t >> 1)).shr_by((t & U::splat(1)) << 4);
+    let k = 1. / 255.;
+    (F::from_u32(v & U::splat(255)) * k, F::from_u32((v >> 8) & U::splat(255)) * k)
+}
+
 /// The glyph atlas at (fx, fy) in texels less half a texel (a texel's centre is a whole number there), between the four texels about it: the letter's coverage and its halo's, 0 to 1. Two texels a word (the letter's byte, then its halo's), `stride` texels a row.
 fn sample(atlas: U, stride: u32, fx: F, fy: F) -> (F, F) {
     let (x0, y0) = (fx.floor(), fy.floor());
     let (tx, ty) = (fx - x0, fy - y0);
     let t0 = y0.to_u32().wrapping_mul(U::splat(stride)) + x0.to_u32();
-    let t1 = t0 + U::splat(1);
-    let one = U::splat(1);
-    let (w0, w1) = (atlas + (t0 >> 1), atlas + (t1 >> 1));
-    let (s0, s1) = ((t0 & one) << 4, (t1 & one) << 4);
-    let below = U::splat(stride >> 1);
-    let texel = |w: U, s: U| {
-        let v = word(w).shr_by(s);
-        (F::from_u32(v & U::splat(255)), F::from_u32((v >> 8) & U::splat(255)))
-    };
-    let (p, q, r, t) = (texel(w0, s0), texel(w1, s1), texel(w0 + below, s0), texel(w1 + below, s1));
+    // Every read at one address (the word of the first texel, the next word, and the two below them, by their byte offsets): a row's two texels are that word's from the first texel's half on, run on into the next word's, the second shift past 16 leaving nothing of the next word where the first texel starts its word.
+    let w = atlas + (t0 >> 1);
+    let s = (t0 & U::splat(1)) << 4;
+    let back = U::splat(16) - s;
+    let below = stride >> 1;
+    let pair = |a: U, b: U| word(a).shr_by(s) | (word(b).shl_by(back) << 16);
+    let (top, bottom) = (pair(w, w + U::splat(1)), pair(w + U::splat(below), w + U::splat(below + 1)));
+    let byte = |v: U, k: u32| F::from_u32((v >> (8 * k)) & U::splat(255));
     let lerp = |a: F, b: F, k: F| (b - a).mul_add(k, a);
     let k = 1. / 255.;
-    (lerp(lerp(p.0, q.0, tx), lerp(r.0, t.0, tx), ty) * k, lerp(lerp(p.1, q.1, tx), lerp(r.1, t.1, tx), ty) * k)
+    let at = |c: u32| lerp(lerp(byte(top, c), byte(top, c + 2), tx), lerp(byte(bottom, c), byte(bottom, c + 2), tx), ty) * k;
+    (at(0), at(1))
 }
 
 /// The ring over `v` at the pixel centred at (sx, sy): `mix(coverage, v)` where the pixel is within the ring's reach of its circle, `v` elsewhere, the work branched over by every warp beside it (most of the screen).

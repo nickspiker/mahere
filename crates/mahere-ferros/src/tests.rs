@@ -758,11 +758,21 @@ fn a_real_lettering_on_the_gpu() {
         let f = letters.frame(labels.atlas().into(), &quads, &lay, 0, &mut words);
         let us = t.elapsed().as_micros();
         let mut c = arena::consts(map.luts(), &plan, &lay, 0, false, None);
+        // Without the lettering first, for what it adds (`surface` says the instructions a warp issues).
+        surface(&kernel::record(&c), &words, w, h);
         c.letters = f.map(|f| f.consts);
         let k = kernel::record(&c);
         let gpu = surface(&k, &words, w, h);
         let s = letters.take_stats();
         let (used, most) = letters.atlas_bytes();
+        if let Some(l) = c.letters {
+            // The passes a warp makes of the loop: the most any of its sixteen pixels' tiles holds.
+            let count = |i: usize| words[l.tiles_at as usize + (i / w >> crate::letters::TILE_SHIFT) * l.cols as usize + (i % w >> crate::letters::TILE_SHIFT)] & 255;
+            let warps = (w * h) / 16;
+            let passes: u32 = (0..warps).map(|k| (16 * k..16 * k + 16).map(count).max().unwrap()).sum();
+            let busy = (0..warps).filter(|&k| (16 * k..16 * k + 16).any(|i| count(i) > 0)).count();
+            println!("{name}: the loop {} words ({} of them constants), peak {} registers; {:.2} passes a warp, {busy} of {warps} warps in a tile with letters", k.loop_words, k.loop_consts, k.peak, passes as f64 / warps as f64);
+        }
         println!("{name}: {} quads, {} letters drawn, {} left out, {} tile entries; {} glyphs into the atlas, {} KiB of {}; the host {us} us (first frame, every glyph averaged); the kernel {} words; the labeller's atlas {} square", quads.len(), s.letters, s.left_out, s.entries, s.glyphs, used >> 10, most >> 10, k.words.len(), labels.atlas().side);
         if let Some(dir) = &out {
             let code = |v: u32| ((v as f32 / 16384.) * 255.).round().min(255.) as u8;

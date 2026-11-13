@@ -207,9 +207,10 @@ impl Letters {
                 turn = 0.;
             }
             let (reach_x, reach_y) = (hx + 0.5, hy + 0.5);
-            // The tiles its turned quad can reach: the circle about it.
-            let reach = reach_x.hypot(reach_y);
-            let (x0, x1, y0, y1) = (cx - reach, cx + reach, cy - reach, cy + reach);
+            // The tiles its turned quad can reach: the box about it turned.
+            let (s, c) = turn.sin_cos();
+            let (ex, ey) = (c.abs() * reach_x + s.abs() * reach_y, s.abs() * reach_x + c.abs() * reach_y);
+            let (x0, x1, y0, y1) = (cx - ex, cx + ex, cy - ey, cy + ey);
             // WHY: the labeller hands over the letters of every label whose anchor is within a screen of this one (`Lettering::glyphs`), and a letter wholly off the screen has no tile.
             if x1 < 0. || y1 < 0. || x0 >= w as f32 || y0 >= h as f32 {
                 continue;
@@ -232,7 +233,6 @@ impl Letters {
             if g[19] > 0. {
                 halo = [value(g[16]), value(g[17]), value(g[18]), g[19]];
             }
-            let (s, c) = turn.sin_cos();
             records.push([cx.to_bits(), cy.to_bits(), ax.to_bits(), ay.to_bits(), h2(c, s), h2(reach_x, reach_y), h2(value(g[12]), value(g[13])), h2(value(g[14]), g[15])]);
             boxes.push(b);
         }
