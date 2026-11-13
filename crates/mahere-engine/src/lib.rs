@@ -38,15 +38,24 @@ pub struct View {
     pub radius: f64,
 }
 
-static VIEW: std::sync::OnceLock<View> = std::sync::OnceLock::new();
+/// The view's three numbers as their bits (dx, dy, radius): read for every pixel the CPU raster places, so plain loads, no lock. Unset: the frame's middle and an unbounded radius.
+static VIEW: [std::sync::atomic::AtomicU64; 3] = [std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(f64::INFINITY.to_bits())];
 
-/// The view's place in the frame, set once by the host before its first frame; false (nothing changed) for a second call.
+/// The view's place in the frame, set by the host before its first frame and again when the host's word on it changes (ferros: the display's safe area, ferros WINDOWS.md "Drawn under the controls"), between frames; true when it changed.
 pub fn set_view(v: View) -> bool {
-    VIEW.set(v).is_ok()
+    use std::sync::atomic::Ordering::Relaxed;
+    let was = view();
+    for (a, x) in VIEW.iter().zip([v.dx, v.dy, v.radius]) {
+        a.store(x.to_bits(), Relaxed);
+    }
+    (was.dx, was.dy, was.radius) != (v.dx, v.dy, v.radius)
 }
 
-fn view() -> View {
-    VIEW.get().copied().unwrap_or(View { dx: 0., dy: 0., radius: f64::INFINITY })
+/// The view's place in the frame as the host last set it (`set_view`).
+pub fn view() -> View {
+    use std::sync::atomic::Ordering::Relaxed;
+    let x = |i: usize| f64::from_bits(VIEW[i].load(Relaxed));
+    View { dx: x(0), dy: x(1), radius: x(2) }
 }
 
 /// View state: the globe seen from far off, orthographically. The view is a rotation of the ball, kept as its basis in world coordinates (the unit sphere, x toward 0°N 0°E, z toward the north pole): screen right, screen up, and the axis toward the viewer, which is the camera point at the screen's centre. Latitude, longitude and bearing are read off it, never stored, so no pole is special: an unmarked ball (Nick 2026-10-10). ppd = pixels per degree of arc at the centre, so the whole globe is a disk of radius ppd·180/π pixels.

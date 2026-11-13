@@ -259,6 +259,9 @@ impl GpuMap {
         let mut hs = std::collections::hash_map::DefaultHasher::new();
         (w, h, c.lat().to_bits(), c.lon().to_bits(), c.ppd.to_bits(), c.bearing().to_bits(), map.pool_version(), map.style_version(), map.layers().bits()).hash(&mut hs);
         (app.panel.is_open(), app.panel.ru().to_bits(), map.globe_loading().map(|d| d.to_bits()), map.gps.is_some()).hash(&mut hs);
+        // The view's place in the frame: the display's safe area moves it (`App::on_safe_area`).
+        let v = mahere_engine::view();
+        (v.dx.to_bits(), v.dy.to_bits(), v.radius.to_bits()).hash(&mut hs);
         // The display's bake: a brightness change plans the frame again with the new one.
         fluor::host::ferros::bake().map(|b| b.generation).hash(&mut hs);
         hs.finish()
