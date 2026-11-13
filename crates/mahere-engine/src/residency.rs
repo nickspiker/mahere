@@ -118,6 +118,9 @@ impl DemQ {
     }
 }
 
+/// The kept elevation's step ([`Entry::elev`]): every 2^2 = fourth texel each way. At a city's depth (14) a texel is about 2 m, so the readout's and the plan's elevation come from every 7 m, finer than the terrain's sources; at a coarse depth the readout reads the finest cell resident, as before.
+pub const ELEV_SHIFT: usize = 2;
+
 /// A resident cell: whichever layers it carried. All `None` = the loader confirmed the object does not exist (absent), which still ends probing.
 pub const PRESENT_DEM: u8 = 1;
 pub const PRESENT_LINE: u8 = 2;
@@ -152,7 +155,7 @@ pub struct Entry {
     pub exists: bool,
     /// The geoid's height above the ellipsoid, centimetres per texel, kept for the ten depth-0 cells alone: the geoid layer draws from them at every zoom (about 27 km a texel, finer than the geoid itself varies).
     pub geoid: Option<Vec<i16>>,
-    /// The terrain's elevation alone (the packed texels' low word: half-metre steps, ELEV_NODATA for none), memory order, 256 KiB: what a GPU host that took the packed texels into its own memory keeps of them ([`Entry::release_dem`]), for the plan's elevation range and the readouts.
+    /// The terrain's elevation alone at a quarter of its texels' resolution each way (the packed texels' low word, half-metre steps, ELEV_NODATA for none; every fourth texel of every fourth row, both halves, [`ELEV_SHIFT`]), 16 KiB: what a GPU host that took the packed texels into its own memory keeps of them ([`Entry::release_dem`]), for the plan's elevation range and the readouts.
     pub elev: Option<Box<[u16]>>,
 }
 
@@ -163,7 +166,8 @@ impl Entry {
             return Some((p.texel[i] & 0xFFFF) as u16);
         }
         if let Some(q) = &self.elev {
-            return Some(q[i]);
+            let (tx, ty, half) = ((i >> 1) & (mahere_tiles::TEX - 1), i >> 9, i & 1);
+            return Some(q[(((ty >> ELEV_SHIFT) << (8 - ELEV_SHIFT) | tx >> ELEV_SHIFT) << 1) | half]);
         }
         let d = self.dem_q.as_ref()?;
         let (tx, ty, half) = ((i >> 1) & (mahere_tiles::TEX - 1), i >> 9, i & 1);
@@ -181,10 +185,19 @@ impl Entry {
         self.vec_bytes() + self.img.as_ref().map_or(0, |i| i.red.len() + i.green.len() + i.blue.len() + i.nir.len()) + self.dem_q.as_ref().map_or(0, |d| d.tex.len() * 2) + self.dem.as_ref().map_or(0, |d| d.texel.len() * 8) + self.geoid.as_ref().map_or(0, |g| g.len() * 2) + self.elev.as_ref().map_or(0, |q| q.len() * 2)
     }
 
-    /// A GPU host wrote the packed terrain into its own memory: the CPU keeps its elevation alone ([`Entry::elev`]), a quarter of a megabyte for the megabyte of texels and normals. The presence bits keep saying the cell has terrain.
+    /// A GPU host wrote the packed terrain into its own memory: the CPU keeps its elevation alone at a quarter of the resolution each way ([`Entry::elev`]), 16 KiB for the megabyte of texels and normals. The presence bits keep saying the cell has terrain.
     pub fn release_dem(&mut self) {
         if let Some(d) = self.dem.take() {
-            self.elev = Some(d.texel.iter().map(|t| *t as u16).collect());
+            let side = mahere_tiles::TEX >> ELEV_SHIFT;
+            let mut q = vec![0u16; 2 * side * side].into_boxed_slice();
+            for ty in 0..side {
+                for tx in 0..side {
+                    for half in 0..2 {
+                        q[((ty * side + tx) << 1) | half] = d.texel[((((ty << ELEV_SHIFT) << 8) | (tx << ELEV_SHIFT)) << 1) | half] as u16;
+                    }
+                }
+            }
+            self.elev = Some(q);
         }
     }
 

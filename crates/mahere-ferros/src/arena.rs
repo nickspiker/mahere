@@ -104,6 +104,8 @@ pub struct Slots {
     pub cap: u8,
     pub kept: u64,
     pub lost: Vec<CellKey>,
+    /// The cells the view wants (`MapCore::desired_sorted`), set each frame by `view`: their slots go after those of cells no view wants (`victim`), and only theirs are written ahead.
+    pub desired: Vec<CellKey>,
     /// Planes whose CPU copies went once written (`Entry::release_dem`, `release_vec`), cells forgotten with their slot, planes written ahead into free slots (`ahead`), slots freed when their cell left the pool.
     pub released: u64,
     pub forgotten: u64,
@@ -118,7 +120,7 @@ const AHEAD: usize = 1 << 3;
 
 impl Slots {
     pub fn new(n: usize) -> Slots {
-        Slots { held: vec![None; n], frame: 0, written: 0, starved: 0, capped: 0, cap: 0, kept: 1, lost: Vec::new(), released: 0, forgotten: 0, ahead: 0, freed: 0, orphans: 0 }
+        Slots { held: vec![None; n], frame: 0, written: 0, starved: 0, capped: 0, cap: 0, kept: 1, lost: Vec::new(), desired: Vec::new(), released: 0, forgotten: 0, ahead: 0, freed: 0, orphans: 0 }
     }
 
     /// Whether the cells in `want` (each a key and its plane, no repeats) can all be in a slot this frame: those not in one yet against the slots free or neither this frame's nor a kept one's (`kept`).
@@ -146,7 +148,7 @@ impl Slots {
         }
     }
 
-    /// The slot holding `key`'s `plane`, written now if it is not there or the cell was loaded again since (taking a free slot, else the one drawn longest ago); None when every slot is this frame's or a kept one's.
+    /// The slot holding `key`'s `plane`, written now if it is not there or the cell was loaded again since (taking a free slot, else the one whose loss costs least: `victim`); None when every slot is this frame's or a kept one's.
     pub fn slot_for(&mut self, pool: &mut Pool, key: CellKey, plane: Plane, lay: &Layout, arena: &mut [u32]) -> Option<usize> {
         let frame = self.frame;
         if let Some(i) = self.held.iter().position(|s| matches!(s, Some(h) if h.key == key && h.plane == plane)) {
@@ -156,46 +158,52 @@ impl Slots {
             }
             return Some(i);
         }
-        let i = match self.held.iter().position(|s| s.is_none()) {
-            Some(i) => i,
-            None => {
-                let (i, h) = self.held.iter().enumerate().map(|(i, s)| (i, s.unwrap())).min_by_key(|(_, h)| h.frame)?;
-                // Not this frame's, nor the ones before it the GPU may still be reading (`kept`).
-                if h.frame + self.kept >= frame {
-                    return None;
-                }
-                // Its plane lived only here: its cell is forgotten, and loads again from the vault when a view wants it.
-                if pool.map.get(&h.key).is_some_and(|e| e.released(h.plane.vec())) {
-                    self.lost.push(h.key);
-                    self.forgotten += 1;
-                }
-                i
-            }
-        };
+        let i = self.victim(true)?;
+        self.take(i, pool);
         self.held[i] = Some(Held { key, plane, frame });
         self.write(pool, i, key, plane, lay, arena);
         Some(i)
     }
 
-    /// Planes of cells in the pool still on the CPU that no frame has drawn yet (a parent the view wants that its children cover, a cell arriving that the next plan names), written ahead into slots no cell holds, at most `AHEAD` a frame, and their copies released: the pool's CPU memory is then the cells on their way in and little more.
-    fn ahead(&mut self, pool: &mut Pool, lay: &Layout, arena: &mut [u32]) {
-        let free: Vec<usize> = (0..self.held.len()).filter(|&i| self.held[i].is_none()).take(AHEAD).collect();
-        if free.is_empty() {
-            return;
+    /// The slot a new plane takes: a free one, else of those neither this frame's nor a kept one's the one whose loss costs least: a cell no view wants (a coarse cell kept out of view) before one the view wants (gone, it is read again at once: on the 8a, 2026-11-13, a zoom from the globe to a town took the globe's base cells' slots, and they were read again and again), the globe's base set last (the stand-ins of last resort, always wanted); of each the one drawn longest ago. With `wanted` false, only a free slot or one of a cell no view wants.
+    fn victim(&self, wanted: bool) -> Option<usize> {
+        if let Some(i) = self.held.iter().position(|s| s.is_none()) {
+            return Some(i);
         }
-        let mut todo: Vec<(CellKey, Plane)> = Vec::with_capacity(free.len());
+        let rank = |h: &Held| if h.key.depth == 0 { 2 } else { self.desired.binary_search(&h.key).is_ok() as u8 };
+        let (frame, kept) = (self.frame, self.kept);
+        let (i, h) = self.held.iter().enumerate().map(|(i, s)| (i, s.unwrap())).filter(|(_, h)| h.frame + kept < frame).min_by_key(|(_, h)| (rank(h), h.frame))?;
+        (wanted || rank(&h) == 0).then_some(i)
+    }
+
+    /// Slot `i` taken from what it holds: when that plane lived only there, its cell is forgotten, and loads again from the vault when a view wants it.
+    fn take(&mut self, i: usize, pool: &Pool) {
+        if let Some(h) = self.held[i] {
+            if pool.map.get(&h.key).is_some_and(|e| e.released(h.plane.vec())) {
+                self.lost.push(h.key);
+                self.forgotten += 1;
+            }
+        }
+        self.held[i] = None;
+    }
+
+    /// Planes of cells the view wants still on the CPU that no frame has drawn yet (a parent its children cover, a cell arriving that the next plan names), written ahead, at most `AHEAD` a frame, into a free slot or one of a cell no view wants, and their copies released: the pool's CPU memory is then the cells on their way in and little more.
+    fn ahead(&mut self, pool: &mut Pool, lay: &Layout, arena: &mut [u32]) {
+        let mut todo: Vec<(CellKey, Plane)> = Vec::with_capacity(AHEAD);
         'pool: for (k, e) in pool.map.iter() {
             for plane in [Plane::Dem, Plane::Vec] {
-                if todo.len() == free.len() {
+                if todo.len() == AHEAD {
                     break 'pool;
                 }
                 // A forgotten cell's other plane is not worth a slot: the cell goes from the pool after this frame.
-                if e.holds(plane.vec()) && !self.held.iter().any(|s| matches!(s, Some(h) if h.key == *k && h.plane == plane)) && !self.lost.contains(k) {
+                if e.holds(plane.vec()) && self.desired.binary_search(k).is_ok() && !self.held.iter().any(|s| matches!(s, Some(h) if h.key == *k && h.plane == plane)) && !self.lost.contains(k) {
                     todo.push((*k, plane));
                 }
             }
         }
-        for ((key, plane), i) in todo.into_iter().zip(free) {
+        for (key, plane) in todo {
+            let Some(i) = self.victim(false) else { break };
+            self.take(i, pool);
             self.held[i] = Some(Held { key, plane, frame: 0 });
             self.write(pool, i, key, plane, lay, arena);
             self.ahead += 1;

@@ -742,7 +742,7 @@ fn a_written_plane_lives_in_its_slot_alone() {
             let e = &pool.map[&r.key];
             assert!(!e.holds(false) && !e.holds(true), "{:?}: a plane drawn this frame still on the CPU", r.key);
             assert_eq!(e.elev_q_at(0), Some(26000), "{:?}: its elevation", r.key);
-            assert!(e.bytes() == 2 * TRI, "{:?}: {} bytes on the CPU, its elevation's {}", r.key, e.bytes(), 2 * TRI);
+            assert!(e.bytes() == 2 * (TRI >> (2 * mahere_engine::residency::ELEV_SHIFT)), "{:?}: {} bytes on the CPU", r.key, e.bytes());
         }
     }
     assert!(slots.released > 0 && slots.lost.is_empty() && slots.orphans == 0);
@@ -1003,4 +1003,33 @@ fn the_kernel_letters_as_the_host_does() {
     }
     println!("at rest, the atlas's coverage at most {most} from the labeller's 3 x 3 mean");
     assert!(most <= 1. / 255., "a pixel's coverage {most} from the labeller's mean");
+}
+
+/// What a slot's cell costs when the slot goes: a cell the view wants is read again at once (the 8a, 2026-11-13: a zoom from the globe to a town took the globe's base cells' slots, and they were read again and again), so a new plane takes the slot of a cell no view wants first, however recently drawn; and the elevation kept on the CPU is every fourth texel each way.
+#[test]
+fn a_slot_goes_from_a_cell_no_view_wants_first() {
+    let (w, h) = (96usize, 80usize);
+    let cam = Camera::new(46.2, -121.5, 6000.0, 0.7);
+    let d = select_depth(cam.ppd, 0, 14);
+    let keys: Vec<CellKey> = plan_view(w, h, &cam, &Pool::default(), d, d).want.iter().copied().filter(|k| k.depth > 0).take(3).collect();
+    let lay = Layout::new(w, h, BYTES, kernel::Out::Surface).unwrap();
+    let mut words = vec![0u32; BYTES / 4];
+    let mut pool = Pool::default();
+    for (n, k) in keys.iter().enumerate() {
+        pool.map.insert(*k, cell(n as u32));
+    }
+    let mut slots = Slots::new(2);
+    slots.kept = 0;
+    slots.desired = vec![keys[0]];
+    slots.frame = 1;
+    slots.slot_for(&mut pool, keys[0], arena::Plane::Dem, &lay, &mut words).unwrap();
+    slots.frame = 2;
+    slots.slot_for(&mut pool, keys[1], arena::Plane::Dem, &lay, &mut words).unwrap();
+    slots.frame = 3;
+    slots.slot_for(&mut pool, keys[2], arena::Plane::Dem, &lay, &mut words).unwrap();
+    assert_eq!(slots.lost, vec![keys[1]], "the slot drawn longest ago is the wanted cell's; the one no view wants goes");
+    // Texel (5, 9), its second half: the kept elevation's is (4, 8)'s.
+    let e = &pool.map[&keys[0]];
+    assert!(e.released(false));
+    assert_eq!(e.elev_q_at((((9 << 8) | 5) << 1) | 1), Some(26000 + 4 * 3 + 8 * 5));
 }

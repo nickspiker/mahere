@@ -133,6 +133,8 @@ struct Stats {
     staged: (usize, usize),
     /// What the last frame drew where the screen shows (`arena::Drawn`).
     drawn: arena::Drawn,
+    /// The cells the view wants, those asked for and not arrived, those the budget kept from being asked for.
+    wants: (usize, usize, usize),
     /// How many depths coarser than the scale asks the last plan was made (`MapCore::depth_short`).
     short: u8,
     gpu_us: u64,
@@ -399,8 +401,8 @@ impl GpuMap {
             let n = s.frames.max(1);
             let lay = self.lay.unwrap();
             println!(
-                "mahere: GPU {} frames: the kernel {} us a frame on the GPU (longest {}), {} words from {} nodes, {} faces in view ({}), {} squares, {} points; host per frame: plan {} us (view {}, plan {} [faces and points {}, desired {}, boxes and stand-ins {}, range {}], want {}), page table {} us, tables {} us, overlay {} us, record {} us, the kernel {} us ({} compiled at {} us each, {} bound), its words {} us, the call {} us, the wait for the GPU's frame {} us; the overlay a frame: panel {} us, marks {} us, sum {} us; {} panels painted ({} us each, {} of it finding its box), {} marks ({} us each), {} boxes summed ({} pixels and {} us each); {} cell planes written so far, {} wanted with no slot free ({} slots), {} frames held to a coarser depth to fit them (the last to depth {}); the pool {} cells, {} MiB ({} cells, {} MiB, holding planes not yet in a slot); the plans {} depths short of the scale's; the last frame's planes on screen {} from cells at the plan's depth, {} from coarser ones (at most {} depths), {} with no slot; {} slots holding a plane; so far {} planes taken off the CPU once written, {} cells forgotten with their slot (read again from the vault), {} planes written ahead into free slots, {} slots freed with their cell gone from the pool, {} planes found with neither a CPU copy nor a slot",
-                s.frames, s.gpu_us / n, s.gpu_max, s.words, s.nodes, s.faces, if s.near { "near" } else { "far" }, s.squares, s.samples, s.plan_us / n, s.plan_parts[0] / n, s.plan_parts[1] / n, s.plan_inner[0] / n, s.plan_inner[1] / n, s.plan_inner[2] / n, s.plan_inner[3] / n, s.plan_parts[2] / n, s.table_us / n, s.luts_us / n, s.overlay_us / n, s.record_us / n, s.kernel_us / n, s.compiled, s.compile_us / s.compiled.max(1), s.bound, s.code_us / n, s.call_us / n, s.wait_us / n, s.overlay_parts[0] / n, s.overlay_parts[1] / n, s.overlay_parts[2] / n, s.panels, s.overlay_parts[0] / s.panels.max(1), s.panel_box_us / s.panels.max(1), s.marks, s.overlay_parts[1] / s.marks.max(1), s.overlays, s.summed / s.overlays.max(1), s.overlay_parts[2] / s.overlays.max(1), self.slots.written, self.slots.starved, lay.slots, self.slots.capped, self.slots.cap, s.pool.0, s.pool.1 >> 20, s.staged.0, s.staged.1 >> 20, s.short, s.drawn.own, s.drawn.coarser, s.drawn.most, s.drawn.none, self.slots.used(), self.slots.released, self.slots.forgotten, self.slots.ahead, self.slots.freed, self.slots.orphans
+                "mahere: GPU {} frames: the kernel {} us a frame on the GPU (longest {}), {} words from {} nodes, {} faces in view ({}), {} squares, {} points; host per frame: plan {} us (view {}, plan {} [faces and points {}, desired {}, boxes and stand-ins {}, range {}], want {}), page table {} us, tables {} us, overlay {} us, record {} us, the kernel {} us ({} compiled at {} us each, {} bound), its words {} us, the call {} us, the wait for the GPU's frame {} us; the overlay a frame: panel {} us, marks {} us, sum {} us; {} panels painted ({} us each, {} of it finding its box), {} marks ({} us each), {} boxes summed ({} pixels and {} us each); {} cell planes written so far, {} wanted with no slot free ({} slots), {} frames held to a coarser depth to fit them (the last to depth {}); the pool {} cells, {} MiB ({} cells, {} MiB, holding planes not yet in a slot), the view wanting {} cells, {} on their way, {} withheld by the budget; the plans {} depths short of the scale's; the last frame's planes on screen {} from cells at the plan's depth, {} from coarser ones (at most {} depths), {} with no slot; {} slots holding a plane; so far {} planes taken off the CPU once written, {} cells forgotten with their slot (read again from the vault), {} planes written ahead into free slots, {} slots freed with their cell gone from the pool, {} planes found with neither a CPU copy nor a slot",
+                s.frames, s.gpu_us / n, s.gpu_max, s.words, s.nodes, s.faces, if s.near { "near" } else { "far" }, s.squares, s.samples, s.plan_us / n, s.plan_parts[0] / n, s.plan_parts[1] / n, s.plan_inner[0] / n, s.plan_inner[1] / n, s.plan_inner[2] / n, s.plan_inner[3] / n, s.plan_parts[2] / n, s.table_us / n, s.luts_us / n, s.overlay_us / n, s.record_us / n, s.kernel_us / n, s.compiled, s.compile_us / s.compiled.max(1), s.bound, s.code_us / n, s.call_us / n, s.wait_us / n, s.overlay_parts[0] / n, s.overlay_parts[1] / n, s.overlay_parts[2] / n, s.panels, s.overlay_parts[0] / s.panels.max(1), s.panel_box_us / s.panels.max(1), s.marks, s.overlay_parts[1] / s.marks.max(1), s.overlays, s.summed / s.overlays.max(1), s.overlay_parts[2] / s.overlays.max(1), self.slots.written, self.slots.starved, lay.slots, self.slots.capped, self.slots.cap, s.pool.0, s.pool.1 >> 20, s.staged.0, s.staged.1 >> 20, s.wants.0, s.wants.1, s.wants.2, s.short, s.drawn.own, s.drawn.coarser, s.drawn.most, s.drawn.none, self.slots.used(), self.slots.released, self.slots.forgotten, self.slots.ahead, self.slots.freed, self.slots.orphans
             );
             if let Some(l) = self.letters.as_mut() {
                 let t = l.take_stats();
@@ -430,6 +432,7 @@ impl GpuMap {
         let t1 = std::time::Instant::now();
         let arena = unsafe { core::slice::from_raw_parts_mut(self.arena, self.bytes / 4) };
         let capped = self.slots.capped;
+        self.slots.desired = app.map.desired_sorted();
         let drawn = arena::view(&mut self.slots, app.map.pool_mut(), &plan, &lay, region, arena)?;
         // The cells whose plane lived only in a slot this frame took: out of the pool, read again from the vault when a view wants them.
         let lost = std::mem::take(&mut self.slots.lost);
@@ -438,6 +441,7 @@ impl GpuMap {
         self.stats.pool = (pool.map.len(), pool.map.values().map(|e| e.bytes()).sum());
         self.stats.staged = pool.map.values().filter(|e| e.holds(false) || e.holds(true)).fold((0, 0), |(n, b), e| (n + 1, b + e.bytes()));
         self.stats.drawn = drawn;
+        self.stats.wants = (self.slots.desired.len(), app.map.pending_cells(), app.map.withheld());
         app.map.set_drawn_range(plan.range);
         // The depth the next plans are made at, held to what the slots can draw (`arena::shortfall`).
         app.map.depth_short = arena::shortfall(app.map.depth_short, &plan, lay.slots);
@@ -500,8 +504,10 @@ impl GpuMap {
     /// Sharp: a frame that drew every shown plane from a slot, its plan at the scale's depth and not held coarser to fit the slots, with the pool asking for nothing more (no cell pending, none withheld by its budget). Said once a view, with the time since the camera last moved: the time to sharp after a pan or a zoom.
     /// Squares past the finest data (the sea far from a coast, a cell confirmed absent) draw from coarser cells for good, so `coarser` need not reach zero.
     fn sharpness(&mut self, app: &DeviceApp<NoGpu>, depth: u8, drawn: arena::Drawn, capped: bool) {
+        // The camera to a pixel's move, a 2^-6 step of the zoom's octave and a 2^-8 radian turn: a view still to the eye is still here (the motion after a gesture settles over many frames of less).
         let c = app.map.cam;
-        let cam = [c.lat(), c.lon(), c.ppd, c.bearing()].iter().fold(0u64, |h, x| (h ^ x.to_bits()).wrapping_mul(0x100_0000_01B3));
+        let px = |deg: f64| (deg * c.ppd).round() as i64;
+        let cam = [px(c.lat()), px(c.lon()), (c.ppd.log2() * (1 << 6) as f64).round() as i64, (c.bearing() * (1 << 8) as f64).round() as i64].iter().fold(0u64, |h, x| (h ^ *x as u64).wrapping_mul(0x100_0000_01B3));
         if cam != self.moved.0 {
             self.moved = (cam, std::time::Instant::now());
             self.sharp_said = false;

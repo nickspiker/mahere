@@ -1549,6 +1549,13 @@ impl MapCore {
         self.res.converged()
     }
 
+    /// The cells the last want named (the view's cells at its depths, the ancestors it falls back through, the rings around them, the globe's base set), sorted: what a GPU host keeps in its memory before cells no view wants.
+    pub fn desired_sorted(&self) -> Vec<mahere_tiles::CellKey> {
+        let mut d: Vec<mahere_tiles::CellKey> = self.res.desired.iter().copied().collect();
+        d.sort_unstable();
+        d
+    }
+
     /// Cells in view the pool's budget keeps from being asked for, drawn from their parents meanwhile ([`residency::Residency::withheld`]).
     pub fn withheld(&self) -> usize {
         self.res.withheld()
