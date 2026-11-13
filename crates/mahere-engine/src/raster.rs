@@ -1181,6 +1181,7 @@ mod tests {
                 layers: u8::MAX,
                 exists: true,
                 geoid: None,
+                elev: None,
             },
         );
 

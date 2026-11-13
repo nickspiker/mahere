@@ -152,6 +152,8 @@ pub struct Entry {
     pub exists: bool,
     /// The geoid's height above the ellipsoid, centimetres per texel, kept for the ten depth-0 cells alone: the geoid layer draws from them at every zoom (about 27 km a texel, finer than the geoid itself varies).
     pub geoid: Option<Vec<i16>>,
+    /// The terrain's elevation alone (the packed texels' low word: half-metre steps, ELEV_NODATA for none), memory order, 256 KiB: what a GPU host that took the packed texels into its own memory keeps of them ([`Entry::release_dem`]), for the plan's elevation range and the readouts.
+    pub elev: Option<Box<[u16]>>,
 }
 
 impl Entry {
@@ -159,6 +161,9 @@ impl Entry {
     pub fn elev_q_at(&self, i: usize) -> Option<u16> {
         if let Some(p) = &self.dem {
             return Some((p.texel[i] & 0xFFFF) as u16);
+        }
+        if let Some(q) = &self.elev {
+            return Some(q[i]);
         }
         let d = self.dem_q.as_ref()?;
         let (tx, ty, half) = ((i >> 1) & (mahere_tiles::TEX - 1), i >> 9, i & 1);
@@ -173,7 +178,35 @@ impl Entry {
 
     /// The bytes its planes hold: every decoded plane, both terrain forms, the geoid.
     pub fn bytes(&self) -> usize {
-        self.vec_bytes() + self.img.as_ref().map_or(0, |i| i.red.len() + i.green.len() + i.blue.len() + i.nir.len()) + self.dem_q.as_ref().map_or(0, |d| d.tex.len() * 2) + self.dem.as_ref().map_or(0, |d| d.texel.len() * 8) + self.geoid.as_ref().map_or(0, |g| g.len() * 2)
+        self.vec_bytes() + self.img.as_ref().map_or(0, |i| i.red.len() + i.green.len() + i.blue.len() + i.nir.len()) + self.dem_q.as_ref().map_or(0, |d| d.tex.len() * 2) + self.dem.as_ref().map_or(0, |d| d.texel.len() * 8) + self.geoid.as_ref().map_or(0, |g| g.len() * 2) + self.elev.as_ref().map_or(0, |q| q.len() * 2)
+    }
+
+    /// A GPU host wrote the packed terrain into its own memory: the CPU keeps its elevation alone ([`Entry::elev`]), a quarter of a megabyte for the megabyte of texels and normals. The presence bits keep saying the cell has terrain.
+    pub fn release_dem(&mut self) {
+        if let Some(d) = self.dem.take() {
+            self.elev = Some(d.texel.iter().map(|t| *t as u16).collect());
+        }
+    }
+
+    /// A GPU host wrote the lines, the land cover and the water into its own memory: their CPU copies go (each cell's largest line magnitudes stay in `line_mag_max`). Ownership, motor vehicle use and imagery the GPU map does not draw, so they stay.
+    pub fn release_vec(&mut self) {
+        self.line = None;
+        self.land = None;
+        self.water = None;
+    }
+
+    /// Whether the terrain's packed texels are on the CPU, or (`vec`) any of the lines, land cover or water: what a GPU host has yet to write into its memory.
+    pub fn holds(&self, vec: bool) -> bool {
+        if vec { self.line.is_some() || self.land.is_some() || self.water.is_some() } else { self.dem.is_some() }
+    }
+
+    /// Whether a plane the cell carries lives only in a GPU host's memory: its terrain released ([`Entry::release_dem`]), or (`vec`) any of its lines, land cover or water.
+    pub fn released(&self, vec: bool) -> bool {
+        if vec {
+            (self.present & PRESENT_LINE != 0 && self.line.is_none()) || (self.present & PRESENT_LAND != 0 && self.land.is_none()) || (self.present & PRESENT_WATER != 0 && self.water.is_none())
+        } else {
+            self.present & PRESENT_DEM != 0 && self.dem.is_none() && self.dem_q.is_none()
+        }
     }
 
     /// Whether the terrain it holds, if any, is in the form a host packing for the CPU (`pack`) or for a GPU draws from.
@@ -306,6 +339,8 @@ pub struct Residency {
     prefetched: FxHashSet<CellKey>,
     /// Cells in view without their base, at the last want.
     bases_left: usize,
+    /// Cells in view not asked for at the last want, the budget having no room for them ([`Residency::withhold`]): drawn from their parents meanwhile.
+    withheld: usize,
     /// The view the ring was last looked for around (a fingerprint of its cells), so a still view does not look every frame.
     prefetch_view: u64,
     /// The most bytes the resident cells' planes may hold before cells out of view are let go, farthest first ([`Residency::set_budget`]); unbounded by default.
@@ -354,6 +389,7 @@ impl Residency {
             prefetched: FxHashSet::default(),
             prefetch_view: 0,
             bases_left: 0,
+            withheld: 0,
             budget: usize::MAX,
         }
     }
@@ -409,6 +445,7 @@ impl Residency {
                         if e.layers & WANT_DEM != 0 {
                             old.dem = e.dem;
                             old.dem_q = e.dem_q;
+                            old.elev = e.elev;
                             old.elev_lo = e.elev_lo;
                             old.elev_hi = e.elev_hi;
                             old.present = (old.present & !PRESENT_DEM) | (e.present & PRESENT_DEM);
@@ -490,7 +527,9 @@ impl Residency {
         }
         list.sort_by_key(|k| near(k, center));
         fill.sort_by_key(|k| near(k, center));
+        let asked = list.len();
         self.withhold(&mut list, center);
+        self.withheld = asked - list.len();
         self.fill_left = fill.len();
         self.bases_left = list.len();
         // Cells baked whole carry everything in one read; cells in layers come base first, the layers after. The globe's depth-0 set before all of it: its bases, then its layers, then the view's bases, then the view's layers.
@@ -538,6 +577,28 @@ impl Residency {
     /// The most bytes the resident cells' planes may hold ([`Entry::bytes`]): past it, the coarse cells kept out of view ([`PIN_DEPTH`]) are let go farthest from the view first; the cells the view wants and the globe's ten depth-0 cells always stay (Mahere on ferros, 2026-11-11: the pinned levels grew with every place looked at, up to 850 cells of a few megabytes each).
     pub fn set_budget(&mut self, bytes: usize) {
         self.budget = bytes;
+    }
+
+    /// Cells a GPU host no longer holds a plane of, whose CPU copy it had released: out of the pool, so the view asks for them again and they come from the store (the vault on a device) whole.
+    pub fn forget(&mut self, keys: &[CellKey]) {
+        let before = self.pool.map.len();
+        for k in keys {
+            self.pool.map.remove(k);
+        }
+        if self.pool.map.len() != before {
+            self.pool_version += 1;
+        }
+    }
+
+    /// Every cell with a plane only a GPU host held (a GPU map made afresh, or the CPU raster drawing in its place): out of the pool, to be loaded again whole.
+    pub fn drop_released(&mut self) -> usize {
+        let before = self.pool.map.len();
+        self.pool.map.retain(|_, e| !e.released(false) && !e.released(true));
+        let n = before - self.pool.map.len();
+        if n > 0 {
+            self.pool_version += 1;
+        }
+        n
     }
 
     /// Whether a cell has something drawn in its place without it: a coarser cell over it resident with its base, or (`coming`) on its way.
@@ -703,6 +764,11 @@ impl Residency {
     /// Cells in view still without their base, at the last want: the lines are all drawn when it is none.
     pub fn bases_left(&self) -> usize {
         self.bases_left
+    }
+
+    /// Cells in view the budget kept from being asked for at the last want ([`Residency::withhold`]).
+    pub fn withheld(&self) -> usize {
+        self.withheld
     }
 
     /// Cells asked for and not yet arrived.
@@ -995,7 +1061,7 @@ fn load_cell(store: &dyn CellStore, layers: Option<&LayerStores>, want: u8, key:
     if let Some(im) = &mut img {
         im.retone(mahere_tiles::tone::IMG_TAG);
     }
-    Loaded { key, merge, entry: Some(Entry { present, line_mag_max, elev_lo, elev_hi, dem, dem_q, line: planes.line, land: planes.land, water: planes.water, img, own: planes.own, mvum: planes.mvum, layers: layers_loaded, exists: true, geoid: if key.depth == 0 { planes.geoid } else { None } }) }
+    Loaded { key, merge, entry: Some(Entry { present, line_mag_max, elev_lo, elev_hi, dem, dem_q, line: planes.line, land: planes.land, water: planes.water, img, own: planes.own, mvum: planes.mvum, layers: layers_loaded, exists: true, geoid: if key.depth == 0 { planes.geoid } else { None }, elev: None }) }
 }
 
 // ==================== TIERED STORE: VAULT CACHE OVER THE BUCKET ====================

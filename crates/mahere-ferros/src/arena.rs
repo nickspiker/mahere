@@ -60,24 +60,32 @@ impl Layout {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub enum Plane {
     Dem,
     Vec,
 }
 
-/// What a slot holds: the cell, its plane, the pool's version when it was written (a cell loaded again is written again) and the last frame that drew it.
+impl Plane {
+    fn vec(self) -> bool {
+        self == Plane::Vec
+    }
+}
+
+/// What a slot holds: the cell, its plane and the last frame that drew it (0 for a plane written ahead that no frame has drawn yet).
+/// The slot is the plane's only copy once written (`Slots::write` releases the CPU's), so the slot is current while the cell's entry holds no CPU copy of the plane, and a copy there is a newer load (from the vault after the cell was let go, or a newer copy from the store) to write again.
 #[derive(Clone, Copy)]
 struct Held {
     key: CellKey,
     plane: Plane,
-    version: u64,
     frame: u64,
 }
 
 /// The slots' contents, and what the frames so far wrote and could not place.
 /// `capped` counts the frames whose cells were held to a coarser depth to fit the slots (`fit`), `cap` the last such frame's depth.
 /// `kept`: how many frames before this one keep their slots, 1 while frames are pipelined (the GPU may still be running the last frame's kernel over its cells while this one is planned), 0 when each frame waits for the GPU's last (one frame region), so every slot this frame does not use can be taken.
+/// The slots are the cells' planes' home (the owner on the 8a, 2026-11-13: "it's almost fuzzy now"): a plane written into its slot leaves the CPU, so the pool holds the cells on their way in and each cell's metadata and elevation, and the slots, not the CPU's budget, decide how many cells draw.
+/// `lost`: the cells a frame took a slot from whose plane lived only there; the host forgets them (`MapCore::forget_cells`), so the view asks for them again and they come from the vault whole.
 pub struct Slots {
     held: Vec<Option<Held>>,
     pub frame: u64,
@@ -86,11 +94,22 @@ pub struct Slots {
     pub capped: u64,
     pub cap: u8,
     pub kept: u64,
+    pub lost: Vec<CellKey>,
+    /// Planes whose CPU copies went once written (`Entry::release_dem`, `release_vec`), cells forgotten with their slot, planes written ahead into free slots (`ahead`), slots freed when their cell left the pool.
+    pub released: u64,
+    pub forgotten: u64,
+    pub ahead: u64,
+    pub freed: u64,
+    /// Planes a frame drew whose CPU copy and slot were both gone, written as no data and their cells forgotten: a broken invariant, said on the console, never expected.
+    pub orphans: u64,
 }
+
+/// The most planes written ahead a frame (`Slots::ahead`): a plane's write is a megabyte, 0.1 to 0.5 ms on the 8a's A715s.
+const AHEAD: usize = 1 << 3;
 
 impl Slots {
     pub fn new(n: usize) -> Slots {
-        Slots { held: vec![None; n], frame: 0, written: 0, starved: 0, capped: 0, cap: 0, kept: 1 }
+        Slots { held: vec![None; n], frame: 0, written: 0, starved: 0, capped: 0, cap: 0, kept: 1, lost: Vec::new(), released: 0, forgotten: 0, ahead: 0, freed: 0, orphans: 0 }
     }
 
     /// Whether the cells in `want` (each a key and its plane, no repeats) can all be in a slot this frame: those not in one yet against the slots free or neither this frame's nor a kept one's (`kept`).
@@ -104,15 +123,26 @@ impl Slots {
         new <= free.count()
     }
 
-    /// The slot holding `key`'s `plane`, written now if it is not there (taking a free slot, else the one drawn longest ago); None when every slot is this frame's.
-    pub fn slot_for(&mut self, pool: &Pool, key: CellKey, plane: Plane, version: u64, lay: &Layout, arena: &mut [u32]) -> Option<usize> {
+    /// A frame's start: the slots of its cells (`want`, sorted) marked as drawn now, so none of them is taken for another of its cells; the slots whose cell has left the pool, past the kept frames, freed (a cell loaded again is written again, so they hold nothing a frame can use).
+    fn begin(&mut self, pool: &Pool, want: &[(CellKey, Plane)]) {
+        let (frame, kept) = (self.frame, self.kept);
+        for s in self.held.iter_mut() {
+            let Some(h) = s else { continue };
+            if want.binary_search(&(h.key, h.plane)).is_ok() {
+                h.frame = frame;
+            } else if h.frame + kept < frame && !pool.map.contains_key(&h.key) {
+                *s = None;
+                self.freed += 1;
+            }
+        }
+    }
+
+    /// The slot holding `key`'s `plane`, written now if it is not there or the cell was loaded again since (taking a free slot, else the one drawn longest ago); None when every slot is this frame's or a kept one's.
+    pub fn slot_for(&mut self, pool: &mut Pool, key: CellKey, plane: Plane, lay: &Layout, arena: &mut [u32]) -> Option<usize> {
         let frame = self.frame;
         if let Some(i) = self.held.iter().position(|s| matches!(s, Some(h) if h.key == key && h.plane == plane)) {
-            let h = self.held[i].as_mut().unwrap();
-            h.frame = frame;
-            let stale = h.version != version;
-            h.version = version;
-            if stale {
+            self.held[i].as_mut().unwrap().frame = frame;
+            if pool.map[&key].holds(plane.vec()) {
                 self.write(pool, i, key, plane, lay, arena);
             }
             return Some(i);
@@ -125,20 +155,55 @@ impl Slots {
                 if h.frame + self.kept >= frame {
                     return None;
                 }
+                // Its plane lived only here: its cell is forgotten, and loads again from the vault when a view wants it.
+                if pool.map.get(&h.key).is_some_and(|e| e.released(h.plane.vec())) {
+                    self.lost.push(h.key);
+                    self.forgotten += 1;
+                }
                 i
             }
         };
-        self.held[i] = Some(Held { key, plane, version, frame });
+        self.held[i] = Some(Held { key, plane, frame });
         self.write(pool, i, key, plane, lay, arena);
         Some(i)
     }
 
-    /// A cell's plane into slot `i`: the terrain's packed texels as they are (elevation, then the normal's east, north and up, 16 bits each), or the vector planes packed two words a texel (line class, coverage, magnitude, the water's coverage; land class and coverage).
-    fn write(&mut self, pool: &Pool, i: usize, key: CellKey, plane: Plane, lay: &Layout, arena: &mut [u32]) {
+    /// Planes of cells in the pool still on the CPU that no frame has drawn yet (a parent the view wants that its children cover, a cell arriving that the next plan names), written ahead into slots no cell holds, at most `AHEAD` a frame, and their copies released: the pool's CPU memory is then the cells on their way in and little more.
+    fn ahead(&mut self, pool: &mut Pool, lay: &Layout, arena: &mut [u32]) {
+        let free: Vec<usize> = (0..self.held.len()).filter(|&i| self.held[i].is_none()).take(AHEAD).collect();
+        if free.is_empty() {
+            return;
+        }
+        let mut todo: Vec<(CellKey, Plane)> = Vec::with_capacity(free.len());
+        'pool: for (k, e) in pool.map.iter() {
+            for plane in [Plane::Dem, Plane::Vec] {
+                if todo.len() == free.len() {
+                    break 'pool;
+                }
+                // A forgotten cell's other plane is not worth a slot: the cell goes from the pool after this frame.
+                if e.holds(plane.vec()) && !self.held.iter().any(|s| matches!(s, Some(h) if h.key == *k && h.plane == plane)) && !self.lost.contains(k) {
+                    todo.push((*k, plane));
+                }
+            }
+        }
+        for ((key, plane), i) in todo.into_iter().zip(free) {
+            self.held[i] = Some(Held { key, plane, frame: 0 });
+            self.write(pool, i, key, plane, lay, arena);
+            self.ahead += 1;
+        }
+    }
+
+    /// A cell's plane into slot `i`, and its CPU copy released (the slot is its home from now on): the terrain's packed texels as they are (elevation, then the normal's east, north and up, 16 bits each), or the vector planes packed two words a texel (line class, coverage, magnitude, the water's coverage; land class and coverage).
+    fn write(&mut self, pool: &mut Pool, i: usize, key: CellKey, plane: Plane, lay: &Layout, arena: &mut [u32]) {
         self.written += 1;
         let at = (lay.slots_at + i * SLOT) / 4;
         let out = &mut arena[at..at + 2 * TRI];
-        let e = &pool.map[&key];
+        let e = pool.map.get_mut(&key).expect("a cell a frame draws is in the pool (MapCore::plan_view)");
+        // Released with no slot holding it: nothing to write it from. Drawn as no data this frame, and the cell forgotten so it loads again.
+        if e.released(plane.vec()) {
+            self.orphans += 1;
+            self.lost.push(key);
+        }
         match plane {
             Plane::Dem => match &e.dem {
                 Some(d) => {
@@ -159,11 +224,34 @@ impl Slots {
                 }
             }
         }
+        if e.holds(plane.vec()) {
+            self.released += 1;
+        }
+        match plane {
+            Plane::Dem => e.release_dem(),
+            Plane::Vec => e.release_vec(),
+        }
+    }
+
+    /// How many slots hold a plane.
+    pub fn used(&self) -> usize {
+        self.held.iter().filter(|s| s.is_some()).count()
     }
 }
 
-/// The page table in frame region `region`: each role's squares, each the slot of the cell standing in for it (written into its slot when it is not there yet), and the faces' rows when there is more than one face in view.
-pub fn view(slots: &mut Slots, pool: &Pool, plan: &ViewPlan, version: u64, lay: &Layout, region: usize, arena: &mut [u32]) -> Result<(), String> {
+/// What a frame drew where the screen shows, both roles: planes from a cell at its role's depth (`own`), from a coarser one standing in (`coarser`, at most `most` depths coarser), and with no slot (`none`, the loading mesh).
+/// Coarser stand in while a cell is on its way, past the finest data (a cell confirmed absent: the sea far from a coast), and where the slots held the frame to a coarser depth (`fit`).
+#[derive(Clone, Copy, Default, Debug)]
+pub struct Drawn {
+    pub own: usize,
+    pub coarser: usize,
+    pub most: u8,
+    pub none: usize,
+}
+
+/// The page table in frame region `region`: each role's squares, each the slot of the cell standing in for it (written into its slot when it is not there yet, its CPU copy released), and the faces' rows when there is more than one face in view; then planes still on the CPU written ahead into free slots (`Slots::ahead`).
+/// The cells it took a slot from whose planes lived only there are in `slots.lost`, for the host to forget.
+pub fn view(slots: &mut Slots, pool: &mut Pool, plan: &ViewPlan, lay: &Layout, region: usize, arena: &mut [u32]) -> Result<Drawn, String> {
     slots.frame += 1;
     let total = plan.roles[0].squares.len() + plan.roles[1].squares.len();
     if total > kernel::MAX_SQUARES {
@@ -172,15 +260,31 @@ pub fn view(slots: &mut Slots, pool: &Pool, plan: &ViewPlan, version: u64, lay: 
     let base = lay.regions[region] / 4;
     let mut at = base + kernel::SQUARES / 4;
     let keys = fit(slots, pool, plan);
+    let mut want: Vec<(CellKey, Plane)> = keys[0].iter().map(|k| (*k, Plane::Dem)).chain(keys[1].iter().map(|k| (*k, Plane::Vec))).collect();
+    want.sort_unstable();
+    want.dedup();
+    slots.begin(pool, &want);
+    let mut drawn = Drawn::default();
     for ((t, plane), keys) in plan.roles.iter().zip([Plane::Dem, Plane::Vec]).zip(&keys) {
         // Each stand-in's square word, the cells holding a point of the screen first: a full arena starves a box's margin before what shows.
         let mut word = vec![0u32; t.refs.len()];
         for shown in [true, false] {
             for (i, _) in t.refs.iter().enumerate().filter(|(_, r)| r.on_screen == shown) {
                 let key = keys[i];
-                match slots.slot_for(pool, key, plane, version, lay, arena) {
-                    Some(s) => word[i] = ((lay.slots_at + s * SLOT) / 4) as u32 | (22 - key.depth as u32) << kernel::SQUARE_SHIFT,
-                    None => slots.starved += 1,
+                match slots.slot_for(pool, key, plane, lay, arena) {
+                    Some(s) => {
+                        word[i] = ((lay.slots_at + s * SLOT) / 4) as u32 | (22 - key.depth as u32) << kernel::SQUARE_SHIFT;
+                        if shown {
+                            let short = t.depth - key.depth.min(t.depth);
+                            drawn.own += (short == 0) as usize;
+                            drawn.coarser += (short > 0) as usize;
+                            drawn.most = drawn.most.max(short);
+                        }
+                    }
+                    None => {
+                        slots.starved += 1;
+                        drawn.none += shown as usize;
+                    }
                 }
             }
         }
@@ -189,6 +293,7 @@ pub fn view(slots: &mut Slots, pool: &Pool, plan: &ViewPlan, version: u64, lay: 
         }
         at += t.squares.len();
     }
+    slots.ahead(pool, lay, arena);
     let (faces, n, _, fold) = faces(plan, lay, region);
     let at = base + kernel::FACES / 4;
     match fold {
@@ -205,7 +310,7 @@ pub fn view(slots: &mut Slots, pool: &Pool, plan: &ViewPlan, version: u64, lay: 
         }
         None => {}
     }
-    Ok(())
+    Ok(drawn)
 }
 
 /// How many depths coarser than the scale asks the next plans are made (`MapCore::depth_short`), from `short` and the plan just made at it: the cells the screen names at the plan's depth, both roles (the plan's own wants at that depth), against the slots, one depth a frame.

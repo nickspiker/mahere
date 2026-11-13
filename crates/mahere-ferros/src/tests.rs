@@ -95,7 +95,7 @@ fn luts(plan: &ViewPlan, cam: &Camera, mask: LayerMask) -> FrameLuts {
 }
 
 /// The frame both ways for `cam` over `pool` with `mask`; the CPU's codes and the kernel's (through the CPU's encode).
-fn both(cam: &Camera, pool: &Pool, mask: LayerMask, w: usize, h: usize, out: kernel::Out) -> (Vec<u32>, Vec<u32>, usize) {
+fn both(cam: &Camera, pool: &mut Pool, mask: LayerMask, w: usize, h: usize, out: kernel::Out) -> (Vec<u32>, Vec<u32>, usize) {
     let d = select_depth(cam.ppd, 0, 14);
     let user = UserLayer::default();
     let plan = plan_view(w, h, cam, pool, d, d);
@@ -106,7 +106,7 @@ fn both(cam: &Camera, pool: &Pool, mask: LayerMask, w: usize, h: usize, out: ker
     let lay = Layout::new(w, h, BYTES, out).unwrap();
     let mut words = vec![0u32; BYTES / 4];
     let mut slots = Slots::new(lay.slots);
-    arena::view(&mut slots, pool, &plan, 1, &lay, 0, &mut words).unwrap();
+    arena::view(&mut slots, pool, &plan, &lay, 0, &mut words).unwrap();
     arena::tables(&luts, &plan, true, &lay, 0, &mut words);
     let c = arena::consts(&luts, &plan, &lay, 0, false, None);
     let k = kernel::record(&c);
@@ -161,12 +161,12 @@ fn apart(a: &[u32], b: &[u32], tol: i32) -> (i32, usize) {
 }
 
 /// Every pixel's depth-30 (u, v) from the kernel's projection (its words in the emulator) against the plan's own (f64) and the encoder's diamond: the most units apart, and the pixels whose (u, v) is further than `tol` units from the plan's.
-fn located(cam: &Camera, pool: &Pool, w: usize, h: usize) -> (i64, usize, usize, usize, usize, bool) {
+fn located(cam: &Camera, pool: &mut Pool, w: usize, h: usize) -> (i64, usize, usize, usize, usize, bool) {
     let d = select_depth(cam.ppd, 0, 14);
     let plan = plan_view(w, h, cam, pool, d, d);
     let lay = Layout::new(w, h, BYTES, kernel::Out::Surface).unwrap();
     let mut words = vec![0u32; BYTES / 4];
-    arena::view(&mut Slots::new(lay.slots), pool, &plan, 1, &lay, 0, &mut words).unwrap();
+    arena::view(&mut Slots::new(lay.slots), pool, &plan, &lay, 0, &mut words).unwrap();
     let luts = luts(&plan, cam, LayerMask::default());
     let c = arena::consts(&luts, &plan, &lay, 0, false, None);
     let k = kernel::record_locate(&c);
@@ -237,7 +237,7 @@ fn the_kernel_locates_every_pixel_as_the_plan_does() {
                 pool.map.insert(*k, cell(n as u32));
             }
         }
-        let (worst, far, wrong, seams, faces, near) = located(&cam, &pool, w, h);
+        let (worst, far, wrong, seams, faces, near) = located(&cam, &mut pool, w, h);
         println!("view ({lat}, {lon}, ppd {ppd}): {faces} faces, near {near}: the kernel's (u, v) at most {worst} units from the plan's, {far} pixels past a sixteenth of a pixel, {seams} on a seam took the other diamond; {wrong} pixels' squares or texels not the host's");
         assert!(far * 1000 <= w * h, "view ({lat}, {lon}, {ppd}): {far} pixels located apart from the plan (at most {worst} units)");
         assert!(seams <= w, "view ({lat}, {lon}, {ppd}): {seams} pixels took another diamond than the plan's, more than a seam's line");
@@ -251,26 +251,30 @@ fn the_kernel_draws_what_the_cpu_draws() {
     // Zoomed to depth 11 over the Cascades, turned, so blocks interpolate with a twist and the frame spans several cells.
     let cam = Camera::new(46.2, -121.5, 6000.0, 0.7);
     let d = select_depth(cam.ppd, 0, 14);
-    let mut pool = Pool::default();
-    let plan = plan_view(w, h, &cam, &pool, d, d);
+    let plan = plan_view(w, h, &cam, &Pool::default(), d, d);
     let mut wanted: Vec<CellKey> = plan.want.iter().copied().filter(|k| k.depth == d).collect();
     wanted.sort();
     assert!(wanted.len() >= 2, "the view should span cells: {}", wanted.len());
     // Every wanted cell but the last, which is left to its parent (one depth up) standing in, and that parent's sibling cells are not there: the dark mesh where neither is.
-    for (n, k) in wanted.iter().enumerate() {
-        if n + 1 < wanted.len() {
-            pool.map.insert(*k, cell(n as u32 * 7919));
+    // Made again for each frame: the GPU's slots take the planes off the CPU (`Slots::write`).
+    let fill = || {
+        let mut pool = Pool::default();
+        for (n, k) in wanted.iter().enumerate() {
+            if n + 1 < wanted.len() {
+                pool.map.insert(*k, cell(n as u32 * 7919));
+            }
         }
-    }
-    let last = wanted[wanted.len() - 1];
-    pool.map.insert(CellKey { depth: d - 1, prefix: last.prefix >> 2 }, cell(4242));
+        let last = wanted[wanted.len() - 1];
+        pool.map.insert(CellKey { depth: d - 1, prefix: last.prefix >> 2 }, cell(4242));
+        pool
+    };
     for (name, mask, out) in [
         ("default, into the surface", LayerMask::default(), kernel::Out::Surface),
         ("default, fluor's pixels", LayerMask::default(), kernel::Out::Argb8),
         ("no land: the hypsometric tint", LayerMask { land: false, ..LayerMask::default() }, kernel::Out::Surface),
         ("no contours, no water", LayerMask { contours: false, water: false, ..LayerMask::default() }, kernel::Out::Surface),
     ] {
-        let (cpu, gpu, words) = both(&cam, &pool, mask, w, h, out);
+        let (cpu, gpu, words) = both(&cam, &mut fill(), mask, w, h, out);
         let (worst, over) = apart(&cpu, &gpu, 4);
         let mut distinct: Vec<u32> = cpu.clone();
         distinct.sort();
@@ -296,7 +300,7 @@ fn the_kernel_draws_what_the_cpu_draws_where_faces_meet() {
                 pool.map.insert(*k, cell(n as u32 * 7919));
             }
         }
-        let (cpu, gpu, words) = both(&cam, &pool, LayerMask::default(), w, h, kernel::Out::Surface);
+        let (cpu, gpu, words) = both(&cam, &mut pool, LayerMask::default(), w, h, kernel::Out::Surface);
         // The CPU's tiles whose corners lie in different diamonds: it draws those by its exact fallback at each pixel's centre (raster.rs `render_block_exact`), every other tile at the pixel's corner as the kernel does everywhere, so there the two sample half a pixel apart over these cells' noise of normals. Compared outside them; the seams themselves are checked exactly by `the_kernel_locates_every_pixel_as_the_plan_does`.
         let plan = plan_view(w, h, &cam, &pool, d, d);
         let diamond = |x: usize, y: usize| plan.faces[plan.locate(plan.view_dir(x as f64, y as f64)).0].diamond;
@@ -339,13 +343,13 @@ fn the_kernel_draws_the_loading_ring_as_the_marks_did() {
     use mahere_engine::{GlobeRing, PixelBox, draw_segment};
     let (w, h) = (160usize, 120usize);
     let cam = Camera::new(10.0, 30.0, 0.5, 0.0);
-    let pool = Pool::default();
+    let mut pool = Pool::default();
     let d = select_depth(cam.ppd, 0, 14);
     let plan = plan_view(w, h, &cam, &pool, d, d);
     let luts = luts(&plan, &cam, LayerMask::default());
     let lay = Layout::new(w, h, BYTES, kernel::Out::Surface).unwrap();
     let mut words = vec![0u32; BYTES / 4];
-    arena::view(&mut Slots::new(lay.slots), &pool, &plan, 1, &lay, 0, &mut words).unwrap();
+    arena::view(&mut Slots::new(lay.slots), &mut pool, &plan, &lay, 0, &mut words).unwrap();
     arena::tables(&luts, &plan, true, &lay, 0, &mut words);
     let (cx, cy) = Camera::centre(w, h);
     for turn in [0.01f32, 0.3, 0.5, 0.7, 1.0] {
@@ -404,7 +408,7 @@ fn the_fold_draws_what_the_search_drew() {
         let luts = luts(&plan, &cam, LayerMask::default());
         let lay = Layout::new(w, h, BYTES, kernel::Out::Surface).unwrap();
         let mut words = vec![0u32; BYTES / 4];
-        arena::view(&mut Slots::new(lay.slots), &pool, &plan, 1, &lay, 0, &mut words).unwrap();
+        arena::view(&mut Slots::new(lay.slots), &mut pool, &plan, &lay, 0, &mut words).unwrap();
         arena::tables(&luts, &plan, true, &lay, 0, &mut words);
         let c = arena::consts(&luts, &plan, &lay, 0, false, None);
         assert!(c.fold.is_some(), "({lat}, {lon}): {} faces, near {}: no fold", c.face_count, c.near);
@@ -471,7 +475,7 @@ fn issued_a_warp() {
         let luts = luts(&plan, &cam, LayerMask::default());
         let lay = Layout::new(w, h, BYTES, kernel::Out::Surface).unwrap();
         let mut words = vec![0u32; BYTES / 4];
-        arena::view(&mut Slots::new(lay.slots), &pool, &plan, 1, &lay, 0, &mut words).unwrap();
+        arena::view(&mut Slots::new(lay.slots), &mut pool, &plan, &lay, 0, &mut words).unwrap();
         arena::tables(&luts, &plan, true, &lay, 0, &mut words);
         print!("{name}: ");
         surface(&kernel::record(&arena::consts(&luts, &plan, &lay, 0, false, None)), &words, w, h);
@@ -492,7 +496,7 @@ fn the_kernel_bakes_as_the_display_does() {
     let luts = luts(&plan, &cam, LayerMask::default());
     let lay = Layout::new(w, h, BYTES, kernel::Out::Surface).unwrap();
     let mut words = vec![0u32; BYTES / 4];
-    arena::view(&mut Slots::new(lay.slots), &pool, &plan, 1, &lay, 0, &mut words).unwrap();
+    arena::view(&mut Slots::new(lay.slots), &mut pool, &plan, &lay, 0, &mut words).unwrap();
     arena::tables(&luts, &plan, true, &lay, 0, &mut words);
     let plain = arena::consts(&luts, &plan, &lay, 0, false, None);
     let bake = kernel::Bake { k: 0.113f32.sqrt().atanh(), m: [[1.359550, -0.372458, 0.012909], [-0.098444, 0.863965, -0.026116], [0.001826, -0.001101, 0.816481]], g: 1. / 2.19 };
@@ -542,7 +546,8 @@ fn a_planned_cell_is_in_the_pool_when_its_frame_is_written() {
                     assert!(map.pool().map.contains_key(&r.key), "budget {budget}, step {step}: the plan names {:?}, gone from the pool", r.key);
                 }
             }
-            arena::view(&mut slots, map.pool(), &plan, map.pool_version(), &lay, step & 1, &mut arena).unwrap();
+            arena::view(&mut slots, map.pool_mut(), &plan, &lay, step & 1, &mut arena).unwrap();
+            map.forget_cells(&std::mem::take(&mut slots.lost));
             written = slots.written;
             for k in plan.want.clone() {
                 if !map.pool().map.contains_key(&k) {
@@ -611,7 +616,8 @@ fn the_globe_fits_a_small_block() {
     // One region: each frame waits for the GPU's last, so no frame before this one keeps its slots (as the GPU host sets it).
     slots.kept = lay.two() as u64;
     for frame in 0..3usize {
-        arena::view(&mut slots, map.pool(), &plan, map.pool_version(), &lay, frame & 1, &mut arena).unwrap();
+        arena::view(&mut slots, map.pool_mut(), &plan, &lay, frame & 1, &mut arena).unwrap();
+        map.forget_cells(&std::mem::take(&mut slots.lost));
         if frame == 0 {
             continue;
         }
@@ -713,4 +719,56 @@ fn one_lookup_a_host_however_many_loaders_ask() {
             assert!(got.iter().all(|g| g.as_ref().is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)), "every loader waiting on a lookup with no address takes its outcome");
         }
     }
+}
+
+/// A cell's planes live in its slots alone once written (the owner on the 8a, 2026-11-13: "it's almost fuzzy now", the CPU's copies of the planes holding the pool, and so the map, short): the frame's cells keep their elevation on the CPU and nothing more of their planes; a slot taken from a cell whose plane lived only there forgets the cell; the cell loaded again (from the vault) is written again in its slot and released again.
+#[test]
+fn a_written_plane_lives_in_its_slot_alone() {
+    let (w, h) = (96usize, 80usize);
+    let cam = Camera::new(46.2, -121.5, 6000.0, 0.7);
+    let d = select_depth(cam.ppd, 0, 14);
+    let mut pool = Pool::default();
+    for (n, k) in plan_view(w, h, &cam, &pool, d, d).want.iter().enumerate() {
+        pool.map.insert(*k, cell(n as u32));
+    }
+    let plan = plan_view(w, h, &cam, &pool, d, d);
+    let lay = Layout::new(w, h, BYTES, kernel::Out::Surface).unwrap();
+    let mut words = vec![0u32; BYTES / 4];
+    let mut slots = Slots::new(lay.slots);
+    let drawn = arena::view(&mut slots, &mut pool, &plan, &lay, 0, &mut words).unwrap();
+    assert!(drawn.own > 0 && drawn.none == 0, "{drawn:?}");
+    for t in &plan.roles {
+        for r in &t.refs {
+            let e = &pool.map[&r.key];
+            assert!(!e.holds(false) && !e.holds(true), "{:?}: a plane drawn this frame still on the CPU", r.key);
+            assert_eq!(e.elev_q_at(0), Some(26000), "{:?}: its elevation", r.key);
+            assert!(e.bytes() == 2 * TRI, "{:?}: {} bytes on the CPU, its elevation's {}", r.key, e.bytes(), 2 * TRI);
+        }
+    }
+    assert!(slots.released > 0 && slots.lost.is_empty() && slots.orphans == 0);
+    // Two slots, no frame kept: a third cell takes the slot drawn longest ago.
+    let keys: Vec<CellKey> = plan.want.iter().copied().take(3).collect();
+    let mut pool = Pool::default();
+    for (n, k) in keys.iter().enumerate() {
+        pool.map.insert(*k, cell(n as u32));
+    }
+    let mut slots = Slots::new(2);
+    slots.kept = 0;
+    slots.frame = 1;
+    for k in &keys[..2] {
+        slots.slot_for(&mut pool, *k, arena::Plane::Dem, &lay, &mut words).unwrap();
+    }
+    slots.frame = 2;
+    slots.slot_for(&mut pool, keys[2], arena::Plane::Dem, &lay, &mut words).unwrap();
+    assert_eq!(slots.lost, vec![keys[0]], "the slot taken from a cell whose terrain lived only there forgets it");
+    assert!(pool.map[&keys[0]].released(false) && !pool.map[&keys[2]].holds(false));
+    // Loaded again: written again where it is held.
+    pool.map.insert(keys[2], cell(7));
+    let written = slots.written;
+    slots.frame = 3;
+    let at = slots.slot_for(&mut pool, keys[2], arena::Plane::Dem, &lay, &mut words).unwrap();
+    assert_eq!(slots.written, written + 1);
+    assert!(!pool.map[&keys[2]].holds(false));
+    let base = (lay.slots_at + at * arena::SLOT) / 4;
+    assert_eq!(words[base] & 0xFFFF, 26000);
 }

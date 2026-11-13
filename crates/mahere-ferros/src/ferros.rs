@@ -92,6 +92,9 @@ impl FluorApp for App {
                 // This frame and every one after on the CPU raster (fluor draws the scratch when this answers false, and the whole frame, the app saying no smaller damage).
                 println!("mahere: the GPU map stopped: {e}; the map draws on the CPU from now on");
                 self.gpu = None;
+                // The planes that lived only in the GPU's slots are read again for the CPU raster, under its budget.
+                self.inner.map.drop_released();
+                self.inner.map.set_pool_budget(POOL_BUDGET);
                 self.inner.lettering = true;
                 false
             }
@@ -116,8 +119,8 @@ impl FluorApp for App {
 
 /// The most the decoded cells may hold on the CPU path, 192 MiB of the heap's 640 (build.rs): a full screen on the Pro's panel wants 130 to 290 cells of about 2 MiB each (the terrain packed for the CPU raster 1 MiB, seven vector planes 128 KiB each), measured on the desktop 2026-11-11 (mahere-device example `ferros_mem`: the globe 134 cells and 252 MiB, a city 283 cells and 592 MiB). Past it the finest cells farthest from the view's centre wait, drawn from their parents (residency `set_budget`): 100 cells at the globe, 89 at the city. The rest of the heap is the rest of the app, and at the globe it is most of it: the frames (46 MiB), the glyph atlas (32 MiB, 64 while a layout copies it), font packs (60 to 100 MiB with five Han faces and their vault writes), names, the lettering, cells in flight, the thread stacks; 600 MiB in all at the globe on the desktop with this budget (750 at its peak), 340 at the city (385). A GPU host takes the planes off the CPU, and then they count for nothing here.
 const POOL_BUDGET: usize = (1 << 27) + (1 << 26);
-/// The decoded cells' most when the GPU draws the map, 384 MiB: on the 8a (ferros 2026-11-13) with a 512 MiB block Mahere had 488 slots, no plane wanting one and its plans at the scale's depth, while the pool sat at `POOL_BUDGET` with 101 cells, no cell arriving and the map drawn from coarse stand-ins; a 1080 x 2400 screen names 114 to 376 planes at full detail, about 2 MiB a cell of two planes. The heap held 258 MiB at most there with the budget at 192 and no lettering (the GPU map lays out none), so 192 more stays under its 640 MiB ceiling.
-const GPU_POOL_BUDGET: usize = (1 << 28) + (1 << 27);
+/// The decoded cells' most when the GPU draws the map, 128 MiB: a cell's planes leave the CPU once written into its GPU slot (arena.rs `Slots`; the owner on the 8a, 2026-11-13: "it's almost fuzzy now"), so the pool holds the cells on their way in (about 2 MiB each: the terrain packed with its normals, the vector planes) and, for every cell, its metadata and its elevation (256 KiB: the plan's elevation range and the readouts), and the GPU's 488 slots of 1 MiB at 1080 x 2400 are the cells' cache. Before, the planes stayed on the CPU too: at 192 MiB the pool held 101 cells and the map drew from coarse stand-ins, at 384 MiB 211 cells with the arc at 674 MiB of its 692 MiB ceiling.
+const GPU_POOL_BUDGET: usize = 1 << 27;
 
 /// The bottom of the camera cutout in panel rows, husky's then akita's: ferros_sys `CUTOUT_BOTTOM` and `CUTOUT_BOTTOM_AKITA`, measured on the glass (2026-11-08), copied as `sys` is because ferros_sys is not a published crate.
 const CUTOUT_BOTTOM: f64 = 118.5610;
@@ -264,7 +267,7 @@ pub fn run() {
     let mut app = App { inner, gpu: crate::gpu::GpuMap::open(GPU, LAYERS, SURFACE, SURFACE2, most), ticks: [0; 2], ticks_said: std::time::Instant::now(), heap_said: 0 };
     // The GPU map has no lettering yet (its overlay is the panel and the marks): none laid out for it, nor its font packs fetched; the CPU raster letters as before.
     app.inner.lettering = app.gpu.is_none();
-    // The GPU map's cells may hold more (`GPU_POOL_BUDGET`): with no lettering the heap is far under its ceiling, and with ferros's 512 MiB block the slots are no longer what holds the map short.
+    // The GPU map's cells hold their planes in its slots, the CPU only those on their way in (`GPU_POOL_BUDGET`).
     if app.gpu.is_some() {
         app.inner.map.set_pool_budget(GPU_POOL_BUDGET);
     }

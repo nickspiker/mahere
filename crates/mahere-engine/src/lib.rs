@@ -1060,6 +1060,16 @@ impl MapCore {
         self.res.set_budget(bytes);
     }
 
+    /// Cells whose planes a GPU host wrote into its memory and released on the CPU, and which it has since let go of there: loaded again from the store ([`residency::Residency::forget`]).
+    pub fn forget_cells(&mut self, keys: &[mahere_tiles::CellKey]) {
+        self.res.forget(keys);
+    }
+
+    /// Every cell with a plane only a GPU host held, out of the pool to be loaded again whole: the host's memory of them is gone, or the CPU raster draws instead ([`residency::Residency::drop_released`]). How many went.
+    pub fn drop_released(&mut self) -> usize {
+        self.res.drop_released()
+    }
+
     /// A host that draws with the GPU only: the loader stops packing the CPU raster's texels, saving a megabyte and the normal pass per cell.
     pub fn set_gpu_only(&mut self) {
         self.res.set_pack_cpu(false);
@@ -1537,6 +1547,11 @@ impl MapCore {
 
     pub fn converged(&self) -> bool {
         self.res.converged()
+    }
+
+    /// Cells in view the pool's budget keeps from being asked for, drawn from their parents meanwhile ([`residency::Residency::withheld`]).
+    pub fn withheld(&self) -> usize {
+        self.res.withheld()
     }
 
     pub fn pending_cells(&self) -> usize {
