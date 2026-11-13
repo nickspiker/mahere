@@ -104,6 +104,22 @@ impl Atlas {
         Atlas { side, rg: vec![0; side * side * 2], version: self.version + 1, generation: self.generation + 1, x: 0, y: 0, row: 0, slots: HashMap::new() }
     }
 
+    /// Started again in its own memory at `side` square, the next version, as `cleared` makes one: a fresh allocation only when it grows.
+    fn reset(&mut self, side: usize) {
+        self.rg.clear();
+        self.rg.resize(side * side * 2, 0);
+        (self.side, self.version, self.generation, self.x, self.y, self.row) = (side, self.version + 1, self.generation + 1, 0, 0, 0);
+        self.slots.clear();
+    }
+
+    /// The same glyphs as `o`, in this atlas's own memory (of `o`'s size): no allocation when it was that size.
+    fn copy_from(&mut self, o: &Atlas) {
+        self.rg.clear();
+        self.rg.extend_from_slice(&o.rg);
+        self.slots.clone_from(&o.slots);
+        (self.side, self.version, self.generation, self.x, self.y, self.row) = (o.side, o.version, o.generation, o.x, o.y, o.row);
+    }
+
     /// Room for a glyph of this many pixels: the next place on the shelf, or on a new shelf; None when the texture is full.
     fn place(&mut self, w: usize, h: usize) -> Option<(usize, usize)> {
         if self.x + w + 1 > self.side {
@@ -378,6 +394,8 @@ struct Letterer {
     h: usize,
     atlas: std::sync::Arc<Atlas>,
     advance: HashMap<(char, u8, u16, u32), f32>,
+    /// The atlases handed out with the last layouts (each `Lettering`'s): one no layout holds any more takes the next copy of the master in its own memory ([`Letterer::writable`]), so a layout never allocates a fresh atlas while the one on show holds the master (Mahere on ferros, 2026-11-13: "memory allocation of 33554432 bytes failed", a 4096-square atlas copied for a layout with the heap near its ceiling).
+    handed: Vec<std::sync::Arc<Atlas>>,
     /// The typeface of the layout being made.
     family: u8,
     look: [f32; 4],
@@ -630,7 +648,7 @@ impl Labeller {
                 for data in LABEL_FONT_FILES {
                     text.load_font_data_named(data.to_vec());
                 }
-                let mut l = Letterer { text, family: 0, w: 0, h: 0, atlas: std::sync::Arc::new(Atlas::new()), advance: HashMap::new(), look: mahere_engine::theme::LABEL_LOOK, amount: mahere_engine::theme::LABEL_AMOUNT, previous: HashSet::new(), names: Default::default() , font_cursor: Default::default(), han: fluor::packs::Han::Simplified };
+                let mut l = Letterer { text, family: 0, w: 0, h: 0, atlas: std::sync::Arc::new(Atlas::new()), handed: Vec::new(), advance: HashMap::new(), look: mahere_engine::theme::LABEL_LOOK, amount: mahere_engine::theme::LABEL_AMOUNT, previous: HashSet::new(), names: Default::default() , font_cursor: Default::default(), han: fluor::packs::Han::Simplified };
                 while let Ok(mut job) = jobs.recv() {
                     // Only the newest job matters: a camera that moved on has made the others stale.
                     while let Ok(newer) = jobs.try_recv() {
@@ -817,7 +835,7 @@ impl Letterer {
         if let Some(f) = &job.fonts {
             if crate::fonts::load_into(&mut self.text, f, &mut self.font_cursor) {
                 self.advance.clear();
-                self.atlas = std::sync::Arc::new(self.atlas.cleared(self.atlas.side));
+                self.start_again(self.atlas.side);
             }
         }
         let font = job.font * self.look[0];
@@ -846,6 +864,13 @@ impl Letterer {
         let (a, b) = ([w as f64 * 0.25, h as f64 * 0.5], [w as f64 * 0.75, h as f64 * 0.5]);
         if std::env::var_os("MAHERE_LABEL_LOG").is_some() {
             eprintln!("labels: {} lines, {} areas, {} points gathered in {:.1} ms; {} placed, {} glyphs in the atlas, {:.1} ms in all", texels.lines.len(), texels.areas.len(), texels.points.len(), gathered.as_secs_f64() * 1e3, laid.len(), self.atlas.slots.len(), t.elapsed().as_secs_f64() * 1e3);
+        }
+        // Kept, to take the next copy once no layout holds it; the two latest are all a shown layout and one on its way can hold.
+        if !self.handed.iter().any(|a| std::sync::Arc::ptr_eq(a, &self.atlas)) {
+            self.handed.push(self.atlas.clone());
+            if self.handed.len() > 2 {
+                self.handed.remove(0);
+            }
         }
         Lettering {
             kept,
@@ -890,6 +915,48 @@ impl Letterer {
             }
         }
         kept
+    }
+
+    /// The master's own entry among those handed out let go of when nothing else holds it (the layout it went with is no longer on show), so it is written in place.
+    fn unhand(&mut self) {
+        if std::sync::Arc::strong_count(&self.atlas) == 2 {
+            if let Some(j) = self.handed.iter().position(|a| std::sync::Arc::ptr_eq(a, &self.atlas)) {
+                self.handed.swap_remove(j);
+            }
+        }
+    }
+
+    /// The master atlas to write into: itself when no layout holds it, else a copy in the memory of an atlas handed out that no layout holds any more, else (the first copy of a session, or after it grew) a fresh copy.
+    fn writable(&mut self) -> &mut Atlas {
+        self.unhand();
+        if std::sync::Arc::get_mut(&mut self.atlas).is_none() {
+            let side = self.atlas.side;
+            if let Some(j) = self.handed.iter().position(|a| std::sync::Arc::strong_count(a) == 1 && a.side == side) {
+                let mut spare = self.handed.swap_remove(j);
+                std::sync::Arc::get_mut(&mut spare).unwrap().copy_from(&self.atlas);
+                self.atlas = spare;
+            }
+        }
+        std::sync::Arc::make_mut(&mut self.atlas)
+    }
+
+    /// The atlas started again at `side` square: in its own memory when no layout holds it, else in an atlas handed out that none holds, else fresh.
+    fn start_again(&mut self, side: usize) {
+        self.unhand();
+        if let Some(a) = std::sync::Arc::get_mut(&mut self.atlas) {
+            a.reset(side);
+            return;
+        }
+        let now = (self.atlas.version, self.atlas.generation);
+        if let Some(j) = self.handed.iter().position(|a| std::sync::Arc::strong_count(a) == 1) {
+            let mut spare = self.handed.swap_remove(j);
+            let a = std::sync::Arc::get_mut(&mut spare).unwrap();
+            (a.version, a.generation) = now;
+            a.reset(side);
+            self.atlas = spare;
+            return;
+        }
+        self.atlas = std::sync::Arc::new(self.atlas.cleared(side));
     }
 
     /// A glyph's place in the atlas, rasterised by fluor the first time it is asked for, its outline turned to the angle's bin: the letter's coverage, and around it the halo, a distance out from the letter's edge.
@@ -964,16 +1031,16 @@ impl Letterer {
         let (mx, my) = ((cw / 2 - tx0.min(cw / 2)).max(tx1.max(cw / 2) - cw / 2), (chh / 2 - ty0.min(chh / 2)).max(ty1.max(chh / 2) - chh / 2));
         let (ox, oy) = (cw / 2 - mx, chh / 2 - my);
         let (cw2, ch2) = ((2 * mx).min(cw - ox), (2 * my).min(chh - oy));
-        let place = match std::sync::Arc::make_mut(&mut self.atlas).place(cw2, ch2) {
+        let place = match self.writable().place(cw2, ch2) {
             Some(p) => p,
             None => {
                 // Full: a bigger texture up to 4096, else start again (the labels in view ask for theirs again as they are kept).
                 let side = (self.atlas.side * 2).min(4096);
-                self.atlas = std::sync::Arc::new(self.atlas.cleared(side));
-                std::sync::Arc::make_mut(&mut self.atlas).place(cw2, ch2).unwrap_or((0, 0))
+                self.start_again(side);
+                self.writable().place(cw2, ch2).unwrap_or((0, 0))
             }
         };
-        let atlas = std::sync::Arc::make_mut(&mut self.atlas);
+        let atlas = self.writable();
         let side = atlas.side;
         for y in 0..ch2.min(side - place.1) {
             for x in 0..cw2.min(side - place.0) {
@@ -1582,6 +1649,23 @@ impl Lettering {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An atlas copied or started again in memory it already has takes no fresh allocation (the 8a, 2026-11-13: "memory allocation of 33554432 bytes failed", a 4096-square atlas copied for a layout): the bytes stay where they were, the glyphs and the place the next goes come across, and a start again is the next version and generation, empty.
+    #[test]
+    fn an_atlas_copies_and_starts_again_in_its_own_memory() {
+        let mut a = Atlas::new();
+        a.place(40, 30).unwrap();
+        a.rg[7] = 9;
+        a.slots.insert(GlyphKey { ch: 'a', family: 0, size: 160, weight: 400, shear: 0, halo: 0, bin: 0 }, [0, 0, 40, 30]);
+        let mut b = a.cleared(a.side);
+        let at = b.rg.as_ptr();
+        b.copy_from(&a);
+        assert_eq!(b.rg.as_ptr(), at);
+        assert_eq!((b.rg[7], b.slots.len(), b.x, b.version, b.generation), (9, 1, a.x, a.version, a.generation));
+        b.reset(b.side);
+        assert_eq!(b.rg.as_ptr(), at);
+        assert_eq!((b.rg[7], b.slots.len(), b.x, b.version, b.generation), (0, 0, 0, a.version + 1, a.generation + 1));
+    }
     use std::f32::consts::{FRAC_PI_2, PI};
 
     /// A name that turns with the map reads top up however far the map turns: past a quarter turn from level it turns half a turn more; a point's name never turns.

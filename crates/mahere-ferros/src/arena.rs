@@ -8,7 +8,7 @@ use mahere_engine::raster::{FrameLuts, alpha, is_boundary, line_min_depth, rgb3}
 use mahere_engine::residency::Pool;
 use mahere_engine::PixelBox;
 use mahere_coord::{FACE_COUNT, FaceFold, face_fold, face_map};
-use mahere_tiles::{CellKey, TRI};
+use mahere_tiles::{CellKey, ELEV_NODATA, TRI};
 
 /// A cell plane's slot: 131072 texels of 8 bytes.
 pub const SLOT: usize = 1 << 20;
@@ -215,6 +215,7 @@ impl Slots {
         self.written += 1;
         let at = (lay.slots_at + i * SLOT) / 4;
         let out = &mut arena[at..at + 2 * TRI];
+        let mut holes = false;
         let e = pool.map.get_mut(&key).expect("a cell a frame draws is in the pool (MapCore::plan_view)");
         // Released with no slot holding it: nothing to write it from. Drawn as no data this frame, and the cell forgotten so it loads again.
         if e.released(plane.vec()) {
@@ -228,6 +229,7 @@ impl Slots {
                         out[2 * k] = *t as u32;
                         out[2 * k + 1] = (*t >> 32) as u32;
                     }
+                    holes = d.texel.iter().any(|t| *t as u16 == ELEV_NODATA);
                 }
                 // No packed texels: no data everywhere.
                 None => out.iter_mut().step_by(2).for_each(|w| *w = 0xFFFF),
@@ -241,12 +243,54 @@ impl Slots {
                 }
             }
         }
+        if holes {
+            self.fill(key, at, lay, arena);
+        }
         if e.holds(plane.vec()) {
             self.released += 1;
         }
         match plane {
             Plane::Dem => e.release_dem(),
             Plane::Vec => e.release_vec(),
+        }
+    }
+
+    /// The slot holding `key`'s `plane`, and the last frame that drew it.
+    pub fn slot_of(&self, key: CellKey, plane: Plane) -> Option<(usize, u64)> {
+        self.held.iter().position(|s| matches!(s, Some(h) if h.key == key && h.plane == plane)).map(|i| (i, self.held[i].unwrap().frame))
+    }
+
+    /// A terrain plane's texels without data (slot words from `at`) taken from the finest coarser cell holding its terrain in a slot that has data there, as the CPU raster's `dem_texel` climbs: a cell can carry elevation only inside a newer bake's footprint while an older, coarser bake covers the rest (on the 8a, 2026-11-13, around Seattle a quarter to a half of the depth-9 cells' texels have data and some depth-10 cells have none, and drawn from them alone the map showed dark diamonds where the CPU raster draws the coarser terrain).
+    /// A coarser cell written after this one leaves its holes as they were until this one is written again.
+    fn fill(&self, key: CellKey, at: usize, lay: &Layout, arena: &mut [u32]) {
+        let (cu, cv) = key.grid();
+        let s = 22 - key.depth as u32;
+        // The coarser cells holding their terrain in a slot, finest first: each its depth and its slot's first word.
+        let up: Vec<(u32, usize)> = (0..key.depth).rev().filter_map(|d| self.slot_of(key.ancestor(d), Plane::Dem).map(|(i, _)| (d as u32, (lay.slots_at + i * SLOT) / 4))).collect();
+        if up.is_empty() {
+            return;
+        }
+        for k in 0..TRI {
+            if arena[at + 2 * k] as u16 != ELEV_NODATA {
+                continue;
+            }
+            // The texel's triangle's centroid in depth-30 units, in thirds of a texel: (1, 1) in the lower half, (2, 2) in the upper.
+            let (tx, ty, half) = ((k >> 1) & 255, k >> 9, k & 1);
+            let third = (1 + half as u64) << s;
+            let u = ((cu << 8 | tx as u64) << s) * 3 + third;
+            let v = ((cv << 8 | ty as u64) << s) * 3 + third;
+            for &(d, base) in &up {
+                // At depth d a texel is 2^(22 - d) units, 3 · 2^(22 - d) in thirds; its half the sum of the remainders past one texel.
+                let t = 3u64 << (22 - d);
+                let (ru, rv) = (u % t, v % t);
+                let j = ((((v / t) & 255) << 8 | (u / t) & 255) << 1 | ((ru + rv) >= t) as u64) as usize;
+                let w = arena[base + 2 * j];
+                if w as u16 != ELEV_NODATA {
+                    arena[at + 2 * k] = w;
+                    arena[at + 2 * k + 1] = arena[base + 2 * j + 1];
+                    break;
+                }
+            }
         }
     }
 
@@ -612,3 +656,4 @@ pub fn panel_box(panel: &[u32], w: usize) -> PixelBox {
         })
         .reduce(|| PixelBox::EMPTY, PixelBox::union)
 }
+

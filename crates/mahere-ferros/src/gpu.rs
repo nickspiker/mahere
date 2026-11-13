@@ -135,6 +135,8 @@ struct Stats {
     drawn: arena::Drawn,
     /// The cells the view wants, those asked for and not arrived, those the budget kept from being asked for.
     wants: (usize, usize, usize),
+    /// The terrain's squares in the last page table with no cell at any depth (the loading mesh).
+    empty: usize,
     /// How many depths coarser than the scale asks the last plan was made (`MapCore::depth_short`).
     short: u8,
     gpu_us: u64,
@@ -401,8 +403,8 @@ impl GpuMap {
             let n = s.frames.max(1);
             let lay = self.lay.unwrap();
             println!(
-                "mahere: GPU {} frames: the kernel {} us a frame on the GPU (longest {}), {} words from {} nodes, {} faces in view ({}), {} squares, {} points; host per frame: plan {} us (view {}, plan {} [faces and points {}, desired {}, boxes and stand-ins {}, range {}], want {}), page table {} us, tables {} us, overlay {} us, record {} us, the kernel {} us ({} compiled at {} us each, {} bound), its words {} us, the call {} us, the wait for the GPU's frame {} us; the overlay a frame: panel {} us, marks {} us, sum {} us; {} panels painted ({} us each, {} of it finding its box), {} marks ({} us each), {} boxes summed ({} pixels and {} us each); {} cell planes written so far, {} wanted with no slot free ({} slots), {} frames held to a coarser depth to fit them (the last to depth {}); the pool {} cells, {} MiB ({} cells, {} MiB, holding planes not yet in a slot), the view wanting {} cells, {} on their way, {} withheld by the budget; the plans {} depths short of the scale's; the last frame's planes on screen {} from cells at the plan's depth, {} from coarser ones (at most {} depths), {} with no slot; {} slots holding a plane; so far {} planes taken off the CPU once written, {} cells forgotten with their slot (read again from the vault), {} planes written ahead into free slots, {} slots freed with their cell gone from the pool, {} planes found with neither a CPU copy nor a slot",
-                s.frames, s.gpu_us / n, s.gpu_max, s.words, s.nodes, s.faces, if s.near { "near" } else { "far" }, s.squares, s.samples, s.plan_us / n, s.plan_parts[0] / n, s.plan_parts[1] / n, s.plan_inner[0] / n, s.plan_inner[1] / n, s.plan_inner[2] / n, s.plan_inner[3] / n, s.plan_parts[2] / n, s.table_us / n, s.luts_us / n, s.overlay_us / n, s.record_us / n, s.kernel_us / n, s.compiled, s.compile_us / s.compiled.max(1), s.bound, s.code_us / n, s.call_us / n, s.wait_us / n, s.overlay_parts[0] / n, s.overlay_parts[1] / n, s.overlay_parts[2] / n, s.panels, s.overlay_parts[0] / s.panels.max(1), s.panel_box_us / s.panels.max(1), s.marks, s.overlay_parts[1] / s.marks.max(1), s.overlays, s.summed / s.overlays.max(1), s.overlay_parts[2] / s.overlays.max(1), self.slots.written, self.slots.starved, lay.slots, self.slots.capped, self.slots.cap, s.pool.0, s.pool.1 >> 20, s.staged.0, s.staged.1 >> 20, s.wants.0, s.wants.1, s.wants.2, s.short, s.drawn.own, s.drawn.coarser, s.drawn.most, s.drawn.none, self.slots.used(), self.slots.released, self.slots.forgotten, self.slots.ahead, self.slots.freed, self.slots.orphans
+                "mahere: GPU {} frames: the kernel {} us a frame on the GPU (longest {}), {} words from {} nodes, {} faces in view ({}), {} squares, {} points; host per frame: plan {} us (view {}, plan {} [faces and points {}, desired {}, boxes and stand-ins {}, range {}], want {}), page table {} us, tables {} us, overlay {} us, record {} us, the kernel {} us ({} compiled at {} us each, {} bound), its words {} us, the call {} us, the wait for the GPU's frame {} us; the overlay a frame: panel {} us, marks {} us, sum {} us; {} panels painted ({} us each, {} of it finding its box), {} marks ({} us each), {} boxes summed ({} pixels and {} us each); {} cell planes written so far, {} wanted with no slot free ({} slots), {} frames held to a coarser depth to fit them (the last to depth {}); the pool {} cells, {} MiB ({} cells, {} MiB, holding planes not yet in a slot), the view wanting {} cells, {} on their way, {} withheld by the budget, {} of the terrain's squares with no cell (the loading mesh); the plans {} depths short of the scale's; the last frame's planes on screen {} from cells at the plan's depth, {} from coarser ones (at most {} depths), {} with no slot; {} slots holding a plane; so far {} planes taken off the CPU once written, {} cells forgotten with their slot (read again from the vault), {} planes written ahead into free slots, {} slots freed with their cell gone from the pool, {} planes found with neither a CPU copy nor a slot",
+                s.frames, s.gpu_us / n, s.gpu_max, s.words, s.nodes, s.faces, if s.near { "near" } else { "far" }, s.squares, s.samples, s.plan_us / n, s.plan_parts[0] / n, s.plan_parts[1] / n, s.plan_inner[0] / n, s.plan_inner[1] / n, s.plan_inner[2] / n, s.plan_inner[3] / n, s.plan_parts[2] / n, s.table_us / n, s.luts_us / n, s.overlay_us / n, s.record_us / n, s.kernel_us / n, s.compiled, s.compile_us / s.compiled.max(1), s.bound, s.code_us / n, s.call_us / n, s.wait_us / n, s.overlay_parts[0] / n, s.overlay_parts[1] / n, s.overlay_parts[2] / n, s.panels, s.overlay_parts[0] / s.panels.max(1), s.panel_box_us / s.panels.max(1), s.marks, s.overlay_parts[1] / s.marks.max(1), s.overlays, s.summed / s.overlays.max(1), s.overlay_parts[2] / s.overlays.max(1), self.slots.written, self.slots.starved, lay.slots, self.slots.capped, self.slots.cap, s.pool.0, s.pool.1 >> 20, s.staged.0, s.staged.1 >> 20, s.wants.0, s.wants.1, s.wants.2, s.empty, s.short, s.drawn.own, s.drawn.coarser, s.drawn.most, s.drawn.none, self.slots.used(), self.slots.released, self.slots.forgotten, self.slots.ahead, self.slots.freed, self.slots.orphans
             );
             if let Some(l) = self.letters.as_mut() {
                 let t = l.take_stats();
@@ -442,6 +444,8 @@ impl GpuMap {
         self.stats.staged = pool.map.values().filter(|e| e.holds(false) || e.holds(true)).fold((0, 0), |(n, b), e| (n + 1, b + e.bytes()));
         self.stats.drawn = drawn;
         self.stats.wants = (self.slots.desired.len(), app.map.pending_cells(), app.map.withheld());
+        // The terrain's squares in the page table no cell at any depth stands in for (the loading mesh).
+        self.stats.empty = plan.roles[0].squares.iter().filter(|&&s| s == mahere_engine::plan::NONE).count();
         app.map.set_drawn_range(plan.range);
         // The depth the next plans are made at, held to what the slots can draw (`arena::shortfall`).
         app.map.depth_short = arena::shortfall(app.map.depth_short, &plan, lay.slots);
@@ -646,3 +650,4 @@ impl GpuMap {
         msg
     }
 }
+

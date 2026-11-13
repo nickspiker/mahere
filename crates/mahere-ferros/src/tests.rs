@@ -1033,3 +1033,45 @@ fn a_slot_goes_from_a_cell_no_view_wants_first() {
     assert!(e.released(false));
     assert_eq!(e.elev_q_at((((9 << 8) | 5) << 1) | 1), Some(26000 + 4 * 3 + 8 * 5));
 }
+
+/// A cell's terrain without data where a newer bake ends is drawn from the coarser cell's in its slot, as the CPU raster's `dem_texel` climbs (the 8a, 2026-11-13: around Seattle a quarter to a half of the depth-9 cells' texels have data, and the GPU map drew dark diamonds there): every texel of the child's no-data half takes the parent texel under its centroid, the texels with data stay its own.
+#[test]
+fn a_terrain_hole_is_drawn_from_the_coarser_cell() {
+    let (w, h) = (96usize, 80usize);
+    let lay = Layout::new(w, h, BYTES, kernel::Out::Surface).unwrap();
+    let mut words = vec![0u32; BYTES / 4];
+    let child = CellKey::from_grid(3, 9, 300, 211);
+    let parent = child.ancestor(8);
+    let mut pool = Pool::default();
+    pool.map.insert(parent, cell(1));
+    // The child: the rows from 128 on without data.
+    let mut c = cell(2);
+    for (k, t) in c.dem.as_mut().unwrap().texel.iter_mut().enumerate() {
+        if k >> 9 >= 128 {
+            *t |= 0xFFFF;
+        }
+    }
+    pool.map.insert(child, c);
+    let mut slots = Slots::new(4);
+    slots.frame = 1;
+    let p = slots.slot_for(&mut pool, parent, arena::Plane::Dem, &lay, &mut words).unwrap();
+    let s = slots.slot_for(&mut pool, child, arena::Plane::Dem, &lay, &mut words).unwrap();
+    let (pa, sa) = ((lay.slots_at + p * arena::SLOT) / 4, (lay.slots_at + s * arena::SLOT) / 4);
+    let (cu, cv) = child.grid();
+    for (tx, ty, half) in [(0usize, 0usize, 0usize), (5, 127, 1), (7, 128, 0), (255, 255, 1), (100, 200, 1)] {
+        let k = ((ty << 8 | tx) << 1) | half;
+        let got = words[sa + 2 * k] & 0xFFFF;
+        if ty < 128 {
+            assert_eq!(got, (26000 + tx * 3 + ty * 5) as u32, "({tx}, {ty}) its own");
+        } else {
+            // The parent's texel under the centroid: the child's texel at depth 9 is half the parent's each way.
+            let (ux, uy) = ((cu as usize & 1) * 256 + tx, (cv as usize & 1) * 256 + ty);
+            let (fx, fy) = (3 * ux + 1 + half, 3 * uy + 1 + half);
+            let (px, py) = (fx / 6, fy / 6);
+            let ph = ((fx % 6) + (fy % 6) >= 6) as usize;
+            let j = ((py << 8 | px) << 1) | ph;
+            assert_eq!(got, words[pa + 2 * j] & 0xFFFF, "({tx}, {ty}, {half}) the parent's ({px}, {py}, {ph})");
+            assert_ne!(got, 0xFFFF);
+        }
+    }
+}
