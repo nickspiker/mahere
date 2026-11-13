@@ -49,6 +49,8 @@ pub struct DeviceApp<G: MapGpu = NoGpu> {
     pub tick_why: [u64; 3],
     /// The panel asked to be painted again since a host that paints it itself last looked (`tick` takes its dirty flag): a GPU host's overlay repaints it on this as well as on its own key (ferros, 2026-11-12: a font pack arriving marked the panel dirty every tick until a paint loaded it, the GPU host never painted it for that, and the still map drew at the panel's rate).
     pub panel_changed: bool,
+    /// Whether the map is lettered (place names laid out by the labeller and drawn over it): a host that draws the map itself without the lettering turns it off, and with it the labeller's layouts, its glyph atlases and the font packs only place names ask for (ferros's GPU map, 2026-11-12: lettered every time the view rested, never drawn, with the Chinese, Korean and Japanese packs, 37 MiB, loaded for it). On by default.
+    pub lettering: bool,
     /// The way of travel routes take (1 car, 2 bike, 3 foot), kept while no route mode is on; whether the search card is up, and whether the keyboard was last asked up for it.
     pub travel_pref: u8,
     pub searching: bool,
@@ -845,11 +847,11 @@ impl<G: MapGpu> FluorApp for DeviceApp<G> {
                 self.panel.set_updates(view);
             }
             // The lettering is asked for here as well as in the frame, so a view come to rest (a quarter second after the camera stopped) or cells arrived are lettered without a frame drawn to ask; the layout landing is the frame.
-            if mahere_panel::labels::Labeller::wanted(&self.map) {
+            if self.lettering && mahere_panel::labels::Labeller::wanted(&self.map) {
                 let at_rest = self.label_rest();
                 self.labeller.ask(&mut self.map, self.w, self.h, self.panel.label_font_px(), at_rest);
             }
-            let (dirty, lettered) = (self.panel.take_dirty(), self.labeller.poll());
+            let (dirty, lettered) = (self.panel.take_dirty(), self.lettering && self.labeller.poll());
             self.tick_why[1] += dirty as u64;
             self.panel_changed |= dirty;
             self.tick_why[2] += lettered as u64;
@@ -1058,6 +1060,7 @@ impl<G: MapGpu> DeviceApp<G> {
             areas_shown: Instant::now(),
             tick_why: [0; 3],
             panel_changed: false,
+            lettering: true,
             updater: {
                 let mut u = mahere_update::Updater::new(std::path::PathBuf::from(dir.unwrap_or_default()));
                 u.auto = settings.is_none_or(|s| s.auto_update);

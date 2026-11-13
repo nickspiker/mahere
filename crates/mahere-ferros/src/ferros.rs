@@ -92,6 +92,7 @@ impl FluorApp for App {
                 // This frame and every one after on the CPU raster (fluor draws the scratch when this answers false, and the whole frame, the app saying no smaller damage).
                 println!("mahere: the GPU map stopped: {e}; the map draws on the CPU from now on");
                 self.gpu = None;
+                self.inner.lettering = true;
                 false
             }
         }
@@ -252,7 +253,9 @@ pub fn run() {
     if most != usize::MAX {
         println!("mahere: the GPU's block taken as {} MiB at most (the spawn's input byte)", most >> 20);
     }
-    let app = App { inner, gpu: crate::gpu::GpuMap::open(GPU, LAYERS, SURFACE, SURFACE2, most), ticks: [0; 2], ticks_said: std::time::Instant::now(), heap_said: 0 };
+    let mut app = App { inner, gpu: crate::gpu::GpuMap::open(GPU, LAYERS, SURFACE, SURFACE2, most), ticks: [0; 2], ticks_said: std::time::Instant::now(), heap_said: 0 };
+    // The GPU map has no lettering yet (its overlay is the panel and the marks): none laid out for it, nor its font packs fetched; the CPU raster letters as before.
+    app.inner.lettering = app.gpu.is_none();
     let fixes: Arc<Mutex<Option<GpsFix>>> = Arc::new(Mutex::new(None));
     if sys::grant_count() > GPS {
         let fixes = fixes.clone();
