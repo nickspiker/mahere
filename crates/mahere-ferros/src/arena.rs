@@ -77,6 +77,7 @@ struct Held {
 
 /// The slots' contents, and what the frames so far wrote and could not place.
 /// `capped` counts the frames whose cells were held to a coarser depth to fit the slots (`fit`), `cap` the last such frame's depth.
+/// `kept`: how many frames before this one keep their slots, 1 while frames are pipelined (the GPU may still be running the last frame's kernel over its cells while this one is planned), 0 when each frame waits for the GPU's last (one frame region), so every slot this frame does not use can be taken.
 pub struct Slots {
     held: Vec<Option<Held>>,
     pub frame: u64,
@@ -84,20 +85,21 @@ pub struct Slots {
     pub starved: u64,
     pub capped: u64,
     pub cap: u8,
+    pub kept: u64,
 }
 
 impl Slots {
     pub fn new(n: usize) -> Slots {
-        Slots { held: vec![None; n], frame: 0, written: 0, starved: 0, capped: 0, cap: 0 }
+        Slots { held: vec![None; n], frame: 0, written: 0, starved: 0, capped: 0, cap: 0, kept: 1 }
     }
 
-    /// Whether the cells in `want` (each a key and its plane, no repeats) can all be in a slot this frame: those not in one yet against the slots free or neither this frame's nor the last's.
+    /// Whether the cells in `want` (each a key and its plane, no repeats) can all be in a slot this frame: those not in one yet against the slots free or neither this frame's nor a kept one's (`kept`).
     fn fits(&self, want: &[(CellKey, Plane)]) -> bool {
         let frame = self.frame;
         let new = want.iter().filter(|w| !self.held.iter().any(|s| matches!(s, Some(h) if (h.key, h.plane) == **w))).count();
         let free = self.held.iter().filter(|s| match s {
             None => true,
-            Some(h) => h.frame + 1 < frame && !want.contains(&(h.key, h.plane)),
+            Some(h) => h.frame + self.kept < frame && !want.contains(&(h.key, h.plane)),
         });
         new <= free.count()
     }
@@ -119,8 +121,8 @@ impl Slots {
             Some(i) => i,
             None => {
                 let (i, h) = self.held.iter().enumerate().map(|(i, s)| (i, s.unwrap())).min_by_key(|(_, h)| h.frame)?;
-                // Neither this frame's nor the last's: the GPU may still be running the last frame's kernel over its cells while this one is planned.
-                if h.frame + 1 >= frame {
+                // Not this frame's, nor the ones before it the GPU may still be reading (`kept`).
+                if h.frame + self.kept >= frame {
                     return None;
                 }
                 i

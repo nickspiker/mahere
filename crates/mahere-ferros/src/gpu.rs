@@ -281,6 +281,7 @@ impl GpuMap {
                 println!("mahere: GPU layout for {w} x {h}: its block of the layer arena ({} MiB) holds one frame region of {} MiB, not two, so the frames are not pipelined (each waits for the GPU's last); the overlay at {} MiB, the code at {} MiB, {} cell slots of 1 MiB from {} MiB", self.bytes >> 20, l.slots_at >> 20, kernel::OVERLAY >> 20, l.code_at >> 20, l.slots, l.slots_at >> 20);
             }
             self.slots = Slots::new(l.slots);
+            self.slots.kept = self.pipelined as u64;
             self.lay = Some(l);
             // Both regions' overlays made whole once, from the panel and marks painted afresh.
             self.panel_key = None;

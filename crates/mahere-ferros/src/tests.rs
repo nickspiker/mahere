@@ -608,6 +608,8 @@ fn the_globe_fits_a_small_block() {
     let planes: usize = plan.roles.iter().map(|t| t.refs.iter().filter(|r| r.on_screen).count()).sum();
     assert!(planes > lay.slots, "the view's own cells fit the slots ({planes} planes): not the case this checks");
     let mut slots = Slots::new(lay.slots);
+    // One region: each frame waits for the GPU's last, so no frame before this one keeps its slots (as the GPU host sets it).
+    slots.kept = lay.two() as u64;
     for frame in 0..3usize {
         arena::view(&mut slots, map.pool(), &plan, map.pool_version(), &lay, frame & 1, &mut arena).unwrap();
         if frame == 0 {
