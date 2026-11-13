@@ -839,7 +839,8 @@ impl Letterer {
         self.previous = kept.iter().map(|k| ident(&k.name)).collect();
         // The packs the names it shows need, fetched for the next layout; never those of names measured and left out.
         if let Some(f) = &job.fonts {
-            crate::fonts::ask_shown(kept.iter().map(|k| (k.name.name.as_str(), k.anchor)), f, &mut self.font_cursor);
+            let shown: Vec<(String, (f64, f64))> = kept.iter().map(|k| (k.name.label(), k.anchor)).collect();
+            crate::fonts::ask_shown(shown.iter().map(|(s, at)| (s.as_str(), *at)), f, &mut self.font_cursor);
         }
         let route_width = (font * 0.32).max(3.0);
         let (a, b) = ([w as f64 * 0.25, h as f64 * 0.5], [w as f64 * 0.75, h as f64 * 0.5]);
@@ -1575,5 +1576,29 @@ impl Lettering {
                 (x - (ax as f32 + o[0])).hypot(y - (ay as f32 + o[1])) <= r
             })
         }).map(|k| &k.name)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::f32::consts::{FRAC_PI_2, PI};
+
+    /// A name that turns with the map reads top up however far the map turns: past a quarter turn from level it turns half a turn more; a point's name never turns.
+    #[test]
+    fn a_turning_name_reads_top_up() {
+        let named = |kind: u8| Named { kind, rank: 0, name: String::from("Rainier Ave"), reference: String::new() };
+        let key = GlyphKey { ch: 'R', family: 0, size: 0, weight: 400, shear: 0, halo: 0, bin: 0 };
+        let kept = |kind: u8, turns: bool, reads: f32| Kept { name: named(kind), anchor: (0., 0.), letters: vec![(key, [0., 0.], reads)], turns, reads, colour: 0, halo: false };
+        let line = kept(RESIDENTIAL, true, 0.3);
+        for phi in [-3.0f32, -2.0, -1.0, 0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 6.0] {
+            let t = Lettering::turn(&line, phi);
+            let reads = (0.3 + t + PI).rem_euclid(2. * PI) - PI;
+            assert!(reads.abs() <= FRAC_PI_2 + 1e-5, "map turned {phi}: the name reads at {reads}");
+            // Turned with the map, or half a turn more: never anything else.
+            let off = (t - phi).rem_euclid(PI);
+            assert!(off < 1e-5 || PI - off < 1e-5, "map turned {phi}: the name turned {t}");
+        }
+        assert_eq!(Lettering::turn(&kept(CITY, false, 0.), 2.5), 0.);
     }
 }
