@@ -8,6 +8,7 @@
 //! Until then every GET was a connection of its own (`Connection: close`), four at a time: a cell paid a TCP handshake, the server's slow start and a close, and waited for one of the four.
 //! Measured on the 8a over WiFi before (round trip 25 to 50 ms): a 2284-byte cell 811 ms in Mahere, its connection open 263 ms, the same cell 78 ms by httptest; 10 fetches a second at most.
 //! Now up to [`CONNECTIONS`] at once, each kept after its response for the next request to the same server (HTTP/1.1 persistent connections, RFC 9112 9.3), as ureq keeps them for the Android build.
+//! Measured after on the 8a (the same day): a cache check (304) 139 ms on a new connection, 54 ms on a kept one; zooming in on land 98 cells (30.6 MB) at 9.7 fetches and 3.0 MB/s in the busy spells (7.4 and 1.04 before), all eight busy at once, no failures. A fresh cell's first byte is now the bucket's (300 to 560 ms while Cloudflare fetches it from the origin).
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
