@@ -331,6 +331,8 @@ pub struct MapCore {
     fit_globe: bool,
     /// When the map was made, until its first view is complete (then logged).
     started: Option<Instant>,
+    /// Since when the view has had cells missing, and how many arrived since: logged as the view's time to sharp once none is missing (ferros, 2026-11-14: "the map seems to be loading quite slow").
+    unsharp: Option<(Instant, u64)>,
     /// Degrees the device is turned clockwise from north (0 when no sensor feeds it); the lighting turns against it.
     pub device_heading: f32,
     /// The device's rotation matrix from the orientation sensor, world (east, north, up) = R · device (x right, y up the screen, z out of it); identity without a sensor.
@@ -480,6 +482,7 @@ impl MapCore {
             contour_hold: None,
             fit_globe: false,
             started: Some(Instant::now()),
+            unsharp: None,
             device_heading: 0.0,
             device_rot: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
             real_sun: false,
@@ -1252,6 +1255,16 @@ impl MapCore {
         let changed = arrived > 0 || self.dirty || routed || wanted;
         for (n, why) in self.tick_why.iter_mut().zip([arrived > 0, self.dirty, routed, wanted]) {
             *n += why as u64;
+        }
+        // The view's time to sharp: from the first tick with a cell missing to the first with none, and the cells that arrived meanwhile (the network's own summary is plain_http's).
+        match (self.unsharp.as_mut(), self.res.converged()) {
+            (None, false) => self.unsharp = Some((Instant::now(), arrived as u64)),
+            (Some((_, n)), false) => *n += arrived as u64,
+            (Some(&mut (t, n)), true) => {
+                eprintln!("map: the view sharp in {} ms, {} cells arrived meanwhile", t.elapsed().as_millis(), n + arrived as u64);
+                self.unsharp = None;
+            }
+            (None, true) => {}
         }
         // When the first view and the globe's base set are complete, how long that took and the loaders' share (2026-10-22: ten seconds on a relaunch with every cell on the phone).
         if let Some(t) = self.started.filter(|_| self.res.converged() && !self.res.pool.map.is_empty() && self.globe_loading().is_none()) {

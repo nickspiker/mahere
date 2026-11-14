@@ -1,7 +1,8 @@
 //! Mahere's way to the network on ferros: connections over the ip server's client TCP (ferros payloads/ip, its `udp` endpoint: 3 INFO, 4 CONNECT, 5 SEND, 6 RECV, 7 CLOSE), the server's address from the ip server's resolver (10 RESOLVE), for mahere-engine's plain HTTP ([`Dial`]). Nick 2026-11-11: "we have tcp and http so let's get the full meal deal wired up with mahere".
 //!
 //! Every wait is a call the ip server holds until something comes (the wait byte of its ops 6 and 10), never a poll (Nick 2026-11-10: "No polling!"): a loader thread blocks in the call as it blocks on a socket elsewhere. The one deadline here is a real one: a connection that brings nothing for 32 s is given up (DNS's are the ip server's own).
-//! The ip server's TCP since 2026-11-11 (Nick: "sounds like it needs re-engineered"): sixteen connections, a 1 MiB window each, receives of up to 256 KiB; Mahere takes four connections at once and reads each a big reply at a time.
+//! The ip server's TCP since 2026-11-11 (Nick: "sounds like it needs re-engineered"): sixteen connections, a 1 MiB window each, receives of up to 256 KiB; Mahere reads each a big reply at a time.
+//! How many connections Mahere holds, and their keeping between requests, are plain_http's (`CONNECTIONS`, `KEEP`; eight kept connections since 2026-11-14, four of one request each before): this is the dialer alone.
 //! Names since 2026-11-12: the device's one resolver, in the ip server, in place of the copy Mahere carried (its own questions, port and cache). What Mahere's cache did the device's does for every app: one lookup a name however many loaders ask (the others' calls held on it), the last good address answered at once while it is asked for again and kept when that lookup brings no answer, and asked for again after four failed connections in a row (the ip server counts its own connections).
 //! Mahere holds one of those calls a host, its loaders waiting on it (`names.rs`): the ip server holds sixteen, the oldest giving way to a seventeenth, and Mahere's twenty loaders each holding their own pushed each other out, about 240 fetches failing "DNS still asking" in its first second (the 8a, 2026-11-12).
 
@@ -9,7 +10,8 @@ use crate::ferros::sys;
 use crate::names::{Asked, Names};
 use mahere_engine::plain_http::{Conn, Dial};
 use std::io;
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// The ip server's INFO reply: 71 bytes (addresses, flags, the DNS servers).
 const INFO_LEN: usize = 71;
@@ -19,19 +21,18 @@ const RESOLVE_WAIT_S: u8 = 1 << 4;
 const RESOLVE_LEN: usize = 22;
 /// How long a connection may bring nothing before it is given up: 32 s, the ip server's own idle reaping time (WHY a deadline: ip fails a connection only when what it sent goes unanswered, and a GET's body is all receiving; a server gone silent mid-body would hold a loader for ever).
 const STALL_S: u8 = 1 << 5;
-/// The connections Mahere holds at once: four of the ip server's sixteen, the rest left to the device's own (attest's fgtw, the kist installer) and other apps. The loaders wait their turn, a doorbell (a condition variable), not a poll.
-const CONNECTIONS: usize = 1 << 2;
 /// The most data one TCP receive asks for: 256 KiB, all one reply of the ip server carries (its RECV_MAX, the kernel's largest reply); the buffer holds the state byte ahead of it.
 const RECV_MOST: usize = 1 << 18;
 /// The most of a request one SEND carries: a call carries 4096 bytes (the kernel's limit), less the op and the handle.
 const SEND_MAX: usize = (1 << 12) - 2;
 
-/// The ip server at grant slot `slot`, the turn for a connection, the lookups under way (one a host), and the address said last for each host (a line on the console when it changes, not at every dial).
+/// The ip server at grant slot `slot`, the lookups under way (one a host), the address said last for each host (a line on the console when it changes, not at every dial), and the RESOLVE calls and their microseconds since the network's last summary line.
 pub struct IpNet {
     slot: u64,
-    turn: Arc<(Mutex<usize>, Condvar)>,
     names: Names,
     said: Mutex<Vec<(String, u8, [u8; 16])>>,
+    resolves: AtomicU64,
+    resolve_us: AtomicU64,
 }
 
 impl IpNet {
@@ -45,7 +46,7 @@ impl IpNet {
         if n < INFO_LEN as u64 {
             return Err("the ip server's INFO is short".into());
         }
-        Ok(IpNet { slot, turn: Arc::new((Mutex::new(0), Condvar::new())), names: Names::new(), said: Mutex::new(Vec::new()) })
+        Ok(IpNet { slot, names: Names::new(), said: Mutex::new(Vec::new()), resolves: AtomicU64::new(0), resolve_us: AtomicU64::new(0) })
     }
 
     fn call(&self, req: &[u8], reply: &mut [u8]) -> io::Result<usize> {
@@ -68,7 +69,10 @@ impl IpNet {
         let mut q = vec![10u8, 0, RESOLVE_WAIT_S];
         q.extend_from_slice(host.as_bytes());
         let mut r = [0u8; RESOLVE_LEN];
-        let n = match self.call(&q, &mut r) {
+        let called = self.call(&q, &mut r);
+        self.resolves.fetch_add(1, Ordering::Relaxed);
+        self.resolve_us.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
+        let n = match called {
             Ok(n) => n,
             Err(_) => return Asked::Failed(io::ErrorKind::Other, "the ip server refused the call"),
         };
@@ -117,48 +121,32 @@ fn shown(fam: u8, a: &[u8; 16]) -> String {
 }
 
 impl Dial for IpNet {
+    /// The address (one RESOLVE call, the ip server answering from its cache while the TTL holds), then the CONNECT; the handshake goes on in the ip server and the first receive waits for it.
     fn dial(&self, host: &str, port: u16) -> io::Result<Box<dyn Conn>> {
-        // The address before the turn: a dialer looking one up holds none of the four connections while it waits.
         let (fam, addr) = self.address(host)?;
-        let turn = Turn::take(self.turn.clone());
         let mut req = vec![4u8, fam];
         req.extend_from_slice(&addr);
         req.extend_from_slice(&port.to_be_bytes());
         let mut r = [0u8; 16];
         let n = self.call(&req, &mut r)?;
         match (n, r[0]) {
-            (2.., 0) => Ok(Box::new(IpConn { slot: self.slot, handle: r[1], rx: vec![0u8; 1 + RECV_MOST], at: 1, len: 1, state: 1, closed: false, _turn: turn })),
+            (2.., 0) => Ok(Box::new(IpConn { slot: self.slot, handle: r[1], rx: vec![0u8; 1 + RECV_MOST], at: 1, len: 1, state: 1, closed: false, abandoned: false })),
             (_, 2) => Err(io::Error::new(io::ErrorKind::AddrNotAvailable, "no address yet")),
             (_, 4) => Err(io::Error::other("the ip server has no free connection")),
             (_, 6) => Err(io::Error::other("the ip server has no memory for another connection")),
             _ => Err(io::Error::other("the ip server refused the connection")),
         }
     }
-}
 
-/// A turn at one of Mahere's connections, given back when dropped (with its connection).
-struct Turn(Arc<(Mutex<usize>, Condvar)>);
-
-impl Turn {
-    fn take(t: Arc<(Mutex<usize>, Condvar)>) -> Turn {
-        let mut held = t.0.lock().unwrap();
-        while *held == CONNECTIONS {
-            held = t.1.wait(held).unwrap();
-        }
-        *held += 1;
-        drop(held);
-        Turn(t)
+    /// The RESOLVE calls since the last summary line and their average time.
+    fn said(&self) -> String {
+        let n = self.resolves.swap(0, Ordering::Relaxed);
+        let us = self.resolve_us.swap(0, Ordering::Relaxed);
+        format!("{n} name lookups ({} us on average)", if n == 0 { 0 } else { us / n })
     }
 }
 
-impl Drop for Turn {
-    fn drop(&mut self) {
-        *self.0.0.lock().unwrap() -= 1;
-        self.0.1.notify_one();
-    }
-}
-
-/// One connection on the ip server: its handle, the last reply (its state byte, then data read up to `at` of `len`), the state it said last, whether the server closed.
+/// One connection on the ip server: its handle, the last reply (its state byte, then data read up to `at` of `len`), the state it said last, whether the server closed, whether it was let go without a close (kept too long: its handle may be another's).
 struct IpConn {
     slot: u64,
     handle: u8,
@@ -167,8 +155,13 @@ struct IpConn {
     len: usize,
     state: u8,
     closed: bool,
-    /// Dropped after the connection's close (fields drop in order, after `drop`).
-    _turn: Turn,
+    abandoned: bool,
+}
+
+impl Conn for IpConn {
+    fn abandon(&mut self) {
+        self.abandoned = true;
+    }
 }
 
 impl IpConn {
@@ -252,9 +245,12 @@ impl io::Write for IpConn {
     }
 }
 
-/// Closed at the ip server (a FIN after what was sent; the server frees it once both sides have closed), then the turn is given back.
+/// Closed at the ip server (a FIN after what was sent; the server frees it once both sides have closed); one let go is left to the ip server, which freed it on its own (32 s unasked).
 impl Drop for IpConn {
     fn drop(&mut self) {
+        if self.abandoned {
+            return;
+        }
         let mut r = [0u8; 4];
         let _ = self.call(&[7, self.handle], &mut r);
     }

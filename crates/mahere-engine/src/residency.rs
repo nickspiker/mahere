@@ -1410,7 +1410,15 @@ impl HttpStore {
         let r = crate::plain_http::get(url, tag);
         let path = url.strip_prefix(self.base.as_str()).unwrap_or(url);
         match &r {
-            Ok(g) => eprintln!("mahere: fetch {path}: {} {} bytes in {} ms", g.status, g.body.len(), t.elapsed().as_millis()),
+            Ok(g) => {
+                // Where the time went (2026-11-14): the wait for a connection, the dial or how long the connection was kept, the first byte, the body.
+                let p = g.phases;
+                let how = match p.kept {
+                    Some(idle) => format!("a connection kept {} ms", idle / 1000),
+                    None => format!("a new connection{}, dial {} ms", if p.retried { " (a kept one gave nothing)" } else { "" }, p.dial / 1000),
+                };
+                eprintln!("mahere: fetch {path}: {} {} bytes in {} ms ({how}, waited {} ms, first byte {} ms, body {} ms)", g.status, g.body.len(), t.elapsed().as_millis(), p.wait / 1000, p.first / 1000, p.body / 1000);
+            }
             Err(e) => eprintln!("mahere: fetch {path} failed in {} ms: {e}", t.elapsed().as_millis()),
         }
         r
