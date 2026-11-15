@@ -193,6 +193,11 @@ pub struct Settings {
     pub ruler: bool,
     /// The contour interval held by hand, metres; None fits it to the view, as before the hold (Nick 2026-10-21).
     pub contour_hold: Option<f32>,
+    /// The recorded track's colour, RGBA; None when the settings predate it.
+    pub track_rgba: Option<[u8; 4]>,
+    /// The where-I-am marker: shown (stored as its absence, so settings from before show it) and its style.
+    pub marker_on: bool,
+    pub marker_style: u8,
 }
 
 fn ui_scale_key() -> String {
@@ -236,12 +241,13 @@ fn settings_key() -> String {
 }
 
 pub fn save_settings(store: &FlatStorage, s: &Settings) -> Result<(), StorageError> {
-    let flags = (s.real_sun as u64) | (s.follow_heading as u64) << 1 | (s.lock_to_fix as u64) << 2 | (!s.compressed as u64) << 3 | (s.real_light as u64) << 4 | (s.ruler as u64) << 5;
+    let flags = (s.real_sun as u64) | (s.follow_heading as u64) << 1 | (s.lock_to_fix as u64) << 2 | (!s.compressed as u64) << 3 | (s.real_light as u64) << 4 | (s.ruler as u64) << 5 | (!s.marker_on as u64) << 6;
     // The pen's colour is stored one more than its packed RGBA, so 0 says there is none.
     let pen = s.pen_rgba.map_or(0, |c| u32::from_be_bytes(c) as u64 + 1);
     // The held contour interval in millimetres, 0 for none.
     let hold = s.contour_hold.map_or(0, |m| (m * 1000.0).round().max(1.0) as u64);
-    let t = VsfType::t_u6(Tensor::new(vec![11], vec![s.cache_budget, s.layer_bits, flags, s.theme, (s.ui_ru * 1000.0).round() as u64, s.tool as u64, pen, s.travel as u64, !s.auto_update as u64, s.record as u64, hold]));
+    let track = s.track_rgba.map_or(0, |c| u32::from_be_bytes(c) as u64 + 1);
+    let t = VsfType::t_u6(Tensor::new(vec![13], vec![s.cache_budget, s.layer_bits, flags, s.theme, (s.ui_ru * 1000.0).round() as u64, s.tool as u64, pen, s.travel as u64, !s.auto_update as u64, s.record as u64, hold, track, s.marker_style as u64]));
     store.write_device(&settings_key(), &t.flatten())
 }
 
@@ -255,7 +261,7 @@ pub fn load_settings(store: &FlatStorage) -> Option<Settings> {
     if d.len() < 3 {
         return None;
     }
-    Some(Settings { cache_budget: d[0], layer_bits: d[1], real_sun: d[2] & 1 != 0, follow_heading: d[2] & 2 != 0, lock_to_fix: d[2] & 4 != 0, theme: d.get(3).copied().unwrap_or(0), compressed: d[2] & 8 == 0, real_light: d[2] & 16 != 0, ui_ru: d.get(4).map_or(1.0, |&v| v as f32 / 1000.0), tool: d.get(5).map_or(0, |&v| v.min(3) as u8), pen_rgba: d.get(6).filter(|&&v| v != 0).map(|&v| ((v - 1) as u32).to_be_bytes()), travel: d.get(7).map_or(0, |&v| v.min(3) as u8), auto_update: d.get(8).is_none_or(|&v| v == 0), record: d.get(9).is_some_and(|&v| v != 0), ruler: d[2] & 32 != 0, contour_hold: d.get(10).filter(|&&v| v != 0).map(|&v| v as f32 / 1000.0) })
+    Some(Settings { cache_budget: d[0], layer_bits: d[1], real_sun: d[2] & 1 != 0, follow_heading: d[2] & 2 != 0, lock_to_fix: d[2] & 4 != 0, theme: d.get(3).copied().unwrap_or(0), compressed: d[2] & 8 == 0, real_light: d[2] & 16 != 0, ui_ru: d.get(4).map_or(1.0, |&v| v as f32 / 1000.0), tool: d.get(5).map_or(0, |&v| v.min(3) as u8), pen_rgba: d.get(6).filter(|&&v| v != 0).map(|&v| ((v - 1) as u32).to_be_bytes()), travel: d.get(7).map_or(0, |&v| v.min(3) as u8), auto_update: d.get(8).is_none_or(|&v| v == 0), record: d.get(9).is_some_and(|&v| v != 0), ruler: d[2] & 32 != 0, contour_hold: d.get(10).filter(|&&v| v != 0).map(|&v| v as f32 / 1000.0), track_rgba: d.get(11).filter(|&&v| v != 0).map(|&v| ((v - 1) as u32).to_be_bytes()), marker_on: d[2] & 64 == 0, marker_style: d.get(12).map_or(0, |&v| (v % 4) as u8) })
 }
 
 /// Width-agnostic float-array read, per VSF doctrine.
@@ -425,6 +431,12 @@ mod tests {
             bearing: 0.7,
             sun_az: 315.0,
             sun_alt: 40.0,
+            route_mode: 1,
+            travel: 3,
+            pin_a: Some((46.2, -121.49)),
+            pin_b: None,
+            nav_to: None,
+            window: Some((-40, 120, 1280, 784)),
         };
         save_session(&store, &s).unwrap();
         assert_eq!(load_session(&store), Some(s));

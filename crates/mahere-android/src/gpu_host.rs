@@ -336,12 +336,12 @@ impl GpuHost {
             self.labeller.ask(map, w as usize, h as usize, panel.label_font_px(), !in_motion);
             let a = self.labeller.atlas();
             self.map.set_atlas(&self.device, &self.queue, a.side as u32, &a.rg, a.version);
-            let (glyphs, segments) = (self.labeller.glyphs(&map.cam, w as usize, h as usize), self.labeller.segments(&map.cam, w as usize, h as usize));
+            let (glyphs, segments) = (self.labeller.glyphs(&map.cam, w as usize, h as usize), self.labeller.segments_with_track(map, w as usize, h as usize));
             self.map.set_labels(&self.device, &self.queue, &glyphs, &segments);
         } else {
             self.map.set_labels(&self.device, &self.queue, &[], &[]);
         }
-        self.map.pin = map.gps_screen(w as usize, h as usize);
+        self.map.pin = map.marker(w as usize, h as usize);
         self.map.measure = measure_view.as_ref().map(|m| (m.origin_px.0, m.origin_px.1, m.target_px.0, m.target_px.1));
         // A bearing or readout change repaints at most a few times a second (the orientation sensor would otherwise repaint the panel's text every frame); the panel opening, closing or a row flipping repaints at once.
         self.labels_ms += t_labels.elapsed().as_secs_f32() * 1000.0;

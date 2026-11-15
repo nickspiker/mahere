@@ -620,6 +620,10 @@ pub extern "system" fn Java_nz_mahere_app_MahereTrackService_nativeOnTrackFixes<
     }
     let app = shell(ptr).app();
     if app.recording {
+        // Drawn as it grows.
+        for i in 0..n {
+            app.map.track_push(la[i], lo[i]);
+        }
         if let Some(rec) = &app.recorder {
             let rec = rec.clone();
             let some = |v: f32| v.is_finite().then_some(v);

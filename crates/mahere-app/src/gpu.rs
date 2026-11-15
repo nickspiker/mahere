@@ -189,13 +189,13 @@ impl Gpu {
             labeller.ask(map, w, h, font_px, !in_motion);
             let a = labeller.atlas();
             self.map.set_atlas(&self.device, &self.queue, a.side as u32, &a.rg, a.version);
-            let (glyphs, segments) = (labeller.glyphs(&map.cam, w, h), labeller.segments(&map.cam, w, h));
+            let (glyphs, segments) = (labeller.glyphs(&map.cam, w, h), labeller.segments_with_track(map, w, h));
             self.map.set_labels(&self.device, &self.queue, &glyphs, &segments);
         } else {
             self.map.set_labels(&self.device, &self.queue, &[], &[]);
         }
-        // The pin is the shader's; the compass and the other marks, and the panel, are the overlay the present pass lays over the map, built and uploaded only when either changed.
-        self.map.pin = map.gps_screen(w, h);
+        // The marker is the shader's; the compass and the other marks, and the panel, are the overlay the present pass lays over the map, built and uploaded only when either changed.
+        self.map.pin = map.marker(w, h);
         self.map.measure = map.measure_view(w, h, 2).map(|m| (m.origin_px.0, m.origin_px.1, m.target_px.0, m.target_px.1));
         let t_ov = Instant::now();
         let marks = map.overlay(w, h, false);

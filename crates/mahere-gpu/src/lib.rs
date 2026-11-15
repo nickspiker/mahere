@@ -99,6 +99,8 @@ struct Uniforms {
     pole: [f32; 4],
     // The raw elevation view's range: lowest and highest metres in view.
     raw: [f32; 4],
+    // The where-I-am marker beyond `pin` (x, y, accuracy radius, style + 1, 0 none): the heading on the screen (radians clockwise from up) and 1 when it is known.
+    pin_dir: [f32; 4],
 }
 
 /// The layer mask as the shader's bits.
@@ -419,7 +421,8 @@ pub struct GpuMap {
     /// Where inside a screen pixel the shader samples, in pixels; the CPU raster samples the top-left corner, which is (-0.5, -0.5) here, and the default centre is 0.
     pub sample_offset: [f32; 2],
     /// The GPS pin, drawn by the present pass: screen centre and accuracy radius in pixels.
-    pub pin: Option<(f32, f32, f32)>,
+    /// The where-I-am marker, drawn in the present pass as a wrapping add of half the code range over whatever lies under it.
+    pub pin: Option<mahere_engine::Marker>,
     /// The measurement, drawn by the present pass: origin and target in screen pixels.
     pub measure: Option<(f32, f32, f32, f32)>,
     style_loaded: bool,
@@ -1438,8 +1441,12 @@ impl GpuMap {
             depths: [plan.dem_depth as u32, plan.vec_depth as u32, plan.magnified as u32, 0],
             offset: [self.sample_offset[0], self.sample_offset[1], 0.0, 0.0],
             pin: match self.pin {
-                Some((x, y, r)) => [x, y, r, 1.0],
+                Some(m) => [m.x, m.y, m.accuracy_px, m.style as f32 + 1.0],
                 None => [0.0, 0.0, 0.0, 0.0],
+            },
+            pin_dir: match self.pin.and_then(|m| m.heading) {
+                Some(h) => [h, 1.0, 0.0, 0.0],
+                None => [0.0; 4],
             },
             line_hi: {
                 let hi = self.line_drawn.unwrap_or(plan.line_mag_hi);

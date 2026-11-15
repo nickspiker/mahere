@@ -723,8 +723,20 @@ impl Labeller {
         self.shown.segments(cam, w, h)
     }
 
+    /// The route's and the recorded track's segments together, the track over the route.
+    pub fn segments_with_track(&self, map: &mahere_engine::MapCore, w: usize, h: usize) -> Vec<Segment> {
+        let mut s = self.shown.segments(&map.cam, w, h);
+        s.extend(track_segments(map, w, h, self.shown.route_width));
+        s
+    }
+
     pub fn draw_cpu(&self, canvas: &mut [u32], cam: &mahere_engine::Camera, w: usize, h: usize) {
         self.shown.draw_cpu(canvas, cam, w, h)
+    }
+
+    /// As [`Self::draw_cpu`], the recorded track under the route and the letters.
+    pub fn draw_cpu_with_track(&self, canvas: &mut [u32], map: &mahere_engine::MapCore, w: usize, h: usize) {
+        self.shown.draw_cpu_with_track(canvas, map, w, h)
     }
 
     pub fn hit(&self, cam: &mahere_engine::Camera, w: usize, h: usize, x: f32, y: f32) -> Option<&Named> {
@@ -736,9 +748,9 @@ impl Labeller {
         ((c.lat() * 1e7) as i64, (c.lon() * 1e7) as i64, (c.ppd * 100.0) as i64, (c.bearing() * 1e5) as i64, map.vec_depth(), map.pool_version() as usize ^ (w << 20) ^ (h << 40), map.route_version, map.layers().labels, map.style_version())
     }
 
-    /// Whether there is anything to draw: labels shown, or a route.
+    /// Whether there is anything to draw: labels shown, a route, or a track being recorded.
     pub fn wanted(map: &mahere_engine::MapCore) -> bool {
-        map.layers().labels || map.route_points().is_some()
+        map.layers().labels || map.route_points().is_some() || map.track.len() > 1
     }
 }
 
@@ -1433,6 +1445,12 @@ impl Lettering {
         out
     }
 
+    /// For a CPU frontend: the frame's route, the recorded track and the letters drawn straight into a display 0xRRGGBB canvas.
+    pub fn draw_cpu_with_track(&self, canvas: &mut [u32], map: &mahere_engine::MapCore, w: usize, h: usize) {
+        stroke_cpu(canvas, w, h, &track_segments(map, w, h, self.route_width));
+        self.draw_cpu(canvas, &map.cam, w, h);
+    }
+
     /// For a CPU frontend: the frame's route and letters drawn straight into a display 0xRRGGBB canvas.
     pub fn draw_cpu(&self, canvas: &mut [u32], cam: &mahere_engine::Camera, w: usize, h: usize) {
         let blend = |canvas: &mut [u32], i: usize, c: [f32; 3], a: f32| {
@@ -1528,5 +1546,53 @@ impl Lettering {
                 (x - (ax as f32 + o[0])).hypot(y - (ay as f32 + o[1])) <= r
             })
         }).map(|k| &k.name)
+    }
+}
+
+/// The track being recorded as line segments (Nick 2026-11-15: "Draw what's being recorded"), in its colour, as wide as the route: a fix within half the line's width of the last one kept is passed over, so a day's recording costs what the screen can show.
+pub fn track_segments(map: &mahere_engine::MapCore, w: usize, h: usize, width: f32) -> Vec<Segment> {
+    if map.track.len() < 2 {
+        return Vec::new();
+    }
+    // The colour as the map shows an authored colour unlit, the same as its swatch in the panel.
+    let t = map.track_rgba;
+    let v = mahere_engine::colour::Display::default().swatch([t[0], t[1], t[2]]);
+    let c = [v[0] as f32 / 255.0, v[1] as f32 / 255.0, v[2] as f32 / 255.0, t[3] as f32 / 255.0];
+    let mut out = Vec::new();
+    let mut last: Option<(f32, f32)> = None;
+    for &(la, lo) in &map.track {
+        let (x, y) = map.cam.geo_to_screen(la, lo, w, h);
+        let p = (x as f32, y as f32);
+        match last {
+            Some(q) if (p.0 - q.0).hypot(p.1 - q.1) < width * 0.5 => continue,
+            Some(q) => out.push([q.0, q.1, p.0, p.1, width / 2.0, 0.0, 0.0, 0.0, c[0], c[1], c[2], c[3]]),
+            None => {}
+        }
+        last = Some(p);
+    }
+    out
+}
+
+/// Segments stroked straight into a display 0xRRGGBB canvas, anti-aliased over a pixel, each at its colour's opacity.
+fn stroke_cpu(canvas: &mut [u32], w: usize, h: usize, segments: &[Segment]) {
+    for s in segments {
+        let (a, b, half) = ([s[0], s[1]], [s[2], s[3]], s[4]);
+        let (x0, x1) = ((a[0].min(b[0]) - half - 1.0).floor().max(0.0) as usize, ((a[0].max(b[0]) + half + 1.0).ceil().max(0.0) as usize).min(w));
+        let (y0, y1) = ((a[1].min(b[1]) - half - 1.0).floor().max(0.0) as usize, ((a[1].max(b[1]) + half + 1.0).ceil().max(0.0) as usize).min(h));
+        let (dx, dy) = (b[0] - a[0], b[1] - a[1]);
+        let len2 = (dx * dx + dy * dy).max(1e-6);
+        for y in y0..y1 {
+            for x in x0..x1 {
+                let (px, py) = (x as f32 + 0.5, y as f32 + 0.5);
+                let t = (((px - a[0]) * dx + (py - a[1]) * dy) / len2).clamp(0.0, 1.0);
+                let d = (px - (a[0] + dx * t)).hypot(py - (a[1] + dy * t));
+                let al = (half - d + 0.5).clamp(0.0, 1.0) * s[11];
+                if al > 0.0 {
+                    let p = canvas[y * w + x];
+                    let mix = |shift: u32, v: f32| -> u32 { ((((p >> shift) & 255) as f32 * (1.0 - al) + v * 255.0 * al).round() as u32).min(255) };
+                    canvas[y * w + x] = (mix(16, s[8]) << 16) | (mix(8, s[9]) << 8) | mix(0, s[10]);
+                }
+            }
+        }
     }
 }

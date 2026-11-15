@@ -127,6 +127,8 @@ struct Uniforms {
     pole: vec4<f32>,
     // The raw elevation view's range: lowest and highest metres in view.
     raw: vec4<f32>,
+    // The where-I-am marker beyond `pin` (x, y, accuracy radius, style + 1, 0 none): the heading on the screen (radians clockwise from up) and 1 when it is known.
+    pin_dir: vec4<f32>,
 };
 
 // a: diamond, depth, cu, cv. b: dem slot, line slot, land+water slot, img slot. c: flags. d: base, step, eu, nu. e: ev, nv, inv det.
@@ -1263,8 +1265,59 @@ fn fs_present(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         }
     }
     c = sqrt(c / f32(s * s));
-    // Truncated to the code value, written exactly so the hardware's own rounding has nothing to do. The route, the labels and then the top layer are blended over it in the same pass.
-    return vec4<f32>(min(floor(c * 256.0), vec3<f32>(255.0)) / 255.0, 1.0);
+    // Truncated to the code value, written exactly so the hardware's own rounding has nothing to do. The route, the track and the labels are in the map's layer already; the top layer is blended over this in the same pass.
+    var code = min(floor(c * 256.0), vec3<f32>(255.0));
+    // The where-I-am marker (Nick 2026-11-15: "a wrapping half add, like 128 to make sure it's always visible"): half the code range added to each channel under it, wrapping, by its coverage.
+    if (U.pin.w > 0.5) {
+        let screen = U.size / U.scale;
+        let span = 2.0 * screen.x * screen.y / (screen.x + screen.y);
+        let cov = marker_cov(pos.xy - U.pin.xy, span);
+        let wrapped = (code + 128.0) - 256.0 * floor((code + 128.0) / 256.0);
+        code = code + (wrapped - code) * cov;
+    }
+    return vec4<f32>(round(code) / 255.0, 1.0);
+}
+
+// How much of the pixel at `d` from the marker's centre it covers, every size a fraction of the screen's span: as mahere_engine::marker_coverage, which the CPU draws with.
+fn marker_cov(d: vec2<f32>, span: f32) -> f32 {
+    let hw = span / 512.0;
+    let r = length(d);
+    let reach = span / 24.0;
+    let style = u32(U.pin.w - 1.0 + 0.5);
+    var mark = 0.0;
+    if (style == 0u) {
+        let gap = span / 128.0;
+        let along = max(abs(d.x), abs(d.y));
+        let across = min(abs(d.x), abs(d.y));
+        let past = max(max(gap - along, along - reach), 0.0);
+        mark = clamp(hw - length(vec2<f32>(across, past)) + 0.5, 0.0, 1.0);
+    } else if (style == 2u) {
+        mark = clamp(span / 48.0 - r + 0.5, 0.0, 1.0);
+    } else if (style == 3u && U.pin_dir.y > 0.5) {
+        let s = sin(U.pin_dir.x);
+        let c = cos(U.pin_dir.x);
+        let u = d.x * s - d.y * c;
+        let v = d.x * c + d.y * s;
+        let tip = vec2<f32>(reach, 0.0);
+        let bl = vec2<f32>(-reach * 0.5, reach * 0.5);
+        let br = vec2<f32>(-reach * 0.5, -reach * 0.5);
+        // Corners in the order that puts the inside on each edge's left.
+        let inside = min(min(edge_dist(vec2<f32>(u, v), tip, br), edge_dist(vec2<f32>(u, v), br, bl)), edge_dist(vec2<f32>(u, v), bl, tip));
+        mark = clamp(inside + 0.5, 0.0, 1.0);
+    } else {
+        mark = clamp(hw - abs(r - span / 32.0) + 0.5, 0.0, 1.0);
+    }
+    var accuracy = 0.0;
+    if (U.pin.z > reach * 1.5) {
+        accuracy = clamp(hw * 0.5 - abs(r - U.pin.z) + 0.5, 0.0, 1.0);
+    }
+    return max(mark, accuracy);
+}
+
+// Signed distance of `p` to the left of the edge from `a` to `b`.
+fn edge_dist(p: vec2<f32>, a: vec2<f32>, b: vec2<f32>) -> f32 {
+    let e = b - a;
+    return ((p.x - a.x) * e.y - (p.y - a.y) * e.x) / length(e);
 }
 
 // Premultiplied `top` of opacity `a` over what is gathered so far.
@@ -1277,15 +1330,6 @@ fn over(acc: vec4<f32>, top: vec3<f32>, a: f32) -> vec4<f32> {
 fn fs_top(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     let o = textureLoad(overlay_tex, vec2<i32>(pos.xy), 0);
     var acc = vec4<f32>(o.rgb * (255.0 / 256.0), o.a);
-    // The GPS pin: an accuracy ring and a crosshair, feathered over a pixel, in the engine's pin blue.
-    if (U.pin.w > 0.5) {
-        let d = pos.xy - U.pin.xy;
-        let dist = length(d);
-        let ring = clamp(1.0 - abs(dist - U.pin.z) + 0.45, 0.0, 1.0);
-        let cross = select(0.0, clamp(1.6 - min(abs(d.x), abs(d.y)) + 0.5, 0.0, 1.0), max(abs(d.x), abs(d.y)) <= 9.0);
-        let cov = max(ring, cross);
-        acc = over(acc, vec3<f32>(64.0, 156.0, 255.0) / 256.0, cov);
-    }
     // The measurement: a line from origin to target and a crosshair on the target, feathered over a pixel.
     if (U.depths.w != 0u) {
         let o = U.measure.xy;

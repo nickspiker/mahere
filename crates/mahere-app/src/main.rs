@@ -221,7 +221,7 @@ impl MahereApp {
             mahere_engine::RouteMode::Directions => 1,
             mahere_engine::RouteMode::Navigate => 2,
         };
-        Controls { real_sun: self.map.real_sun, real_light: self.map.real_light, follow_heading: self.map.follow_heading, lock_to_fix: self.map.lock_to_fix, cache_budget: self.cache_budget, theme: self.map.theme, compressed: self.map.compressed(), tool: self.map.tool as u8, pen_rgba: self.map.pen_colour, travel: self.travel_pref, route, search: self.searching, record: false, clear_ink: false, clear_sel: false, locate: false, ruler: self.map.ruler, contour_auto: self.map.contour_hold.is_none(), contour_interval: self.map.contour_hold.unwrap_or(self.map.contour_interval) }
+        Controls { real_sun: self.map.real_sun, real_light: self.map.real_light, follow_heading: self.map.follow_heading, lock_to_fix: self.map.lock_to_fix, cache_budget: self.cache_budget, theme: self.map.theme, compressed: self.map.compressed(), tool: self.map.tool as u8, pen_rgba: self.map.pen_colour, track_rgba: self.map.track_rgba, marker_on: self.map.marker_on, marker_style: self.map.marker_style, travel: self.travel_pref, route, search: self.searching, record: false, clear_ink: false, clear_sel: false, locate: false, ruler: self.map.ruler, contour_auto: self.map.contour_hold.is_none(), contour_interval: self.map.contour_hold.unwrap_or(self.map.contour_interval) }
     }
 
     /// A search of the view for `query` over the cells the device keeps, on a thread of its own; the places come in through [`Self::poll_search`].
@@ -353,6 +353,8 @@ impl MahereApp {
             _ => mahere_engine::ink::Tool::None,
         });
         self.map.set_pen_colour(ctl.pen_rgba);
+        self.map.set_marker(ctl.marker_on, ctl.marker_style);
+        self.map.set_track_colour(ctl.track_rgba);
         if ctl.clear_ink {
             self.map.clear_ink();
         }
@@ -1028,7 +1030,7 @@ impl FluorApp for MahereApp {
         if self.gpu.is_none() && mahere_panel::labels::Labeller::wanted(&self.map) {
             let at_rest = self.label_cam.1.elapsed().as_millis() >= 250;
             self.labeller.ask(&mut self.map, w, h, self.panel.label_font_px(), at_rest);
-            self.labeller.draw_cpu(&mut map, &self.map.cam, w, h);
+            self.labeller.draw_cpu_with_track(&mut map, &self.map, w, h);
         }
         self.panel.composite_rgb(&mut map, w, h);
         let t3 = Instant::now();
@@ -1128,6 +1130,23 @@ fn main() {
     }
     let docs = std::sync::Arc::new(mahere_store::VaultDocs::new(vault.clone()));
     areas.set_docs(docs.clone());
+    // MAHERE_FIX=lat,lon[,accuracy m] and MAHERE_TRACK=lat,lon;lat,lon;…: a GPS fix and a recorded track on a computer that has neither, to look at the marker and the track's line.
+    if let Some(v) = std::env::var("MAHERE_FIX").ok().map(|f| f.split(',').filter_map(|x| x.trim().parse::<f64>().ok()).collect::<Vec<_>>()).filter(|v| v.len() >= 2) {
+        map.set_gps(mahere_engine::GpsFix { lat: v[0], lon: v[1], accuracy_m: v.get(2).copied().unwrap_or(10.0) as f32, height_m: None, v_accuracy_m: None });
+    }
+    // MAHERE_HEADING=degrees: the phone's heading, for the arrow.
+    if let Some(h) = std::env::var("MAHERE_HEADING").ok().and_then(|h| h.trim().parse::<f32>().ok()) {
+        map.have_rotation = true;
+        map.set_device_heading(h);
+    }
+    if let Ok(t) = std::env::var("MAHERE_TRACK") {
+        for p in t.split(';') {
+            let v: Vec<f64> = p.split(',').filter_map(|x| x.trim().parse().ok()).collect();
+            if v.len() == 2 {
+                map.track_push(v[0], v[1]);
+            }
+        }
+    }
     let mut app = MahereApp::new(map, areas);
     app.docs = Some(docs);
     // Font packs (Nick 2026-10-16): names in scripts the binary lacks draw in their own face once its pack, signed by the author, is fetched.

@@ -40,6 +40,11 @@ pub struct Controls {
     pub tool: u8,
     /// The pen's colour and opacity, VSF RGB at gamma 2.
     pub pen_rgba: [u8; 4],
+    /// The recorded track's colour, RGBA.
+    pub track_rgba: [u8; 4],
+    /// Where-I-am: shown or not, and its style (mahere_engine::MARKER_STYLES).
+    pub marker_on: bool,
+    pub marker_style: u8,
     /// How routes go: 1 by car, 2 by bike, 3 on foot (0 read as by car).
     pub travel: u8,
     /// What a tap does with routes (Nick 2026-10-25): 0 nothing, 1 directions (the start, then the end), 2 navigation (where to go, from the fix).
@@ -195,9 +200,11 @@ enum Layer {
     Updates,
     /// Recording a track, the screen on or off.
     Record,
+    /// Where-I-am, shown or not; its style under it.
+    Marker,
 }
 
-const LAYERS: [(Layer, &str); 25] = [
+const LAYERS: [(Layer, &str); 26] = [
     (Layer::Dem, "Terrain"),
     (Layer::Hypso, "Elevation tint"),
     (Layer::Raw, "Raw elevation"),
@@ -221,6 +228,7 @@ const LAYERS: [(Layer, &str); 25] = [
     (Layer::FollowHeading, "Follow heading"),
     (Layer::LockToFix, "Measure from me"),
     (Layer::Record, "Record track"),
+    (Layer::Marker, "Position marker"),
     (Layer::Areas, "Areas  \u{203a}"),
     (Layer::Updates, "Updates  \u{203a}"),
 ];
@@ -232,7 +240,7 @@ const GROUPS: [(&str, &[Layer]); 8] = [
     ("Lines and names", &[Layer::Line, Layer::Labels, Layer::Boundaries]),
     ("Land and water", &[Layer::Land, Layer::Water, Layer::Own, Layer::Mvum]),
     ("Light", &[Layer::RealSun, Layer::RealLight, Layer::Linear]),
-    ("Location", &[Layer::FollowHeading, Layer::LockToFix, Layer::Record]),
+    ("Location", &[Layer::Marker, Layer::FollowHeading, Layer::LockToFix, Layer::Record]),
     // The interface's size, a slider, on a computer (Nick 2026-10-25); on a phone the pinch on the panel sets it and the group is not shown.
     ("Display", &[]),
     ("Diagnostics", &[Layer::Debug]),
@@ -275,6 +283,10 @@ enum TreeRow {
     Slider(usize),
     /// The text size slider, the Display group's row.
     TextSize,
+    /// Under Record track: the track's colour, opening its colour page.
+    TrackColour,
+    /// Under Position marker: its style, a fluor Choice.
+    MarkerStyle,
 }
 
 /// A layer's own settings, opened under its row (Nick 2026-10-21: "sliders under each element so we don't have to open separate pages"): the theme's fields that layer draws with, and for the contours their interval.
@@ -291,6 +303,8 @@ fn settings_of(l: Layer) -> Vec<TreeRow> {
         Layer::Own => fields(&|f| matches!(f, Field::Own(_) | Field::Wild)),
         Layer::Mvum => fields(&|f| matches!(f, Field::Mvum(_))),
         Layer::Labels => fields(&|f| matches!(f, Field::LabelLook | Field::LabelAmount | Field::LabelFont | Field::Label(_))),
+        Layer::Record => vec![TreeRow::TrackColour],
+        Layer::Marker => vec![TreeRow::MarkerStyle],
         _ => Vec::new(),
     }
 }
@@ -374,7 +388,7 @@ fn inert(mask: &LayerMask, ctl: &Controls, l: Layer) -> bool {
         Layer::ContourAuto => !mask.contours || mask.geoid,
         Layer::RealSun => ctl.real_light,
         Layer::RealLight => ctl.real_sun,
-        Layer::Linear | Layer::FollowHeading | Layer::LockToFix | Layer::Record | Layer::Areas | Layer::Updates => false,
+        Layer::Linear | Layer::FollowHeading | Layer::LockToFix | Layer::Record | Layer::Marker | Layer::Areas | Layer::Updates => false,
         _ => get(&mask.inert(), &Controls::default(), l),
     }
 }
@@ -404,6 +418,7 @@ fn get(mask: &LayerMask, ctl: &Controls, l: Layer) -> bool {
         Layer::Imagery => mask.imagery,
         Layer::Debug => mask.debug,
         Layer::Record => ctl.record,
+        Layer::Marker => ctl.marker_on,
         Layer::Areas | Layer::Updates => false,
     }
 }
@@ -433,6 +448,7 @@ fn set(mask: &mut LayerMask, ctl: &mut Controls, l: Layer, v: bool) {
         Layer::Imagery => mask.imagery = v,
         Layer::Debug => mask.debug = v,
         Layer::Record => ctl.record = v,
+        Layer::Marker => ctl.marker_on = v,
         Layer::Areas | Layer::Updates => {}
     }
 }
@@ -667,6 +683,10 @@ pub struct Panel {
     /// fluor's own choices and lists (Nick 2026-10-26): the way of travel and the toolbox; the themes, the areas and the places found.
     travel: Choice,
     toolbox: Choice,
+    /// The position marker's style.
+    marker_choice: Choice,
+    /// The colour page edits the track's colour rather than the pen's.
+    colour_of_track: bool,
     theme_list: List,
     area_list: List,
     search_list: List,
@@ -806,13 +826,14 @@ impl Panel {
         let auto_check = Checkbox::new(&mut hits, "Automatic updates", 0.0, 0.0, 10.0, 10.0, 10.0, true);
         let travel = Choice::new(&mut hits, &["Car", "Bike", "Foot"], 0, 10.0);
         let mut toolbox = Choice::new(&mut hits, &[], 0, 10.0);
+        let marker_choice = Choice::new(&mut hits, &mahere_engine::MARKER_STYLES, 0, 10.0);
         toolbox.set_vertical(true);
         let (theme_list, area_list, search_list) = (List::new(&mut hits, 0.0, 0.0, 10.0, 10.0, 10.0), List::new(&mut hits, 0.0, 0.0, 10.0, 10.0, 10.0), List::new(&mut hits, 0.0, 0.0, 10.0, 10.0, 10.0));
         // The buttons take their ids after every checkbox: the counter they are handed is their own from here on.
         let pills = Pills::new(hits + 1000);
         let interval = Slider::new(&mut hits, 0.0, 0.0, 10.0, 10.0, 0.0);
         let text_slider = Slider::new(&mut hits, 0.0, 0.0, 10.0, 10.0, text_pos(1.0));
-        Panel { fonts: None, font_cursor: Default::default(), open: false, dirty: true, ru: 1.0, stack: vec![Page::Layers], theme_rows: Vec::new(), edit_rows: Vec::new(), edit_scroll: 0.0, edit_extent: 0.0, press: None, sliders: Vec::new(), field_vals: [0.0; 4], held: None, edits: Vec::new(), hits, shown: vec![true; LAYERS.len()], group_open: GROUPS_OPEN, group_rows: Vec::new(), tree: Vec::new(), layer_open: None, field_open: None, theme_now: None, interval, interval_held: false, text_slider, text_pending: None, ru_request: None, label_scale: 1.0, touch: false, checks, text: TextRenderer::new(), buf: Vec::new(), w: 0, h: 0, font: 16.0, gear: (0.0, 0.0, 0.0), panel_w: 0.0, theme_row: (0.0, 0.0, 0.0), slider: (0.0, 0.0, 0.0), slider_held: false, cache_max: CACHE_MIN + 1, strip_close: None, clear_measure: false, area_rows: Vec::new(), area_acts: Vec::new(), areas: AreasView::default(), update_rows: Vec::new(), update_acts: Vec::new(), updates: UpdatesView::default(), host_orb: None, layers_scroll: 0.0, layers_extent: 0.0, layers_press: None, layers_band: (0.0, 0.0), orb_icon: fluor::host::icon::Icon::from_vsf_bytes(APP_ORB_VSF).ok(), orb_scaled: (0, Vec::new()), locate_btn: None, tool_btn: None, toolbox_open: false, tool_rows: Vec::new(), pills, auto_check, travel, toolbox, theme_list, area_list, search_list, copy_btns: Vec::new(), copied: None, query: String::new(), search_box: None, query_dirty: false, search_pending: false, found: Vec::new(), picked: None, search_act: None, search_rows: Vec::new(), search_acts: Vec::new(), search_field: None, route_pills: Vec::new(), swap: false, card_top: None }
+        Panel { fonts: None, font_cursor: Default::default(), open: false, dirty: true, ru: 1.0, stack: vec![Page::Layers], theme_rows: Vec::new(), edit_rows: Vec::new(), edit_scroll: 0.0, edit_extent: 0.0, press: None, sliders: Vec::new(), field_vals: [0.0; 4], held: None, edits: Vec::new(), hits, shown: vec![true; LAYERS.len()], group_open: GROUPS_OPEN, group_rows: Vec::new(), tree: Vec::new(), layer_open: None, field_open: None, theme_now: None, interval, interval_held: false, text_slider, text_pending: None, ru_request: None, label_scale: 1.0, touch: false, checks, text: TextRenderer::new(), buf: Vec::new(), w: 0, h: 0, font: 16.0, gear: (0.0, 0.0, 0.0), panel_w: 0.0, theme_row: (0.0, 0.0, 0.0), slider: (0.0, 0.0, 0.0), slider_held: false, cache_max: CACHE_MIN + 1, strip_close: None, clear_measure: false, area_rows: Vec::new(), area_acts: Vec::new(), areas: AreasView::default(), update_rows: Vec::new(), update_acts: Vec::new(), updates: UpdatesView::default(), host_orb: None, layers_scroll: 0.0, layers_extent: 0.0, layers_press: None, layers_band: (0.0, 0.0), orb_icon: fluor::host::icon::Icon::from_vsf_bytes(APP_ORB_VSF).ok(), orb_scaled: (0, Vec::new()), locate_btn: None, tool_btn: None, toolbox_open: false, tool_rows: Vec::new(), pills, auto_check, travel, toolbox, marker_choice, colour_of_track: false, theme_list, area_list, search_list, copy_btns: Vec::new(), copied: None, query: String::new(), search_box: None, query_dirty: false, search_pending: false, found: Vec::new(), picked: None, search_act: None, search_rows: Vec::new(), search_acts: Vec::new(), search_field: None, route_pills: Vec::new(), swap: false, card_top: None }
     }
 
     pub fn is_open(&self) -> bool {
@@ -1094,6 +1115,7 @@ impl Panel {
             Pick::Eraser => tool(ctl, 3, 0, false, false),
             Pick::PenColour => {
                 self.open = true;
+                self.colour_of_track = false;
                 let rgba = ctl.pen_rgba;
                 self.open_pen(rgba);
             }
@@ -1331,6 +1353,16 @@ impl Panel {
                             self.tree.push((y + slider_row * 0.5, slider_row * 0.5, item));
                             y += slider_row;
                         }
+                        TreeRow::TrackColour => {
+                            self.tree.push((y + setting * 0.5, setting * 0.5, item));
+                            y += setting;
+                        }
+                        TreeRow::MarkerStyle => {
+                            self.marker_choice.set_font_size(self.font * 0.8);
+                            self.marker_choice.set_rect(sx, y + row * 0.15, sw, row * 0.7);
+                            self.tree.push((y + row * 0.5, row * 0.5, item));
+                            y += row;
+                        }
                         TreeRow::Field(f) => {
                             self.tree.push((y + setting * 0.5, setting * 0.5, item));
                             y += setting;
@@ -1415,6 +1447,23 @@ impl Panel {
                 return false;
             }
             Some(TreeRow::Interval | TreeRow::Slider(_) | TreeRow::TextSize) => return false,
+            // The track's colour: its page, the pen's sliders on the track's colour.
+            Some(TreeRow::TrackColour) => {
+                self.colour_of_track = true;
+                let rgba = ctl.track_rgba;
+                self.open_pen(rgba);
+                return false;
+            }
+            // A style picked: the controls changed, for the host to apply.
+            Some(TreeRow::MarkerStyle) => {
+                self.dirty = true;
+                if self.marker_choice.click_at(x, y) {
+                    ctl.marker_style = self.marker_choice.selected() as u8;
+                    ctl.marker_on = true;
+                    return true;
+                }
+                return false;
+            }
             _ => {}
         }
         for (i, (l, cb)) in self.checks.iter_mut().enumerate() {
@@ -1690,7 +1739,11 @@ impl Panel {
                         sl.set_value_from_x(x);
                         self.held = Some(i);
                         self.field_vals[i] = (sl.value() * 255.0).round();
-                        ctl.pen_rgba[i] = self.field_vals[i] as u8;
+                        if self.colour_of_track {
+                            ctl.track_rgba[i] = self.field_vals[i] as u8;
+                        } else {
+                            ctl.pen_rgba[i] = self.field_vals[i] as u8;
+                        }
                         self.dirty = true;
                         return true;
                     }
@@ -1889,7 +1942,7 @@ impl Panel {
                     }
                 }
                 Page::Field(f) => Self::paint_field(&mut canvas, &mut self.text, font, rail, cw, self.gear, f, &mut self.sliders, self.field_vals, current),
-                Page::Pen => Self::paint_pen(&mut canvas, &mut self.text, font, rail, cw, self.gear, &mut self.sliders, self.field_vals),
+                Page::Pen => Self::paint_pen(&mut canvas, &mut self.text, font, rail, cw, self.gear, &mut self.sliders, self.field_vals, if self.colour_of_track { "Track colour" } else { "Pen colour" }),
                 Page::Areas => self.area_rows = Self::paint_areas(&mut canvas, &mut self.text, &mut self.pills, &mut self.area_list, font, rail, cw, self.gear, &self.areas),
                 Page::Updates => self.update_rows = Self::paint_updates(&mut canvas, &mut self.text, &mut self.pills, &mut self.auto_check, font, rail, cw, self.gear, &self.updates),
                 Page::Search => {
@@ -2057,6 +2110,18 @@ impl Panel {
                         if cy - hh >= band_top && cy + hh <= footer_top {
                             sl.render_content_into(&mut canvas, None, HIT_NONE);
                         }
+                    }
+                }
+                TreeRow::TrackColour => {
+                    let x = self.layer_open.map_or(tx, col);
+                    self.text.draw_text_left(&mut canvas, "\u{25b8}  Colour", x, cy, &row_ink, clip, None);
+                    let s = font * 0.9;
+                    paint::fill_rect(&mut canvas, (self.panel_w - font * 2.2) as isize, (cy - s * 0.5) as isize, (font * 1.4) as isize, s as isize, pen_swatch(ctl.track_rgba), clip, None);
+                }
+                TreeRow::MarkerStyle => {
+                    self.marker_choice.set_selected(ctl.marker_style as usize);
+                    if cy - hh >= band_top && cy + hh <= footer_top {
+                        self.marker_choice.render_content_into(&mut canvas, &mut self.text, clip, None);
                     }
                 }
                 TreeRow::Group(_) => {}
@@ -2571,7 +2636,11 @@ impl Panel {
             if let Some(sl) = self.sliders.get_mut(i) {
                 sl.set_value_from_x(x);
                 self.field_vals[i] = (sl.value() * 255.0).round();
-                ctl.pen_rgba[i] = self.field_vals[i] as u8;
+                if self.colour_of_track {
+                    ctl.track_rgba[i] = self.field_vals[i] as u8;
+                } else {
+                    ctl.pen_rgba[i] = self.field_vals[i] as u8;
+                }
                 self.dirty = true;
             }
             return true;
@@ -2928,13 +2997,14 @@ impl Panel {
     }
 
     /// The pen's mixer: the colour as a swatch, then red, green, blue and opacity sliders.
-    fn paint_pen(canvas: &mut Canvas, text: &mut TextRenderer, font: f32, ox: f32, cw: f32, gear: (f32, f32, f32), sliders: &mut [Slider], vals: [f32; 4]) {
+    #[allow(clippy::too_many_arguments)]
+    fn paint_pen(canvas: &mut Canvas, text: &mut TextRenderer, font: f32, ox: f32, cw: f32, gear: (f32, f32, f32), sliders: &mut [Slider], vals: [f32; 4], title_word: &str) {
         let x0 = ox + font * 0.9;
         let mut y = gear.1 + gear.2 + font * 0.9 + font * 0.8;
         let title = TextStyle::new(font, theme::TEXTBOX_TEXT);
         let small = TextStyle::new(font * 0.8, READOUT);
         let dim = TextStyle::new(font * 0.72, READOUT_DIM);
-        text.draw_text_left(canvas, "\u{2039}  Pen colour", x0, y, &title, None, None);
+        text.draw_text_left(canvas, &format!("\u{2039}  {title_word}"), x0, y, &title, None, None);
         y += font * 1.6;
         // The swatch: the colour at its opacity over the panel, as a stroke would sit over a dark ground.
         let sw = cw - font * 1.8;

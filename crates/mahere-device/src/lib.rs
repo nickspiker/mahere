@@ -245,7 +245,7 @@ impl<G: MapGpu> DeviceApp<G> {
     }
 
     pub fn controls(&self) -> Controls {
-        Controls { real_sun: self.map.real_sun, real_light: self.map.real_light, follow_heading: self.map.follow_heading, lock_to_fix: self.map.lock_to_fix, cache_budget: self.cache_budget, theme: self.map.theme, compressed: self.map.compressed(), tool: self.map.tool as u8, pen_rgba: self.map.pen_colour, travel: self.travel_pref, route: match self.map.route_mode {
+        Controls { real_sun: self.map.real_sun, real_light: self.map.real_light, follow_heading: self.map.follow_heading, lock_to_fix: self.map.lock_to_fix, cache_budget: self.cache_budget, theme: self.map.theme, compressed: self.map.compressed(), tool: self.map.tool as u8, pen_rgba: self.map.pen_colour, track_rgba: self.map.track_rgba, marker_on: self.map.marker_on, marker_style: self.map.marker_style, travel: self.travel_pref, route: match self.map.route_mode {
             mahere_engine::RouteMode::Off => 0,
             mahere_engine::RouteMode::Directions => 1,
             mahere_engine::RouteMode::Navigate => 2,
@@ -367,8 +367,13 @@ impl<G: MapGpu> DeviceApp<G> {
                 SearchAct::To(lat, lon) => self.map.set_pin(mahere_engine::Pin::B, (lat, lon)),
             }
         }
+        // The marker and the track's colour as the panel has them.
+        self.map.set_marker(ctl.marker_on, ctl.marker_style);
+        self.map.set_track_colour(ctl.track_rgba);
         if ctl.record != self.recording {
             self.recording = ctl.record;
+            // The track drawn is the one being recorded: a recording starts with none, and stopping takes it away.
+            self.map.track_clear();
             // Each recording a track of its own.
             if let (true, Some(rec)) = (self.recording, &self.recorder) {
                 let rec = rec.clone();
@@ -507,7 +512,7 @@ impl<G: MapGpu> DeviceApp<G> {
 
     pub fn save_settings(&self) {
         if let Some(store) = &self.store {
-            let s = mahere_store::Settings { cache_budget: self.cache_budget, layer_bits: self.map.layers().bits() as u64, real_sun: self.map.real_sun, real_light: self.map.real_light, follow_heading: self.map.follow_heading, lock_to_fix: self.map.lock_to_fix, theme: self.map.theme as u64, compressed: self.map.compressed(), ui_ru: self.ui_ru, tool: self.map.tool as u8, pen_rgba: Some(self.map.pen_colour), travel: self.travel_pref, auto_update: self.updater.auto, record: self.recording, ruler: self.map.ruler, contour_hold: self.map.contour_hold };
+            let s = mahere_store::Settings { cache_budget: self.cache_budget, layer_bits: self.map.layers().bits() as u64, real_sun: self.map.real_sun, real_light: self.map.real_light, follow_heading: self.map.follow_heading, lock_to_fix: self.map.lock_to_fix, theme: self.map.theme as u64, compressed: self.map.compressed(), ui_ru: self.ui_ru, tool: self.map.tool as u8, pen_rgba: Some(self.map.pen_colour), travel: self.travel_pref, auto_update: self.updater.auto, record: self.recording, ruler: self.map.ruler, contour_hold: self.map.contour_hold, track_rgba: Some(self.map.track_rgba), marker_on: self.map.marker_on, marker_style: self.map.marker_style };
             self.persist.settings(store.clone(), s);
         }
     }
@@ -962,6 +967,10 @@ impl<G: MapGpu> DeviceApp<G> {
             if let Some(c) = s.pen_rgba {
                 map.set_pen_colour(c);
             }
+            if let Some(c) = s.track_rgba {
+                map.set_track_colour(c);
+            }
+            map.set_marker(s.marker_on, s.marker_style);
         }
         let recorder = store.clone().map(|s| std::sync::Arc::new(std::sync::Mutex::new(mahere_store::TrackRecorder::new(s))));
         let fonts = mahere_panel::fonts::FontPacks::new(mahere_store::VaultFonts::new(store.clone()), mahere_update::AUTHOR_PUBKEY);

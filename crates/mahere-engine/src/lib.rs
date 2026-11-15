@@ -325,6 +325,13 @@ pub struct MapCore {
     pub pen: u8,
     /// The pen's colour, VSF RGB at gamma 2, and its opacity (Nick 2026-10-10: a mixer, not a selector).
     pub pen_colour: [u8; 4],
+    /// Where-I-am (Nick 2026-11-15: "a few different where I am indicators, the one that's there is difficult to see"): shown or not, and its style, one of [`MARKER_STYLES`].
+    pub marker_on: bool,
+    pub marker_style: u8,
+    /// The track being recorded, drawn as it grows (Nick: "Draw what's being recorded"), in its own colour.
+    pub track: Vec<(f64, f64)>,
+    pub track_rgba: [u8; 4],
+    pub track_version: u64,
     pub pen_width: f32,
     stroke: Option<Stroke>,
     /// The selection being drawn, as a screen mask (w × h bytes, 255 inside the closed curve), and a version for a renderer to notice a change; empty when none.
@@ -440,6 +447,11 @@ impl MapCore {
             tool: ink::Tool::None,
             pen: 0,
             pen_colour: [230, 40, 40, 255],
+            marker_on: true,
+            marker_style: 0,
+            track: Vec::new(),
+            track_rgba: TRACK_RGBA,
+            track_version: 0,
             pen_width: 6.0,
             stroke: None,
             preview: Vec::new(),
@@ -617,6 +629,49 @@ impl MapCore {
 
     pub fn set_pen_colour(&mut self, rgba: [u8; 4]) {
         self.pen_colour = rgba;
+    }
+
+    /// The marker shown or not, and its style.
+    pub fn set_marker(&mut self, on: bool, style: u8) {
+        if (on, style) != (self.marker_on, self.marker_style) {
+            (self.marker_on, self.marker_style) = (on, style % MARKER_STYLES.len() as u8);
+            self.dirty = true;
+        }
+    }
+
+    /// The recorded track's colour.
+    pub fn set_track_colour(&mut self, rgba: [u8; 4]) {
+        if rgba != self.track_rgba {
+            self.track_rgba = rgba;
+            self.track_version += 1;
+            self.dirty = true;
+        }
+    }
+
+    /// A new track: what was drawn of the last one is let go.
+    pub fn track_clear(&mut self) {
+        if !self.track.is_empty() {
+            self.track.clear();
+            self.track_version += 1;
+            self.dirty = true;
+        }
+    }
+
+    /// A recorded fix onto the drawn track.
+    pub fn track_push(&mut self, lat: f64, lon: f64) {
+        self.track.push((lat, lon));
+        self.track_version += 1;
+        self.dirty = true;
+    }
+
+    /// The marker as this frame places it: where, the accuracy's radius in pixels, the style, and which way the phone faces on the screen (radians clockwise from up) when the heading is known; None with the marker off or no fix.
+    pub fn marker(&self, w: usize, h: usize) -> Option<Marker> {
+        if !self.marker_on {
+            return None;
+        }
+        let (x, y, r) = self.gps_screen(w, h)?;
+        let heading = self.have_rotation.then(|| (self.true_heading() - self.cam.bearing().to_degrees() as f32).to_radians());
+        Some(Marker { x, y, accuracy_px: r, style: self.marker_style, heading })
     }
 
     /// Where the user's cells are kept; loading what is there.
@@ -1890,27 +1945,21 @@ impl MapCore {
     }
 
     /// GPS pin: accuracy ring, crosshair, seven-segment elevation readout.
+    /// The where-I-am marker on the CPU's canvas: each pixel it covers has half the code range added, wrapping, so it shows on any ground ([`marker_coverage`]).
     fn draw_gps(&mut self, w: usize, h: usize) {
-        let Some(g) = self.gps else { return };
-        let (x, y) = self.cam.geo_to_screen(g.lat, g.lon, w, h);
-        let (x, y) = (x as f32, y as f32);
-        const PIN: [u8; 3] = [64, 156, 255];
-        let px_per_m = (self.cam.ppd / 111_320.0) as f32;
-        let r = (g.accuracy_m * px_per_m).clamp(6.0, 4000.0);
-        let steps = (r as usize * 2).clamp(24, 720);
-        let mut prev = (x + r, y);
-        for i in 1..=steps {
-            let a = i as f32 / steps as f32 * core::f32::consts::TAU;
-            let p = (x + r * a.cos(), y + r * a.sin());
-            draw_segment(&mut self.canvas, w, h, prev.0, prev.1, p.0, p.1, 0.9, PIN);
-            prev = p;
-        }
-        for (dx0, dy0, dx1, dy1) in [(-9., 0., 9., 0.), (0., -9., 0., 9.)] {
-            draw_segment(&mut self.canvas, w, h, x + dx0, y + dy0, x + dx1, y + dy1, 1.6, PIN);
-        }
-        if let Some(elev) = self.elevation_at(g.lat, g.lon) {
-            let text = format!("{}", elev.round() as i64);
-            draw_seven_seg(&mut self.canvas, w, h, &text, x, y - r.min(60.0) - 44.0, 26.0, PIN);
+        let Some(m) = self.marker(w, h) else { return };
+        let span = 2.0 * (w * h) as f32 / (w + h).max(1) as f32;
+        let reach = (span / 24.0).max(if m.accuracy_px > span / 16.0 { m.accuracy_px } else { 0.0 }) + 2.0;
+        let (x0, x1) = ((m.x - reach).floor().max(0.0) as usize, ((m.x + reach).ceil().max(0.0) as usize).min(w));
+        let (y0, y1) = ((m.y - reach).floor().max(0.0) as usize, ((m.y + reach).ceil().max(0.0) as usize).min(h));
+        for y in y0..y1 {
+            for x in x0..x1 {
+                let cov = marker_coverage(x as f32 + 0.5 - m.x, y as f32 + 0.5 - m.y, &m, span);
+                if cov > 0.0 {
+                    let i = y * w + x;
+                    self.canvas[i] = wrap_half(self.canvas[i], cov);
+                }
+            }
         }
     }
 }
@@ -1918,6 +1967,68 @@ impl MapCore {
 // Keep TEX re-exported for frontends/tests that size things off cells.
 pub use mahere_tiles::TEX as CELL_TEX;
 const _: () = assert!(TEX == 256);
+
+/// The where-I-am marker's styles, by their number.
+pub const MARKER_STYLES: [&str; 4] = ["Cross", "Ring", "Dot", "Arrow"];
+
+/// The recorded track's colour until one is chosen: a magenta no theme draws a road, a river or the route in.
+pub const TRACK_RGBA: [u8; 4] = [255, 32, 176, 255];
+
+/// The where-I-am marker in screen pixels: its place, the accuracy's radius, its style, and the phone's heading on the screen when known (radians clockwise from up).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Marker {
+    pub x: f32,
+    pub y: f32,
+    pub accuracy_px: f32,
+    pub style: u8,
+    pub heading: Option<f32>,
+}
+
+/// How much of a pixel `(dx, dy)` from the marker's centre the marker covers, 0 to 1, every size a fraction of the screen's span (the harmonic mean of its width and height): the cross a twelfth of the span across (Nick 2026-11-15), the ring, the dot, the arrow along the heading (a ring without one), and the accuracy as a thin ring where it reaches past the mark. The GPU's present pass computes the same (map.wgsl, marker_cov); both draw it as a wrapping add of half the code range, so it shows on any ground.
+pub fn marker_coverage(dx: f32, dy: f32, m: &Marker, span: f32) -> f32 {
+    let hw = span / (1 << 9) as f32;
+    let stroke = |d: f32, hw: f32| (hw - d + 0.5).clamp(0.0, 1.0);
+    let seg = |ax: f32, ay: f32, bx: f32, by: f32| -> f32 {
+        let (ux, uy) = (bx - ax, by - ay);
+        let t = (((dx - ax) * ux + (dy - ay) * uy) / (ux * ux + uy * uy)).clamp(0.0, 1.0);
+        (dx - ax - ux * t).hypot(dy - ay - uy * t)
+    };
+    let r = dx.hypot(dy);
+    let reach = span / 24.0;
+    let mark = match (m.style, m.heading) {
+        (0, _) => {
+            let gap = span / (1 << 7) as f32;
+            [seg(gap, 0.0, reach, 0.0), seg(-gap, 0.0, -reach, 0.0), seg(0.0, gap, 0.0, reach), seg(0.0, -gap, 0.0, -reach)].into_iter().map(|d| stroke(d, hw)).fold(0.0, f32::max)
+        }
+        (2, _) => (span / 48.0 - r + 0.5).clamp(0.0, 1.0),
+        (3, Some(h)) => {
+            // A triangle pointing the heading: its tip at the reach, its base half the reach behind the centre, as wide as the reach.
+            let (s, c) = h.sin_cos();
+            let (u, v) = (dx * s - dy * c, dx * c + dy * s);
+            let (tip, back, half) = (reach, -reach * 0.5, reach * 0.5);
+            let edge = |px: f32, py: f32, qx: f32, qy: f32| -> f32 {
+                let (ex, ey) = (qx - px, qy - py);
+                ((u - px) * ey - (v - py) * ex) / ex.hypot(ey)
+            };
+            // Corners in the order that puts the inside on each edge's left.
+            let inside = edge(tip, 0.0, back, -half).min(edge(back, -half, back, half)).min(edge(back, half, tip, 0.0));
+            (inside + 0.5).clamp(0.0, 1.0)
+        }
+        _ => stroke((r - span / 32.0).abs(), hw),
+    };
+    let accuracy = if m.accuracy_px > reach * 1.5 { stroke((r - m.accuracy_px).abs(), hw * 0.5) } else { 0.0 };
+    mark.max(accuracy)
+}
+
+/// A 0xRRGGBB pixel with half the code range added to each channel, wrapping, by coverage: the marker's ink, which shows on any ground.
+pub fn wrap_half(p: u32, cov: f32) -> u32 {
+    let mix = |shift: u32| -> u32 {
+        let c = ((p >> shift) & 255) as f32;
+        let w = (((p >> shift) & 255) ^ 128) as f32;
+        ((c + (w - c) * cov).round() as u32) << shift
+    };
+    mix(16) | mix(8) | mix(0)
+}
 
 /// Anti-aliased stroke (screen-space overlay layer: GPS pin etc.).
 #[allow(clippy::too_many_arguments)]
@@ -2761,5 +2872,41 @@ pub fn named_kind(n: &mahere_tiles::Named) -> &'static str {
         theme::LAND_NAMES.get((n.kind - mahere_tiles::names::AREA + 1) as usize).copied().filter(|s| !s.is_empty()).unwrap_or("Area")
     } else {
         theme::class_word(n.kind)
+    }
+}
+
+#[cfg(test)]
+mod marker_tests {
+    use super::{marker_coverage, wrap_half, Marker};
+
+    #[test]
+    fn the_marker_is_sized_by_the_span_and_inverts_what_it_covers() {
+        let span = 1536.0;
+        let m = |style: u8, heading: Option<f32>| Marker { x: 0.0, y: 0.0, accuracy_px: 0.0, style, heading };
+        // The cross a twelfth of the span across: its arms reach a twenty-fourth each way, with a gap at the centre.
+        let reach = span / 24.0;
+        assert_eq!(marker_coverage(reach - 2.0, 0.0, &m(0, None), span), 1.0);
+        assert_eq!(marker_coverage(0.0, -(reach - 2.0), &m(0, None), span), 1.0);
+        assert_eq!(marker_coverage(reach + 4.0, 0.0, &m(0, None), span), 0.0);
+        assert_eq!(marker_coverage(0.0, 0.0, &m(0, None), span), 0.0, "the centre is left open to see the spot");
+        assert_eq!(marker_coverage(reach * 0.5, reach * 0.5, &m(0, None), span), 0.0, "off the arms");
+        // The dot filled, the ring hollow.
+        assert_eq!(marker_coverage(0.0, 0.0, &m(2, None), span), 1.0);
+        assert_eq!(marker_coverage(0.0, 0.0, &m(1, None), span), 0.0);
+        assert_eq!(marker_coverage(span / 32.0, 0.0, &m(1, None), span), 1.0);
+        // The arrow points the heading: east (a quarter turn clockwise from up) covers ahead to the east, not to the west.
+        let east = Some(std::f32::consts::FRAC_PI_2);
+        assert_eq!(marker_coverage(reach * 0.5, 0.0, &m(3, east), span), 1.0);
+        assert_eq!(marker_coverage(-reach * 0.9, 0.0, &m(3, east), span), 0.0);
+        // Without a heading the arrow is a ring.
+        assert_eq!(marker_coverage(span / 32.0, 0.0, &m(3, None), span), 1.0);
+        // The accuracy's ring where it reaches past the mark.
+        let wide = Marker { accuracy_px: 400.0, ..m(2, None) };
+        assert_eq!(marker_coverage(400.0, 0.0, &wide, span), 1.0);
+        // Half the code range added, wrapping: black to grey, white to dark grey, every colour moved by half.
+        assert_eq!(wrap_half(0x000000, 1.0), 0x808080);
+        assert_eq!(wrap_half(0xFFFFFF, 1.0), 0x7F7F7F);
+        assert_eq!(wrap_half(0x12C480, 1.0), 0x924400);
+        assert_eq!(wrap_half(0x12C480, 0.0), 0x12C480);
     }
 }
