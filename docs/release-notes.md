@@ -1,5 +1,16 @@
 # Mahere release notes
 
+## 7.0 · November 2026
+
+### Where you are
+- A choice of position markers: a cross, a ring, a dot, or an arrow that points the way the phone faces. Pick one under Location, Position marker, or switch the marker off.
+- The marker is bigger and shows on any map: it flips the colours under it, so it stands out on land, water, roads and imagery alike.
+- Where the GPS is unsure, a thin ring shows how far.
+
+### Recording a track
+- The track you are recording is drawn on the map as you go.
+- Choose its colour under Location, Record track, Colour.
+
 ## 6.0 · October 2026
 
 ### Addresses
