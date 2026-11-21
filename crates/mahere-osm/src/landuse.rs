@@ -1,4 +1,4 @@
-//! Land ownership (PAD-US 4.1, USGS) and motor vehicle use (MVUM, USDA Forest Service), read from the shapefiles `scripts/landuse-prep.py` writes: who manages the ground, where bikes are banned, and what may be driven on which Forest Service road or trail (Nick 2026-10-10).
+//! Land ownership (PAD-US 4.1, USGS) and motor vehicle use (MVUM, USDA Forest Service), read from the shapefiles `mahere-landuse` writes ([`crate::padus`]): who manages the ground, where bikes are banned, and what may be driven on which Forest Service road or trail (Nick 2026-10-10).
 //! This is the one table of classes: the prep step keeps the sources' own words, and they are mapped here.
 
 use shapefile::dbase::FieldValue;

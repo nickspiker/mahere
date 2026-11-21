@@ -3,9 +3,11 @@
 //! Three parallel passes over the extract: relations (multipolygon areas), ways (lines, closed-way areas, relation members), then only the referenced nodes. Waterways get a weight from their upstream network length — the catchment proxy OSM can give — so a map can draw the Waikato and a headwater trickle differently without a styling table.
 
 pub mod addr;
+pub mod filegdb;
 pub mod hydro;
 pub mod landuse;
 pub mod names;
+pub mod padus;
 use std::collections::HashMap;
 
 use mahere_coord::Coord;

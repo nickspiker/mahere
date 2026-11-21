@@ -1,4 +1,4 @@
-//! The overlays: land ownership (PAD-US) and motor vehicle use (USFS MVUM) baked into an area's cells, merged over what is there, terrain and imagery untouched. Reads the shapefiles `scripts/landuse-prep.py` writes for the area.
+//! The overlays: land ownership (PAD-US) and motor vehicle use (USFS MVUM) baked into an area's cells, merged over what is there, terrain and imagery untouched. Reads the shapefiles `mahere-landuse` writes for the area.
 //!   mahere-overlay --out <cells dir> --area <file.vsf.zst> --src <dir with own.shp, wild.shp, mvum.shp> [--under <cell name>] [--base 14] [--min 9]
 //! With --under, only the cells under that cell are made, and the polygon fill scans only its texels, so a large area runs a piece at a time as the loader does.
 use std::path::Path;

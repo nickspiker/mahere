@@ -1,5 +1,5 @@
 #!/bin/sh
-# Land ownership and motor vehicle use over an area's baked cells, a piece at a time (the pieces of data/areas/<area>/pieces.txt), from the shapefiles scripts/landuse-prep.py wrote into <src>.
+# Land ownership and motor vehicle use over an area's baked cells, a piece at a time (the pieces of data/areas/<area>/pieces.txt), from the shapefiles mahere-landuse wrote into <src> (cargo run --release -p mahere-tiles --bin mahere-landuse -- <lat0,lon0,lat1,lon1> <src> <PAD-US .gdb>... --mvum <roads.shp> <trails.shp>).
 # Usage: overlay-pieces.sh <area.vsf.zst> <area> <src> <out>
 set -e
 cd "$(dirname "$0")/.."
