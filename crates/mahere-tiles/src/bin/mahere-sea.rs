@@ -1,5 +1,6 @@
 //! The sea in an area's cells (Nick 2026-10-16: Puget Sound drew as land in the Seattle area, whose OSM extract marks the sea only by its coastline): OSM's water polygons rasterised into each cell's water plane and merged over what is there (lakes and rivers kept, the higher coverage wins), terrain and imagery untouched.
-//!   mahere-sea --out <cells dir> --area <file.vsf> --shp <water_polygons.shp> [--base 14] [--min 9]
+//!   mahere-sea --out <cells dir> --area <file.vsf> --shp <water_polygons.shp> [--under <cell name>] [--base 14] [--min 9]
+//! With --under, only that piece is filled (a streamed area bakes one piece at a time).
 //! The shapefile is read once for the area's box; each depth-9 piece is then filled from the polygons clipped to its own box, so a run holds one piece's cells at a time.
 use std::collections::HashSet;
 use std::path::Path;
@@ -16,13 +17,14 @@ fn main() {
     let shp = arg(&args, "--shp").expect("--shp");
     let base: u8 = arg(&args, "--base").map(|v| v.parse().unwrap()).unwrap_or(14);
     let min: u8 = arg(&args, "--min").map(|v| v.parse().unwrap()).unwrap_or(9);
+    let under = arg(&args, "--under").map(|n| mahere_tiles::CellKey::from_name(&n).expect("--under: a cell name"));
     let t = std::time::Instant::now();
     let bbox = area.bounds().expect("an area with a shape");
     let sea = mahere_osm::landuse::load_sea(&shp, bbox).expect("water polygons");
     eprintln!("{} sea polygons touch the area, {:.1}s", sea.len(), t.elapsed().as_secs_f32());
     let sets: Vec<HashSet<mahere_tiles::CellKey>> = (0..=base).map(|d| if d >= min { area.cells_at(d).into_iter().collect() } else { HashSet::new() }).collect();
     let (mut edited, mut pieces) = (0usize, 0usize);
-    for piece in area.cells_at(min) {
+    for piece in area.cells_at(min).into_iter().filter(|p| under.is_none_or(|u| *p == u)) {
         // The piece's box, a little loose so its edge texels are filled.
         let corners = piece.corners();
         let pad = 0.001;

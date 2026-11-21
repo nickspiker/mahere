@@ -1,16 +1,17 @@
 //! An area's source lists for fetch-area.sh and bake-pieces.sh, written into data/areas/<area>/: dem-urls.txt (USGS 1 m lidar DEM tiles, and with --topobathy NOAA's CUDEM 1/9 arc-second topo-bathymetric tiles for the water), naip-urls.txt (the newest NAIP year that covers the box), and pieces.txt (each depth-9 piece of the shape with the files that touch it, lidar newest project first and the topo-bathy last so it fills only where lidar has no data).
-//! Usage, from the repository root: `cargo run --release -p mahere-tiles --example area_sources -- <area> [--naip-year YYYY] [--topobathy <CUDEM directory URL>]`
+//! Usage, from the repository root: `cargo run --release -p mahere-tiles --example area_sources -- <area> [--naip-year YYYY] [--topobathy <CUDEM directory URL>]...`
 use std::io::Read;
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let Some(area) = args.first() else {
-        eprintln!("usage: area_sources <area> [--naip-year YYYY] [--topobathy <url>]");
+        eprintln!("usage: area_sources <area> [--naip-year YYYY] [--topobathy <url>]...");
         std::process::exit(2);
     };
     let arg = |name: &str| args.iter().position(|a| a == name).map(|i| args[i + 1].clone());
     let naip_year: Option<u32> = arg("--naip-year").map(|y| y.parse().expect("--naip-year: a year"));
-    let topobathy = arg("--topobathy").map(|u| format!("{}/", u.trim_end_matches('/')));
+    // --topobathy may be given more than once: an area along several of NOAA's sets (Puget Sound, Bellingham, Juan de Fuca).
+    let topobathy: Vec<String> = args.windows(2).filter(|w| w[0] == "--topobathy").map(|w| format!("{}/", w[1].trim_end_matches('/'))).collect();
     let root = format!("data/areas/{area}");
     // The area's document: VSF with its planes coded inside, or the zstd form areas had before 7.1.
     let doc = [format!("{root}/{area}.vsf"), format!("{root}/{area}.vsf.zst")].into_iter().find(|p| std::path::Path::new(p).exists()).unwrap_or_else(|| format!("{root}/{area}.vsf"));
@@ -60,22 +61,23 @@ fn main() {
 
     // The topo-bathymetry: CUDEM tiles are a quarter degree, named by their north-west corner.
     let mut bathy: Vec<Source> = Vec::new();
-    if let Some(dir) = &topobathy {
+    for dir in &topobathy {
         let listing = body(agent.get(dir).call(), dir);
         let mut tiles = cudem_tiles(&listing);
         tiles.sort();
         tiles.dedup();
+        let mut found: Vec<Source> = Vec::new();
         for (file, nd, nf, wd, wf) in tiles {
             let north = nd as f64 + nf as f64 / 100.;
             let west = -(wd as f64 + wf as f64 / 100.);
             let b = (west, north - 0.25, west + 0.25, north);
             if b.0 <= lon1 && b.2 >= lon0 && b.1 <= lat1 && b.3 >= lat0 {
-                bathy.push(Source { url: format!("{dir}{file}"), file, box_: b, year: 0 });
+                found.push(Source { url: format!("{dir}{file}"), file, box_: b, year: 0 });
             }
         }
-        // The newest version of a tile only: the greatest name among those that differ only in their `_<year>v<n>.tif` ending.
+        // The newest version of a tile only, within its set: the greatest name among those that differ only in their `_<year>v<n>.tif` ending.
         let mut newest: Vec<Source> = Vec::new();
-        for b in bathy {
+        for b in found {
             let key = version_key(&b.file).to_string();
             match newest.iter_mut().find(|n| version_key(&n.file) == key) {
                 Some(n) if b.file > n.file => *n = b,
@@ -84,24 +86,30 @@ fn main() {
             }
         }
         newest.sort_by(|a, b| a.file.cmp(&b.file));
-        bathy = newest;
-        println!("{} topo-bathymetry tiles", bathy.len());
+        println!("{} topo-bathymetry tiles from {dir}", newest.len());
+        bathy.extend(newest);
     }
 
     // Imagery: the newest NAIP year with quads over the box (or the one asked for).
+    // Asked piece by piece: one search answers at most 1000 quads, and a big area's box holds more (analytic shock's held well over).
     let naip_items = |year: u32| -> Vec<Source> {
         let search = "https://planetarycomputer.microsoft.com/api/stac/v1/search";
-        let req = format!("{{\"collections\": [\"naip\"], \"bbox\": [{lon0:?}, {lat0:?}, {lon1:?}, {lat1:?}], \"datetime\": \"{year}-01-01T00:00:00Z/{year}-12-31T23:59:59Z\", \"limit\": 1000}}");
-        let res = Json::parse(&body(agent.post(search).set("Content-Type", "application/json").send_string(&req), search)).expect("STAC: JSON");
-        res.get("features")
-            .arr()
-            .iter()
-            .map(|f| {
+        let mut out: Vec<Source> = Vec::new();
+        for (_, (la0, lo0, la1, lo1), _) in &pieces {
+            let req = format!("{{\"collections\": [\"naip\"], \"bbox\": [{lo0:?}, {la0:?}, {lo1:?}, {la1:?}], \"datetime\": \"{year}-01-01T00:00:00Z/{year}-12-31T23:59:59Z\", \"limit\": 1000}}");
+            let res = Json::parse(&body(agent.post(search).set("Content-Type", "application/json").send_string(&req), search)).expect("STAC: JSON");
+            let features = res.get("features").arr();
+            assert!(features.len() < 1000, "a piece with 1000 NAIP quads: the answer may be cut short");
+            for f in features {
                 let href = f.get("assets").get("image").get("href").str().to_string();
+                if out.iter().any(|s| s.url == href) {
+                    continue;
+                }
                 let bb: Vec<f64> = f.get("bbox").arr().iter().map(Json::num).collect();
-                Source { file: basename(&href).to_string(), url: href, box_: (bb[0], bb[1], bb[2], bb[3]), year }
-            })
-            .collect()
+                out.push(Source { file: basename(&href).to_string(), url: href, box_: (bb[0], bb[1], bb[2], bb[3]), year });
+            }
+        }
+        out
     };
     let years: Vec<u32> = match naip_year {
         Some(y) => vec![y],
