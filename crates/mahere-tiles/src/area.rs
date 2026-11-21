@@ -211,46 +211,44 @@ impl Area {
     }
 
     /// The document: VSF then zstd. Shared without the device's own fetch record.
+    /// The area as a VSF document (Nick 2026-11-21: "putting the compression in the vsf"): its name, when it was made and its detail, then a section a plane, each plane's coverage context-coded by VSF's own codec as a raster (`vc`, as a cell's planes are), no zstd around it. With `share` false, this device's download record too.
     pub fn encode(&self, share: bool) -> Vec<u8> {
-        let n = self.cells.len();
-        let depth: Vec<u8> = self.cells.iter().map(|(k, _)| k.depth).collect();
-        let cell: Vec<u64> = self.cells.iter().map(|(k, _)| k.raw()).collect();
-        let mut cov = Vec::with_capacity(n * TRI);
-        for (_, c) in &self.cells {
-            cov.extend_from_slice(&c.cov);
-        }
-        let mut b = VsfBuilder::new()
-            .add_section(
-                "area",
+        let mut b = VsfBuilder::new().add_section(
+            "area",
+            vec![
+                ("name".to_string(), VsfType::x(self.name.clone())),
+                ("created".to_string(), VsfType::t_i6(Tensor::new(vec![1], vec![self.created]))),
+                ("depth".to_string(), VsfType::u(self.depth as usize, false)),
+            ],
+        );
+        for (k, c) in &self.cells {
+            // The plane in memory order is the codec's raster already: 256 rows of 512, each square's two halves side by side.
+            let raster = VsfType::t_u3(Tensor::new(vec![TEX, 2 * TEX], c.cov.clone()));
+            let cov = vsf::codec::encode(&raster, vsf::codec::Model::Raster, None).unwrap_or(raster);
+            b = b.add_section(
+                "plane",
                 vec![
-                    ("name".to_string(), VsfType::x(self.name.clone())),
-                    ("created".to_string(), VsfType::t_i6(Tensor::new(vec![1], vec![self.created]))),
-                    ("depth".to_string(), VsfType::u(self.depth as usize, false)),
-                ],
-            )
-            .add_section(
-                "shape",
-                vec![
-                    ("depth".to_string(), VsfType::t_u3(Tensor::new(vec![n], depth))),
-                    ("cell".to_string(), VsfType::t_u6(Tensor::new(vec![n], cell))),
-                    ("cov".to_string(), VsfType::t_u3(Tensor::new(vec![n, TRI], cov))),
+                    ("depth".to_string(), VsfType::u(k.depth as usize, false)),
+                    ("cell".to_string(), VsfType::t_u6(Tensor::new(vec![1], vec![k.raw()]))),
+                    ("cov".to_string(), cov),
                 ],
             );
+        }
         if let (false, Some((when, bytes))) = (share, self.fetched) {
             b = b.add_section("device", vec![("fetched".to_string(), VsfType::t_i6(Tensor::new(vec![1], vec![when]))), ("bytes".to_string(), VsfType::t_u6(Tensor::new(vec![1], vec![bytes])))]);
         }
-        let raw = match b.build() {
+        match b.build() {
             Ok(r) => r,
             Err(e) => {
                 eprintln!("area encode: {e:?}");
                 Vec::new()
             }
-        };
-        zstd::encode_all(raw.as_slice(), 9).unwrap_or(raw)
+        }
     }
 
+    /// An area document: as [`Self::encode`] writes it, or as it was written before (zstd around the VSF, every plane in one `shape` section), which areas kept on a device and files already shared are.
     pub fn decode(bytes: &[u8]) -> Option<Area> {
-        let raw = zstd::decode_all(bytes).ok()?;
+        let raw = if bytes.starts_with(&[0x28, 0xB5, 0x2F, 0xFD]) { zstd::decode_all(bytes).ok()? } else { bytes.to_vec() };
         let (header, end) = vsf::VsfHeader::decode(&raw).map_err(|e| eprintln!("area header: {e:?}")).ok()?;
         let sections = header.sections(&raw, end).map_err(|e| eprintln!("area sections: {e:?}")).ok()?;
         let mut name = String::new();
@@ -259,10 +257,11 @@ impl Area {
         let mut depths: Vec<u8> = Vec::new();
         let mut cells: Vec<u64> = Vec::new();
         let mut cov: Vec<u8> = Vec::new();
-        let mut fetched: Option<(i64, u64)> = None;
+        let mut planes: Vec<(CellKey, CovCell)> = Vec::new();
         let mut fetched_at: Option<i64> = None;
         let mut fetched_bytes: Option<u64> = None;
         for s in sections {
+            let (mut pd, mut pc, mut pv): (Option<u8>, Option<u64>, Option<Vec<u8>>) = (None, None, None);
             for f in s.fields {
                 let v = f.values.into_iter().next();
                 match (s.name.as_str(), f.name.as_str(), v) {
@@ -270,6 +269,15 @@ impl Area {
                     ("area", "created", Some(VsfType::t_i6(t))) => created = t.data.first().copied().unwrap_or(0),
                     ("area", "depth", Some(VsfType::u(d, _))) => depth = d as u8,
                     ("area", "depth", Some(VsfType::u3(d))) => depth = d,
+                    ("plane", "depth", Some(VsfType::u(d, _))) => pd = Some(d as u8),
+                    ("plane", "depth", Some(VsfType::u3(d))) => pd = Some(d),
+                    ("plane", "cell", Some(VsfType::t_u6(t))) => pc = t.data.first().copied(),
+                    ("plane", "cov", Some(v)) => {
+                        let plain = if matches!(v, VsfType::v(vsf::codec::ENCODING, _)) { vsf::codec::decode(&v, None).ok() } else { Some(v) };
+                        if let Some(VsfType::t_u3(t)) = plain {
+                            pv = Some(t.data);
+                        }
+                    }
                     ("shape", "depth", Some(VsfType::t_u3(t))) => depths = t.data,
                     ("shape", "cell", Some(VsfType::t_u6(t))) => cells = t.data,
                     ("shape", "cov", Some(VsfType::t_u3(t))) => cov = t.data,
@@ -278,21 +286,23 @@ impl Area {
                     _ => {}
                 }
             }
+            if let (Some(d), Some(c), Some(v)) = (pd, pc, pv) {
+                if v.len() != TRI {
+                    return None;
+                }
+                planes.push((CellKey { depth: d, prefix: c >> (60 - 2 * d as u32) }, CovCell { cov: v }));
+            }
         }
-        if let (Some(a), Some(b)) = (fetched_at, fetched_bytes) {
-            fetched = Some((a, b));
-        }
+        // A document from before: every plane in the one `shape` section.
         let n = depths.len().min(cells.len());
         if cov.len() < n * TRI {
             return None;
         }
-        let planes = (0..n)
-            .map(|i| {
-                let d = depths[i];
-                let key = CellKey { depth: d, prefix: cells[i] >> (60 - 2 * d as u32) };
-                (key, CovCell { cov: cov[i * TRI..(i + 1) * TRI].to_vec() })
-            })
-            .collect();
+        for i in 0..n {
+            let d = depths[i];
+            planes.push((CellKey { depth: d, prefix: cells[i] >> (60 - 2 * d as u32) }, CovCell { cov: cov[i * TRI..(i + 1) * TRI].to_vec() }));
+        }
+        let fetched = fetched_at.zip(fetched_bytes);
         Some(Area { name, created, depth: depth.clamp(AREA_MIN_DEPTH, AREA_MAX_DEPTH), cells: planes, fetched })
     }
 }

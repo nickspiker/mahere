@@ -1,9 +1,9 @@
-//! Read a shared area document: `area <file.vsf.zst> [info|bbox|cells <depth>|pieces <depth>]`.
+//! Read a shared area document: `area <file.vsf> [info|bbox|cells <depth>|pieces <depth>]`.
 //! `info` (the default) prints the name, when it was made, the detail wanted, the bounds and the cell counts per depth; `bbox` prints lat0,lon0,lat1,lon1 for a baker; `cells <depth>` prints one cell name per line, the objects the bucket would hold.
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let Some(file) = args.get(1) else {
-        eprintln!("usage: area <file.vsf.zst> [info|bbox|cells <depth>]");
+        eprintln!("usage: area <file.vsf> [info|bbox|cells <depth>]");
         std::process::exit(2);
     };
     let bytes = std::fs::read(file).expect("read the area file");

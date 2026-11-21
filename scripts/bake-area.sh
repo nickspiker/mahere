@@ -1,11 +1,11 @@
 #!/bin/sh
 # Bake one area into a fresh cell directory and swap it in. The area's box and sources are declared below; vectors and terrain at depth 14 (1.2 m texels) across the whole box, imagery wherever NAIP quads are present. Run after scripts/fetch-area.sh, then scripts/publish-cells.sh.
-# An area shared from the phone (a .vsf.zst area document) bakes only the cells its shape covers: `bake-area.sh <file.vsf.zst> <dem.tif>... [-- <naip.tif>...]`; its box comes from the shape (`cargo run -p mahere-tiles --example area -- <file> bbox` prints it, for fetching the sources).
+# An area shared from the phone (a .vsf area document, .vsf.zst before 7.1) bakes only the cells its shape covers: `bake-area.sh <file.vsf> <dem.tif>... [-- <naip.tif>...]`; its box comes from the shape (`cargo run -p mahere-tiles --example area -- <file> bbox` prints it, for fetching the sources).
 set -e
 cd "$(dirname "$0")/.."
 AREA=$1
 case "$AREA" in
-    *.vsf.zst)
+    *.vsf|*.vsf.zst)
         cargo build --release -p mahere-tiles
         BOX=$(target/release/examples/area "$AREA" bbox 2>/dev/null || cargo run --release -q -p mahere-tiles --example area -- "$AREA" bbox)
         shift

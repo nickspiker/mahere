@@ -1,4 +1,4 @@
-//! `coverage <area.vsf.zst> <cells dir> [depth]`: what the baked cells actually hold, not what the sources' outlines claim: every cell of the area at the depth (14 by default) decoded, its texels with no elevation and with no imagery counted, the worst cells listed with where they are.
+//! `coverage <area.vsf> <cells dir> [depth]`: what the baked cells actually hold, not what the sources' outlines claim: every cell of the area at the depth (14 by default) decoded, its texels with no elevation and with no imagery counted, the worst cells listed with where they are.
 use rayon::prelude::*;
 
 static WET: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);

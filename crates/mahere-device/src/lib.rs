@@ -481,7 +481,7 @@ impl<G: MapGpu> DeviceApp<G> {
                     if let (Some(dir), Some((name, bytes))) = (&self.data_dir, self.areas.share_bytes(i)) {
                         let share = std::path::PathBuf::from(dir).join("share");
                         let _ = std::fs::create_dir_all(&share);
-                        let path = share.join(format!("{}.vsf.zst", name.replace(' ', "-")));
+                        let path = share.join(format!("{}.vsf", name.replace(' ', "-")));
                         match std::fs::write(&path, &bytes) {
                             Ok(()) => self.share_file = Some(path.to_string_lossy().to_string()),
                             Err(e) => eprintln!("share: writing {}: {e}", path.display()),

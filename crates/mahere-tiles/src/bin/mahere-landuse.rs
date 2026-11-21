@@ -1,6 +1,6 @@
 //! Land ownership (PAD-US 4.1) and motor vehicle use (USFS MVUM) for one area, as the shapefiles mahere-overlay reads: own.shp, wild.shp and mvum.shp, in latitude and longitude, clipped to the area's box (mahere_osm::padus).
 //!   mahere-landuse <lat0,lon0,lat1,lon1> <out dir> <PADUS4_1_State<XX>.gdb>... --mvum <roads.shp> <trails.shp>
-//! The box is what `area <file.vsf.zst> bbox` prints.
+//! The box is what `area <file.vsf> bbox` prints.
 use std::path::Path;
 
 fn main() {

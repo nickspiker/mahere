@@ -1,7 +1,7 @@
 //! The loader: bake a region's cells into a directory whose layout is the bucket. Cells already in the directory are merged over, so regions can be baked one at a time (and a 1 m region over a 10 m one). Usage:
 //!   mahere-load --pbf <file> --dem <tif>... --out <dir> \
 //!     --bbox lat0,lon0,lat1,lon1 [--vec-base 13] [--dem-base 11] [--min 6] [--dem-loss m] [--img-loss levels]
-//!     [--area <file.vsf.zst>] [--under <cell name>]
+//!     [--area <file.vsf>] [--under <cell name>]
 //! --area bakes only the cells a shared area's shape covers, every layer; --under bakes only the cells under one cell (a piece of a large area, so a run holds only that piece's sources), its box the area's cells under it when --bbox is not given. Run pieces with --min at the piece's depth and they never write the same cell twice.
 use std::path::Path;
 

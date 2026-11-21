@@ -37,7 +37,7 @@
                 <category android:name="android.intent.category.BROWSABLE" />
                 <data android:scheme="geo" />
             </intent-filter>
-            <!-- A shared area document (.vsf.zst), sent to the app or opened with it; messaging apps type it as they please, so the plain types are taken too and anything that is not an area is ignored. -->
+            <!-- A shared area document (.vsf, or .vsf.zst from before 7.1), sent to the app or opened with it; messaging apps type it as they please, so the plain types are taken too and anything that is not an area is ignored. -->
             <intent-filter>
                 <action android:name="android.intent.action.SEND" />
                 <action android:name="android.intent.action.VIEW" />

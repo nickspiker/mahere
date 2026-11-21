@@ -415,7 +415,7 @@ impl MahereApp {
                     if let Some((name, bytes)) = self.areas.share_bytes(i) {
                         let dir = mahere_store::user_dir().join("share");
                         let _ = std::fs::create_dir_all(&dir);
-                        let path = dir.join(format!("{}.vsf.zst", name.replace(' ', "-")));
+                        let path = dir.join(format!("{}.vsf", name.replace(' ', "-")));
                         match std::fs::write(&path, &bytes) {
                             Ok(()) => eprintln!("area shared: {}", path.display()),
                             Err(e) => eprintln!("area share failed: {e}"),
@@ -1178,18 +1178,23 @@ fn main() {
 struct DirAreas(std::path::PathBuf);
 
 impl DirAreas {
-    fn path(&self, name: &str) -> std::path::PathBuf {
-        self.0.join(format!("{}.vsf.zst", name.replace(' ', "-")))
+    /// An area's file: VSF, its planes coded inside (Nick 2026-11-21); `old` the name it had while areas were zstd around VSF.
+    fn path(&self, name: &str, old: bool) -> std::path::PathBuf {
+        self.0.join(format!("{}.vsf{}", name.replace(' ', "-"), if old { ".zst" } else { "" }))
     }
 }
 
 impl mahere_engine::areas::AreaStore for DirAreas {
     fn put(&self, name: &str, bytes: &[u8]) {
-        let _ = std::fs::write(self.path(name), bytes);
+        if std::fs::write(self.path(name, false), bytes).is_ok() {
+            // Written anew: the file it had in the old form goes, or the area would load twice.
+            let _ = std::fs::remove_file(self.path(name, true));
+        }
     }
 
     fn delete(&self, name: &str) {
-        let _ = std::fs::remove_file(self.path(name));
+        let _ = std::fs::remove_file(self.path(name, false));
+        let _ = std::fs::remove_file(self.path(name, true));
     }
 
     fn load_all(&self) -> Vec<Vec<u8>> {

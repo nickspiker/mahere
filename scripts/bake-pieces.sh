@@ -1,13 +1,13 @@
 #!/bin/sh
 # Bake a large shared area a piece at a time: one loader run per depth-9 cell of the shape, each holding only that piece's sources, merged into one cell directory. Pieces are listed in data/areas/<area>/pieces.txt as `<cell name> <dem files, comma separated, preferred first> <naip files>`; a piece runs as soon as all its files are in <src>/dem and <src>/naip (so it can follow a fetch still running) and is marked done in <out>/.done.
-# Usage: bake-pieces.sh <area.vsf.zst> <area dir name> <src dir> <out dir>; PBF names the OSM extract (default data/washington-latest.osm.pbf).
+# Usage: bake-pieces.sh <area.vsf> <area dir name> <src dir> <out dir>; PBF names the OSM extract (default data/washington-latest.osm.pbf).
 set -e
 cd "$(dirname "$0")/.."
 AREA_FILE=$1
 AREA=$2
 SRC=$3
 OUT=$4
-[ -n "$OUT" ] || { echo "usage: bake-pieces.sh <area.vsf.zst> <area> <src> <out>" >&2; exit 2; }
+[ -n "$OUT" ] || { echo "usage: bake-pieces.sh <area.vsf> <area> <src> <out>" >&2; exit 2; }
 PBF=${PBF:-data/washington-latest.osm.pbf}
 cargo build --release -q -p mahere-tiles --bin mahere-load
 mkdir -p "$OUT/.done"

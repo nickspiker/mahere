@@ -1,4 +1,4 @@
-//! `elev_outliers <area.vsf.zst> <cells dir> [floor m] [depth]`: texels whose elevation is below a floor (-500 m by default) in an area's cells, counted and located: a source's no-data value read as ground.
+//! `elev_outliers <area.vsf> <cells dir> [floor m] [depth]`: texels whose elevation is below a floor (-500 m by default) in an area's cells, counted and located: a source's no-data value read as ground.
 use rayon::prelude::*;
 
 fn main() {

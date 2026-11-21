@@ -1,5 +1,5 @@
 //! The sea in an area's cells (Nick 2026-10-16: Puget Sound drew as land in the Seattle area, whose OSM extract marks the sea only by its coastline): OSM's water polygons rasterised into each cell's water plane and merged over what is there (lakes and rivers kept, the higher coverage wins), terrain and imagery untouched.
-//!   mahere-sea --out <cells dir> --area <file.vsf.zst> --shp <water_polygons.shp> [--base 14] [--min 9]
+//!   mahere-sea --out <cells dir> --area <file.vsf> --shp <water_polygons.shp> [--base 14] [--min 9]
 //! The shapefile is read once for the area's box; each depth-9 piece is then filled from the polygons clipped to its own box, so a run holds one piece's cells at a time.
 use std::collections::HashSet;
 use std::path::Path;

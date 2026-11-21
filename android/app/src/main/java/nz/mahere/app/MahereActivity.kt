@@ -173,8 +173,8 @@ class MahereActivity : Activity(), SurfaceHolder.Callback, Choreographer.FrameCa
         val send = Intent(Intent.ACTION_SEND).apply {
             type = "application/vnd.mahere.area"
             putExtra(Intent.EXTRA_STREAM, uri)
-            putExtra(Intent.EXTRA_SUBJECT, f.name.removeSuffix(".vsf.zst"))
-            putExtra(Intent.EXTRA_TEXT, "A mahere area: " + f.name.removeSuffix(".vsf.zst").replace('-', ' '))
+            putExtra(Intent.EXTRA_SUBJECT, f.name.removeSuffix(".zst").removeSuffix(".vsf"))
+            putExtra(Intent.EXTRA_TEXT, "A mahere area: " + f.name.removeSuffix(".zst").removeSuffix(".vsf").replace('-', ' '))
             // The clip carries the grant to the share sheet itself, so it can show the file.
             clipData = android.content.ClipData.newUri(contentResolver, "mahere area", uri)
             addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)

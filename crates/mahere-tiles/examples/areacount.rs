@@ -1,4 +1,4 @@
-//! areacount <area.vsf.zst> <points.txt> [published dir]: how many of the points (one "lat lon bytes" per line) fall inside the area's depth-14 cells, their bytes, and, given the published directory, what the area's cells weigh there now (base, dem, img, nir at depths 9 to 14).
+//! areacount <area.vsf> <points.txt> [published dir]: how many of the points (one "lat lon bytes" per line) fall inside the area's depth-14 cells, their bytes, and, given the published directory, what the area's cells weigh there now (base, dem, img, nir at depths 9 to 14).
 fn main() {
     let a: Vec<String> = std::env::args().collect();
     let area = mahere_tiles::area::Area::decode(&std::fs::read(&a[1]).unwrap()).unwrap();

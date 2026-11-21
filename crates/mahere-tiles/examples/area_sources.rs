@@ -12,7 +12,8 @@ fn main() {
     let naip_year: Option<u32> = arg("--naip-year").map(|y| y.parse().expect("--naip-year: a year"));
     let topobathy = arg("--topobathy").map(|u| format!("{}/", u.trim_end_matches('/')));
     let root = format!("data/areas/{area}");
-    let doc = format!("{root}/{area}.vsf.zst");
+    // The area's document: VSF with its planes coded inside, or the zstd form areas had before 7.1.
+    let doc = [format!("{root}/{area}.vsf"), format!("{root}/{area}.vsf.zst")].into_iter().find(|p| std::path::Path::new(p).exists()).unwrap_or_else(|| format!("{root}/{area}.vsf"));
 
     // The pieces and their boxes, from the area document.
     let a = mahere_tiles::area::Area::decode(&std::fs::read(&doc).unwrap_or_else(|e| panic!("{doc}: {e}"))).expect("an area document");
