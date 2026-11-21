@@ -89,6 +89,10 @@ impl Areas {
     pub fn set_store(&mut self, store: Arc<dyn AreaStore>) {
         for bytes in store.load_all() {
             if let Some(a) = Area::decode(&bytes) {
+                // An area kept in the form before 2026-11-21 (zstd around it) is written again in today's, so the old form dies out.
+                if !bytes.starts_with("RÅ<".as_bytes()) {
+                    store.put(&a.name, &a.encode(false));
+                }
                 self.push(a);
             }
         }

@@ -1,9 +1,9 @@
-//! graphcheck <cell.vsf[.zst]>...: each cell's route section, its ways, nodes and corridors, and whether it carries the graph; with -v, each way's trixels (its own and stacked) and each corridor's marked trixels, so an unmarked corridor (a route's straight jump) shows.
+//! graphcheck <cell.vsf>...: each cell's route section, its ways, nodes and corridors, and whether it carries the graph; with -v, each way's trixels (its own and stacked) and each corridor's marked trixels, so an unmarked corridor (a route's straight jump) shows.
 fn main() {
     let verbose = std::env::args().any(|a| a == "-v");
     for p in std::env::args().skip(1).filter(|a| a != "-v") {
         let b = std::fs::read(&p).unwrap();
-        let plain = zstd::decode_all(&b[..]).unwrap_or(b);
+        let plain = b;
         let Some(r) = mahere_tiles::decode_route(&plain) else {
             println!("{p}: no route section");
             continue;

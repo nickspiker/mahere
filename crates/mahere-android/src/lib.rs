@@ -628,7 +628,7 @@ pub extern "system" fn Java_nz_mahere_app_MahereTrackService_nativeOnTrackFixes<
             let rec = rec.clone();
             let some = |v: f32| v.is_finite().then_some(v);
             let fixes: Vec<mahere_store::Fix> = (0..n)
-                .map(|i| mahere_store::Fix { coord: mahere_coord::Coord::from_lat_lon(la[i], lo[i]).raw(), unix_ms: tm[i], height_m: ht[i].is_finite().then_some(ht[i] as f32), accuracy_m: ac[i], v_accuracy_m: some(va[i]), speed_ms: some(sp[i]), bearing_deg: some(be[i]) })
+                .map(|i| mahere_store::Fix { coord: mahere_coord::Coord::from_lat_lon(la[i], lo[i]).raw(), et: mahere_store::et_of_unix_ms(tm[i]), height_m: ht[i].is_finite().then_some(ht[i] as f32), accuracy_m: ac[i], v_accuracy_m: some(va[i]), speed_ms: some(sp[i]), bearing_deg: some(be[i]) })
                 .collect();
             app.persist.run(move || {
                 let mut r = rec.lock().unwrap();

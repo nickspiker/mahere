@@ -1,4 +1,4 @@
-//! Address documents (Nick 2026-10-27: geocoding, "TIGER and all"): one per ZIP code, `addr/<zip>.vsf` beside the cells, holding the ZIP's streets, their TIGER address ranges (each block's numbers by side and its line) and the addresses OSM places exactly; and one index of every ZIP's box, `addr/zips.vsf`, for an address typed without its ZIP. VSF then zstd, as an area is.
+//! Address documents (Nick 2026-10-27: geocoding, "TIGER and all"): one per ZIP code, `addr/<zip>.vsf` beside the cells, holding the ZIP's streets, their TIGER address ranges (each block's numbers by side and its line) and the addresses OSM places exactly; and one index of every ZIP's box, `addr/zips.vsf`, for an address typed without its ZIP. VSF, every column coded in it (`vc` series, each value as its change from the one before) and each street name a text value of its own; nothing around the file (Nick 2026-11-21: zstd was never approved).
 //!
 //! A lookup asks a ZIP's document for a house number on a street: an exact address where one is placed, else the place along its block the number falls at, on its side of the street.
 
@@ -69,6 +69,9 @@ pub fn zip_path(zip: u32) -> String {
 
 pub const INDEX_PATH: &str = "addr/zips.vsf";
 
+/// The documents' form, asked for in the URL (`?e=`) so a cache that holds an older form does not answer: 1 since the documents stopped being zstd (2026-11-21).
+pub const FORM: u32 = 1;
+
 fn micro(v: f64, off: f64) -> u32 {
     ((v + off) * 1e6).round() as u32
 }
@@ -77,26 +80,33 @@ fn unmicro(v: u32, off: f64) -> f64 {
     v as f64 / 1e6 - off
 }
 
-fn build(sections: Vec<(&str, Vec<(String, VsfType)>)>) -> Vec<u8> {
-    let mut b = VsfBuilder::new();
-    for (name, fields) in sections {
-        b = b.add_section(name, fields);
-    }
-    let raw = b.build().unwrap_or_default();
-    zstd::encode_all(raw.as_slice(), 19).unwrap_or(raw)
+/// A column of numbers coded as a series (`vc`): street ids, house numbers and microdegrees along a line change little from one to the next.
+fn series(v: Vec<u32>) -> VsfType {
+    let t = VsfType::t_u5(Tensor::new(vec![v.len()], v));
+    vsf::codec::encode(&t, vsf::codec::Model::Series, None).unwrap_or(t)
 }
 
-/// A document's fields by section and name, each field's first value.
-fn fields(bytes: &[u8]) -> Option<Vec<(String, String, VsfType)>> {
-    let raw = zstd::decode_all(bytes).ok()?;
-    let (header, end) = vsf::VsfHeader::decode(&raw).ok()?;
-    let sections = header.sections(&raw, end).ok()?;
+fn build(sections: Vec<(&str, Vec<(String, Vec<VsfType>)>)>) -> Vec<u8> {
+    let mut b = VsfBuilder::new();
+    for (name, fields) in sections {
+        let mut s = vsf::VsfSection::new(name);
+        for (n, v) in fields {
+            s.add_field_multi(n, v);
+        }
+        b = b.add_section_direct(s);
+    }
+    b.build().unwrap_or_default()
+}
+
+/// A document's fields by section and name, each with its values, a coded column decoded.
+fn fields(bytes: &[u8]) -> Option<Vec<(String, String, Vec<VsfType>)>> {
+    let (header, end) = vsf::VsfHeader::decode(bytes).ok()?;
+    let sections = header.sections(bytes, end).ok()?;
     let mut out = Vec::new();
     for s in sections {
         for f in s.fields {
-            if let Some(v) = f.values.into_iter().next() {
-                out.push((s.name.clone(), f.name.clone(), v));
-            }
+            let values = f.values.into_iter().map(|v| if matches!(v, VsfType::v(vsf::codec::ENCODING, _)) { vsf::codec::decode(&v, None).unwrap_or(v) } else { v }).collect();
+            out.push((s.name.clone(), f.name.clone(), values));
         }
     }
     Some(out)
@@ -123,10 +133,10 @@ impl ZipDoc {
                 lon.push(micro(o, 180.0));
             }
         }
-        let t5 = |v: Vec<u32>| VsfType::t_u5(Tensor::new(vec![v.len()], v));
+        let t5 = |v: Vec<u32>| vec![series(v)];
         build(vec![
             ("zip", vec![("code".to_string(), t5(vec![self.zip]))]),
-            ("street", vec![("name".to_string(), VsfType::x(self.streets.join("\n")))]),
+            ("street", vec![("name".to_string(), self.streets.iter().map(|s| VsfType::x(s.clone())).collect())]),
             (
                 "range",
                 vec![
@@ -159,22 +169,23 @@ impl ZipDoc {
         let mut p: [Vec<u32>; 4] = Default::default();
         for (s, f, v) in fields(bytes)? {
             match (s.as_str(), f.as_str()) {
-                ("zip", "code") => doc.zip = u32s(&v).first().copied().unwrap_or(0),
+                ("zip", "code") => doc.zip = u32s(v.first()?).first().copied().unwrap_or(0),
                 ("street", "name") => {
-                    if let VsfType::x(t) | VsfType::a(t) = v {
-                        doc.streets = t.split('\n').map(str::to_string).collect();
-                    }
+                    doc.streets = v.into_iter().filter_map(|s| match s {
+                        VsfType::x(t) => Some(t),
+                        _ => None,
+                    }).collect();
                 }
                 ("range", name) => {
                     let i = ["street", "lfrom", "lto", "rfrom", "rto", "parity", "nv", "lat", "lon"].iter().position(|n| *n == name);
                     if let Some(i) = i {
-                        r[i] = u32s(&v);
+                        r[i] = u32s(v.first()?);
                     }
                 }
                 ("point", name) => {
                     let i = ["street", "number", "lat", "lon"].iter().position(|n| *n == name);
                     if let Some(i) = i {
-                        p[i] = u32s(&v);
+                        p[i] = u32s(v.first()?);
                     }
                 }
                 _ => {}
@@ -306,7 +317,7 @@ impl ZipIndex {
         }
         build(vec![(
             "zips",
-            vec![("code".to_string(), VsfType::t_u5(Tensor::new(vec![codes.len()], codes))), ("box".to_string(), VsfType::t_u5(Tensor::new(vec![boxes.len()], boxes)))],
+            vec![("code".to_string(), vec![series(codes)]), ("box".to_string(), vec![series(boxes)])],
         )])
     }
 
@@ -314,8 +325,8 @@ impl ZipIndex {
         let (mut codes, mut boxes) = (Vec::new(), Vec::new());
         for (s, f, v) in fields(bytes)? {
             match (s.as_str(), f.as_str()) {
-                ("zips", "code") => codes = u32s(&v),
-                ("zips", "box") => boxes = u32s(&v),
+                ("zips", "code") => codes = u32s(v.first()?),
+                ("zips", "box") => boxes = u32s(v.first()?),
                 _ => {}
             }
         }

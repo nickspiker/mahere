@@ -1,7 +1,7 @@
 //! An area: a selection's shape, snapshotted (Nick 2026-10-10: "snapshot and share the shape").
 //!
 //! The shape is the selection's own coverage planes, copied at the depths they were drawn, so it survives exactly and the cells it covers at any depth can be derived later: a cell under a shape cell maps to a square block of the shape's texels, exact for eight levels down, loose only beyond.
-//! An area document is VSF then zstd, like a cell: a name, when it was made, the detail wanted (a depth), and the planes. It is what the phone keeps, what is shared, and what the pipeline reads to bake imagery for just those cells.
+//! An area document is VSF, its planes coding themselves, like a cell: a name, when it was made, the detail wanted (a depth), and the planes. It is what the phone keeps, what is shared, and what the pipeline reads to bake imagery for just those cells.
 
 use std::collections::BTreeSet;
 
@@ -210,7 +210,6 @@ impl Area {
         Some((lat0 - pad, lon0 - pad, lat1 + pad, lon1 + pad))
     }
 
-    /// The document: VSF then zstd. Shared without the device's own fetch record.
     /// The area as a VSF document (Nick 2026-11-21: "putting the compression in the vsf"): its name, when it was made and its detail, then a section a plane, each plane's coverage context-coded by VSF's own codec as a raster (`vc`, as a cell's planes are), no zstd around it. With `share` false, this device's download record too.
     pub fn encode(&self, share: bool) -> Vec<u8> {
         let mut b = VsfBuilder::new().add_section(
@@ -246,7 +245,7 @@ impl Area {
         }
     }
 
-    /// An area document: as [`Self::encode`] writes it, or as it was written before (zstd around the VSF, every plane in one `shape` section), which areas kept on a device and files already shared are.
+    /// An area document: as [`Self::encode`] writes it, or as it was written before 2026-11-21 (zstd around the VSF, every plane in one `shape` section), which areas kept on a device and files already shared are; a device writes such an area again in today's form as it loads it, and this reader, all that is left of zstd here, goes once they have.
     pub fn decode(bytes: &[u8]) -> Option<Area> {
         let raw = if bytes.starts_with(&[0x28, 0xB5, 0x2F, 0xFD]) { zstd::decode_all(bytes).ok()? } else { bytes.to_vec() };
         let (header, end) = vsf::VsfHeader::decode(&raw).map_err(|e| eprintln!("area header: {e:?}")).ok()?;

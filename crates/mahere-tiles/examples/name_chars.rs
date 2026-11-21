@@ -5,7 +5,7 @@ fn main() {
     let mut cells = 0usize;
     for e in std::fs::read_dir(&dir).unwrap().flatten() {
         let p = e.path();
-        if !p.to_string_lossy().ends_with(".vsf.zst") {
+        if !p.to_string_lossy().ends_with(".vsf") {
             continue;
         }
         let Ok(b) = std::fs::read(&p) else { continue };

@@ -4,7 +4,7 @@
 //!
 //! Lossy means the diffs are quantised with a per-level step and a small dead zone; the encoder predicts from what the decoder will reconstruct, so quantisation error never compounds. Smooth terrain and flat imagery collapse to runs of zeros, rough ground keeps its detail.
 //!
-//! Entropy coding is bit-packing in blocks: every block of BLOCK coefficients is zigzag-mapped and packed at the width its largest member needs, with one width byte per block. The packed bits are VSF `BitPackedTensor`s, one per width in use, so the file stays self-describing and whole-file zstd finishes the job.
+//! Entropy coding is bit-packing in blocks: every block of BLOCK coefficients is zigzag-mapped and packed at the width its largest member needs, with one width byte per block. The packed bits are VSF `BitPackedTensor`s, one per width in use, so the file stays self-describing; a cell then codes the coefficients again through VSF's own codec ([`crate::ac`]).
 
 use std::sync::OnceLock;
 

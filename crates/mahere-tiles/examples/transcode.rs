@@ -1,4 +1,4 @@
-// transcode <cell.vsf.zst>... [--dem-loss m] [--img-loss levels] [--out dir]: decode cells, re-encode them with the current codec at the given loss, and report sizes and the elevation error — the dial for choosing a bake's loss. With --out, the re-encoded cells are written there under their own names (a whole directory migrates with `transcode data/cells/*.zst --out data/cells-next`).
+// transcode <cell.vsf>... [--dem-loss m] [--img-loss levels] [--out dir]: decode cells, re-encode them with the current codec at the given loss, and report sizes and the elevation error — the dial for choosing a bake's loss. With --out, the re-encoded cells are written there under their own names (a whole directory migrates with `transcode data/cells/*.vsf --out data/cells-next`).
 use mahere_tiles::{Loss, TRI, decode_cell};
 use rayon::prelude::*;
 
@@ -47,8 +47,7 @@ fn main() {
                 }
             };
             let plain = planes.encode(&loss).expect("encode");
-            let z = zstd::encode_all(&plain[..], 3).expect("zstd");
-            let back = decode_cell(&z).expect("decode again");
+            let back = decode_cell(&plain).expect("decode again");
             if let (Some(a), Some(b)) = (&planes.dem, &back.dem) {
                 for i in 0..TRI {
                     if a.elev[i].is_nan() != b.elev[i].is_nan() {
@@ -64,10 +63,10 @@ fn main() {
             }
             if let Some(o) = &out {
                 let name = std::path::Path::new(f).file_name().unwrap();
-                std::fs::write(o.join(name), &z).expect("write");
+                std::fs::write(o.join(name), &plain).expect("write");
             }
             t.before = bytes.len();
-            t.after = z.len();
+            t.after = plain.len();
             t.n = 1;
             t
         })

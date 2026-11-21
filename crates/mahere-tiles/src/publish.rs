@@ -44,20 +44,14 @@ impl Layer {
 const IMG_FIELDS: [&str; 6] = ["red", "redmask", "green", "greenmask", "blue", "bluemask"];
 const NIR_FIELDS: [&str; 2] = ["nir", "nirmask"];
 
-/// A baked cell (the working form: one VSF document, zstd around it) as its published layers, each a document of its own; a layer the cell lacks is absent.
+/// A baked cell (the working form: one VSF document, its sections coded) as its published layers, each a document of its own; a layer the cell lacks is absent.
 pub fn split(bytes: &[u8]) -> Result<HashMap<Layer, Vec<u8>>, String> {
     split_keeping(bytes, |_| None)
 }
 
 /// [`split`], keeping a layer's document as `kept` gives it when its contents are the new one's (only the header's time and hashes differ), so a republish of an unchanged layer leaves its bytes, its hash and the bucket's copy as they were (2026-10-17: a republish gave every layer a new hash at the same size, and a size-only upload left the bases naming layers the bucket did not hold).
 pub fn split_keeping(bytes: &[u8], kept: impl Fn(Layer) -> Option<Vec<u8>>) -> Result<HashMap<Layer, Vec<u8>>, String> {
-    let plain: Vec<u8>;
-    let data = if bytes.starts_with(&[0x28, 0xB5, 0x2F, 0xFD]) {
-        plain = zstd::decode_all(bytes).map_err(|e| e.to_string())?;
-        &plain[..]
-    } else {
-        bytes
-    };
+    let data = bytes;
     let (header, end) = vsf::VsfHeader::decode(data).map_err(|e| format!("{e:?}"))?;
     let sections = header.sections(data, end).map_err(|e| format!("{e:?}"))?;
     let mut docs: HashMap<Layer, VsfBuilder> = HashMap::new();

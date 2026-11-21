@@ -21,7 +21,7 @@ Early. Working today:
 - `mahere-coord` — the coordinate system, tested (round-trips < 2 cm globally, prefix/containment algebra, all diamonds reachable).
 - `mahere-osm` — the ingest boundary: `.osm.pbf` in, codec-quantized coordinates out (a Washington-state extract loads in ~7 s).
 - `mahere-dem` — the raster elevation boundary: USGS 3DEP GeoTIFFs in, bilinear elevation + gradient queries out.
-- `mahere-tiles` + `mahere-load` — the bake: sources in, dymaxion **cells** out. A cell is one diamond-Morton rhombus whose texels are **triangles**: the icosahedron's own subdivision, 256×256 UV squares each split into a lower and an upper equilateral triangle (131072 texels). One zstd'd VSF file per cell at `{cell}.vsf.zst` (the cell named by its flattened VSF value in base64url) carries a section per layer — a layout that is also the object-store bucket, and writes merge over what's there so regions bake one at a time. Triangles matter: the tiling has 6-fold symmetry and a line always crosses it edge-to-edge, so linework is isotropic. Layers:
+- `mahere-tiles` + `mahere-load` — the bake: sources in, dymaxion **cells** out. A cell is one diamond-Morton rhombus whose texels are **triangles**: the icosahedron's own subdivision, 256×256 UV squares each split into a lower and an upper equilateral triangle (131072 texels). One VSF file per cell, every section coding itself (`vc`), at `{cell}.vsf` (the cell named by its flattened VSF value in base64url) carries a section per layer — a layout that is also the object-store bucket, and writes merge over what's there so regions bake one at a time. Triangles matter: the tiling has 6-fold symmetry and a line always crosses it edge-to-edge, so linework is isotropic. Layers:
   - `dem` — elevation (0.25 m steps) and unit normals, sampled at triangle
     centroids from USGS GeoTIFFs (geographic or UTM — the 1 m lidar tiles
     bake directly) at the base depth, then a pyramid of means down to 6;
@@ -68,7 +68,7 @@ cargo run --release -p mahere-app   # Linux/macOS; reads data/cells if present
 cargo test                          # coordinates, tiles, engine, store
 ```
 
-Without a local `data/cells`, both frontends stream cells from the public bucket (`https://brobdingnagian.holdmyoscilloscope.com/mahere/cells/…`, the same `{layer}/{cell}.vsf.zst` layout) into the kete vault on the device, and serve them from there afterwards — the Android APK carries no map data. `scripts/publish-cells.sh` syncs a bake to the bucket; `scripts/publish-android.sh` builds the release-signed APK and puts it at `https://brobdingnagian.holdmyoscilloscope.com/mahere/mahere.apk`, which the project page links.
+Without a local `data/cells`, both frontends stream cells from the public bucket (`https://brobdingnagian.holdmyoscilloscope.com/mahere/cells/…`, the same `{layer}/{cell}.vsf` layout) into the kete vault on the device, and serve them from there afterwards — the Android APK carries no map data. `scripts/publish-cells.sh` syncs a bake to the bucket; `scripts/publish-android.sh` builds the release-signed APK and puts it at `https://brobdingnagian.holdmyoscilloscope.com/mahere/mahere.apk`, which the project page links.
 
 ## ferros
 

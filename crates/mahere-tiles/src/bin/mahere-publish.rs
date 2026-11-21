@@ -1,4 +1,4 @@
-//! `mahere-publish <baked dir> <published dir> [--min-depth n] [--max-depth n] [--check k]`: every baked cell in the directory (one level, `*.vsf.zst`) written as its published layers, `<published>/<layer>/<cell>.vsf` ([`mahere_tiles::publish`]), a cell already published and newer than its bake skipped, so a run can stop and go on; a layer whose contents did not change keeps its document, and so its hash.
+//! `mahere-publish <baked dir> <published dir> [--min-depth n] [--max-depth n] [--check k]`: every baked cell in the directory (one level, `*.vsf`) written as its published layers, `<published>/<layer>/<cell>.vsf` ([`mahere_tiles::publish`]), a cell already published and newer than its bake skipped, so a run can stop and go on; a layer whose contents did not change keeps its document, and so its hash.
 //! `--check k` decodes every k-th cell both ways and stops on any difference; a summary of bytes in and out per layer at the end.
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -20,7 +20,7 @@ fn main() {
         .filter_map(|e| e.ok())
         .filter_map(|e| {
             let name = e.file_name().into_string().ok()?;
-            if !name.ends_with(".vsf.zst") {
+            if !name.ends_with(".vsf") {
                 return None;
             }
             let k = CellKey::from_name(&name)?;

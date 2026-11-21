@@ -1,4 +1,4 @@
-// decode_check <cell.vsf.zst>: decode on whatever CPU this runs on and report the dem section — a cross-compile target for chasing platform differences.
+// decode_check <cell.vsf>: decode on whatever CPU this runs on and report the dem section — a cross-compile target for chasing platform differences.
 fn main() {
     let path = std::env::args().nth(1).expect("cell path");
     let bytes = std::fs::read(&path).expect("read");

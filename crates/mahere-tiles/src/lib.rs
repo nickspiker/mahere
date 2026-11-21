@@ -1,4 +1,4 @@
-//! The cell pipeline: bake source data into dymaxion-cell rasters — the #pagetable renderer's entire diet.
+//! Th cell pipeline: bake source data into dymaxion-cell rasters — the #pagetable renderer's entire diet.
 //!
 //! **One object per cell, every layer inside it.** A cell is one rhombus of the diamond-Morton grid at `depth`; its file carries a VSF section per layer present at that depth, and the client decides what to decode, draw and style:
 //!
@@ -12,7 +12,7 @@
 //!
 //! In memory a cell's planes are indexed `((ty << 8 | tx) << 1) | half` (the renderer's stepping order). On disk they are in triangle-path order — the triangle code's digits — so a parent texel's four children are contiguous. [`disk_to_mem`] / [`mem_to_disk`] convert.
 //!
-//! Files are zstd'd VSF at `{name}.vsf.zst` where the name is the cell's flattened VSF value (`u` depth, `wm` cell) in base64url: no delimiters, no numerals — a directory layout that is byte-for-byte the bucket.
+//! Files are VSF, every section coding itself, at `{name}.vsf` where the name is the cell's flattened VSF value (`u` depth, `wm` cell) in base64url: no delimiters, no numerals — a directory layout that is byte-for-byte the bucket.
 
 pub mod ac;
 pub mod addr;
@@ -137,7 +137,7 @@ impl CellKey {
     }
 
     pub fn path(self) -> String {
-        format!("{}.vsf.zst", self.name())
+        format!("{}.vsf", self.name())
     }
 
     /// The key as a file name on the device: the depth and the world cell in lowercase hex. The bucket's name tells cells apart by letter case, which a Mac's or a Windows file system does not: two cells named alike but for case were one file there, and each showed the other's roads, water and names (Nick 2026-10-25, a second Point Southworth inland).
@@ -158,7 +158,7 @@ impl CellKey {
 
     /// The key back from its file name (with or without the extension): the base64url undone, the depth and world cell parsed.
     pub fn from_name(name: &str) -> Option<CellKey> {
-        let name = name.trim_end_matches(".vsf.zst");
+        let name = name.trim_end_matches(".vsf");
         const A: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
         let mut bytes = Vec::with_capacity(name.len() * 3 / 4);
         for chunk in name.as_bytes().chunks(4) {
@@ -1870,11 +1870,13 @@ impl CellPlanes {
 
     /// Encode, with already-encoded terrain and imagery sections in place of `self.dem` and `self.img` when given.
     fn encode_with(&self, loss: &Loss, dem_raw: Option<vsf::VsfSection>, img_raw: Option<vsf::VsfSection>) -> Result<Vec<u8>, String> {
+        // Every section codes itself (`vc`, as a published layer does), and nothing goes around the file (Nick 2026-11-21: zstd was never approved).
         let mut b = VsfBuilder::new();
+        let mut sections: Vec<vsf::VsfSection> = Vec::new();
         if let Some(raw) = dem_raw {
-            b = b.add_section_direct(raw);
+            sections.push(raw);
         } else if let Some(d) = &self.dem {
-            b = b.add_section_direct(dem_section(d, loss));
+            sections.push(dem_section(d, loss));
         }
         for (name, planes) in [("line", &self.line), ("land", &self.land), ("own", &self.own), ("mvum", &self.mvum)] {
             if let Some(p) = planes {
@@ -1888,28 +1890,32 @@ impl CellPlanes {
                 if p.uses.len() == TRI {
                     fields.push(("use".to_string(), VsfType::t_u3(Tensor::new(vec![2, TEX * TEX], mem_to_disk(&p.uses)))));
                 }
-                b = b.add_section(name, fields);
+                let mut s = vsf::VsfSection::new(name);
+                for (n, v) in fields {
+                    s.add_field(n, v);
+                }
+                sections.push(s);
             }
         }
         if let Some(w) = &self.water {
-            b = b.add_section(
-                "water",
-                vec![("cov".to_string(), VsfType::t_u3(Tensor::new(vec![2, TEX * TEX], mem_to_disk(&w.cov))))],
-            );
+            let mut s = vsf::VsfSection::new("water");
+            s.add_field("cov", VsfType::t_u3(Tensor::new(vec![2, TEX * TEX], mem_to_disk(&w.cov))));
+            sections.push(s);
         }
         if let Some(raw) = img_raw {
-            b = b.add_section_direct(raw);
+            sections.push(raw);
         } else if let Some(im) = &self.img {
-            b = b.add_section_direct(img_section(im, loss));
+            sections.push(img_section(im, loss));
         }
-        if let Some(s) = self.names.as_ref().and_then(NameCell::section) {
-            b = b.add_section_direct(s);
-        }
-        if let Some(s) = self.route.as_ref().and_then(route::RouteCell::section) {
-            b = b.add_section_direct(s);
-        }
+        sections.extend(self.names.as_ref().and_then(NameCell::section));
+        sections.extend(self.route.as_ref().and_then(route::RouteCell::section));
         if let Some(g) = &self.geoid {
-            b = b.add_section("geoid", vec![("cm".to_string(), VsfType::t_i4(Tensor::new(vec![2, TEX * TEX], mem_to_disk(g))))]);
+            let mut s = vsf::VsfSection::new("geoid");
+            s.add_field("cm", VsfType::t_i4(Tensor::new(vec![2, TEX * TEX], mem_to_disk(g))));
+            sections.push(s);
+        }
+        for s in sections {
+            b = b.add_section_direct(ac::code_section(s));
         }
         b.build().map_err(|e| format!("cell build: {e:?}"))
     }
@@ -1960,13 +1966,6 @@ pub fn edit_vectors(path: &Path, edit: impl FnOnce(&mut CellPlanes)) -> Result<b
 
 /// One section of a cell file as stored, for carrying over unchanged.
 fn raw_section(data: &[u8], name: &str) -> Option<vsf::VsfSection> {
-    let plain: Vec<u8>;
-    let data = if data.starts_with(&[0x28, 0xB5, 0x2F, 0xFD]) {
-        plain = zstd::decode_all(data).ok()?;
-        &plain[..]
-    } else {
-        data
-    };
     let (header, end) = vsf::VsfHeader::decode(data).ok()?;
     header.sections(data, end).ok()?.into_iter().find(|s| s.name == name)
 }
@@ -1975,23 +1974,14 @@ fn write_file(path: &Path, bytes: &[u8]) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
-    // Whole-file zstd: VSF internals untouched, the bucket keeps the .vsf.zst names, and empty planes shrink to nothing.
-    let z = zstd::encode_all(bytes, 3).map_err(|e| e.to_string())?;
     // Written whole beside it and renamed over it: a crash mid-write (the machine went down mid-bake, 2026-10-13) leaves the old cell or the new one, never half of one.
     let part = path.with_extension(format!("part{}", std::process::id()));
-    std::fs::write(&part, z).map_err(|e| format!("{}: {e}", part.display()))?;
+    std::fs::write(&part, bytes).map_err(|e| format!("{}: {e}", part.display()))?;
     std::fs::rename(&part, path).map_err(|e| format!("{}: {e}", path.display()))
 }
 
-/// Decode a cell from raw file bytes (zstd or plain VSF) — the loader thread's entry point; no filesystem coupling. Width-agnostic reads.
+/// Decode a cell from its file bytes (VSF) — the loader thread's entry point; no filesystem coupling. Width-agnostic reads.
 pub fn decode_cell(data: &[u8]) -> Result<CellPlanes, String> {
-    let plain: Vec<u8>;
-    let data = if data.starts_with(&[0x28, 0xB5, 0x2F, 0xFD]) {
-        plain = zstd::decode_all(data).map_err(|e| e.to_string())?;
-        &plain[..]
-    } else {
-        data
-    };
     let (header, end) = vsf::VsfHeader::decode(data).map_err(|e| e.to_string())?;
     let sections = header.sections(data, end).map_err(|e| e.to_string())?;
     let mut out = CellPlanes::default();
@@ -2032,13 +2022,6 @@ pub fn decode_cell(data: &[u8]) -> Result<CellPlanes, String> {
 
 /// One section of a cell file, read alone through the header's table of contents: the others (a cell's terrain and imagery are most of it) are not parsed at all.
 fn section_alone(data: &[u8], name: &str) -> Option<HashMap<String, Vec<VsfType>>> {
-    let plain: Vec<u8>;
-    let data = if data.starts_with(&[0x28, 0xB5, 0x2F, 0xFD]) {
-        plain = zstd::decode_all(data).ok()?;
-        &plain[..]
-    } else {
-        data
-    };
     let (header, end) = vsf::VsfHeader::decode(data).ok()?;
     let entry = header.fields.iter().find(|f| f.name == name && f.size_bytes > 0)?;
     let mut ptr = if entry.offset_bytes != 0 { entry.offset_bytes } else { end };

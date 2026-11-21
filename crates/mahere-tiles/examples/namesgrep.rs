@@ -1,4 +1,4 @@
-//! namesgrep <cell dir> <text> [depth]: the names in a directory's cells that contain the text (any case), with their kind's word, reference and the cell; how many cells were read. Cells are read as baked (`.vsf.zst`) or as published (`.vsf`).
+//! namesgrep <cell dir> <text> [depth]: the names in a directory's cells that contain the text (any case), with their kind's word, reference and the cell; how many cells were read. Cells are read as baked or as published.
 fn main() {
     let a: Vec<String> = std::env::args().collect();
     let q = a[2].to_lowercase();
@@ -7,7 +7,7 @@ fn main() {
     for e in std::fs::read_dir(&a[1]).unwrap().flatten() {
         let p = e.path();
         let Ok(b) = std::fs::read(&p) else { continue };
-        let plain = zstd::decode_all(&b[..]).unwrap_or(b);
+        let plain = b;
         let Some(names) = mahere_tiles::decode_names(&plain) else { continue };
         let name = p.file_name().unwrap().to_string_lossy().to_string();
         let depth = mahere_tiles::CellKey::from_name(name.split('.').next().unwrap()).map(|k| k.depth);

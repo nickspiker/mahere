@@ -36,7 +36,7 @@ fn main() {
     };
     let per: Vec<(usize, usize, Vec<(&'static str, usize)>, Vec<String>)> = files.par_iter().map(|p| {
         let Ok(b) = std::fs::read(p) else { return (0, 0, Vec::new(), Vec::new()) };
-        let plain = zstd::decode_all(&b[..]).unwrap_or(b);
+        let plain = b;
         let Some(names) = mahere_tiles::decode_names(&plain) else { return (0, 0, Vec::new(), Vec::new()) };
         let (mut all, mut hit) = (0, 0);
         let mut scripts: Vec<(&'static str, usize)> = Vec::new();

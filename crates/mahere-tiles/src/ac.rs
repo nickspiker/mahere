@@ -103,3 +103,67 @@ pub fn coefs(values: &[VsfType], reference: Option<&[i32]>) -> Option<Vec<i32>> 
         None => crate::pyr::from_vsf(values, crate::pyr::NCOEF),
     }
 }
+
+/// A section with every field a cell codes coded, as a published layer is: an image's green and blue against its red, every other field alone; a field already coded, or of a kind not coded, stays as it is.
+pub fn code_section(mut s: vsf::VsfSection) -> vsf::VsfSection {
+    let red = (s.name == "img").then(|| s.fields.iter().find(|f| f.name == "red").and_then(|f| crate::pyr::from_vsf(&f.values, crate::pyr::NCOEF))).flatten();
+    for f in &mut s.fields {
+        let reference = if f.name == "green" || f.name == "blue" { red.as_deref() } else { None };
+        if let Some(v) = code_field(&f.values, reference) {
+            f.values = v;
+        }
+    }
+    s
+}
+
+/// A cell document with every section coded ([`code_section`]), built again; for cells written before their sections coded themselves.
+pub fn code_document(plain: &[u8]) -> Result<Vec<u8>, String> {
+    let (header, end) = vsf::VsfHeader::decode(plain).map_err(|e| format!("{e:?}"))?;
+    let sections = header.sections(plain, end).map_err(|e| format!("{e:?}"))?;
+    let mut b = vsf::vsf_builder::VsfBuilder::new();
+    for s in sections {
+        b = b.add_section_direct(code_section(s));
+    }
+    b.build().map_err(|e| format!("{e:?}"))
+}
+
+/// Whether every field of `coded` reads back as the same field of `plain`: pyramids as their coefficients, planes and tables as their tensors, the rest as they are. What a recoding is checked against.
+pub fn same_fields(plain: &[u8], coded: &[u8]) -> Result<(), String> {
+    let sections = |d: &[u8]| -> Result<Vec<vsf::VsfSection>, String> {
+        let (header, end) = vsf::VsfHeader::decode(d).map_err(|e| format!("{e:?}"))?;
+        header.sections(d, end).map_err(|e| format!("{e:?}"))
+    };
+    let (a, b) = (sections(plain)?, sections(coded)?);
+    if a.len() != b.len() {
+        return Err(format!("{} sections, {} after", a.len(), b.len()));
+    }
+    for (sa, sb) in a.iter().zip(&b) {
+        if sa.name != sb.name || sa.fields.len() != sb.fields.len() {
+            return Err(format!("section {} differs in its fields", sa.name));
+        }
+        let red = sa.fields.iter().find(|f| f.name == "red").and_then(|f| crate::pyr::from_vsf(&f.values, crate::pyr::NCOEF));
+        for (fa, fb) in sa.fields.iter().zip(&sb.fields) {
+            if fa.name != fb.name {
+                return Err(format!("{}: field {} where {} was", sa.name, fb.name, fa.name));
+            }
+            let same = if let Some(c) = crate::pyr::from_vsf(&fa.values, crate::pyr::NCOEF) {
+                let reference = if sa.name == "img" && (fa.name == "green" || fa.name == "blue") { red.as_deref() } else { None };
+                coefs(&fb.values, reference).as_deref() == Some(&c[..])
+            } else if let Some(t) = uncode_field(&fb.values) {
+                match (&fa.values[..], t) {
+                    ([VsfType::p(x)], VsfType::p(y)) => x.data == y.data,
+                    ([VsfType::t_u3(x)], VsfType::t_u3(y)) => x.data == y.data,
+                    ([VsfType::t_u4(x)], VsfType::t_u4(y)) => x.data == y.data,
+                    ([VsfType::t_i4(x)], VsfType::t_i4(y)) => x.data == y.data,
+                    _ => false,
+                }
+            } else {
+                fa.values == fb.values
+            };
+            if !same {
+                return Err(format!("{}.{} reads back differently", sa.name, fa.name));
+            }
+        }
+    }
+    Ok(())
+}

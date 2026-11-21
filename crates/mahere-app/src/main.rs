@@ -1208,7 +1208,7 @@ struct DirUser(std::path::PathBuf);
 
 impl DirUser {
     fn path(&self, key: mahere_tiles::CellKey) -> std::path::PathBuf {
-        self.0.join(format!("{}.vsf.zst", key.file_name()))
+        self.0.join(format!("{}.vsf", key.file_name()))
     }
 }
 
@@ -1221,7 +1221,7 @@ impl mahere_engine::ink::UserStore for DirUser {
         let _ = std::fs::remove_file(self.path(key));
     }
 
-    /// Every cell here; one still under its bucket name (before 2026-10-25) is renamed to the case-free one as it is read.
+    /// Every cell here; one still under its bucket name (before 2026-10-25), or named .vsf.zst (before 2026-11-21, though never zstd inside), is renamed to the case-free .vsf one as it is read.
     fn load_all(&self) -> Vec<(mahere_tiles::CellKey, Vec<u8>)> {
         let Ok(dir) = std::fs::read_dir(&self.0) else { return Vec::new() };
         dir.flatten()
@@ -1229,9 +1229,14 @@ impl mahere_engine::ink::UserStore for DirUser {
             .filter_map(|e| {
                 let name = e.file_name().to_string_lossy().to_string();
                 let key = match mahere_tiles::CellKey::from_file_name(&name) {
-                    Some(k) => k,
+                    Some(k) => {
+                        if name.ends_with(".zst") {
+                            let _ = std::fs::rename(e.path(), self.path(k));
+                        }
+                        k
+                    }
                     None => {
-                        let k = mahere_tiles::CellKey::from_name(&name)?;
+                        let k = mahere_tiles::CellKey::from_name(name.trim_end_matches(".zst"))?;
                         let _ = std::fs::rename(e.path(), self.path(k));
                         k
                     }
