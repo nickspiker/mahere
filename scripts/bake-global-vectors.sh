@@ -24,28 +24,21 @@ if [ ! -f "$SRC/osm/regions/.cut-done" ]; then
     echo "$(date +%T) cutting the planet into $(grep -c '"output"' "$REGIONS_JSON") extracts"
     mkdir -p "$SRC/osm/regions"
     # osmium keeps an id set per extract sized by the planet's largest id, about 1.3 GB each, so a pass may carry twenty extracts at most: the planet is cut into 30°×60° chunks in passes of twenty, then each chunk into its regions in passes of twenty.
-    python3 - "$REGIONS_JSON" "$SRC/osm" <<'PY'
-import json, sys, os
-r = json.load(open(sys.argv[1]))
-src = sys.argv[2]
-os.makedirs(f"{src}/chunks", exist_ok=True)
-groups = {}
-for e in r['extracts']:
-    b = e['bbox']
-    key = (int((b['bottom'] + b['top']) / 2 // 30), int((b['left'] + b['right']) / 2 // 60))
-    groups.setdefault(key, []).append(e)
-chunks = []
-for i, (key, ex) in enumerate(sorted(groups.items())):
-    bb = {'left': min(e['bbox']['left'] for e in ex), 'bottom': min(e['bbox']['bottom'] for e in ex), 'right': max(e['bbox']['right'] for e in ex), 'top': max(e['bbox']['top'] for e in ex)}
-    chunks.append({'output': f"chunk{i}.osm.pbf", 'output_format': 'pbf,add_metadata=false', 'bbox': bb})
-    for j in range(0, len(ex), 20):
-        part = dict(r)
-        part['extracts'] = ex[j:j + 20]
-        json.dump(part, open(f"{src}/chunks/chunk{i}.part{j // 20:03}.json", 'w'))
-for j in range(0, len(chunks), 20):
-    json.dump({'directory': f"{src}/chunks", 'extracts': chunks[j:j + 20]}, open(f"{src}/chunks/chunks.pass{j // 20}.json", 'w'))
-print(len(chunks), 'chunks')
-PY
+    # The extracts grouped by the 30°×60° chunk their centre falls in, the groups in order; each chunk's box takes in all of its extracts. One line per file to write: its name, a tab, its JSON.
+    mkdir -p "$SRC/osm/chunks"
+    jq -r --arg dir "$SRC/osm/chunks" '
+        def pad3: tostring | if length < 3 then ("00" + .)[-3:] else . end;
+        . as $r
+        | [.extracts | group_by([((.bbox.bottom + .bbox.top) / 2 / 30 | floor), ((.bbox.left + .bbox.right) / 2 / 60 | floor)]) | to_entries[]] as $chunks
+        | ($chunks[] | .key as $i | .value as $ex | range(0; $ex | length; 20) as $j
+            | "chunk\($i).part\($j / 20 | pad3).json\t\($r | .extracts = $ex[$j:$j + 20] | tojson)"),
+          (range(0; $chunks | length; 20) as $j
+            | "chunks.pass\($j / 20).json\t\({directory: $dir, extracts: [$chunks[$j:$j + 20][] | .key as $i | .value as $ex
+                | {output: "chunk\($i).osm.pbf", output_format: "pbf,add_metadata=false", bbox: {left: ($ex | map(.bbox.left) | min), bottom: ($ex | map(.bbox.bottom) | min), right: ($ex | map(.bbox.right) | max), top: ($ex | map(.bbox.top) | max)}}]} | tojson)")
+    ' "$REGIONS_JSON" | while IFS="$(printf '\t')" read -r name json; do
+        printf '%s\n' "$json" > "$SRC/osm/chunks/$name"
+    done
+    echo "$(jq -s '[.[].extracts | length] | add' "$SRC"/osm/chunks/chunks.pass*.json) chunks"
     for pass in "$SRC"/osm/chunks/chunks.pass*.json; do
         echo "$(date +%T) cutting the planet: $(basename "$pass")"
         osmium extract -c "$pass" -s simple --overwrite "$SRC/osm/planet-latest.osm.pbf"
