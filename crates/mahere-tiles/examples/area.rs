@@ -16,18 +16,7 @@ fn main() {
         // `pieces <depth>`: the area cut into the cells of that depth it covers, each with the box of the finest cells under it, for baking a piece at a time.
         "pieces" => {
             let depth: u8 = args.get(3).and_then(|d| d.parse().ok()).unwrap_or(9);
-            let mut boxes: std::collections::BTreeMap<mahere_tiles::CellKey, (f64, f64, f64, f64, usize)> = Default::default();
-            for k in a.cells_at(14.max(depth)) {
-                let e = boxes.entry(k.ancestor(depth)).or_insert((90.0, 180.0, -90.0, -180.0, 0));
-                for (la, lo) in k.corners() {
-                    e.0 = e.0.min(la);
-                    e.1 = e.1.min(lo);
-                    e.2 = e.2.max(la);
-                    e.3 = e.3.max(lo);
-                }
-                e.4 += 1;
-            }
-            for (k, (la0, lo0, la1, lo1, n)) in boxes {
+            for (k, (la0, lo0, la1, lo1), n) in a.pieces(depth) {
                 println!("{} {la0:.6} {lo0:.6} {la1:.6} {lo1:.6} {n}", k.name());
             }
         }

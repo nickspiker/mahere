@@ -127,6 +127,22 @@ impl Area {
         (0..=depth).flat_map(|d| self.cells_at(d)).collect()
     }
 
+    /// The shape cut into the cells of `depth` it covers, for baking a piece at a time: each with the box (lat0, lon0, lat1, lon1) of the finest cells under it and how many there are, sorted by cell.
+    pub fn pieces(&self, depth: u8) -> Vec<(CellKey, (f64, f64, f64, f64), usize)> {
+        let mut boxes: std::collections::BTreeMap<CellKey, ((f64, f64, f64, f64), usize)> = Default::default();
+        for k in self.cells_at(14.max(depth)) {
+            let (b, n) = boxes.entry(k.ancestor(depth)).or_insert(((90.0, 180.0, -90.0, -180.0), 0));
+            for (la, lo) in k.corners() {
+                b.0 = b.0.min(la);
+                b.1 = b.1.min(lo);
+                b.2 = b.2.max(la);
+                b.3 = b.3.max(lo);
+            }
+            *n += 1;
+        }
+        boxes.into_iter().map(|(k, (b, n))| (k, b, n)).collect()
+    }
+
     /// Cells and bytes the shape asks for down to `depth`, estimated from the mean cell size at each depth.
     pub fn estimate_to(&self, depth: u8) -> (u64, u64) {
         let mut cells = 0;
