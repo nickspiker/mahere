@@ -2104,6 +2104,7 @@ dependencies = [
  "mahere-osm",
  "png 0.17.16",
  "rayon",
+ "tiff 0.9.1",
  "ureq",
  "vsf",
  "zstd",

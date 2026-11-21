@@ -1,5 +1,5 @@
 //! An area's source lists for fetch-area.sh and bake-pieces.sh, written into data/areas/<area>/: dem-urls.txt (USGS 1 m lidar DEM tiles, and with --topobathy NOAA's CUDEM 1/9 arc-second topo-bathymetric tiles for the water), naip-urls.txt (the newest NAIP year that covers the box), and pieces.txt (each depth-9 piece of the shape with the files that touch it, lidar newest project first and the topo-bathy last so it fills only where lidar has no data).
-//! Usage, from the repository root: `cargo run --release -p mahere-tiles --example area_sources -- <area> [--naip-year YYYY] [--topobathy <CUDEM directory URL>]...`
+//! Usage, from the repository root: `cargo run --release -p mahere-tiles --example area_sources -- <area> [--naip-year YYYY] [--topobathy <CUDEM directory URL>]... [--hrdem]`
 use std::io::Read;
 
 fn main() {
@@ -122,6 +122,35 @@ fn main() {
             println!("{} NAIP {y} quads", naips.len());
             break;
         }
+    }
+
+    // With --hrdem, Canada's lidar too (NRCan's HRDEM, one cloud-optimised file a project, read by the loader a window at a time from its URL): pieces-hrdem.txt lists every piece some project touches, its sources the US lidar, then the HRDEM projects newest first, then the topo-bathy, and its NAIP or `-` where it has none (north of the border). The other lists are left as they are, so a stream reading them is undisturbed.
+    if args.iter().any(|a| a == "--hrdem") {
+        let search = "https://datacube.services.geo.ca/stac/api/search";
+        let mut lines = String::new();
+        let mut n = 0;
+        for (key, b, _) in &pieces {
+            let req = format!("{{\"collections\": [\"hrdem-lidar\"], \"bbox\": [{:?}, {:?}, {:?}, {:?}], \"limit\": 100}}", b.1, b.0, b.3, b.2);
+            let res = Json::parse(&body(agent.post(search).set("Content-Type", "application/json").send_string(&req), search)).expect("HRDEM STAC: JSON");
+            let mut found: Vec<(String, String)> = res.get("features").arr().iter().map(|f| (f.get("properties").get("datetime").str().to_string(), f.get("assets").get("dtm").get("href").str().to_string())).filter(|f| !f.1.is_empty()).collect();
+            if found.is_empty() {
+                continue;
+            }
+            found.sort_by(|a, b| b.0.cmp(&a.0));
+            let mut pd: Vec<String> = dems.iter().filter(|d| overlaps(d.box_, *b)).map(|d| d.file.clone()).collect();
+            pd.extend(found.into_iter().map(|f| f.1));
+            pd.extend(bathy.iter().filter(|d| overlaps(d.box_, *b)).map(|d| d.file.clone()));
+            let pn: Vec<&str> = naips.iter().filter(|n| overlaps(n.box_, *b)).map(|n| n.file.as_str()).collect();
+            // A piece with NAIP is in the US; it holds Canadian ground only if it reaches north of the 49th parallel or lies west of 123° W, where the border turns south through Haro Strait round Vancouver Island's south end (a project's outline reaches far into the US, Vancouver Island's to 47.4° N, and its file is empty there).
+            if !pn.is_empty() && b.2 <= 49.0 && b.1 >= -123.0 {
+                continue;
+            }
+            lines += &format!("{} {} {}\n", key.name(), pd.join(","), if pn.is_empty() { "-".to_string() } else { pn.join(",") });
+            n += 1;
+        }
+        std::fs::write(format!("{root}/pieces-hrdem.txt"), lines).expect("write pieces-hrdem.txt");
+        println!("wrote {root}/pieces-hrdem.txt ({n} pieces with Canadian lidar)");
+        return;
     }
 
     let dem_lines: String = dems.iter().chain(&bathy).map(|d| format!("{}\n", d.url)).collect();

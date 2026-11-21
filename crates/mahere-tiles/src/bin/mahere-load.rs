@@ -42,9 +42,9 @@ fn main() {
     };
     let (lat0, lon0, lat1, lon1) =
         (bbox[0].min(bbox[2]), bbox[1].min(bbox[3]), bbox[0].max(bbox[2]), bbox[1].max(bbox[3]));
-    // What this run may write: the area's cells at every depth, under the piece when there is one.
+    // What this run may write: the area's cells at every depth it bakes (to AREA_MAX_DEPTH, 14), under the piece when there is one. To depth 20 they were 4096 cells for every one at 14: analytic shock's 137,000 became 560 million, and a piece was killed at the 28 GB cap before it read a tile.
     let area_sets: std::collections::HashMap<u8, std::collections::HashSet<mahere_tiles::CellKey>> = match &area {
-        Some(a) => (0..=20u8).map(|d| (d, a.cells_at(d).into_iter().filter(|k| under.is_none_or(|p| k.depth < p.depth || k.ancestor(p.depth) == p)).collect())).collect(),
+        Some(a) => (0..=mahere_tiles::area::AREA_MAX_DEPTH).map(|d| (d, a.cells_at(d).into_iter().filter(|k| under.is_none_or(|p| k.depth < p.depth || k.ancestor(p.depth) == p)).collect())).collect(),
         None => Default::default(),
     };
     let keep = |k: &mahere_tiles::CellKey| -> bool {
@@ -174,7 +174,25 @@ fn main() {
         return;
     }
     let t = std::time::Instant::now();
-    let dem = mahere_dem::DemStore::load(&tifs).expect("dem");
+    // A source given as a URL is read by byte ranges, only its window under the box (Canada's HRDEM: one file a lidar project, up to 68 GB); a local file is read whole. The order given stays the order of preference.
+    let dem = if tifs.iter().any(|t| t.starts_with("https://")) {
+        use rayon::prelude::*;
+        let bbox = (lat0, lon0, lat1, lon1);
+        let tiles: Vec<Option<mahere_dem::DemTile>> = tifs
+            .par_iter()
+            .map(|t| {
+                if !t.starts_with("https://") {
+                    return Some(mahere_dem::DemTile::load(t).expect("dem"));
+                }
+                let r = mahere_tiles::remote::SharedRange::open(t).expect("dem source");
+                let p = r.clone();
+                mahere_dem::DemTile::load_window(r, t, bbox, &mut |spans| p.prefetch(spans).expect("dem source")).expect("dem window")
+            })
+            .collect();
+        mahere_dem::DemStore::from_tiles(tiles.into_iter().flatten().collect())
+    } else {
+        mahere_dem::DemStore::load(&tifs).expect("dem")
+    };
     eprintln!("dem source loaded ({} tiles) {:.1}s", dem.tile_count(), t.elapsed().as_secs_f32());
     let t = std::time::Instant::now();
     let keys = in_area(mahere_tiles::cells_covering(lat0, lon0, lat1, lon1, dem_base), dem_base);

@@ -24,4 +24,5 @@ ureq = { version = "2", default-features = false }
 zstd = { version = "0.13", default-features = false }
 
 [dev-dependencies]
+tiff = "0.9"
 png = "0.17"

@@ -27,6 +27,7 @@ pub use names::{IdCell, NameCell};
 pub mod names;
 pub mod publish;
 pub mod pyr;
+pub mod remote;
 pub mod route;
 pub mod tone;
 

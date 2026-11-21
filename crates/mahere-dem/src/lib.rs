@@ -22,6 +22,8 @@ enum Grid {
     Geographic,
     /// UTM zone (northern hemisphere), meters per pixel.
     UtmNorth(u8),
+    /// NAD83(CSRS) Canada Atlas Lambert (EPSG:3979), meters per pixel: Canada's HRDEM lidar mosaics.
+    CanadaLambert,
 }
 
 /// One loaded DEM tile: an f32 elevation raster on a geographic or UTM grid.
@@ -48,6 +50,91 @@ const GT_MODEL_TYPE: u16 = 1024;
 const PROJECTED_CS_TYPE: u16 = 3072;
 
 impl DemTile {
+    /// A window of a tiled GeoTIFF through any reader (a remote file read by byte ranges: Canada's HRDEM publishes a lidar project as one file of up to 68 GB): only the tiles under the box (lat0, lon0, lat1, lon1) decoded, a few pixels beyond it kept for the bilinear footprint, and None when the file holds nothing there. Each row of tiles is handed to `prefetch` as byte spans before it is decoded, so a remote reader fetches the row together.
+    pub fn load_window<R: std::io::Read + std::io::Seek>(reader: R, name: &str, bbox: (f64, f64, f64, f64), prefetch: &mut dyn FnMut(&[(u64, u64)])) -> Result<Option<DemTile>, String> {
+        let mut dec = Decoder::new(reader).map_err(|e| format!("{name}: {e}"))?.with_limits(tiff::decoder::Limits::unlimited());
+        let (w, h) = dec.dimensions().map_err(|e| format!("{name}: {e}"))?;
+        let scale = dec.get_tag_f64_vec(Tag::ModelPixelScaleTag).map_err(|e| format!("{name}: ModelPixelScale: {e}"))?;
+        let tie = dec.get_tag_f64_vec(Tag::ModelTiepointTag).map_err(|e| format!("{name}: ModelTiepoint: {e}"))?;
+        if scale.len() < 2 || tie.len() < 5 {
+            return Err(format!("{name}: malformed georeferencing tags"));
+        }
+        let keys = dec.get_tag_u32_vec(Tag::GeoKeyDirectoryTag).map_err(|e| format!("{name}: GeoKeyDirectory: {e}"))?;
+        let grid = grid_of(&keys).ok_or_else(|| format!("{name}: unsupported CRS in GeoKeyDirectory"))?;
+        if dec.get_chunk_type() != tiff::decoder::ChunkType::Tile {
+            return Err(format!("{name}: a window is read from a tiled file only"));
+        }
+        let origin = (tie[3] - tie[0] * scale[0], tie[4] + tie[1] * scale[1]);
+        let step = (scale[0], scale[1]);
+        // The box's outline in the grid's units: its edges walked, since a conic grid bends a parallel.
+        let (lat0, lon0, lat1, lon1) = bbox;
+        let mut ext = (f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY);
+        for i in 0..=16 {
+            let f = i as f64 / 16.0;
+            for (lat, lon) in [(lat0, lon0 + (lon1 - lon0) * f), (lat1, lon0 + (lon1 - lon0) * f), (lat0 + (lat1 - lat0) * f, lon0), (lat0 + (lat1 - lat0) * f, lon1)] {
+                let (x, y) = match grid {
+                    Grid::Geographic => (lon, lat),
+                    Grid::UtmNorth(zone) => utm_forward(lat, lon, zone),
+                    Grid::CanadaLambert => canada_lambert_forward(lat, lon),
+                };
+                ext = (ext.0.min(x), ext.1.min(y), ext.2.max(x), ext.3.max(y));
+            }
+        }
+        // The pixels under it and two more each way, cut to the image: the box reaches past a project's edge wherever a piece does, and nothing is there to read.
+        let c0 = (((ext.0 - origin.0) / step.0).floor() as i64 - 2).max(0);
+        let c1 = (((ext.2 - origin.0) / step.0).ceil() as i64 + 2).min(w as i64);
+        let r0 = (((origin.1 - ext.3) / step.1).floor() as i64 - 2).max(0);
+        let r1 = (((origin.1 - ext.1) / step.1).ceil() as i64 + 2).min(h as i64);
+        if c0 >= c1 || r0 >= r1 {
+            return Ok(None);
+        }
+        let (ww, wh) = ((c1 - c0) as usize, (r1 - r0) as usize);
+        let (tw, th) = dec.chunk_dimensions();
+        let (tw, th) = (tw as i64, th as i64);
+        let across = (w as i64 + tw - 1) / tw;
+        let offsets = dec.get_tag_u64_vec(Tag::TileOffsets).map_err(|e| format!("{name}: TileOffsets: {e}"))?;
+        let counts = dec.get_tag_u64_vec(Tag::TileByteCounts).map_err(|e| format!("{name}: TileByteCounts: {e}"))?;
+        let mut data = vec![f32::MIN; ww * wh];
+        let (tx0, tx1, ty0, ty1) = (c0 / tw, (c1 - 1) / tw, r0 / th, (r1 - 1) / th);
+        for ty in ty0..=ty1 {
+            let spans: Vec<(u64, u64)> = (tx0..=tx1).map(|tx| (ty * across + tx) as usize).filter(|&i| counts[i] > 0).map(|i| (offsets[i], offsets[i] + counts[i])).collect();
+            prefetch(&spans);
+            for tx in tx0..=tx1 {
+                let index = (ty * across + tx) as u32;
+                // A tile the file never wrote (a sparse file's empty corner) is no data.
+                if counts[index as usize] == 0 {
+                    continue;
+                }
+                let samples: Vec<f32> = match dec.read_chunk(index).map_err(|e| format!("{name}: tile {index}: {e}"))? {
+                    DecodingResult::F32(v) => v,
+                    DecodingResult::I16(v) => v.into_iter().map(|x| x as f32).collect(),
+                    DecodingResult::U16(v) => v.into_iter().map(|x| x as f32).collect(),
+                    DecodingResult::I32(v) => v.into_iter().map(|x| x as f32).collect(),
+                    other => return Err(format!("{name}: expected float or integer samples, got {:?} variant", sample_kind(&other))),
+                };
+                let (dw, dh) = dec.chunk_data_dimensions(index);
+                // An edge tile comes back at its data's width or padded to the full tile; either way a row is `stride` samples.
+                let stride = if samples.len() == (tw * th) as usize { tw as usize } else { dw as usize };
+                for y in 0..dh as i64 {
+                    let row = ty * th + y;
+                    if row < r0 || row >= r1 {
+                        continue;
+                    }
+                    for x in 0..dw as i64 {
+                        let col = tx * tw + x;
+                        if col < c0 || col >= c1 {
+                            continue;
+                        }
+                        data[(row - r0) as usize * ww + (col - c0) as usize] = samples[y as usize * stride + x as usize];
+                    }
+                }
+            }
+        }
+        eprintln!("dem window {name}: {ww}x{wh} of {w}x{h} {grid:?}");
+        let origin = (origin.0 + c0 as f64 * step.0, origin.1 - r0 as f64 * step.1);
+        Ok(Some(DemTile { width: ww, height: wh, grid, origin, step, data }))
+    }
+
     pub fn load(path: &str) -> Result<DemTile, String> {
         let file = File::open(path).map_err(|e| format!("{path}: {e}"))?;
         let mut dec = Decoder::new(BufReader::new(file))
@@ -91,6 +178,7 @@ impl DemTile {
         let (x, y) = match self.grid {
             Grid::Geographic => (lon, lat),
             Grid::UtmNorth(zone) => utm_forward(lat, lon, zone),
+            Grid::CanadaLambert => canada_lambert_forward(lat, lon),
         };
         let px = (x - self.origin.0) / self.step.0 - 0.5;
         let py = (self.origin.1 - y) / self.step.1 - 0.5;
@@ -107,7 +195,7 @@ impl DemTile {
                 (self.step.0.to_radians() * EARTH_RADIUS_M * lat.to_radians().cos()) as f32,
                 (self.step.1.to_radians() * EARTH_RADIUS_M) as f32,
             ),
-            Grid::UtmNorth(_) => (self.step.0 as f32, self.step.1 as f32),
+            Grid::UtmNorth(_) | Grid::CanadaLambert => (self.step.0 as f32, self.step.1 as f32),
         }
     }
 
@@ -165,6 +253,7 @@ fn grid_of(keys: &[u32]) -> Option<Grid> {
     }
     match (model, pcs) {
         (Some(2), _) | (None, None) => Some(Grid::Geographic),
+        (Some(1), Some(3979)) => Some(Grid::CanadaLambert),
         (Some(1), Some(epsg)) => {
             let zone = match epsg {
                 32601..=32660 => epsg - 32600,
@@ -176,6 +265,23 @@ fn grid_of(keys: &[u32]) -> Option<Grid> {
         }
         _ => None,
     }
+}
+
+/// Lambert conformal conic forward projection with two standard parallels (Snyder, Map Projections: A Working Manual, eq. 15-1 to 15-10), on GRS80, for NAD83(CSRS) Canada Atlas Lambert (EPSG:3979): parallels 49° and 77°, origin 49° N 95° W, no false easting or northing.
+pub fn canada_lambert_forward(lat: f64, lon: f64) -> (f64, f64) {
+    const A: f64 = 6_378_137.0;
+    const F: f64 = 1.0 / 298.257_222_101;
+    let e2 = F * (2.0 - F);
+    let e = e2.sqrt();
+    let m = |phi: f64| phi.cos() / (1.0 - e2 * phi.sin() * phi.sin()).sqrt();
+    let t = |phi: f64| (std::f64::consts::FRAC_PI_4 - phi / 2.0).tan() / ((1.0 - e * phi.sin()) / (1.0 + e * phi.sin())).powf(e / 2.0);
+    let (p1, p2, p0) = (49f64.to_radians(), 77f64.to_radians(), 49f64.to_radians());
+    let n = (m(p1).ln() - m(p2).ln()) / (t(p1).ln() - t(p2).ln());
+    let big_f = m(p1) / (n * t(p1).powf(n));
+    let rho = |phi: f64| A * big_f * t(phi).powf(n);
+    let theta = n * (lon - -95.0).to_radians();
+    let r = rho(lat.to_radians());
+    (r * theta.sin(), rho(p0) - r * theta.cos())
 }
 
 /// Transverse Mercator forward projection (WGS84/GRS80 ellipsoid — identical to sub-millimeter), UTM parameters: k0 = 0.9996, false easting 500 km.
@@ -216,6 +322,11 @@ pub fn utm_forward(lat: f64, lon: f64, zone: u8) -> (f64, f64) {
 }
 
 impl DemStore {
+    /// A store of tiles already loaded, searched in the order given.
+    pub fn from_tiles(tiles: Vec<DemTile>) -> DemStore {
+        DemStore { tiles, land_squares: None }
+    }
+
     /// Tiles decode in parallel, kept in the order given: a sample takes the first tile with data, so earlier paths win.
     pub fn load(paths: &[String]) -> Result<DemStore, String> {
         use rayon::prelude::*;
@@ -353,6 +464,19 @@ mod tests {
         assert_eq!(store(vec![tile(|_, _| -0.5577851), shallow]).elevation(lat, lon), Some(-0.5577851), "nothing deeper: the water surface stays");
         let (_, g) = store(vec![tile(|_, _| -0.5577851), tile(|x, _| -100.0 - x as f32)]).elev_and_gradient(lat, lon).unwrap();
         assert!(g.0 < 0.0, "the gradient is the bottom's, deepening east: {g:?}");
+    }
+
+    /// Canada Atlas Lambert: its origin (49° N, 95° W) is (0, 0), the central meridian has no easting, a point west of it lies west and, on the 49th parallel, bows north of the origin's line (the parallel is an arc about the cone's apex); and Burnaby Mountain lands inside the Burnaby HRDEM file's extent (x -1986977 to -1956116, y 450807 to 486451), where its lidar reads 343 m.
+    #[test]
+    fn canada_lambert_forward_shape() {
+        let (x, y) = canada_lambert_forward(49.0, -95.0);
+        assert!(x.abs() < 1e-6 && y.abs() < 1e-6, "{x} {y}");
+        let (x, _) = canada_lambert_forward(60.0, -95.0);
+        assert!(x.abs() < 1e-6);
+        let (x, y) = canada_lambert_forward(49.0, -123.0);
+        assert!(x < -1.9e6 && y > 0.0, "{x} {y}");
+        let (x, y) = canada_lambert_forward(49.2791, -122.9187);
+        assert!((-1986977.0..-1956116.0).contains(&x) && (450807.0..486451.0).contains(&y), "{x} {y}");
     }
 
     /// Port Orchard, UTM 10N — reference values from PROJ (EPSG:26910).
@@ -519,6 +643,7 @@ impl ImgTile {
         let (x, y) = match self.grid {
             Grid::Geographic => (lon, lat),
             Grid::UtmNorth(zone) => utm_forward(lat, lon, zone),
+            Grid::CanadaLambert => canada_lambert_forward(lat, lon),
         };
         let px = (x - self.origin.0) / self.step.0;
         let py = (self.origin.1 - y) / self.step.1;
