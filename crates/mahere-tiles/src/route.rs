@@ -46,6 +46,10 @@ pub struct RouteCell {
     pub stackcor: Vec<u16>,
     /// At bake time only (never written): each stamped trixel's distance along its way's own line, metres from the line's start, sorted by (trixel, way). A corridor's length is the difference at its two nodes — the road's true length, whatever its bearing on the grid (Nick 2026-10-26: a corridor's trixel steps are a staircase, 12 to 21 percent short and 9 points apart by bearing). Carried up the pyramid; a cell read from its section has none, and its graph measures the staircase.
     pub arc: Vec<(u32, u16, f32)>,
+    /// Worked out the first time a route search stands on a corridor (never written), one slot a corridor: its trixels' distances along it to its two nodes, texel edges, sorted by trixel, so a search standing anywhere on it looks it up instead of walking it (Nick 2026-11-21: navigation "abhorrently slow"; 168,000 walks took 5.6 of a 15 km route's 6.4 seconds).
+    pub places: Vec<std::sync::OnceLock<Vec<(u32, f32, f32)>>>,
+    /// Worked out when the cell is read (never written): the nodes by (name, way, trixel), so a node's trixels are a binary search, not a pass over every node ([`Self::index_nodes`]).
+    pub by_name: Vec<(u32, u16, u32)>,
 }
 
 /// A run of one way's trixels between two nodes.
@@ -173,7 +177,17 @@ impl RouteCell {
 
     /// The trixels of a node cluster on a way.
     pub fn node_trixels(&self, name: u32, way: u16) -> Vec<u32> {
+        if self.by_name.len() == self.nodes.len() && !self.nodes.is_empty() {
+            let lo = self.by_name.partition_point(|n| (n.0, n.1) < (name, way));
+            return self.by_name[lo..].iter().take_while(|n| (n.0, n.1) == (name, way)).map(|n| n.2).collect();
+        }
         self.nodes.iter().filter(|n| n.2 == name && n.1 == way).map(|n| n.0).collect()
+    }
+
+    /// The nodes indexed by name and way for [`Self::node_trixels`]; again after the graph changes.
+    pub fn index_nodes(&mut self) {
+        self.by_name = self.nodes.iter().map(|&(t, w, n)| (n, w, t)).collect();
+        self.by_name.sort_unstable();
     }
 
     /// Whether the cell's graph is built (a cell baked before the graph has none, and routes the slow way).
@@ -548,7 +562,7 @@ impl RouteCell {
         if stackcor.len() != stack.len() {
             stackcor = vec![0; stack.len()];
         }
-        Some(RouteCell { way, ways, stack, joins: u32s("join"), dir, nodes, corridors, cor, stackcor, arc: Vec::new() })
+        Some(RouteCell { way, ways, stack, joins: u32s("join"), dir, nodes, corridors, cor, stackcor, arc: Vec::new(), places: Vec::new(), by_name: Vec::new() })
     }
 }
 

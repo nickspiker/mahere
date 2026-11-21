@@ -11,7 +11,11 @@ fn main() {
     };
     // A published directory (base/, dem/ under it) or a flat one.
     let root = std::path::PathBuf::from(&a[1]);
-    let (store, dem): (Arc<dyn mahere_engine::residency::CellStore>, Arc<dyn mahere_engine::residency::CellStore>) = if root.join("base").is_dir() {
+    let (store, dem): (Arc<dyn mahere_engine::residency::CellStore>, Arc<dyn mahere_engine::residency::CellStore>) = if a[1] == "bucket" {
+        // The bucket itself, as a phone with nothing on it reads it.
+        use mahere_engine::residency::{HttpStore, DEFAULT_CELLS_URL};
+        (Arc::new(HttpStore::layer(DEFAULT_CELLS_URL, mahere_tiles::publish::Layer::Base)), Arc::new(HttpStore::layer(DEFAULT_CELLS_URL, mahere_tiles::publish::Layer::Dem)))
+    } else if root.join("base").is_dir() {
         (Arc::new(mahere_engine::residency::LayerDir(root.clone(), mahere_tiles::publish::Layer::Base)), Arc::new(mahere_engine::residency::LayerDir(root, mahere_tiles::publish::Layer::Dem)))
     } else {
         let s = Arc::new(mahere_engine::residency::DirStore(root));

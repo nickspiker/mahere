@@ -275,6 +275,27 @@ pub struct RouteCache(std::sync::Mutex<HashMap<CellKey, Option<Arc<RouteCell>>>>
 /// Cells a route cache holds before it is cleared: about 70 MB of planes at most.
 const CACHE_CELLS: usize = 4000;
 
+/// A cell's routing made ready for the search: its graph built if it was baked before the graph (the same graph the baker makes), its nodes indexed by name, a slot for each corridor's places.
+fn prepare(mut r: RouteCell, key: CellKey) -> RouteCell {
+    if !r.has_graph() {
+        let t = std::time::Instant::now();
+        r.build_graph(key.depth);
+        if std::env::var_os("MAHERE_ROUTE_LOG").is_some() {
+            eprintln!("graph: {} ways, {} nodes, {} corridors built in {:.1} ms", r.ways.len(), r.nodes.len(), r.corridors.len(), t.elapsed().as_secs_f64() * 1e3);
+        }
+    }
+    r.index_nodes();
+    r.places = (0..r.corridors.len()).map(|_| std::sync::OnceLock::new()).collect();
+    r
+}
+
+/// How many cells out from a missing one its neighbours are fetched with it: two rings, 25 cells a round trip.
+const PREFETCH_RING: i64 = 2;
+
+/// Time spent reading cells from the store and decoding their routing, summed over a process (MAHERE_ROUTE_LOG).
+pub static READ_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static DECODE_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Cells' routing as the search reads it, each read once from the store, through the shared cache.
 struct Cells {
     store: Arc<dyn CellStore>,
@@ -293,21 +314,25 @@ impl Cells {
             self.got.insert(key, shared.clone());
             return shared;
         }
+        // A cell the search lacks: its neighbours at its depth are fetched beside it, at once, since the search goes on into them (Nick 2026-11-21: navigation "abhorrently slow"; a phone with nothing kept fetched a 15 km route's 229 cells one after another, 36 of its 51 seconds).
+        if !self.local {
+            self.prefetch_around(key);
+            if let Some(c) = self.got.get(&key) {
+                return c.clone();
+            }
+        }
+        let t_read = std::time::Instant::now();
         let fetched = if self.local { self.store.get_local(key) } else { self.store.get(key) };
+        let read_ns = t_read.elapsed().as_nanos() as u64;
+        let t_decode = std::time::Instant::now();
         let c = match fetched {
-            Fetch::Bytes(b) => mahere_tiles::decode_route(&b).map(|mut r| {
-                // A cell baked before the graph: built here from its planes, the same graph the baker makes.
-                if !r.has_graph() {
-                    let t = std::time::Instant::now();
-                    r.build_graph(key.depth);
-                    if std::env::var_os("MAHERE_ROUTE_LOG").is_some() {
-                        eprintln!("graph: {} ways, {} nodes, {} corridors built in {:.1} ms", r.ways.len(), r.nodes.len(), r.corridors.len(), t.elapsed().as_secs_f64() * 1e3);
-                    }
-                }
-                Arc::new(r)
-            }),
+            Fetch::Bytes(b) => mahere_tiles::decode_route(&b).map(|r| Arc::new(prepare(r, key))),
             _ => None,
         };
+        if std::env::var_os("MAHERE_ROUTE_LOG").is_some() {
+            READ_NS.fetch_add(read_ns, std::sync::atomic::Ordering::Relaxed);
+            DECODE_NS.fetch_add(t_decode.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+        }
         self.got.insert(key, c.clone());
         if let Some(cache) = &self.cache {
             if let Ok(mut m) = cache.0.lock() {
@@ -321,6 +346,46 @@ impl Cells {
             }
         }
         c
+    }
+
+    /// The cell and its neighbours within [`PREFETCH_RING`] in its diamond, those not held yet, fetched on threads of their own and decoded into the search's cells.
+    fn prefetch_around(&mut self, key: CellKey) {
+        let (cu, cv) = key.grid();
+        let side = 1i64 << key.depth;
+        let mut want: Vec<CellKey> = Vec::new();
+        let r = PREFETCH_RING;
+        for dv in -r..=r {
+            for du in -r..=r {
+                let (u, v) = (cu as i64 + du, cv as i64 + dv);
+                if u < 0 || v < 0 || u >= side || v >= side {
+                    continue;
+                }
+                let k = CellKey::from_grid(key.diamond(), key.depth, u as u64, v as u64);
+                if !self.got.contains_key(&k) {
+                    want.push(k);
+                }
+            }
+        }
+        let store = &self.store;
+        let got: Vec<(CellKey, Option<RouteCell>)> = std::thread::scope(|s| {
+            let hs: Vec<_> = want.iter().map(|&k| s.spawn(move || (k, match store.get(k) {
+                Fetch::Bytes(b) => mahere_tiles::decode_route(&b),
+                _ => None,
+            }))).collect();
+            hs.into_iter().filter_map(|h| h.join().ok()).collect()
+        });
+        for (k, r) in got {
+            let c = r.map(|r| Arc::new(prepare(r, k)));
+            if let (Some(cache), Some(_)) = (&self.cache, &c) {
+                if let Ok(mut m) = cache.0.lock() {
+                    if m.len() >= CACHE_CELLS {
+                        m.clear();
+                    }
+                    m.insert(k, c.clone());
+                }
+            }
+            self.got.insert(k, c);
+        }
     }
 
     /// The ways on a trixel, by OSM id, with the cell's way record.
@@ -562,6 +627,51 @@ enum Stand {
     Between { cor: u16, a: Node, b: Node, to_a: f64, to_b: f64 },
 }
 
+/// One corridor's trixels with their distances along it to its two nodes, texel edges, sorted by trixel: a walk from each node through the corridor's own trixels and its two nodes' (as [`trace`] walks for one trixel).
+fn corridor_places(cell: &RouteCell, cor: u16) -> Vec<(u32, f32, f32)> {
+    let c = cell.corridors[cor as usize - 1];
+    let walk = |from: u32| -> Vec<(usize, f32)> {
+        let mut dist: Vec<(usize, f32)> = Vec::new();
+        let at = |dist: &Vec<(usize, f32)>, j: usize| dist.iter().position(|d| d.0 == j);
+        let mut heap = BinaryHeap::new();
+        for s in cell.node_trixels(from, c.way) {
+            dist.push((s as usize, 0.0));
+            heap.push(Reverse((0u64, s as usize)));
+        }
+        while let Some(Reverse((dk, k))) = heap.pop() {
+            let d = dk as f32 / 256.0;
+            if at(&dist, k).is_some_and(|p| d > dist[p].1 + 1e-6) {
+                continue;
+            }
+            for j in cell_around(k) {
+                if cell.corridor_at(j, c.way) != cor && !cell.node_of(j, c.way).is_some_and(|n| n == c.a || n == c.b) {
+                    continue;
+                }
+                let nd = d + (grid_m(cell_centre(k), cell_centre(j)) / mahere_tiles::texel_m(ROUTE_DEPTH)) as f32;
+                match at(&dist, j) {
+                    Some(p) if dist[p].1 <= nd => {}
+                    Some(p) => {
+                        dist[p].1 = nd;
+                        heap.push(Reverse(((nd * 256.0) as u64, j)));
+                    }
+                    None => {
+                        dist.push((j, nd));
+                        heap.push(Reverse(((nd * 256.0) as u64, j)));
+                    }
+                }
+            }
+        }
+        dist.sort_unstable_by_key(|d| d.0);
+        dist
+    };
+    let (from_a, from_b) = (walk(c.a), walk(c.b));
+    from_a
+        .into_iter()
+        .filter(|&(j, _)| cell.corridor_at(j, c.way) == cor)
+        .filter_map(|(j, da)| from_b.binary_search_by_key(&j, |d| d.0).ok().map(|k| (j as u32, da, from_b[k].1)))
+        .collect()
+}
+
 /// The shortest run of trixels from `from` to any of `to`, through the trixels of corridor `cor` of way `w` and the clusters at its ends, in texel edges; None when there is none.
 /// Any corridor trixel of the way may carry it, at four times the cost off its own: a hub (one run of trixels touching several nodes, a coarse cell's merged switchbacks) marks its trixels with its first corridor only, and the others share them (Nick 2026-10-26: the Snow Lake route jumped the switchbacks). Another node's trixels still block, so the run cannot stray past the two ends.
 fn trace(cell: &RouteCell, w: u16, cor: u16, from: usize, to: &[usize], ends: [u32; 2]) -> Option<(f64, Vec<usize>)> {
@@ -637,6 +747,12 @@ fn stand(cells: &mut Cells, t: T, osm: i64) -> Option<(Stand, Arc<RouteCell>, u1
         return None;
     }
     let c = cell.corridors[cor as usize - 1];
+    // Where the cell's read worked it out; a trixel its own corridor's walk does not reach (one shared by a hub's corridors) is walked here.
+    let places = cell.places.get(cor as usize - 1).map(|p| p.get_or_init(|| corridor_places(&cell, cor)));
+    if let Some(k) = places.and_then(|p| p.binary_search_by_key(&(i as u32), |q| q.0).ok()) {
+        let (_, to_a, to_b) = places.unwrap()[k];
+        return Some((Stand::Between { cor, a: Node { key, name: c.a, osm }, b: Node { key, name: c.b, osm }, to_a: to_a as f64, to_b: to_b as f64 }, cell, w));
+    }
     let to = |name: u32| -> Option<f64> {
         let targets: Vec<usize> = cell.node_trixels(name, w).into_iter().map(|x| x as usize).collect();
         trace(&cell, w, cor, i, &targets, [c.a, c.b]).map(|(d, _)| d)
@@ -648,7 +764,8 @@ fn stand(cells: &mut Cells, t: T, osm: i64) -> Option<(Stand, Arc<RouteCell>, u1
 /// The best route from one point to another, or why there is none: a search over the cells' graphs, node to node along corridors, onto other ways at junctions, across cells (and diamonds) at the edges.
 /// `dem` is where the terrain comes from for the climb (the base store itself for cells baked whole).
 pub fn find(store: Arc<dyn CellStore>, dem: Arc<dyn CellStore>, from: (f64, f64), to: (f64, f64), travel: Travel) -> Result<Route, String> {
-    find_cached(store, dem, from, to, travel, None)
+    // A cache of its own, so the search's cells are not read again to draw the line, as the app's shared cache does for it.
+    find_cached(store, dem, from, to, travel, Some(Arc::new(RouteCache::default())))
 }
 
 /// [`find`] through a cache of cells kept across searches.
@@ -922,7 +1039,7 @@ pub fn find_cached(store: Arc<dyn CellStore>, dem: Arc<dyn CellStore>, from: (f6
         }
     }
     if std::env::var_os("MAHERE_ROUTE_LOG").is_some() {
-        eprintln!("route: {} nodes, {} cells read", states.len(), cells.got.len());
+        eprintln!("route: {} nodes, {} cells read, {:.0} ms reading them, {:.0} ms decoding them", states.len(), cells.got.len(), READ_NS.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e6, DECODE_NS.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e6);
     }
     let Some((last, seconds)) = done else { return Err("no route between them on the ways baked so far".into()) };
     // The nodes back to the start, then the trixels: along each corridor its traced run, at a turn or a hop the node itself.
