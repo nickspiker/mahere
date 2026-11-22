@@ -308,6 +308,7 @@ impl GpuHost {
             let mut hs = std::collections::hash_map::DefaultHasher::new();
             if panel.is_open() {
                 areas.hash(&mut hs);
+                panel.tracks_version().hash(&mut hs);
             }
             // The zoom shown under the compass, and whether it is past the data (it turns amber).
             map.view_depth().hash(&mut hs);

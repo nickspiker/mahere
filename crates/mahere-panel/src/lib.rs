@@ -196,6 +196,8 @@ enum Layer {
     Debug,
     /// The areas page: saved selections, downloaded and shared.
     Areas,
+    /// The recorded tracks page (Nick 2026-11-21).
+    Tracks,
     /// The updates page.
     Updates,
     /// Recording a track, the screen on or off.
@@ -204,7 +206,7 @@ enum Layer {
     Marker,
 }
 
-const LAYERS: [(Layer, &str); 26] = [
+const LAYERS: [(Layer, &str); 27] = [
     (Layer::Dem, "Terrain"),
     (Layer::Hypso, "Elevation tint"),
     (Layer::Raw, "Raw elevation"),
@@ -230,6 +232,7 @@ const LAYERS: [(Layer, &str); 26] = [
     (Layer::Record, "Record track"),
     (Layer::Marker, "Position marker"),
     (Layer::Areas, "Areas  \u{203a}"),
+    (Layer::Tracks, "Tracks  \u{203a}"),
     (Layer::Updates, "Updates  \u{203a}"),
 ];
 
@@ -283,6 +286,8 @@ enum TreeRow {
     Slider(usize),
     /// The text size slider, the Display group's row.
     TextSize,
+    /// Under Record track: the recording's numbers as it goes, opening the tracks page.
+    TrackNow,
     /// Under Record track: the track's colour, opening its colour page.
     TrackColour,
     /// Under Position marker: its style, a fluor Choice.
@@ -303,7 +308,7 @@ fn settings_of(l: Layer) -> Vec<TreeRow> {
         Layer::Own => fields(&|f| matches!(f, Field::Own(_) | Field::Wild)),
         Layer::Mvum => fields(&|f| matches!(f, Field::Mvum(_))),
         Layer::Labels => fields(&|f| matches!(f, Field::LabelLook | Field::LabelAmount | Field::LabelFont | Field::Label(_))),
-        Layer::Record => vec![TreeRow::TrackColour],
+        Layer::Record => vec![TreeRow::TrackNow, TreeRow::TrackColour],
         Layer::Marker => vec![TreeRow::MarkerStyle],
         _ => Vec::new(),
     }
@@ -388,7 +393,7 @@ fn inert(mask: &LayerMask, ctl: &Controls, l: Layer) -> bool {
         Layer::ContourAuto => !mask.contours || mask.geoid,
         Layer::RealSun => ctl.real_light,
         Layer::RealLight => ctl.real_sun,
-        Layer::Linear | Layer::FollowHeading | Layer::LockToFix | Layer::Record | Layer::Marker | Layer::Areas | Layer::Updates => false,
+        Layer::Linear | Layer::FollowHeading | Layer::LockToFix | Layer::Record | Layer::Marker | Layer::Areas | Layer::Tracks | Layer::Updates => false,
         _ => get(&mask.inert(), &Controls::default(), l),
     }
 }
@@ -419,7 +424,7 @@ fn get(mask: &LayerMask, ctl: &Controls, l: Layer) -> bool {
         Layer::Debug => mask.debug,
         Layer::Record => ctl.record,
         Layer::Marker => ctl.marker_on,
-        Layer::Areas | Layer::Updates => false,
+        Layer::Areas | Layer::Tracks | Layer::Updates => false,
     }
 }
 
@@ -449,7 +454,7 @@ fn set(mask: &mut LayerMask, ctl: &mut Controls, l: Layer, v: bool) {
         Layer::Debug => mask.debug = v,
         Layer::Record => ctl.record = v,
         Layer::Marker => ctl.marker_on = v,
-        Layer::Areas | Layer::Updates => {}
+        Layer::Areas | Layer::Tracks | Layer::Updates => {}
     }
 }
 
@@ -504,6 +509,9 @@ enum Page {
     /// The saved areas, and one of them.
     Areas,
     Area(usize),
+    /// The recorded tracks, and one of them.
+    Tracks,
+    Track(usize),
     /// Search (Nick 2026-10-26: a page of its own, the field up top, the places found below).
     Search,
     /// Updates: this build, the release and dev channels' builds, automatic updates.
@@ -564,6 +572,91 @@ pub enum AreaAct {
     /// The area's shape shown as the selection.
     Show(usize),
     Delete(usize),
+}
+
+/// A track's numbers as the panel shows them (Nick 2026-11-21: "distance, time, avg speed, etc").
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct TrackNumbers {
+    pub metres: f64,
+    /// From the first fix to the last, and the part of it spent moving.
+    pub seconds: f64,
+    pub moving_s: f64,
+    /// The fastest the receiver measured, metres a second.
+    pub max_ms: f32,
+    pub climb_m: f32,
+    pub descent_m: f32,
+    pub fixes: u32,
+}
+
+/// A saved track in the list: when it began, as a person reads it, and its numbers.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct TrackView {
+    pub when: String,
+    pub numbers: TrackNumbers,
+}
+
+/// The tracks the panel shows: the saved ones (newest first), the recording's numbers while one runs, and which saved one is on the map.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct TracksView {
+    pub tracks: Vec<TrackView>,
+    pub live: Option<TrackNumbers>,
+    pub shown: Option<usize>,
+}
+
+/// What the tracks pages ask of the host, polled after every tap.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TrackAct {
+    /// The saved track drawn on the map and the view moved to it.
+    Show(usize),
+    /// The shown track taken off the map.
+    Hide,
+    Delete(usize),
+}
+
+/// A tappable row of the tracks pages.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TrackRow {
+    Back,
+    Show,
+    Hide,
+    Delete,
+}
+
+/// A span of time as a person reads it: seconds under a minute, minutes under an hour, then hours and minutes.
+pub fn duration_text(s: f64) -> String {
+    let s = s.round() as i64;
+    if s < 60 {
+        format!("{s} s")
+    } else if s < 3600 {
+        format!("{} min", s / 60)
+    } else {
+        format!("{} h {:02} min", s / 3600, s % 3600 / 60)
+    }
+}
+
+/// A speed in kilometres an hour, one decimal.
+pub fn speed_text(ms: f64) -> String {
+    format!("{:.1} km/h", ms * 3.6)
+}
+
+/// A track's numbers as lines of a label and a value, each short enough for a phone's panel: distance, time and moving time, the averages over each, top speed, climb and descent.
+fn track_lines(n: &TrackNumbers) -> Vec<(&'static str, String)> {
+    let avg = |s: f64| if s > 0.0 { speed_text(n.metres / s) } else { "\u{2014}".into() };
+    vec![
+        ("Distance", length_text(n.metres)),
+        ("Time", duration_text(n.seconds)),
+        ("Moving", duration_text(n.moving_s)),
+        ("Average", avg(n.seconds)),
+        ("Moving avg", avg(n.moving_s)),
+        ("Top speed", if n.max_ms > 0.0 { speed_text(n.max_ms as f64) } else { "\u{2014}".into() }),
+        ("Climb", format!("{} m", n.climb_m.round() as i64)),
+        ("Descent", format!("{} m", n.descent_m.round() as i64)),
+    ]
+}
+
+/// One short line of a track's numbers for a list row or the Record row: distance and time.
+fn track_brief(n: &TrackNumbers) -> String {
+    format!("{}  \u{b7}  {}", length_text(n.metres), duration_text(n.seconds))
 }
 
 /// What the editor asks of the host, polled after every tap and drag.
@@ -689,6 +782,12 @@ pub struct Panel {
     colour_of_track: bool,
     theme_list: List,
     area_list: List,
+    /// The tracks pages: the list, what the host last gave (and a count of its changes, for a host that repaints only on change), the rows the last paint laid out, and what was asked.
+    track_list: List,
+    tracks: TracksView,
+    tracks_version: u64,
+    track_rows: Vec<(f32, f32, TrackRow)>,
+    track_acts: Vec<TrackAct>,
     search_list: List,
     /// Copy buttons (Nick 2026-10-26: one next to the degrees, the degrees-minutes-seconds and the world code): each with the text it copies, and the text of the one tapped, for the host's clipboard.
     copy_btns: Vec<((f32, f32, f32, f32), String)>,
@@ -829,11 +928,12 @@ impl Panel {
         let marker_choice = Choice::new(&mut hits, &mahere_engine::MARKER_STYLES, 0, 10.0);
         toolbox.set_vertical(true);
         let (theme_list, area_list, search_list) = (List::new(&mut hits, 0.0, 0.0, 10.0, 10.0, 10.0), List::new(&mut hits, 0.0, 0.0, 10.0, 10.0, 10.0), List::new(&mut hits, 0.0, 0.0, 10.0, 10.0, 10.0));
+        let track_list = List::new(&mut hits, 0.0, 0.0, 10.0, 10.0, 10.0);
         // The buttons take their ids after every checkbox: the counter they are handed is their own from here on.
         let pills = Pills::new(hits + 1000);
         let interval = Slider::new(&mut hits, 0.0, 0.0, 10.0, 10.0, 0.0);
         let text_slider = Slider::new(&mut hits, 0.0, 0.0, 10.0, 10.0, text_pos(1.0));
-        Panel { fonts: None, font_cursor: Default::default(), open: false, dirty: true, ru: 1.0, stack: vec![Page::Layers], theme_rows: Vec::new(), edit_rows: Vec::new(), edit_scroll: 0.0, edit_extent: 0.0, press: None, sliders: Vec::new(), field_vals: [0.0; 4], held: None, edits: Vec::new(), hits, shown: vec![true; LAYERS.len()], group_open: GROUPS_OPEN, group_rows: Vec::new(), tree: Vec::new(), layer_open: None, field_open: None, theme_now: None, interval, interval_held: false, text_slider, text_pending: None, ru_request: None, label_scale: 1.0, touch: false, checks, text: TextRenderer::new(), buf: Vec::new(), w: 0, h: 0, font: 16.0, gear: (0.0, 0.0, 0.0), panel_w: 0.0, theme_row: (0.0, 0.0, 0.0), slider: (0.0, 0.0, 0.0), slider_held: false, cache_max: CACHE_MIN + 1, strip_close: None, clear_measure: false, area_rows: Vec::new(), area_acts: Vec::new(), areas: AreasView::default(), update_rows: Vec::new(), update_acts: Vec::new(), updates: UpdatesView::default(), host_orb: None, layers_scroll: 0.0, layers_extent: 0.0, layers_press: None, layers_band: (0.0, 0.0), orb_icon: fluor::host::icon::Icon::from_vsf_bytes(APP_ORB_VSF).ok(), orb_scaled: (0, Vec::new()), locate_btn: None, tool_btn: None, toolbox_open: false, tool_rows: Vec::new(), pills, auto_check, travel, toolbox, marker_choice, colour_of_track: false, theme_list, area_list, search_list, copy_btns: Vec::new(), copied: None, query: String::new(), search_box: None, query_dirty: false, search_pending: false, found: Vec::new(), picked: None, search_act: None, search_rows: Vec::new(), search_acts: Vec::new(), search_field: None, route_pills: Vec::new(), swap: false, card_top: None }
+        Panel { fonts: None, font_cursor: Default::default(), open: false, dirty: true, ru: 1.0, stack: vec![Page::Layers], theme_rows: Vec::new(), edit_rows: Vec::new(), edit_scroll: 0.0, edit_extent: 0.0, press: None, sliders: Vec::new(), field_vals: [0.0; 4], held: None, edits: Vec::new(), hits, shown: vec![true; LAYERS.len()], group_open: GROUPS_OPEN, group_rows: Vec::new(), tree: Vec::new(), layer_open: None, field_open: None, theme_now: None, interval, interval_held: false, text_slider, text_pending: None, ru_request: None, label_scale: 1.0, touch: false, checks, text: TextRenderer::new(), buf: Vec::new(), w: 0, h: 0, font: 16.0, gear: (0.0, 0.0, 0.0), panel_w: 0.0, theme_row: (0.0, 0.0, 0.0), slider: (0.0, 0.0, 0.0), slider_held: false, cache_max: CACHE_MIN + 1, strip_close: None, clear_measure: false, area_rows: Vec::new(), area_acts: Vec::new(), areas: AreasView::default(), update_rows: Vec::new(), update_acts: Vec::new(), updates: UpdatesView::default(), host_orb: None, layers_scroll: 0.0, layers_extent: 0.0, layers_press: None, layers_band: (0.0, 0.0), orb_icon: fluor::host::icon::Icon::from_vsf_bytes(APP_ORB_VSF).ok(), orb_scaled: (0, Vec::new()), locate_btn: None, tool_btn: None, toolbox_open: false, tool_rows: Vec::new(), pills, auto_check, travel, toolbox, marker_choice, colour_of_track: false, theme_list, area_list, search_list, track_list, tracks: TracksView::default(), tracks_version: 0, track_rows: Vec::new(), track_acts: Vec::new(), copy_btns: Vec::new(), copied: None, query: String::new(), search_box: None, query_dirty: false, search_pending: false, found: Vec::new(), picked: None, search_act: None, search_rows: Vec::new(), search_acts: Vec::new(), search_field: None, route_pills: Vec::new(), swap: false, card_top: None }
     }
 
     pub fn is_open(&self) -> bool {
@@ -957,6 +1057,35 @@ impl Panel {
     /// What the areas pages asked since last polled.
     pub fn take_area_acts(&mut self) -> Vec<AreaAct> {
         std::mem::take(&mut self.area_acts)
+    }
+
+    /// The tracks page open, and with `track` one saved track's page over it (previews, and a host that opens a track).
+    pub fn show_tracks(&mut self, track: Option<usize>) {
+        self.open = true;
+        self.stack = vec![Page::Layers, Page::Tracks];
+        if let Some(i) = track {
+            self.stack.push(Page::Track(i));
+        }
+        self.dirty = true;
+    }
+
+    /// What the tracks pages asked since last polled.
+    pub fn take_track_acts(&mut self) -> Vec<TrackAct> {
+        std::mem::take(&mut self.track_acts)
+    }
+
+    /// The tracks as the host has them; the panel repaints when they change.
+    pub fn set_tracks(&mut self, v: TracksView) {
+        if v != self.tracks {
+            self.tracks = v;
+            self.tracks_version += 1;
+            self.dirty = true;
+        }
+    }
+
+    /// A count of the tracks' changes, for a host that repaints its overlay only when something it shows changed.
+    pub fn tracks_version(&self) -> u64 {
+        self.tracks_version
     }
 
     /// What the Updates page shows, from the host's updater; repaints when it changed while the page is open.
@@ -1353,7 +1482,7 @@ impl Panel {
                             self.tree.push((y + slider_row * 0.5, slider_row * 0.5, item));
                             y += slider_row;
                         }
-                        TreeRow::TrackColour => {
+                        TreeRow::TrackNow | TreeRow::TrackColour => {
                             self.tree.push((y + setting * 0.5, setting * 0.5, item));
                             y += setting;
                         }
@@ -1447,6 +1576,12 @@ impl Panel {
                 return false;
             }
             Some(TreeRow::Interval | TreeRow::Slider(_) | TreeRow::TextSize) => return false,
+            // The recording's numbers: the tracks page, where they are in full.
+            Some(TreeRow::TrackNow) => {
+                self.stack.push(Page::Tracks);
+                self.dirty = true;
+                return false;
+            }
             // The track's colour: its page, the pen's sliders on the track's colour.
             Some(TreeRow::TrackColour) => {
                 self.colour_of_track = true;
@@ -1473,6 +1608,11 @@ impl Panel {
             if cb.bbox().contains(x, y) {
                 if *l == Layer::Areas {
                     self.stack.push(Page::Areas);
+                    self.dirty = true;
+                    return false;
+                }
+                if *l == Layer::Tracks {
+                    self.stack.push(Page::Tracks);
                     self.dirty = true;
                     return false;
                 }
@@ -1689,6 +1829,49 @@ impl Panel {
                         self.stack.push(Page::Area(i));
                         self.open_area_slider(depth);
                         self.dirty = true;
+                    }
+                }
+                return true;
+            }
+            Page::Tracks => {
+                if self.track_rows.iter().any(|&(cy, hh, r)| r == TrackRow::Back && (y - cy).abs() <= hh) {
+                    self.pop();
+                    self.dirty = true;
+                    return true;
+                }
+                if self.track_rows.iter().any(|&(cy, hh, r)| r == TrackRow::Hide && (y - cy).abs() <= hh) {
+                    self.track_acts.push(TrackAct::Hide);
+                    self.dirty = true;
+                    return true;
+                }
+                // A row of the list opens the track's page.
+                if self.track_list.click_at(x, y) {
+                    if let Some(i) = self.track_list.take_click() {
+                        self.stack.push(Page::Track(i));
+                        self.dirty = true;
+                    }
+                }
+                return true;
+            }
+            Page::Track(i) => {
+                let rows = self.track_rows.clone();
+                for (cy, hh, row) in rows {
+                    if (y - cy).abs() <= hh {
+                        match row {
+                            TrackRow::Back => self.pop(),
+                            // Shown: the map, the panel out of the way.
+                            TrackRow::Show => {
+                                self.track_acts.push(TrackAct::Show(i));
+                                self.open = false;
+                            }
+                            TrackRow::Hide => self.track_acts.push(TrackAct::Hide),
+                            TrackRow::Delete => {
+                                self.track_acts.push(TrackAct::Delete(i));
+                                self.pop();
+                            }
+                        }
+                        self.dirty = true;
+                        return true;
                     }
                 }
                 return true;
@@ -1944,6 +2127,8 @@ impl Panel {
                 Page::Field(f) => Self::paint_field(&mut canvas, &mut self.text, font, rail, cw, self.gear, f, &mut self.sliders, self.field_vals, current),
                 Page::Pen => Self::paint_pen(&mut canvas, &mut self.text, font, rail, cw, self.gear, &mut self.sliders, self.field_vals, if self.colour_of_track { "Track colour" } else { "Pen colour" }),
                 Page::Areas => self.area_rows = Self::paint_areas(&mut canvas, &mut self.text, &mut self.pills, &mut self.area_list, font, rail, cw, self.gear, &self.areas),
+                Page::Tracks => self.track_rows = Self::paint_tracks(&mut canvas, &mut self.text, &mut self.track_list, font, rail, cw, self.gear, &self.tracks, ctl.record),
+                Page::Track(i) => self.track_rows = Self::paint_track(&mut canvas, &mut self.text, &mut self.pills, font, rail, cw, self.gear, &self.tracks, i),
                 Page::Updates => self.update_rows = Self::paint_updates(&mut canvas, &mut self.text, &mut self.pills, &mut self.auto_check, font, rail, cw, self.gear, &self.updates),
                 Page::Search => {
                     // The field: a fluor textbox, focused, holding the query as typed.
@@ -2112,6 +2297,15 @@ impl Panel {
                         }
                     }
                 }
+                TreeRow::TrackNow => {
+                    let x = self.layer_open.map_or(tx, col);
+                    let line = match (&self.tracks.live, ctl.record) {
+                        (Some(n), true) if n.fixes > 0 => track_brief(n),
+                        (_, true) => "Waiting for a fix".to_string(),
+                        _ => format!("{} saved  \u{203a}", self.tracks.tracks.len()),
+                    };
+                    self.text.draw_text_left(&mut canvas, &line, x, cy, &dim, clip, None);
+                }
                 TreeRow::TrackColour => {
                     let x = self.layer_open.map_or(tx, col);
                     self.text.draw_text_left(&mut canvas, "\u{25b8}  Colour", x, cy, &row_ink, clip, None);
@@ -2145,7 +2339,7 @@ impl Panel {
                 continue;
             }
             // The pages at the foot are rows to open, not boxes to tick (Nick 2026-10-26: "random checkboxes next to things like updates").
-            if matches!(l, Layer::Areas | Layer::Updates) {
+            if matches!(l, Layer::Areas | Layer::Tracks | Layer::Updates) {
                 self.text.draw_text_left(&mut canvas, cb.label(), b.x + self.font * 0.3, b.y + b.h * 0.5, &TextStyle::new(self.font * 0.9, theme::TEXTBOX_TEXT), clip, None);
                 continue;
             }
@@ -2990,6 +3184,85 @@ impl Panel {
         };
         for (label, r) in actions.into_iter().chain([("\u{203a}  Share", AreaRow::Share), ("\u{25cb}  Show selection", AreaRow::Show), ("\u{2715}  Delete", AreaRow::Delete)]) {
             pills.draw_fit(canvas, text, x0, y, label, false, font * 0.85, None);
+            rows.push((y, row * 0.5, r));
+            y += row;
+        }
+        rows
+    }
+
+    /// The tracks page: the recording's numbers while one runs, then every saved track, newest first, a row each with its distance, time and average, a chevron to its page.
+    #[allow(clippy::too_many_arguments)]
+    fn paint_tracks(canvas: &mut Canvas, text: &mut TextRenderer, list: &mut List, font: f32, ox: f32, cw: f32, gear: (f32, f32, f32), tracks: &TracksView, recording: bool) -> Vec<(f32, f32, TrackRow)> {
+        let x0 = ox + font * 0.9;
+        let row = font * 1.6;
+        let mut y = gear.1 + gear.2 + font * 0.9 + row * 0.5;
+        let title = TextStyle::new(font, theme::TEXTBOX_TEXT);
+        let label = TextStyle::new(font * 0.72, READOUT_DIM);
+        let value = TextStyle::new(font * 0.8, READOUT);
+        let mut rows = Vec::new();
+        text.draw_text_left(canvas, "\u{2039}  Tracks", x0, y, &title, None, None);
+        rows.push((y, row * 0.5, TrackRow::Back));
+        y += row * 1.2;
+        if recording {
+            text.draw_text_left(canvas, "Recording now", x0, y, &title, None, None);
+            y += row * 0.8;
+            match &tracks.live {
+                Some(n) if n.fixes > 0 => {
+                    for (l, v) in track_lines(n) {
+                        text.draw_text_left(canvas, l, x0, y, &label, None, None);
+                        text.draw_text_left(canvas, &v, x0 + font * 5.2, y, &value, None, None);
+                        y += font * 0.95;
+                    }
+                }
+                _ => {
+                    text.draw_text_left(canvas, "Waiting for a fix", x0, y, &value, None, None);
+                    y += font * 0.95;
+                }
+            }
+            y += row * 0.4;
+        }
+        if tracks.shown.is_some() {
+            text.draw_text_left(canvas, "\u{2715}  Hide the shown track", x0, y, &value, None, None);
+            rows.push((y, row * 0.5, TrackRow::Hide));
+            y += row;
+        }
+        if tracks.tracks.is_empty() {
+            text.draw_text_left(canvas, "No saved tracks yet", x0, y, &label, None, None);
+            return rows;
+        }
+        list.set_font_size(font);
+        list.set_rows(tracks.tracks.iter().map(|t| ListRow::new(t.when.clone()).detail(track_brief(&t.numbers)).trail(Trail::Chevron)).collect());
+        list.set_selected(tracks.shown);
+        list.set_rect(ox + font * 0.3, y - row * 0.5, cw - font * 0.6, list.extent());
+        list.render_content_into(canvas, text, None, None);
+        rows
+    }
+
+    /// One saved track: when it was recorded, its numbers, then show it on the map (or take it off) and delete it.
+    #[allow(clippy::too_many_arguments)]
+    fn paint_track(canvas: &mut Canvas, text: &mut TextRenderer, pills: &mut Pills, font: f32, ox: f32, cw: f32, gear: (f32, f32, f32), tracks: &TracksView, i: usize) -> Vec<(f32, f32, TrackRow)> {
+        let x0 = ox + font * 0.9;
+        let row = font * 1.6;
+        let mut y = gear.1 + gear.2 + font * 0.9 + row * 0.5;
+        let title = TextStyle::new(font, theme::TEXTBOX_TEXT);
+        let label = TextStyle::new(font * 0.72, READOUT_DIM);
+        let value = TextStyle::new(font * 0.8, READOUT);
+        let mut rows = Vec::new();
+        let Some(t) = tracks.tracks.get(i) else { return rows };
+        text.draw_text_left(canvas, &format!("\u{2039}  {}", t.when), x0, y, &title, None, None);
+        rows.push((y, row * 0.5, TrackRow::Back));
+        y += row * 1.3;
+        for (l, v) in track_lines(&t.numbers).into_iter().chain([("Fixes", t.numbers.fixes.to_string())]) {
+            text.draw_text_left(canvas, l, x0, y, &label, None, None);
+            text.draw_text_left(canvas, &v, x0 + font * 5.2, y, &value, None, None);
+            y += font * 0.95;
+        }
+        y += row * 0.6;
+        let shown = tracks.shown == Some(i);
+        let actions = [if shown { ("\u{2715}  Hide from map", TrackRow::Hide) } else { ("\u{25cb}  Show on map", TrackRow::Show) }, ("\u{2715}  Delete", TrackRow::Delete)];
+        let _ = cw;
+        for (l, r) in actions {
+            pills.draw_fit(canvas, text, x0, y, l, false, font * 0.85, None);
             rows.push((y, row * 0.5, r));
             y += row;
         }

@@ -127,7 +127,7 @@ fn main() {
     let overlay = map.overlay(w, h, true).to_vec();
     // MAHERE_PANEL=1 lays the open control panel over the GPU frame (the CPU frame has none, so the diff below is then meaningless).
     let panel_mode = std::env::var("MAHERE_PANEL").unwrap_or_default();
-    if panel_mode == "1" || panel_mode == "closed" || panel_mode == "themes" || panel_mode == "pen" || panel_mode == "areas" || panel_mode == "area" || panel_mode == "updates" {
+    if panel_mode == "1" || panel_mode == "closed" || panel_mode == "themes" || panel_mode == "pen" || panel_mode == "areas" || panel_mode == "area" || panel_mode == "updates" || panel_mode == "tracks" || panel_mode == "track" {
         let mut panel = mahere_panel::Panel::new();
         // MAHERE_TOOLBOX=1 shows the toolbox's list open.
         if std::env::var_os("MAHERE_TOOLBOX").is_some() {
@@ -145,6 +145,7 @@ fn main() {
         }
         let mut controls = mahere_panel::Controls::default();
         controls.pen_rgba = [230, 40, 40, 160];
+        controls.record = panel_mode == "tracks";
         if panel_mode == "pen" {
             panel.show_pen(controls.pen_rgba);
         }
@@ -163,6 +164,14 @@ fn main() {
                 panel.show_area(1, 12);
                 panel.pop_page();
             }
+        }
+        // MAHERE_PANEL=tracks lists two made-up tracks with a recording running and the first on the map; =track opens the first.
+        if panel_mode == "tracks" || panel_mode == "track" {
+            let walk = mahere_panel::TrackNumbers { metres: 8_420.0, seconds: 3.0 * 3600.0 + 12.0 * 60.0, moving_s: 2.0 * 3600.0 + 41.0 * 60.0, max_ms: 1.9, climb_m: 612.0, descent_m: 598.0, fixes: 11_520 };
+            let ride = mahere_panel::TrackNumbers { metres: 31_900.0, seconds: 5_100.0, moving_s: 4_700.0, max_ms: 13.4, climb_m: 280.0, descent_m: 301.0, fixes: 5_100 };
+            let live = mahere_panel::TrackNumbers { metres: 1_240.0, seconds: 1_380.0, moving_s: 1_150.0, max_ms: 1.6, climb_m: 64.0, descent_m: 8.0, fixes: 1_380 };
+            panel.set_tracks(mahere_panel::TracksView { tracks: vec![mahere_panel::TrackView { when: "2026-11-20  09:14".into(), numbers: walk }, mahere_panel::TrackView { when: "2026-11-18  16:02".into(), numbers: ride }], live: Some(live), shown: Some(0) });
+            panel.show_tracks((panel_mode == "track").then_some(0));
         }
         // MAHERE_PANEL=updates opens the Updates page with a made-up state: a release to get, dev current, a download part way.
         if panel_mode == "updates" {

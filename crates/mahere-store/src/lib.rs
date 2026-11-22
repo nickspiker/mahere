@@ -383,6 +383,10 @@ impl TrackRecorder {
         let fixes = std::mem::take(&mut self.buf);
         let Some(doc) = chunk_doc(&fixes) else { return };
         if self.store.write_device(&track_chunk_key(self.start, self.chunk), &doc).is_ok() {
+            // A track enters the index with its first chunk: a recording stopped before a fix leaves nothing to list.
+            if self.chunk == 0 {
+                index_track(&self.store, self.start);
+            }
             self.chunk += 1;
             // VSF all the way down: the counter is a u, not naked LE bytes.
             let _ = self.store.write_device(&track_count_key(self.start), &VsfType::u(self.chunk as usize, false).flatten());
@@ -433,6 +437,233 @@ pub fn track_chunks(store: &FlatStorage, start: i64) -> Option<u32> {
     let mut ptr = 0usize;
     let v = vsf::parse(&bytes, &mut ptr).ok()?;
     v.as_u64().and_then(|n| u32::try_from(n).ok())
+}
+
+fn track_index_key() -> String {
+    vault_key(&[name("track"), name("index")])
+}
+
+fn track_recovered_key() -> String {
+    vault_key(&[name("track"), name("recovered")])
+}
+
+/// Every recorded track by its start (Eagle Time, its identity), oldest first: the index the recorder keeps (Nick 2026-11-21: a track "doesn't save to map and disappears when you're done"; the vault keys are hashes, so without it no track could be found again).
+pub fn tracks(store: &FlatStorage) -> Vec<i64> {
+    let Some(b) = store.read_device(&track_index_key()).ok().flatten() else { return Vec::new() };
+    let Ok((header, end)) = vsf::VsfHeader::decode(&b) else { return Vec::new() };
+    let Ok(sections) = header.sections(&b, end) else { return Vec::new() };
+    let mut out: Vec<i64> = sections
+        .into_iter()
+        .filter(|s| s.name == "tracks")
+        .flat_map(|s| s.fields)
+        .filter(|f| f.name == "start")
+        .flat_map(|f| f.values)
+        .filter_map(|v| match v {
+            VsfType::e(EtType::e6(t)) => Some(t),
+            _ => None,
+        })
+        .collect();
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+fn write_track_index(store: &FlatStorage, starts: &[i64]) {
+    // The starts as one field of many values, never a field a track.
+    let mut s = vsf::VsfSection::new("tracks");
+    s.add_field_multi("start", starts.iter().map(|&t| VsfType::e(EtType::e6(t))).collect());
+    if let Ok(b) = VsfBuilder::new().add_section_direct(s).build() {
+        let _ = store.write_device(&track_index_key(), &b);
+    }
+}
+
+fn index_track(store: &FlatStorage, start: i64) {
+    let mut starts = tracks(store);
+    if !starts.contains(&start) {
+        starts.push(start);
+        starts.sort_unstable();
+        write_track_index(store, &starts);
+    }
+}
+
+impl Fix {
+    /// Where the fix is, latitude and longitude.
+    pub fn lat_lon(&self) -> (f64, f64) {
+        mahere_coord::Coord::from_raw(self.coord).to_lat_lon()
+    }
+}
+
+/// An Eagle Time as UNIX seconds, for showing a date to a person and nothing else (the platform's clock and time zone count in them).
+pub fn display_unix_secs(et: i64) -> i64 {
+    vsf::types::eagle_time::to_unix_ns(et).0
+}
+
+/// A recorded track's fixes, every chunk in order.
+pub fn track_fixes(store: &FlatStorage, start: i64) -> Vec<Fix> {
+    (0..track_chunks(store, start).unwrap_or(0)).filter_map(|c| track_chunk(store, start, c)).flatten().collect()
+}
+
+/// A recorded track gone: its chunks, its count and its place in the index.
+pub fn delete_track(store: &FlatStorage, start: i64) {
+    let mut keys: Vec<String> = (0..track_chunks(store, start).unwrap_or(0)).map(|c| track_chunk_key(start, c)).collect();
+    keys.push(track_count_key(start));
+    let _ = store.delete_device_batch(&keys);
+    let starts: Vec<i64> = tracks(store).into_iter().filter(|&s| s != start).collect();
+    write_track_index(store, &starts);
+}
+
+/// A track written whole from its fixes, under a start of its own: chunks, count and index, as the recorder would have written it.
+fn write_track(store: &FlatStorage, start: i64, fixes: &[Fix]) -> bool {
+    let mut n = 0u32;
+    for part in fixes.chunks(CHUNK_FIXES) {
+        let Some(doc) = chunk_doc(part) else { return false };
+        if store.write_device(&track_chunk_key(start, n), &doc).is_err() {
+            return false;
+        }
+        n += 1;
+    }
+    let _ = store.write_device(&track_count_key(start), &VsfType::u(n as usize, false).flatten());
+    index_track(store, start);
+    true
+}
+
+/// Recordings made before the index (to 2026-11-21) found again, once: every chunk in the vault that is a chunk of fixes and holds no fix an indexed track has, grouped into tracks where a fix follows the last within half an hour, each written as a track of its own under its first fix's time. Reads the whole vault, so it runs once (its marker in the vault) and off the interface's thread. The tracks found.
+pub fn recover_tracks(store: &FlatStorage) -> usize {
+    if matches!(store.read_device(&track_recovered_key()), Ok(Some(_))) {
+        return 0;
+    }
+    let mut known: Vec<i64> = tracks(store).into_iter().flat_map(|s| track_fixes(store, s)).map(|f| f.et).collect();
+    known.sort_unstable();
+    let mut chunks: Vec<Vec<Fix>> = Vec::new();
+    for addr in store.live_addrs().unwrap_or_default() {
+        let Ok(Some(b)) = store.read_device_addr(&addr) else { continue };
+        let fixes = if b.starts_with("RÅ<".as_bytes()) {
+            chunk_fixes(&b, false)
+        } else if b.starts_with(&[0x28, 0xB5, 0x2F, 0xFD]) {
+            zstd::decode_all(&b[..]).ok().and_then(|p| chunk_fixes(&p, true))
+        } else {
+            None
+        };
+        if let Some(f) = fixes.filter(|f| !f.is_empty() && known.binary_search(&f[0].et).is_err()) {
+            chunks.push(f);
+        }
+    }
+    chunks.sort_by_key(|c| c[0].et);
+    let gap = 30 * 60 * vsf::types::eagle_time::OSCILLATIONS_PER_SECOND as i64;
+    let mut groups: Vec<Vec<Fix>> = Vec::new();
+    for c in chunks {
+        match groups.last_mut() {
+            Some(g) if c[0].et - g.last().unwrap().et < gap => g.extend(c),
+            _ => groups.push(c),
+        }
+    }
+    let mut found = 0;
+    for g in &mut groups {
+        g.sort_by_key(|f| f.et);
+        g.dedup_by_key(|f| f.et);
+        if write_track(store, g[0].et, g) {
+            found += 1;
+        }
+    }
+    let _ = store.write_device(&track_recovered_key(), &VsfType::u(found, false).flatten());
+    found
+}
+
+/// A track's numbers (Nick 2026-11-21: "distance, time, avg speed, etc"), built a fix at a time so a recording's can grow as it goes and a saved track's are the same sum.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct TrackStats {
+    pub fixes: u32,
+    /// Eagle Time of the first and the last fix.
+    pub first_et: i64,
+    pub last_et: i64,
+    /// Ground covered: a fix counts once it is farther from the last counted place than its own accuracy, so standing still with a wandering fix adds nothing.
+    pub metres: f64,
+    /// Seconds spent moving: between fixes at walking pace or faster (half a metre a second), by the receiver's speed where it gives one.
+    pub moving_s: f64,
+    /// The fastest the receiver measured, metres a second.
+    pub max_ms: f32,
+    /// Height gained and lost, counted in steps of CLIMB_STEP_M so the receiver's vertical wander is not climbed.
+    pub climb_m: f32,
+    pub descent_m: f32,
+    anchor: Option<(f64, f64)>,
+    last: Option<(f64, f64, i64)>,
+    level: Option<f32>,
+}
+
+/// The step a height must change by to count as climbed or descended: a phone's height wanders by several metres standing still.
+const CLIMB_STEP_M: f32 = (1 << 3) as f32;
+/// Walking pace, the least speed that counts as moving.
+const MOVING_MS: f64 = 1. / ((1 << 1) as f64);
+
+impl TrackStats {
+    pub fn of(fixes: &[Fix]) -> TrackStats {
+        let mut s = TrackStats::default();
+        for f in fixes {
+            s.push(f);
+        }
+        s
+    }
+
+    /// Seconds from the first fix to the last.
+    pub fn seconds(&self) -> f64 {
+        (self.last_et - self.first_et) as f64 / vsf::types::eagle_time::OSCILLATIONS_PER_SECOND as f64
+    }
+
+    pub fn push(&mut self, f: &Fix) {
+        let here = mahere_coord::Coord::from_raw(f.coord).to_lat_lon();
+        if self.fixes == 0 {
+            self.first_et = f.et;
+        }
+        self.fixes += 1;
+        self.last_et = f.et;
+        match self.anchor {
+            None => self.anchor = Some(here),
+            Some(a) => {
+                let d = metres_between(a, here);
+                if d > f.accuracy_m as f64 {
+                    self.metres += d;
+                    self.anchor = Some(here);
+                }
+            }
+        }
+        if let Some((lat, lon, et)) = self.last {
+            let dt = (f.et - et) as f64 / vsf::types::eagle_time::OSCILLATIONS_PER_SECOND as f64;
+            let speed = match f.speed_ms {
+                Some(s) => s as f64,
+                None if dt > 0.0 => metres_between((lat, lon), here) / dt,
+                None => 0.0,
+            };
+            if speed >= MOVING_MS && dt > 0.0 {
+                self.moving_s += dt;
+            }
+        }
+        self.last = Some((here.0, here.1, f.et));
+        if let Some(s) = f.speed_ms {
+            self.max_ms = self.max_ms.max(s);
+        }
+        if let Some(h) = f.height_m {
+            match self.level {
+                None => self.level = Some(h),
+                Some(l) if h - l >= CLIMB_STEP_M => {
+                    self.climb_m += h - l;
+                    self.level = Some(h);
+                }
+                Some(l) if l - h >= CLIMB_STEP_M => {
+                    self.descent_m += l - h;
+                    self.level = Some(h);
+                }
+                Some(_) => {}
+            }
+        }
+    }
+}
+
+/// Metres between two places on the sphere (haversine), plenty for a walk's steps.
+fn metres_between(a: (f64, f64), b: (f64, f64)) -> f64 {
+    let (la1, la2) = (a.0.to_radians(), b.0.to_radians());
+    let (dla, dlo) = (la2 - la1, (b.1 - a.1).to_radians());
+    let h = (dla / 2.0).sin().powi(2) + la1.cos() * la2.cos() * (dlo / 2.0).sin().powi(2);
+    2.0 * 6_371_000.0 * h.sqrt().asin()
 }
 
 #[cfg(test)]
@@ -523,6 +754,20 @@ mod tests {
         assert_eq!((fixes[0].coord, fixes[0].et, fixes[0].accuracy_m), (7, et_of_unix_ms(1_791_900_000_000), 3.5));
         assert!(store2.read_device(&track_chunk_key(key, 9)).unwrap().unwrap().starts_with("RÅ<".as_bytes()), "rewritten as VSF");
         assert_eq!(track_chunk(&store2, key, 9), Some(fixes));
+
+        // The recorded track is in the index and reads back whole; a recording from before the index is found once, as a track of its own under its first fix; a deleted track leaves the index and its chunks.
+        assert_eq!(tracks(&store2), vec![key]);
+        assert_eq!(track_fixes(&store2, key).len(), 200);
+        let lost: Vec<Fix> = (0..3).map(|i| Fix { coord: mahere_coord::Coord::from_lat_lon(47.0, -121.0 + i as f64 * 1e-4).raw(), et: et_of_unix_ms(1_700_000_000_000 + i * 1000), height_m: None, accuracy_m: 4.0, v_accuracy_m: None, speed_ms: Some(1.0), bearing_deg: None }).collect();
+        store2.write_device(&track_chunk_key(12345, 0), &chunk_doc(&lost).unwrap()).unwrap();
+        assert_eq!(recover_tracks(&store2), 1);
+        assert_eq!(recover_tracks(&store2), 0, "once");
+        let first = lost[0].et;
+        assert!(tracks(&store2).contains(&first));
+        assert_eq!(track_fixes(&store2, first), lost);
+        delete_track(&store2, first);
+        assert_eq!(tracks(&store2), vec![key]);
+        assert!(track_fixes(&store2, first).is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
@@ -1296,5 +1541,27 @@ impl mahere_engine::geocode::DocStore for VaultDocs {
             let _ = v.write_device(&Self::key(path), &b);
         }
         Some(b)
+    }
+}
+
+#[cfg(test)]
+mod track_stats_tests {
+    use super::*;
+
+    /// A walk due east, a fix every 4 s, 8 m apart (2 m/s), climbing 2 m a fix, with a minute standing still at the end whose fixes wander a metre: 40 steps are 320 m and 160 s moving, the climb counted in whole steps, the standing adds no distance and no moving time.
+    #[test]
+    fn a_walk_sums_as_walked() {
+        let osc = vsf::types::eagle_time::OSCILLATIONS_PER_SECOND as i64;
+        let m_per_deg_lon = 111_320.0 * 47f64.to_radians().cos();
+        let fix = |i: i64, east_m: f64, h: f32, speed: f32| Fix { coord: mahere_coord::Coord::from_lat_lon(47.0, -121.0 + east_m / m_per_deg_lon).raw(), et: i * 4 * osc, height_m: Some(h), accuracy_m: 3.0, v_accuracy_m: None, speed_ms: Some(speed), bearing_deg: None };
+        let mut fixes: Vec<Fix> = (0..=40).map(|i| fix(i, i as f64 * 8.0, i as f32 * 2.0, 2.0)).collect();
+        fixes.extend((41..=55).map(|i| fix(i, 320.0 + (i % 2) as f64, 80.0, 0.1)));
+        let s = TrackStats::of(&fixes);
+        assert_eq!(s.fixes, 56);
+        assert!((s.metres - 320.0).abs() < 1.0, "{}", s.metres);
+        assert!((s.moving_s - 160.0).abs() < 1e-6, "{}", s.moving_s);
+        assert!((s.seconds() - 220.0).abs() < 1e-6);
+        assert_eq!(s.max_ms, 2.0);
+        assert_eq!((s.climb_m, s.descent_m), (80.0, 0.0));
     }
 }

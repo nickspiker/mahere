@@ -86,6 +86,11 @@ pub struct DeviceApp<G: MapGpu = NoGpu> {
     /// Recording a track (Nick 2026-10-13): fixes go to the recorder only while this is on, and the activity runs the track service, which owns the GPS meanwhile.
     pub recording: bool,
     pub fixes_since_save: u32,
+    /// The recorded tracks (Nick 2026-11-21: a track "doesn't save to map and disappears when you're done... no data for the track"): the saved ones newest first with their numbers, the recording's numbers as it grows, the saved one drawn on the map, and a list a background load has made ready.
+    pub tracks: Vec<(i64, mahere_store::TrackStats)>,
+    pub track_live: mahere_store::TrackStats,
+    pub track_shown: Option<i64>,
+    pub tracks_fresh: std::sync::Arc<std::sync::Mutex<Option<Vec<(i64, mahere_store::TrackStats)>>>>,
     pub persist: Persist,
     /// The GPU path, created on the first draw; None after a failure means the CPU present is in use.
     pub gpu: Option<G>,
@@ -372,12 +377,19 @@ impl<G: MapGpu> DeviceApp<G> {
         self.map.set_track_colour(ctl.track_rgba);
         if ctl.record != self.recording {
             self.recording = ctl.record;
-            // The track drawn is the one being recorded: a recording starts with none, and stopping takes it away.
-            self.map.track_clear();
-            // Each recording a track of its own.
-            if let (true, Some(rec)) = (self.recording, &self.recorder) {
+            if let Some(rec) = &self.recorder {
                 let rec = rec.clone();
-                self.persist.run(move || rec.lock().unwrap().begin());
+                if self.recording {
+                    // A recording starts on a clear map, a track of its own.
+                    self.map.track_clear();
+                    self.track_live = Default::default();
+                    self.track_shown = None;
+                    self.persist.run(move || rec.lock().unwrap().begin());
+                } else {
+                    // Stopping keeps the track drawn and its numbers shown, writes its last fixes, and lists it with the saved ones.
+                    self.persist.run(move || rec.lock().unwrap().flush());
+                    self.reload_tracks(false);
+                }
             }
         }
         self.map.set_tool(match ctl.tool {
@@ -496,6 +508,87 @@ impl<G: MapGpu> DeviceApp<G> {
                     }
                 }
                 AreaAct::Delete(i) => self.areas.delete(i),
+            }
+        }
+    }
+
+    /// The saved tracks read again off the interface's thread, after whatever the persist queue holds (a stopped recording's last chunk); with `recover`, recordings from before the track index found first (once, its marker in the vault). The list lands in `tracks_fresh` for the next frame.
+    pub fn reload_tracks(&mut self, recover: bool) {
+        let (Some(store), fresh) = (self.store.clone(), self.tracks_fresh.clone()) else { return };
+        self.persist.run(move || {
+            if recover {
+                let n = mahere_store::recover_tracks(&store);
+                if n > 0 {
+                    eprintln!("tracks: {n} recordings from before the index found again");
+                }
+            }
+            let mut list: Vec<(i64, mahere_store::TrackStats)> = mahere_store::tracks(&store).into_iter().map(|s| (s, mahere_store::TrackStats::of(&mahere_store::track_fixes(&store, s)))).filter(|(_, st)| st.fixes > 0).collect();
+            list.reverse();
+            *fresh.lock().unwrap() = Some(list);
+        });
+    }
+
+    /// Fixes the recorder was handed, counted into the recording's numbers.
+    pub fn count_fixes(&mut self, fixes: &[mahere_store::Fix]) {
+        for f in fixes {
+            self.track_live.push(f);
+        }
+    }
+
+    /// The tracks as the panel shows them, taken from a finished background load when there is one. Every frame, on either draw path.
+    pub fn sync_tracks(&mut self) {
+        if let Some(list) = self.tracks_fresh.lock().unwrap().take() {
+            self.tracks = list;
+        }
+        let numbers = |s: &mahere_store::TrackStats| mahere_panel::TrackNumbers { metres: s.metres, seconds: s.seconds(), moving_s: s.moving_s, max_ms: s.max_ms, climb_m: s.climb_m, descent_m: s.descent_m, fixes: s.fixes };
+        let view = mahere_panel::TracksView {
+            tracks: self.tracks.iter().map(|(start, s)| mahere_panel::TrackView { when: when_text(*start), numbers: numbers(s) }).collect(),
+            live: self.recording.then(|| numbers(&self.track_live)),
+            shown: self.track_shown.and_then(|t| self.tracks.iter().position(|(s, _)| *s == t)),
+        };
+        self.panel.set_tracks(view);
+    }
+
+    /// What the tracks pages asked: a saved track drawn and framed, taken off, or deleted.
+    pub fn apply_track_acts(&mut self) {
+        use mahere_panel::TrackAct;
+        for act in self.panel.take_track_acts() {
+            match act {
+                TrackAct::Show(i) => {
+                    let (Some(store), Some(&(start, _))) = (&self.store, self.tracks.get(i)) else { continue };
+                    let pts: Vec<(f64, f64)> = mahere_store::track_fixes(store, start).iter().map(mahere_store::Fix::lat_lon).collect();
+                    if pts.is_empty() {
+                        continue;
+                    }
+                    self.map.track_clear();
+                    for &(lat, lon) in &pts {
+                        self.map.track_push(lat, lon);
+                    }
+                    self.track_shown = Some(start);
+                    // Framed: the track's box at the middle, as near as both its height and its width fit with an eighth to spare (the smaller scale of the two is the one where both fit).
+                    let b = pts.iter().fold((90.0f64, 180.0f64, -90.0f64, -180.0f64), |b, &(la, lo)| (b.0.min(la), b.1.min(lo), b.2.max(la), b.3.max(lo)));
+                    let (lat, lon) = ((b.0 + b.2) / 2.0, (b.1 + b.3) / 2.0);
+                    let spare = 1. - 1. / ((1 << 3) as f64);
+                    let fit_h = self.h as f64 * spare / (b.2 - b.0);
+                    let fit_w = self.w as f64 * spare / ((b.3 - b.1) * lat.to_radians().cos());
+                    let ppd = fit_h.min(fit_w);
+                    self.map.go_to(lat, lon, ppd.is_finite().then_some(ppd), self.w, self.h);
+                }
+                TrackAct::Hide => {
+                    if !self.recording {
+                        self.map.track_clear();
+                    }
+                    self.track_shown = None;
+                }
+                TrackAct::Delete(i) => {
+                    let (Some(store), Some(&(start, _))) = (self.store.clone(), self.tracks.get(i)) else { continue };
+                    if self.track_shown == Some(start) {
+                        self.track_shown = None;
+                        self.map.track_clear();
+                    }
+                    self.tracks.remove(i);
+                    self.persist.run(move || mahere_store::delete_track(&store, start));
+                }
             }
         }
     }
@@ -620,6 +713,7 @@ impl<G: MapGpu> FluorApp for DeviceApp<G> {
                     self.apply_controls(ctl, mask);
                     self.apply_theme_edits();
                     self.apply_area_acts();
+                    self.apply_track_acts();
                 self.apply_update_acts();
                     self.apply_update_acts();
                     if self.panel.take_clear_measure() {
@@ -676,6 +770,7 @@ impl<G: MapGpu> FluorApp for DeviceApp<G> {
                     self.apply_controls(ctl, mask);
                 }
                 self.apply_area_acts();
+                self.apply_track_acts();
                 self.apply_update_acts();
                 if std::mem::take(&mut self.close_on_lift) {
                     if !self.pinched && self.travel < 12.0 {
@@ -715,6 +810,7 @@ impl<G: MapGpu> FluorApp for DeviceApp<G> {
                     self.apply_controls(ctl, mask);
                     self.apply_theme_edits();
                     self.apply_area_acts();
+                    self.apply_track_acts();
                 self.apply_update_acts();
                     self.apply_update_acts();
                     self.last_cursor = (x, y);
@@ -845,6 +941,7 @@ impl<G: MapGpu> FluorApp for DeviceApp<G> {
         let cache = self.cache_stats();
         let readouts = Readouts { lat: c.lat(), lon: c.lon(), gps_height: self.map.gps_sea_level(), elev: self.map.elevation_at(c.lat(), c.lon()), heading_deg: heading, m_per_px: 111_320.0 / c.ppd, frame_ms: self.map.last_frame_ms, resident: self.map.pool().map.len(), phone_heading: self.map.have_rotation.then(|| self.map.true_heading()), cache_used: cache.0, cache_max: cache.1, has_fix: self.map.gps.is_some(), contour_major_m: self.map.contour_major() };
         let measure = self.map.measure_view(w, h, Panel::strip_samples(w));
+        self.sync_tracks();
         let (mask, ctl, areas) = (self.map.layers(), self.controls(), self.areas.view(self.map.user.has_selection()));
         let map = &self.map;
         let orb = |n: usize| map.orb(n);
@@ -1009,6 +1106,10 @@ impl<G: MapGpu> DeviceApp<G> {
             recorder,
             recording: settings.is_some_and(|s| s.record),
             fixes_since_save: 0,
+            tracks: Vec::new(),
+            track_live: Default::default(),
+            track_shown: None,
+            tracks_fresh: Default::default(),
             persist: Persist::new(),
             gpu: None,
             gpu_failed: false,
@@ -1044,6 +1145,34 @@ impl<G: MapGpu> DeviceApp<G> {
         app.panel.set_fonts(app.fonts.clone());
         // The CPU path's lettering in the faces the packs bring, as the GPU host's.
         app.labeller.set_fonts(app.fonts.clone());
+        // The saved tracks listed, recordings from before the list found first.
+        app.reload_tracks(true);
         app
     }
+}
+
+/// When a track began, for a person to read: the phone's own date and time where it keeps a time zone (Android), else UTC said so. Display only: the track itself is keyed by its Eagle Time.
+fn when_text(et: i64) -> String {
+    let secs = mahere_store::display_unix_secs(et);
+    #[cfg(target_os = "android")]
+    {
+        let t = secs as libc::time_t;
+        // SAFETY: localtime_r writes only the tm it is handed, which lives on this stack for the call.
+        let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+        if !unsafe { libc::localtime_r(&t, &mut tm) }.is_null() {
+            return format!("{:04}-{:02}-{:02}  {:02}:{:02}", tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday, tm.tm_hour, tm.tm_min);
+        }
+    }
+    // The civil date from a count of days (Howard Hinnant's days_from_civil, inverted).
+    let (days, rem) = (secs.div_euclid(86_400), secs.rem_euclid(86_400));
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + (m <= 2) as i64;
+    format!("{y:04}-{m:02}-{d:02}  {:02}:{:02} UTC", rem / 3600, rem % 3600 / 60)
 }

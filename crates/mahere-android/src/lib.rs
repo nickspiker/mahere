@@ -172,6 +172,7 @@ pub extern "system" fn Java_nz_mahere_app_MahereActivity_nativeDraw(
         if let Some(p) = app.updater.take_ready() {
             app.install = Some(p.to_string_lossy().into_owned());
         }
+        app.sync_tracks();
         let areas = app.areas.view(app.map.user.has_selection());
         let AndroidApp { gpu: Some(g), map, panel, w, h, .. } = app else {
             return shell(ptr).draw(&window) as jboolean;
@@ -630,6 +631,7 @@ pub extern "system" fn Java_nz_mahere_app_MahereTrackService_nativeOnTrackFixes<
             let fixes: Vec<mahere_store::Fix> = (0..n)
                 .map(|i| mahere_store::Fix { coord: mahere_coord::Coord::from_lat_lon(la[i], lo[i]).raw(), et: mahere_store::et_of_unix_ms(tm[i]), height_m: ht[i].is_finite().then_some(ht[i] as f32), accuracy_m: ac[i], v_accuracy_m: some(va[i]), speed_ms: some(sp[i]), bearing_deg: some(be[i]) })
                 .collect();
+            app.count_fixes(&fixes);
             app.persist.run(move || {
                 let mut r = rec.lock().unwrap();
                 for f in fixes {
