@@ -33,3 +33,5 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_os, values("ferros"
 # The machine's own device secret and the session Photon leaves for the stack's apps (a desktop's vault and its person, 2026-10-22).
 [target.'cfg(not(any(target_os = "android", target_os = "ferros")))'.dependencies]
 tohu = { version = "0.0.3" }
+# The fleet: device key, fleet key recovery and the fleet-shared state Photon's settings ride (sync.rs).
+fgtw = { version = "0.0.2" }

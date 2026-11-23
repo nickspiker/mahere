@@ -14,6 +14,8 @@ use vsf::VsfType;
 mod cells;
 mod store;
 pub use store::Store;
+#[cfg(not(any(target_os = "android", target_os = "ferros")))]
+pub mod sync;
 pub use cells::{VaultCellLayer, VaultCells};
 
 /// Tests that open a vault take this first: kete's vault directory is one setting for the process, and two tests pointing it at their own directories at once open each other's vaults.
