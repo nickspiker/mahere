@@ -437,12 +437,15 @@ struct Room {
     cols: usize,
     rows: usize,
     taken: Vec<bool>,
+    /// The globe's disk on the screen (centre and radius, pixels): a letter whose centre lies off it is no place for a label. A label is kept as a point on the globe at its letters' middle, and a middle off the globe has no such point, so it was redrawn somewhere else, onto its neighbours, wherever names crowded the limb (2026-11-22, the Pro's globe: Bogotá over Ciudad de México, Shanghai over Chongqing).
+    disk: (f32, f32, f32),
 }
 
 impl Room {
-    fn new(w: usize, h: usize) -> Room {
+    fn new(w: usize, h: usize, cam: &mahere_engine::Camera) -> Room {
         let (cols, rows) = ((w as f32 / GRID).ceil() as usize + 1, (h as f32 / GRID).ceil() as usize + 1);
-        Room { cols, rows, taken: vec![false; cols * rows] }
+        let (cx, cy) = mahere_engine::Camera::centre(w, h);
+        Room { cols, rows, taken: vec![false; cols * rows], disk: (cx as f32, cy as f32, cam.radius() as f32) }
     }
 
     fn cells(&self, b: [f32; 4]) -> Option<(usize, usize, usize, usize)> {
@@ -462,6 +465,11 @@ impl Room {
         let (w, h) = ((self.cols - 1) as f32 * GRID, (self.rows - 1) as f32 * GRID);
         boxes.iter().all(|&b| {
             if b[0] < 0.0 || b[1] < 0.0 || b[2] > w || b[3] > h {
+                return false;
+            }
+            // Every letter on the globe (the disk is round, so then the label's middle is too).
+            let (dx, dy) = ((b[0] + b[2]) * 0.5 - self.disk.0, (b[1] + b[3]) * 0.5 - self.disk.1);
+            if dx * dx + dy * dy > self.disk.2 * self.disk.2 {
                 return false;
             }
             let Some((x0, y0, x1, y1)) = self.cells(b) else { return true };
@@ -1110,7 +1118,7 @@ impl Letterer {
                 *e = (e.0.min((lo as f32 + 1.0).ln()), e.1.max((hi as f32 + 1.0).ln()));
             }
         }
-        let mut room = Room::new(w, h);
+        let mut room = Room::new(w, h, cam);
         let mut out = Vec::new();
         let pad = font * self.look[3];
         for (_, _, _, _, n, shape) in todo {

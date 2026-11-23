@@ -23,7 +23,13 @@ fn main() {
     let (lat, lon, ppd) = (num(1, 46.25), num(2, -122.14), num(3, 20000.0));
     let out = args.get(4).cloned().unwrap_or_else(|| "/tmp/claude-1000/gpu_check".into());
     let bearing = std::env::var("MAHERE_BEARING").ok().and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0).to_radians();
-    let (w, h) = (1024usize, 768usize);
+    // MAHERE_SIZE=WxH renders a phone's frame (the Pixel 8 Pro 1344x2992, the 8a 1080x2400), 1024x768 without it.
+    let (w, h) = std::env::var("MAHERE_SIZE").ok().and_then(|s| s.split_once('x').and_then(|(a, b)| Some((a.parse().ok()?, b.parse().ok()?)))).unwrap_or((1024usize, 768usize));
+    // MAHERE_SAFE=cx,cy,r is ferros's safe circle (the display's word, WINDOWS.md "Drawn under the controls"): the panel lays out round it, and the written frame has the system's corners, outside the circle, washed red so what lies under them shows.
+    let safe: Option<(f32, f32, f32)> = std::env::var("MAHERE_SAFE").ok().map(|s| {
+        let v: Vec<f32> = s.split(',').map(|x| x.parse().unwrap()).collect();
+        (v[0], v[1], v[2])
+    });
 
     let cells = std::env::var("MAHERE_CELLS").unwrap_or_else(|_| "data/cells".into());
     // A published directory (base/, img/, nir/) is read by layer, as the bucket serves it; a baked one as it is.
@@ -36,6 +42,10 @@ fn main() {
     } else {
         MapCore::new(Arc::new(DirStore(root)), Camera::new(lat, lon, ppd, bearing))
     };
+    // The compass, the heading and the zoom below the safe circle's edge over their column, as the ferros shell sets them.
+    if let Some((cx, cy, r)) = safe {
+        map.marks_top = mahere_panel::SafeCircle { cx, cy, r }.top_at(mahere_engine::MapCore::marks_left(w, h));
+    }
     // MAHERE_THEME=n picks a built-in theme (its layers first, MAHERE_LAYERS over them).
     if let Some(t) = std::env::var("MAHERE_THEME").ok().and_then(|s| s.parse::<usize>().ok()) {
         map.set_theme(t);
@@ -129,6 +139,10 @@ fn main() {
     let panel_mode = std::env::var("MAHERE_PANEL").unwrap_or_default();
     if panel_mode == "1" || panel_mode == "closed" || panel_mode == "themes" || panel_mode == "pen" || panel_mode == "areas" || panel_mode == "area" || panel_mode == "updates" || panel_mode == "tracks" || panel_mode == "track" {
         let mut panel = mahere_panel::Panel::new();
+        if let Some((cx, cy, r)) = safe {
+            let c = mahere_panel::SafeCircle { cx, cy, r };
+            panel.set_safe(Some(c));
+        }
         // MAHERE_TOOLBOX=1 shows the toolbox's list open.
         if std::env::var_os("MAHERE_TOOLBOX").is_some() {
             panel.show_toolbox();
@@ -339,7 +353,15 @@ fn main() {
         labeller.draw_cpu(&mut cpu, &map.cam, w, h);
     }
     write_png(&format!("{out}_cpu.png"), w, h, |i| [(cpu[i] >> 16) as u8, (cpu[i] >> 8) as u8, cpu[i] as u8]);
-    write_png(&format!("{out}_gpu.png"), w, h, |i| [(gpu_px[i] >> 16) as u8, (gpu_px[i] >> 8) as u8, gpu_px[i] as u8]);
+    let wash = |i: usize, p: [u8; 3]| -> [u8; 3] {
+        let Some((cx, cy, r)) = safe else { return p };
+        let (x, y) = ((i % w) as f32 + 0.5, (i / w) as f32 + 0.5);
+        if (x - cx).powi(2) + (y - cy).powi(2) <= r * r {
+            return p;
+        }
+        [p[0] / 2 + 128, p[1] / 2, p[2] / 2]
+    };
+    write_png(&format!("{out}_gpu.png"), w, h, |i| wash(i, [(gpu_px[i] >> 16) as u8, (gpu_px[i] >> 8) as u8, gpu_px[i] as u8]));
     println!("wrote {out}_cpu.png and {out}_gpu.png");
 }
 

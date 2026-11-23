@@ -2219,46 +2219,58 @@ impl MapCore {
     }
 
     /// North arrow, top-right, with the view's heading below it: degrees the screen's up is turned from true north, clockwise positive, -180..180. No letters.
+    /// The compass's scale: the screen's span (the harmonic mean of its sides) over that of the 1024 x 768 window it was drawn for, so it is the same share of every screen (the Pro's 1344 x 2992 drew it a speck, 2026-11-22).
+    fn marks_scale(w: usize, h: usize) -> f32 {
+        const SPAN: f32 = ((1 << 10) - (1 << 7)) as f32;
+        2.0 * (w * h) as f32 / (w + h).max(1) as f32 / SPAN
+    }
+
+    /// The left edge of the compass's column (its barbs at their widest), pixels: where a host measures how far down its own controls push the marks ([`Self::marks_top`]).
+    pub fn marks_left(w: usize, h: usize) -> f32 {
+        w as f32 - 92.0 * Self::marks_scale(w, h)
+    }
+
     fn draw_compass(&mut self, w: usize, h: usize) {
-        if w < 120 || (h as f32) < 160.0 + self.marks_top {
+        let s = Self::marks_scale(w, h);
+        if (w as f32) < 120.0 * s || (h as f32) < 160.0 * s + self.marks_top {
             return;
         }
         const INK: [u8; 3] = [236, 238, 244];
-        let (cx, cy) = (w as f32 - 46.0, 78.0 + self.marks_top);
+        let (cx, cy) = (w as f32 - 46.0 * s, 78.0 * s + self.marks_top);
         // Screen direction of true north: up = (sin B, cos B) in east/north, so north on screen is (-sin B, -cos B) in (x right, y down).
         let (sb, cb) = self.cam.bearing().sin_cos();
         let (nx, ny) = (-(sb as f32), -(cb as f32));
-        let len = 26.0;
+        let len = 26.0 * s;
         let (tx, ty) = (cx + nx * len, cy + ny * len);
         let (bx, by) = (cx - nx * len * 0.6, cy - ny * len * 0.6);
-        self.seg(w, h, bx, by, tx, ty, 1.4, INK);
+        self.seg(w, h, bx, by, tx, ty, 1.4 * s, INK);
         // Arrow head: two barbs back from the tip.
         let (px, py) = (-ny, nx);
         for sgn in [-1.0f32, 1.0] {
-            let hx = tx - nx * 9.0 + px * sgn * 6.0;
-            let hy = ty - ny * 9.0 + py * sgn * 6.0;
-            self.seg(w, h, tx, ty, hx, hy, 1.4, INK);
+            let hx = tx - nx * 9.0 * s + px * sgn * 6.0 * s;
+            let hy = ty - ny * 9.0 * s + py * sgn * 6.0 * s;
+            self.seg(w, h, tx, ty, hx, hy, 1.4 * s, INK);
         }
         let mut deg = self.cam.bearing().to_degrees().rem_euclid(360.0);
         if deg > 180.0 {
             deg -= 360.0;
         }
         let text = format!("{}", deg.round() as i64);
-        self.seven(w, h, &text, cx, cy + len + 30.0, 18.0, INK);
+        self.seven(w, h, &text, cx, cy + len + 30.0 * s, 18.0 * s, INK);
         // The zoom: the depth of the cells the view is drawn from, under the heading (Nick 2026-10-10: to see the level and when it changes).
         // Amber past the data (Nick 2026-10-16): the cell under the crosshair at this depth is known not to exist, on the device or in the bucket; white while it is there or still on its way.
         const AMBER: [u8; 3] = [255, 168, 0];
         let zoom_ink = if self.past_data() { AMBER } else { INK };
         let zoom = format!("z{}", self.zoom_depth());
-        self.seven(w, h, &zoom, cx, cy + len + 58.0, 18.0, zoom_ink);
+        self.seven(w, h, &zoom, cx, cy + len + 58.0 * s, 18.0 * s, zoom_ink);
         // With Detail on, its legend under the zoom: a bar in each depth's colour, the depth beside it, finest at the top.
         if self.luts.mask.debug {
             let n = raster::DETAIL_COLOURS.len();
             for (k, col) in raster::DETAIL_COLOURS.iter().enumerate().rev() {
-                let y = cy + len + 84.0 + (n - 1 - k) as f32 * 22.0;
-                self.seg(w, h, cx - 22.0, y, cx - 8.0, y, 5.0, *col);
+                let y = cy + len + 84.0 * s + (n - 1 - k) as f32 * 22.0 * s;
+                self.seg(w, h, cx - 22.0 * s, y, cx - 8.0 * s, y, 5.0 * s, *col);
                 let d = raster::DETAIL_FIRST as usize + k;
-                self.seven(w, h, &format!("{d}"), cx + 14.0, y + 7.0, 14.0, INK);
+                self.seven(w, h, &format!("{d}"), cx + 14.0 * s, y + 7.0 * s, 14.0 * s, INK);
             }
         }
     }

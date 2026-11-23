@@ -37,6 +37,22 @@ pub struct App {
     panel_pinching: bool,
 }
 
+impl App {
+    /// The panel and the corner marks laid out round the app's circle, as the view stands in it (`place_view`'s guess, then the display's word, `on_safe_area`): the orb at its top, the column, the footer and the bottom row inside it, the compass, heading and zoom below its edge (the owner, 2026-11-22: "shit overlaps like crazy").
+    fn follow_safe(&mut self) {
+        let v = mahere_engine::view();
+        let (w, h) = (self.inner.w as f32, self.inner.h as f32);
+        if !v.radius.is_finite() || w <= 0.0 {
+            return;
+        }
+        let c = mahere_panel::SafeCircle { cx: w * 0.5 + v.dx as f32, cy: h * 0.5 + v.dy as f32, r: v.radius as f32 };
+        self.inner.panel.set_safe(Some(c));
+        // The marks below the circle's edge over their column (the compass's left edge, its barbs at their widest).
+        self.inner.map.marks_top = c.top_at(mahere_engine::MapCore::marks_left(self.inner.w, self.inner.h));
+        self.inner.map.mark_dirty();
+    }
+}
+
 impl FluorApp for App {
     type UserEvent = ();
     fn title(&self) -> &str {
@@ -46,7 +62,8 @@ impl FluorApp for App {
         self.inner.init(ctx)
     }
     fn on_resize(&mut self, width: u32, height: u32, ctx: &mut Context) {
-        self.inner.on_resize(width, height, ctx)
+        self.inner.on_resize(width, height, ctx);
+        self.follow_safe();
     }
     fn on_event(&mut self, event: &fluor::event::Event, ctx: &mut Context) -> EventResponse {
         self.inner.on_event(event, ctx)
@@ -116,6 +133,7 @@ impl FluorApp for App {
         let (cx, cy, radius) = (area.cx as f64, area.cy as f64, area.r as f64);
         let moved = mahere_engine::set_view(mahere_engine::View { dx: cx - w * 0.5, dy: cy - h * 0.5, radius });
         println!("mahere: the display's safe area: centre ({cx}, {cy}), radius {radius}{}", if moved { "; the view moved to it" } else { ", where the view already was" });
+        self.follow_safe();
     }
     fn render(&mut self, target: &mut [u32], ctx: &mut Context) {
         self.inner.render(target, ctx)

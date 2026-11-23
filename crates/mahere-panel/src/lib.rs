@@ -144,6 +144,26 @@ pub fn length_text(m: f64) -> String {
     }
 }
 
+/// ferros's safe circle (the display's word, ferros WINDOWS.md "Drawn under the controls"): the app's frame is the whole glass, the system's controls float in front of its corners, and the app is the circle tangent to the camera cutout's bottom and the glass's bottom, wider than the frame (the Pixel 8 Pro's radius 1437 on a frame 1344 wide), so what is the system's is the four corners outside it. The panel keeps every control inside it (the owner, 2026-11-22: "shit overlaps like crazy"); no other host sets one.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SafeCircle {
+    pub cx: f32,
+    pub cy: f32,
+    pub r: f32,
+}
+
+impl SafeCircle {
+    /// The circle's top edge over column `x`. The circle is wider than any phone's frame (its diameter the frame's height less the cutout), so every column of the frame meets it.
+    pub fn top_at(&self, x: f32) -> f32 {
+        self.cy - (self.r * self.r - (x - self.cx) * (x - self.cx)).sqrt()
+    }
+
+    /// The circle's bottom edge over column `x`.
+    pub fn bottom_at(&self, x: f32) -> f32 {
+        self.cy + (self.r * self.r - (x - self.cx) * (x - self.cx)).sqrt()
+    }
+}
+
 /// What the readouts show.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Readouts {
@@ -756,6 +776,8 @@ pub struct Panel {
     updates: UpdatesView,
     /// Where the host draws the orb itself (a desktop's chrome, with the title beside it): the panel then lays out under it, takes a tap there as the toggle, and paints no orb of its own.
     host_orb: Option<(f32, f32, f32)>,
+    /// ferros's safe circle when the host has told one ([`Panel::set_safe`]): every control laid out inside it.
+    safe: Option<SafeCircle>,
     /// The Layers page scrolls between the orb and the footer (Nick 2026-10-11): how far, how far it can, a press on it (where it started, whether it has moved), and the band it scrolls in (top, bottom, where the footer starts).
     layers_scroll: f32,
     layers_extent: f32,
@@ -938,7 +960,7 @@ impl Panel {
         let pills = Pills::new(hits + 1000);
         let interval = Slider::new(&mut hits, 0.0, 0.0, 10.0, 10.0, 0.0);
         let text_slider = Slider::new(&mut hits, 0.0, 0.0, 10.0, 10.0, text_pos(1.0));
-        Panel { fonts: None, font_cursor: Default::default(), open: false, dirty: true, ru: 1.0, stack: vec![Page::Layers], theme_rows: Vec::new(), edit_rows: Vec::new(), edit_scroll: 0.0, edit_extent: 0.0, press: None, sliders: Vec::new(), field_vals: [0.0; 4], held: None, edits: Vec::new(), hits, shown: vec![true; LAYERS.len()], group_open: GROUPS_OPEN, group_rows: Vec::new(), tree: Vec::new(), layer_open: None, field_open: None, theme_now: None, interval, interval_held: false, text_slider, text_pending: None, ru_request: None, label_scale: 1.0, touch: false, checks, text: TextRenderer::new(), buf: Vec::new(), w: 0, h: 0, font: 16.0, gear: (0.0, 0.0, 0.0), panel_w: 0.0, theme_row: (0.0, 0.0, 0.0), slider: (0.0, 0.0, 0.0), slider_held: false, cache_max: CACHE_MIN + 1, strip_close: None, clear_measure: false, area_rows: Vec::new(), area_acts: Vec::new(), areas: AreasView::default(), update_rows: Vec::new(), update_acts: Vec::new(), updates: UpdatesView::default(), host_orb: None, layers_scroll: 0.0, layers_extent: 0.0, layers_press: None, layers_band: (0.0, 0.0), orb_icon: fluor::host::icon::Icon::from_vsf_bytes(APP_ORB_VSF).ok(), orb_scaled: (0, Vec::new()), locate_btn: None, tool_btn: None, toolbox_open: false, tool_rows: Vec::new(), pills, auto_check, travel, toolbox, marker_choice, colour_of_track: false, theme_list, area_list, search_list, track_list, tracks: TracksView::default(), tracks_version: 0, track_rows: Vec::new(), track_acts: Vec::new(), copy_btns: Vec::new(), copied: None, query: String::new(), search_box: None, query_dirty: false, search_pending: false, found: Vec::new(), picked: None, search_act: None, search_rows: Vec::new(), search_acts: Vec::new(), search_field: None, route_pills: Vec::new(), swap: false, card_top: None }
+        Panel { fonts: None, font_cursor: Default::default(), open: false, dirty: true, ru: 1.0, stack: vec![Page::Layers], theme_rows: Vec::new(), edit_rows: Vec::new(), edit_scroll: 0.0, edit_extent: 0.0, press: None, sliders: Vec::new(), field_vals: [0.0; 4], held: None, edits: Vec::new(), hits, shown: vec![true; LAYERS.len()], group_open: GROUPS_OPEN, group_rows: Vec::new(), tree: Vec::new(), layer_open: None, field_open: None, theme_now: None, interval, interval_held: false, text_slider, text_pending: None, ru_request: None, label_scale: 1.0, touch: false, checks, text: TextRenderer::new(), buf: Vec::new(), w: 0, h: 0, font: 16.0, gear: (0.0, 0.0, 0.0), panel_w: 0.0, theme_row: (0.0, 0.0, 0.0), slider: (0.0, 0.0, 0.0), slider_held: false, cache_max: CACHE_MIN + 1, strip_close: None, clear_measure: false, area_rows: Vec::new(), area_acts: Vec::new(), areas: AreasView::default(), update_rows: Vec::new(), update_acts: Vec::new(), updates: UpdatesView::default(), host_orb: None, safe: None, layers_scroll: 0.0, layers_extent: 0.0, layers_press: None, layers_band: (0.0, 0.0), orb_icon: fluor::host::icon::Icon::from_vsf_bytes(APP_ORB_VSF).ok(), orb_scaled: (0, Vec::new()), locate_btn: None, tool_btn: None, toolbox_open: false, tool_rows: Vec::new(), pills, auto_check, travel, toolbox, marker_choice, colour_of_track: false, theme_list, area_list, search_list, track_list, tracks: TracksView::default(), tracks_version: 0, track_rows: Vec::new(), track_acts: Vec::new(), copy_btns: Vec::new(), copied: None, query: String::new(), search_box: None, query_dirty: false, search_pending: false, found: Vec::new(), picked: None, search_act: None, search_rows: Vec::new(), search_acts: Vec::new(), search_field: None, route_pills: Vec::new(), swap: false, card_top: None }
     }
 
     pub fn is_open(&self) -> bool {
@@ -965,6 +987,24 @@ impl Panel {
     }
 
     /// The orb the host draws, (centre x, centre y, radius) in screen pixels, or None for the panel to draw its own.
+    /// ferros's safe circle, or None (every other host): the orb at its top, centred under the camera as every kist's is, and the column, the footer and the controls along the bottom kept inside it.
+    pub fn set_safe(&mut self, safe: Option<SafeCircle>) {
+        if self.safe != safe {
+            self.safe = safe;
+            self.dirty = true;
+        }
+    }
+
+    /// The highest row a box over columns `x0..x1` may reach and keep both its top corners inside the safe circle (0 without one). The edge falls away from the centre, so the lower of the two columns' edges is the one both corners clear.
+    fn safe_top(&self, x0: f32, x1: f32) -> f32 {
+        self.safe.map_or(0.0, |c| c.top_at(x0).max(c.top_at(x1)))
+    }
+
+    /// The lowest row a box over columns `x0..x1` may reach and keep both its bottom corners inside the safe circle (the frame's bottom without one): the higher of the two columns' edges, for the same reason.
+    fn safe_floor(&self, x0: f32, x1: f32) -> f32 {
+        self.safe.map_or(self.h as f32, |c| c.bottom_at(x0).min(c.bottom_at(x1)))
+    }
+
     pub fn set_host_orb(&mut self, orb: Option<(f32, f32, f32)>) {
         if self.host_orb != orb {
             self.host_orb = orb;
@@ -1410,15 +1450,20 @@ impl Panel {
         self.font = (unit * 0.5).max(6.0);
         let r = self.font * 1.15;
         let pad = self.font * 0.6;
-        self.gear = self.host_orb.unwrap_or((pad + r, pad + r, r));
+        // The orb in the top left, or on ferros at the safe circle's top, centred under the camera as every kist's orb is (Photon's OrbLayout).
+        self.gear = self.host_orb.unwrap_or_else(|| match self.safe {
+            Some(c) => (c.cx, c.top_at(c.cx) + pad + r, r),
+            None => (pad + r, pad + r, r),
+        });
         let r = self.gear.2;
         // The column, or the whole screen for the search (Nick 2026-10-26: "Search needs to fill the screen left/right"): its field and the places found want the width.
         self.panel_w = if self.page() == Page::Search { w as f32 } else { (self.font * 13.0).min(w as f32 * 0.7) };
         let row = self.font * 1.7;
         let x0 = self.font * 0.8;
         // The footer: the cache slider and the readouts, fixed at the bottom, the layers scrolling above it.
-        let footer_top = (h as f32 - self.font * FOOTER_LINES).max(self.gear.1 + r + row * 3.0);
-        let band_top = self.gear.1 + r + self.font * 0.5;
+        // The column's top and bottom inside the safe circle on ferros (its edge lowest over the column's outer side), the frame's own elsewhere; below the orb either way.
+        let footer_top = (self.safe_floor(0.0, self.panel_w) - self.font * FOOTER_LINES).max(self.gear.1 + r + row * 3.0);
+        let band_top = (self.gear.1 + r + self.font * 0.5).max(self.safe_top(0.0, self.panel_w) + self.font * 0.3);
         self.layers_band = (band_top, footer_top);
         let scroll = self.layers_scroll;
         // The theme row sits first, then the layers.
@@ -2052,6 +2097,7 @@ impl Panel {
             paint::circle_filled(&mut canvas, gx as isize, gy as isize, gr as isize, GEAR_BG, None, None);
         }
         let (page, rail) = (self.page(), self.rail_w());
+        let floor = self.safe_floor(0.0, w as f32);
         let mut damage = Damage::new();
         let mut canvas = Canvas::new(&mut self.buf, w, h, &mut damage);
         self.strip_close = None;
@@ -2062,11 +2108,13 @@ impl Panel {
         self.search_acts.clear();
         self.search_field = None;
         self.card_top = None;
-        let mut bottom = h as f32;
+        // The bottom row (the strip, the card, the buttons, the scale) stands on the frame's bottom, or on ferros on the safe circle's edge over the full width, clear of the helm's Back and Deck in the corners.
+        let mut bottom = floor;
+        let floor_h = bottom as usize;
         if let Some(m) = measure {
             if m.route {
                 // The way of travel and, for directions, the swap: above the card's lines, so painted before its background.
-                let top = h as f32 - Self::strip_band(&mut self.text, w, font, m) + font * 0.3;
+                let top = bottom - Self::strip_band(&mut self.text, w, font, m) + font * 0.3;
                 let (pw, ph) = (font * 3.4, font * 1.25);
                 self.travel.set_font_size(font * 0.8);
                 self.travel.set_selected(ctl.travel.max(1) as usize - 1);
@@ -2079,7 +2127,7 @@ impl Panel {
                     self.route_pills.push((r, 4));
                 }
             }
-            self.strip_close = Some(Self::paint_strip(&mut canvas, &mut self.text, &mut self.pills, w, h, font, m, &mut self.copy_btns));
+            self.strip_close = Some(Self::paint_strip(&mut canvas, &mut self.text, &mut self.pills, w, floor_h, font, m, &mut self.copy_btns));
             bottom -= Self::strip_band(&mut self.text, w, font, m);
             self.card_top = Some(bottom);
         }
