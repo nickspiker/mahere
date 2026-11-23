@@ -90,8 +90,22 @@ fetch_piece() {
         f="$STAGE/$0/$(basename "$1")"
         [ -s "$f" ] && exit 0
         url=$1
-        [ "$0" = naip ] && url=$(curl -sS "https://planetarycomputer.microsoft.com/api/sas/v1/sign?href=$1" | sed -n "s/.*\"href\":\"\([^\"]*\)\".*/\1/p")
-        curl -sS -L --retry 5 --retry-all-errors -o "$f.part" "$url" && mv "$f.part" "$f"'
+        # NAIP is signed first; the signer answers a burst with 429 (try again in 20 s), so a refusal waits and asks again.
+        if [ "$0" = naip ]; then
+            url=""
+            for _ in 1 2 3 4 5 6 7 8; do
+                url=$(curl -sS "https://planetarycomputer.microsoft.com/api/sas/v1/sign?href=$1" | sed -n "s/.*\"href\":\"\([^\"]*\)\".*/\1/p")
+                [ -n "$url" ] && break
+                sleep 30
+            done
+            [ -n "$url" ] || { echo "no signature for $1" >&2; exit 1; }
+        fi
+        # -f: an error page is a failure, never a file; and what lands must be a TIFF (II* or II+), or it is thrown away (2026-11-21: a corrupt quad stopped the stream after the machine went down).
+        curl -fsS -L --retry 5 --retry-all-errors -o "$f.part" "$url" || { rm -f "$f.part"; exit 1; }
+        case "$(head -c 3 "$f.part" | od -An -c | tr -d " ")" in
+            II\**|II+*) mv "$f.part" "$f" ;;
+            *) echo "not a TIFF: $1" >&2; rm -f "$f.part"; exit 1 ;;
+        esac'
 }
 
 total=$(wc -l < "$A/$PIECES")
