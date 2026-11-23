@@ -2296,7 +2296,7 @@ impl Panel {
                         tb.set_text(&self.query, &mut self.text);
                     }
                     tb.set_focused(true);
-                    let card = Self::paint_search_page(&mut canvas, &mut self.text, &mut self.pills, &mut self.search_list, tb, font, rail, cw, h, self.gear, &self.found, self.picked, self.search_pending, self.query.trim().is_empty());
+                    let card = Self::paint_search_page(&mut canvas, &mut self.text, &mut self.pills, &mut self.search_list, tb, font, rail, cw, floor as usize, self.gear, &self.found, self.picked, self.search_pending, self.query.trim().is_empty());
                     self.search_field = Some(card.field);
                     self.search_rows = card.rows;
                     self.search_acts = card.acts;

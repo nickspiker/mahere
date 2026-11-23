@@ -1095,7 +1095,10 @@ impl<G: MapGpu> DeviceApp<G> {
             map.set_layers(mahere_engine::LayerMask::from_bits(s.layer_bits as u32));
             map.set_real_sun(s.real_sun);
             map.set_real_light(s.real_light);
-            ui_ru = s.ui_ru;
+            // On ferros the scale is the device's (preference 14, followed from the first frame), so a saved one would only flash before it, as Photon found.
+            if !cfg!(target_os = "ferros") {
+                ui_ru = s.ui_ru;
+            }
             map.set_compressed(s.compressed);
             map.set_follow_heading(s.follow_heading);
             map.set_lock_to_fix(s.lock_to_fix);
