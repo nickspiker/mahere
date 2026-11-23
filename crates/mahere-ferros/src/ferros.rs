@@ -1,7 +1,7 @@
 //! The ferros side of Mahere: the grants, the vault's secret, the GPS fix, and the touch server's contacts into the device app's two-finger solve, the rest going to fluor's ferros shell as its pointer.
 
 use fluor::host::EventResponse;
-use fluor::host::app::{Context, FluorApp};
+use fluor::host::app::{Context, FluorApp, SafeArea};
 use fluor::host::ferros::{Caps, Contact, FerrosShell, run_app_with};
 use mahere_device::{DeviceApp, NoGpu};
 use mahere_engine::GpsFix;
@@ -80,6 +80,13 @@ impl FluorApp for App {
     fn wants_keyboard(&mut self) -> Option<bool> {
         self.inner.wants_keyboard()
     }
+    /// The display's word on the circle (ferros WINDOWS.md "Drawn under the controls"): the map's view centred in it, its radius the circle's, so the earth sits where the controls leave room whatever the board (`place_view` guessed it the same way until this came).
+    fn on_safe_area(&mut self, area: SafeArea) {
+        let (w, h) = (self.inner.w as f64, self.inner.h as f64);
+        let (cx, cy, radius) = (area.cx as f64, area.cy as f64, area.r as f64);
+        let moved = mahere_engine::set_view(mahere_engine::View { dx: cx - w * 0.5, dy: cy - h * 0.5, radius });
+        println!("mahere: the display's safe area: centre ({cx}, {cy}), radius {radius}{}", if moved { "; the view moved to it" } else { ", where the view already was" });
+    }
     fn render(&mut self, target: &mut [u32], ctx: &mut Context) {
         self.inner.render(target, ctx)
     }
@@ -126,7 +133,7 @@ const CUTOUT_BOTTOM: f64 = 118.5610;
 const CUTOUT_BOTTOM_AKITA: f64 = 101.8303;
 
 /// The map's view in the circle an app lives in (owner, 2026-11-12, on the Pro: "the earth isn't centered in the app circle"): the circle is tangent to the bottom of the camera cutout and the bottom of the screen (ferros WINDOWS.md), while this app's frame is the whole panel, so its centre is half the cutout's height below the frame's middle.
-/// No display op answers the circle (the display computes it for its clip and its hairline from the board's cutout, ferros_sys `active_circle`), so it is computed here the same way: the panel's size from op 5, the board from the kernel's facts.
+/// The display tells the window that circle, its safe area (`FluorApp::on_safe_area`, ferros WINDOWS.md "Drawn under the controls", 2026-11-12: the frame reaches the glass's edge, the system's controls in front of its corners), and the view follows it (`App::on_safe_area`). That comes once the window has shown, so the first frame would sit at the frame's middle and jump: the circle is computed here first the same way the display does (ferros_sys `active_circle`: the panel's size from op 5, the board from the kernel's facts), which is also all a display from before the safe area gives.
 fn place_view() {
     let mut r = [0u8; 16];
     if sys::call(DISPLAY, &[5], &mut r) < 4 {

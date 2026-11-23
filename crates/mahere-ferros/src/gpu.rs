@@ -294,6 +294,9 @@ impl GpuMap {
         app.panel_changed.hash(&mut hs);
         // A layout of the place names landed: the frame waiting has the last one's.
         app.labeller.landed().hash(&mut hs);
+        // The view's place in the frame: the display's safe area moves it (`App::on_safe_area`).
+        let v = mahere_engine::view();
+        (v.dx.to_bits(), v.dy.to_bits(), v.radius.to_bits()).hash(&mut hs);
         // The display's bake: a brightness change plans the frame again with the new one.
         fluor::host::ferros::bake().map(|b| b.generation).hash(&mut hs);
         hs.finish()
