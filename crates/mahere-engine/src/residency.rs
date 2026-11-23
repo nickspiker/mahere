@@ -118,6 +118,9 @@ impl DemQ {
     }
 }
 
+/// The kept elevation's step ([`Entry::elev`]): every 2^2 = fourth texel each way. At a city's depth (14) a texel is about 2 m, so the readout's and the plan's elevation come from every 7 m, finer than the terrain's sources; at a coarse depth the readout reads the finest cell resident, as before.
+pub const ELEV_SHIFT: usize = 2;
+
 /// A resident cell: whichever layers it carried. All `None` = the loader confirmed the object does not exist (absent), which still ends probing.
 pub const PRESENT_DEM: u8 = 1;
 pub const PRESENT_LINE: u8 = 2;
@@ -152,6 +155,8 @@ pub struct Entry {
     pub exists: bool,
     /// The geoid's height above the ellipsoid, centimetres per texel, kept for the ten depth-0 cells alone: the geoid layer draws from them at every zoom (about 27 km a texel, finer than the geoid itself varies).
     pub geoid: Option<Vec<i16>>,
+    /// The terrain's elevation alone at a quarter of its texels' resolution each way (the packed texels' low word, half-metre steps, ELEV_NODATA for none; every fourth texel of every fourth row, both halves, [`ELEV_SHIFT`]), 16 KiB: what a GPU host that took the packed texels into its own memory keeps of them ([`Entry::release_dem`]), for the plan's elevation range and the readouts.
+    pub elev: Option<Box<[u16]>>,
 }
 
 impl Entry {
@@ -160,11 +165,68 @@ impl Entry {
         if let Some(p) = &self.dem {
             return Some((p.texel[i] & 0xFFFF) as u16);
         }
+        if let Some(q) = &self.elev {
+            let (tx, ty, half) = ((i >> 1) & (mahere_tiles::TEX - 1), i >> 9, i & 1);
+            return Some(q[(((ty >> ELEV_SHIFT) << (8 - ELEV_SHIFT) | tx >> ELEV_SHIFT) << 1) | half]);
+        }
         let d = self.dem_q.as_ref()?;
         let (tx, ty, half) = ((i >> 1) & (mahere_tiles::TEX - 1), i >> 9, i & 1);
         let q = d.tex[(ty + 1) * DEMQ_W + 2 * (tx + 1) + half];
         Some(if q == 0xFFFF { mahere_tiles::ELEV_NODATA } else { mahere_tiles::quantize_elev(d.base + q as f32 * d.step) })
     }
+    /// The bytes its vector planes hold: lines, land, water, ownership and motor vehicle use.
+    pub fn vec_bytes(&self) -> usize {
+        let class = |c: &Option<mahere_tiles::ClassCell>| c.as_ref().map_or(0, |c| c.class.len() + c.cov.len() + c.mag.len() + c.uses.len());
+        class(&self.line) + class(&self.land) + class(&self.own) + class(&self.mvum) + self.water.as_ref().map_or(0, |w| w.cov.len())
+    }
+
+    /// The bytes its planes hold: every decoded plane, both terrain forms, the geoid.
+    pub fn bytes(&self) -> usize {
+        self.vec_bytes() + self.img.as_ref().map_or(0, |i| i.red.len() + i.green.len() + i.blue.len() + i.nir.len()) + self.dem_q.as_ref().map_or(0, |d| d.tex.len() * 2) + self.dem.as_ref().map_or(0, |d| d.texel.len() * 8) + self.geoid.as_ref().map_or(0, |g| g.len() * 2) + self.elev.as_ref().map_or(0, |q| q.len() * 2)
+    }
+
+    /// A GPU host wrote the packed terrain into its own memory: the CPU keeps its elevation alone at a quarter of the resolution each way ([`Entry::elev`]), 16 KiB for the megabyte of texels and normals. The presence bits keep saying the cell has terrain.
+    pub fn release_dem(&mut self) {
+        if let Some(d) = self.dem.take() {
+            let side = mahere_tiles::TEX >> ELEV_SHIFT;
+            let mut q = vec![0u16; 2 * side * side].into_boxed_slice();
+            for ty in 0..side {
+                for tx in 0..side {
+                    for half in 0..2 {
+                        q[((ty * side + tx) << 1) | half] = d.texel[((((ty << ELEV_SHIFT) << 8) | (tx << ELEV_SHIFT)) << 1) | half] as u16;
+                    }
+                }
+            }
+            self.elev = Some(q);
+        }
+    }
+
+    /// A GPU host wrote the lines, the land cover and the water into its own memory: their CPU copies go (each cell's largest line magnitudes stay in `line_mag_max`). Ownership, motor vehicle use and imagery the GPU map does not draw, so they stay.
+    pub fn release_vec(&mut self) {
+        self.line = None;
+        self.land = None;
+        self.water = None;
+    }
+
+    /// Whether the terrain's packed texels are on the CPU, or (`vec`) any of the lines, land cover or water: what a GPU host has yet to write into its memory.
+    pub fn holds(&self, vec: bool) -> bool {
+        if vec { self.line.is_some() || self.land.is_some() || self.water.is_some() } else { self.dem.is_some() }
+    }
+
+    /// Whether a plane the cell carries lives only in a GPU host's memory: its terrain released ([`Entry::release_dem`]), or (`vec`) any of its lines, land cover or water.
+    pub fn released(&self, vec: bool) -> bool {
+        if vec {
+            (self.present & PRESENT_LINE != 0 && self.line.is_none()) || (self.present & PRESENT_LAND != 0 && self.land.is_none()) || (self.present & PRESENT_WATER != 0 && self.water.is_none())
+        } else {
+            self.present & PRESENT_DEM != 0 && self.dem.is_none() && self.dem_q.is_none()
+        }
+    }
+
+    /// Whether the terrain it holds, if any, is in the form a host packing for the CPU (`pack`) or for a GPU draws from.
+    pub fn dem_form_is(&self, pack: bool) -> bool {
+        if pack { !(self.dem.is_none() && self.dem_q.is_some()) } else { !(self.dem.is_some() && self.dem_q.is_none()) }
+    }
+
     pub fn has_dem(&self) -> bool {
         self.present & PRESENT_DEM != 0
     }
@@ -241,7 +303,7 @@ impl Pool {
         for e in self.map.values() {
             let planes = class(&e.line) + class(&e.land) + class(&e.own) + class(&e.mvum) + e.water.as_ref().map_or(0, |w| w.cov.len()) + e.img.as_ref().map_or(0, |i| i.red.len() + i.green.len() + i.blue.len() + i.nir.len());
             waiting += (planes > 0) as usize;
-            bytes += planes + e.dem_q.as_ref().map_or(0, |d| d.tex.len() * 2) + e.dem.as_ref().map_or(0, |d| d.texel.len() * 8) + e.geoid.as_ref().map_or(0, |g| g.len() * 2);
+            bytes += e.bytes();
         }
         (self.map.len(), waiting, bytes)
     }
@@ -290,11 +352,18 @@ pub struct Residency {
     prefetched: FxHashSet<CellKey>,
     /// Cells in view without their base, at the last want.
     bases_left: usize,
+    /// Cells in view not asked for at the last want, the budget having no room for them ([`Residency::withhold`]): drawn from their parents meanwhile.
+    withheld: usize,
     /// The view the ring was last looked for around (a fingerprint of its cells), so a still view does not look every frame.
     prefetch_view: u64,
+    /// The most bytes the resident cells' planes may hold before cells out of view are let go, farthest first ([`Residency::set_budget`]); unbounded by default.
+    budget: usize,
 }
 
 const RETRY_AFTER: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// How often an unchanged missing list is sent to the loaders again.
+const RESEND: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// Cells at this depth and above are never evicted: at most 850 over the whole globe (10 + 40 + 160 + 640). Depth 4 was kept too until 2026-10-19, when a phone that had panned around the planet held over two thousand of them, more than the GPU's 2048 layers per plane, and the cells past them drew as bare ground in cell-shaped patches (South America at z4, Nick); depth 4 now comes and goes with the view, from the device's cell files.
 pub const PIN_DEPTH: u8 = 3;
@@ -333,6 +402,8 @@ impl Residency {
             prefetched: FxHashSet::default(),
             prefetch_view: 0,
             bases_left: 0,
+            withheld: 0,
+            budget: usize::MAX,
         }
     }
 
@@ -351,8 +422,15 @@ impl Residency {
         self.layers.clone()
     }
 
-    pub fn set_pack_cpu(&self, pack: bool) {
+    /// Which terrain form the loader makes, the CPU raster's or the GPU's (only one is made). Cells already resident in the other form are dropped and asked for again.
+    pub fn set_pack_cpu(&mut self, pack: bool) {
         self.pack_cpu.store(pack, std::sync::atomic::Ordering::Relaxed);
+        let before = self.pool.map.len();
+        self.pool.map.retain(|_, e| e.dem_form_is(pack));
+        if self.pool.map.len() != before {
+            self.pool_version += 1;
+            self.last_sent.clear();
+        }
     }
 
     /// Drain finished cells into the pool. Returns how many arrived. A resident cell its store found changed is dropped, so the view asks for it again and gets the new copy.
@@ -368,6 +446,11 @@ impl Residency {
         while let Ok(l) = self.done_rx.try_recv() {
             self.pending.remove(&l.key);
             self.last_sent.retain(|(k, _)| *k != l.key);
+            // Loaded in the terrain form the host no longer draws from (it changed while the cell was on its way): not taken, so the next want asks for it again.
+            let pack = self.pack_cpu.load(std::sync::atomic::Ordering::Relaxed);
+            if l.entry.as_ref().is_some_and(|e| !e.dem_form_is(pack)) {
+                continue;
+            }
             match l.entry {
                 // Layers for a resident cell, into it: the terrain with its range, the imagery bands asked for (a band not asked for keeps what the cell had). Gone from the pool meanwhile: dropped, asked for again with its base.
                 Some(e) if l.merge => {
@@ -375,6 +458,7 @@ impl Residency {
                         if e.layers & WANT_DEM != 0 {
                             old.dem = e.dem;
                             old.dem_q = e.dem_q;
+                            old.elev = e.elev;
                             old.elev_lo = e.elev_lo;
                             old.elev_hi = e.elev_hi;
                             old.present = (old.present & !PRESENT_DEM) | (e.present & PRESENT_DEM);
@@ -427,6 +511,7 @@ impl Residency {
         self.pending.retain(|k| desired.contains(k));
         let now = std::time::Instant::now();
         self.failed.retain(|k, t| desired.contains(k) && now.duration_since(*t) < RETRY_AFTER);
+        self.trim_to_budget(center);
         // Everything still missing goes every time, pending or not: the loader keeps only the newest list, so a cell dropped from an older one would otherwise stay pending forever and never arrive (the holes Nick saw once the orientation sensor made every frame a new list). Nothing is sent while the missing set is unchanged.
         // Resident cells (there, base and all) without a layer the view now shows: asked for again with it, after every missing base.
         let want = self.want_layers;
@@ -455,6 +540,9 @@ impl Residency {
         }
         list.sort_by_key(|k| near(k, center));
         fill.sort_by_key(|k| near(k, center));
+        let asked = list.len();
+        self.withhold(&mut list, center);
+        self.withheld = asked - list.len();
         self.fill_left = fill.len();
         self.bases_left = list.len();
         // Cells baked whole carry everything in one read; cells in layers come base first, the layers after. The globe's depth-0 set before all of it: its bases, then its layers, then the view's bases, then the view's layers.
@@ -485,7 +573,7 @@ impl Residency {
             }
         }
         // An unchanged list is still re-sent once a second: a cell the loader skipped as just-done can otherwise be waited on forever after a quick zoom out and back.
-        if list == self.last_sent && self.last_send_at.elapsed() < std::time::Duration::from_secs(1) {
+        if list == self.last_sent && self.last_send_at.elapsed() < RESEND {
             return;
         }
         self.last_send_at = std::time::Instant::now();
@@ -496,6 +584,125 @@ impl Residency {
         self.last_sent = list.clone();
         if !list.is_empty() {
             let _ = self.want_tx.send(WantList { list, warm, prefetch: Vec::new() });
+        }
+    }
+
+    /// The most bytes the resident cells' planes may hold ([`Entry::bytes`]): past it, the coarse cells kept out of view ([`PIN_DEPTH`]) are let go farthest from the view first; the cells the view wants and the globe's ten depth-0 cells always stay (Mahere on ferros, 2026-11-11: the pinned levels grew with every place looked at, up to 850 cells of a few megabytes each).
+    pub fn set_budget(&mut self, bytes: usize) {
+        self.budget = bytes;
+    }
+
+    /// Cells a GPU host no longer holds a plane of, whose CPU copy it had released: out of the pool, so the view asks for them again and they come from the store (the vault on a device) whole.
+    pub fn forget(&mut self, keys: &[CellKey]) {
+        let before = self.pool.map.len();
+        for k in keys {
+            self.pool.map.remove(k);
+        }
+        if self.pool.map.len() != before {
+            self.pool_version += 1;
+        }
+    }
+
+    /// Every cell with a plane only a GPU host held (a GPU map made afresh, or the CPU raster drawing in its place): out of the pool, to be loaded again whole.
+    pub fn drop_released(&mut self) -> usize {
+        let before = self.pool.map.len();
+        self.pool.map.retain(|_, e| !e.released(false) && !e.released(true));
+        let n = before - self.pool.map.len();
+        if n > 0 {
+            self.pool_version += 1;
+        }
+        n
+    }
+
+    /// Whether a cell has something drawn in its place without it: a coarser cell over it resident with its base, or (`coming`) on its way.
+    fn drawn_from_above(&self, k: CellKey, coming: &FxHashSet<CellKey>) -> bool {
+        (0..k.depth).any(|d| {
+            let a = k.ancestor(d);
+            coming.contains(&a) || self.pool.map.get(&a).is_some_and(|e| e.exists)
+        })
+    }
+
+    /// What a cell's layers cost, by part: its vector planes (their average over the resident cells that have any; seven planes before one has come), its terrain in the form the host draws from, and its imagery's four bands. The terrain and the imagery are the same size in every cell; an average over whole cells was not (2026-11-11: the coarse cells, a few of them empty, brought it under a megabyte, and the city view asked for 206 bases before their terrain landed and took it 400 MiB past the budget).
+    fn costs(&self) -> (usize, usize, usize) {
+        let tri = mahere_tiles::TRI;
+        let (n, bytes) = self.pool.map.values().filter(|e| e.has_vec()).fold((0usize, 0usize), |(n, b), e| (n + 1, b + e.vec_bytes()));
+        let vec = if n == 0 { 7 * tri } else { bytes / n };
+        let dem = if self.pack_cpu.load(std::sync::atomic::Ordering::Relaxed) { tri * 8 } else { DEMQ_W * DEMQ_H * 2 };
+        (vec, dem, 4 * tri)
+    }
+
+    /// What the layers in `want` a cell lacks will add: the terrain and the imagery it has not loaded yet, at their costs (`dem`, `img`).
+    fn to_come(want: u8, layers: u8, (dem, img): (usize, usize)) -> usize {
+        let missing = want & !layers;
+        (missing & WANT_DEM != 0) as usize * dem + (missing & (WANT_IMG | WANT_NIR) != 0) as usize * img
+    }
+
+    /// Over the budget, the cells the view wants that have a coarser cell over them to draw from are not asked for once they would pass it, each counted whole, its layers with it (the bases come first, and counted alone they took the budget from the terrain behind them): the list comes nearest first, so the finest cells farthest from the view's centre wait, drawn from their parents, until the view moves or the budget has room. A resident cell's layers are always asked for: its base was counted with them.
+    fn withhold(&self, list: &mut Vec<CellKey>, center: (u64, u64)) {
+        if self.budget == usize::MAX {
+            return;
+        }
+        let want = self.want_layers;
+        let (vec, dem, img) = self.costs();
+        let each = vec + Self::to_come(want, 0, (dem, img));
+        // A resident cell still waiting on a layer counts with it: what it holds now is its base alone, and the layers on their way are already its.
+        let mut projected: usize = self.pool.map.values().map(|e| e.bytes() + if e.exists { Self::to_come(want, e.layers, (dem, img)) } else { 0 }).sum();
+        // Chosen coarse first, then nearest, so a parent on its way counts as there to draw from (2026-11-11: on a fresh view no parent was resident yet, every cell was asked for, and the city view went 300 MiB past the budget before trimming back); sent in the list's own order.
+        let mut order: Vec<usize> = (0..list.len()).collect();
+        order.sort_by_key(|&i| (list[i].depth, near(&list[i], center)));
+        let mut keep = vec![false; list.len()];
+        let mut coming: FxHashSet<CellKey> = FxHashSet::default();
+        for i in order {
+            let k = list[i];
+            // Over a parent that waits too, the grandparent draws: a cell under a withheld one waits with it (else its children came in whatever the budget, and the pool thrashed).
+            let drawn = self.drawn_from_above(k, &coming);
+            if projected + each > self.budget && drawn {
+                continue;
+            }
+            projected += each;
+            keep[i] = true;
+            coming.insert(k);
+        }
+        let mut i = 0;
+        list.retain(|_| {
+            i += 1;
+            keep[i - 1]
+        });
+    }
+
+    /// The planes brought under the budget: first the coarse cells kept out of view, then the cells the view wants that have their parent to draw from, each time farthest from the view's centre first (measured at depth 30, so every depth compares alike), and of those the finest first.
+    fn trim_to_budget(&mut self, center: (u64, u64)) {
+        if self.budget == usize::MAX {
+            return;
+        }
+        let mut held: usize = self.pool.map.values().map(Entry::bytes).sum();
+        if held <= self.budget {
+            return;
+        }
+        let mut out: Vec<(u64, CellKey, usize)> = self.pool.map.iter().filter(|(k, _)| k.depth > 0 && !self.desired.contains(*k)).map(|(k, e)| (near(k, center) << (30 - k.depth as u32), *k, e.bytes())).filter(|o| o.2 > 0).collect();
+        out.sort_by_key(|o| std::cmp::Reverse(o.0));
+        for (_, k, bytes) in out {
+            if held <= self.budget {
+                break;
+            }
+            self.pool.map.remove(&k);
+            held -= bytes;
+            self.pool_version += 1;
+        }
+        if held <= self.budget {
+            return;
+        }
+        // Still over: the wanted cells drawn from nothing finer (no child resident) whose parent is there to draw from instead, the finest first, then the farthest; [`Residency::withhold`] keeps them from being asked for again while the budget has no room.
+        let leaf = |k: &CellKey| !(0..4).any(|q| self.pool.map.get(&k.child(q)).is_some_and(|c| c.exists));
+        let mut out: Vec<(u8, u64, CellKey, usize)> = self.pool.map.iter().filter(|(k, _)| self.desired.contains(*k) && leaf(k) && self.drawn_from_above(**k, &FxHashSet::default())).map(|(k, e)| (k.depth, near(k, center) << (30 - k.depth as u32), *k, e.bytes())).filter(|o| o.3 > 0).collect();
+        out.sort_by_key(|o| std::cmp::Reverse((o.0, o.1)));
+        for (_, _, k, bytes) in out {
+            if held <= self.budget {
+                break;
+            }
+            self.pool.map.remove(&k);
+            held -= bytes;
+            self.pool_version += 1;
         }
     }
 
@@ -572,6 +779,11 @@ impl Residency {
         self.bases_left
     }
 
+    /// Cells in view the budget kept from being asked for at the last want ([`Residency::withhold`]).
+    pub fn withheld(&self) -> usize {
+        self.withheld
+    }
+
     /// Cells asked for and not yet arrived.
     pub fn pending_count(&self) -> usize {
         self.pending.len()
@@ -579,6 +791,11 @@ impl Residency {
 
     pub fn converged(&self) -> bool {
         self.pending.is_empty() && self.fill_left == 0
+    }
+
+    /// Whether a want now would reach the loaders though nothing changed: the view unsettled and the last list a [`RESEND`] old (a cell the loaders skipped asked for again, a failed one retried once [`RETRY_AFTER`] has passed).
+    pub fn resend_due(&self) -> bool {
+        !self.converged() && self.last_send_at.elapsed() >= RESEND
     }
 }
 
@@ -730,7 +947,12 @@ fn load_cell(store: &dyn CellStore, layers: Option<&LayerStores>, want: u8, key:
     // No base, no cell (a published cell always has one, if empty); a failure is tried again.
     let bytes = match store.get(key) {
         Fetch::Bytes(b) => b,
-        Fetch::Absent => return Loaded { key, merge: false, entry: Some(Entry::default()) },
+        Fetch::Absent => {
+            if crate::trace() {
+                eprintln!("cell {} d{}: not in the store, absent", key.name(), key.depth);
+            }
+            return Loaded { key, merge: false, entry: Some(Entry::default()) };
+        }
         Fetch::Failed(e) => {
             eprintln!("cell {} fetch failed: {e}", key.name());
             return Loaded { key, merge: false, entry: None };
@@ -803,11 +1025,15 @@ fn load_cell(store: &dyn CellStore, layers: Option<&LayerStores>, want: u8, key:
     }
     let layers_loaded = if layers.is_some() { want } else { u8::MAX };
     if bytes.is_empty() && dem_bytes.is_empty() && img_bytes.0.is_empty() && img_bytes.1.is_empty() {
+        if crate::trace() {
+            eprintln!("cell {} d{}: 0 bytes in the store, an empty cell", key.name(), key.depth);
+        }
         return Loaded { key, merge, entry: Some(Entry { layers: layers_loaded, exists: true, ..Entry::default() }) };
     }
     // Fetched: the decode waits its turn (the fetches above did not).
     let _turn = DecodeTurn::take();
-    let planes = match mahere_tiles::publish::decode_layers(if merge { None } else { non_empty(&bytes) }, non_empty(&dem_bytes), non_empty(&img_bytes.0), non_empty(&img_bytes.1)) {
+    // The names and the routing graph are not kept here (the lettering, the search and the router read them from the device themselves): not decoded either.
+    let planes = match mahere_tiles::publish::decode_layers_with(if merge { None } else { non_empty(&bytes) }, non_empty(&dem_bytes), non_empty(&img_bytes.0), non_empty(&img_bytes.1), &|s| s != "name" && s != "route") {
         Ok(p) => p,
         Err(e) => {
             // A corrupt object: treat as a failure so it's retried (the vault may have a bad copy) rather than remembered as absent.
@@ -821,12 +1047,13 @@ fn load_cell(store: &dyn CellStore, layers: Option<&LayerStores>, want: u8, key:
             (lo.min(q), hi.max(q))
         })
     });
-    let dem_q = planes.dem.as_ref().map(DemQ::from_planes);
+    // One form of the terrain, the one the host draws from: the CPU raster's packed texels, or the GPU's quantised image (Mahere on ferros, 2026-11-11: both were kept, a quarter of a megabyte a cell the CPU path never read).
+    let dem_q = if pack_cpu { None } else { planes.dem.as_ref().map(DemQ::from_planes) };
     let dem = if pack_cpu { planes.dem.map(|d| DemPacked { texel: d.pack_texels(key).into_boxed_slice() }) } else { None };
-    if std::env::var_os("MAHERE_TRACE").is_some() || cfg!(target_os = "android") {
+    if crate::trace() || cfg!(target_os = "android") {
         eprintln!("cell {} d{} loaded: dem={} line={} land={} water={} ({} bytes)", key.name(), key.depth, dem.is_some(), planes.line.is_some(), planes.land.is_some(), planes.water.is_some(), bytes.len());
     }
-    let present = (dem_q.is_some() as u8) * PRESENT_DEM
+    let present = ((dem_q.is_some() || dem.is_some()) as u8) * PRESENT_DEM
         | (planes.line.is_some() as u8) * PRESENT_LINE
         | (planes.land.is_some() as u8) * PRESENT_LAND
         | (planes.water.is_some() as u8) * PRESENT_WATER
@@ -847,13 +1074,17 @@ fn load_cell(store: &dyn CellStore, layers: Option<&LayerStores>, want: u8, key:
     if let Some(im) = &mut img {
         im.retone(mahere_tiles::tone::IMG_TAG);
     }
-    Loaded { key, merge, entry: Some(Entry { present, line_mag_max, elev_lo, elev_hi, dem, dem_q, line: planes.line, land: planes.land, water: planes.water, img, own: planes.own, mvum: planes.mvum, layers: layers_loaded, exists: true, geoid: if key.depth == 0 { planes.geoid } else { None } }) }
+    Loaded { key, merge, entry: Some(Entry { present, line_mag_max, elev_lo, elev_hi, dem, dem_q, line: planes.line, land: planes.land, water: planes.water, img, own: planes.own, mvum: planes.mvum, layers: layers_loaded, exists: true, geoid: if key.depth == 0 { planes.geoid } else { None }, elev: None }) }
 }
 
 // ==================== TIERED STORE: VAULT CACHE OVER THE BUCKET ====================
 
 /// Where the baked cells live publicly. The path under it is exactly a cell's `CellKey::path`, so the bake directory and the bucket are the same thing.
+#[cfg(not(target_os = "ferros"))]
 pub const DEFAULT_CELLS_URL: &str = "https://brobdingnagian.holdmyoscilloscope.com/mahere/cells";
+/// The same bucket over plain HTTP on ferros, which speaks no TLS (Nick 2026-11-11: "we have tcp and http so let's get the full meal deal wired up with mahere"; the bucket answers port 80 as it answers 443).
+#[cfg(target_os = "ferros")]
+pub const DEFAULT_CELLS_URL: &str = "http://brobdingnagian.holdmyoscilloscope.com/mahere/cells";
 
 /// Cell format epoch: bumped whenever the encoding changes incompatibly. It rides on the fetch URL as a query (so the CDN edge, which caches a key for hours, sees a new key) and in the vault key (so a cached cell of an older format is never read back as this one). Old clients keep fetching the old objects they understand.
 pub const CELL_EPOCH: u32 = 8;
@@ -1064,15 +1295,17 @@ impl CellStore for TieredStore {
     }
 }
 
-/// The bucket over HTTPS. 404 is absence; anything else is a failure.
+/// The bucket over HTTPS (on ferros over plain HTTP, through [`crate::plain_http`]). 404 is absence; anything else is a failure.
 pub struct HttpStore {
     base: String,
+    #[cfg(not(target_os = "ferros"))]
     agent: ureq::Agent,
     /// The published layer this store fetches (`<base>/<layer>/<cell>.vsf`); None for a baked directory served as it is (`<base>/<cell>.vsf.zst`).
     layer: Option<mahere_tiles::publish::Layer>,
 }
 
 impl HttpStore {
+    #[cfg(not(target_os = "ferros"))]
     pub fn new(base: &str) -> HttpStore {
         // A connection kept for every loader (ureq keeps one a host by default, so eleven of twelve loaders paid a TCP and TLS handshake on every cell, about 160 ms each).
         let agent = ureq::AgentBuilder::new()
@@ -1081,6 +1314,12 @@ impl HttpStore {
             .max_idle_connections_per_host(32)
             .build();
         HttpStore { base: base.trim_end_matches('/').to_string(), agent, layer: None }
+    }
+
+    /// On ferros the connections are the platform's ([`crate::plain_http::set_dial`]): nothing to keep here.
+    #[cfg(target_os = "ferros")]
+    pub fn new(base: &str) -> HttpStore {
+        HttpStore { base: base.trim_end_matches('/').to_string(), layer: None }
     }
 
     /// One published layer of the cells under `base`.
@@ -1096,6 +1335,7 @@ impl HttpStore {
     }
 }
 
+#[cfg(not(target_os = "ferros"))]
 impl RemoteStore for HttpStore {
     fn check(&self, key: CellKey, tag: Option<&str>) -> Checked {
         let url = self.url(key);
@@ -1131,6 +1371,60 @@ impl RemoteStore for HttpStore {
     }
 }
 
+/// On ferros, the same outcomes from [`crate::plain_http::get`]: 200 the bytes, 304 the kept copy, 404 absence; each fetch said on the console (the device's only window on whether its network reaches the bucket).
+#[cfg(target_os = "ferros")]
+impl RemoteStore for HttpStore {
+    fn check(&self, key: CellKey, tag: Option<&str>) -> Checked {
+        match self.got(&self.url(key), tag) {
+            Ok(g) if g.status == 304 => Checked::Same,
+            Ok(g) if (200..300).contains(&g.status) => Checked::Changed(g.body, g.etag),
+            Ok(g) if g.status == 404 => Checked::Gone,
+            Ok(g) => Checked::Failed(format!("HTTP {}", g.status)),
+            Err(e) => Checked::Failed(e),
+        }
+    }
+
+    fn fetch(&self, key: CellKey) -> Fetch {
+        self.fetch_url(&self.url(key))
+    }
+
+    fn fetch_named(&self, key: CellKey, name: &str) -> Fetch {
+        self.fetch_url(&format!("{}&h={name}", self.url(key)))
+    }
+}
+
+#[cfg(target_os = "ferros")]
+impl HttpStore {
+    fn fetch_url(&self, url: &str) -> Fetch {
+        match self.got(url, None) {
+            Ok(g) if (200..300).contains(&g.status) => Fetch::Bytes(g.body),
+            Ok(g) if g.status == 404 => Fetch::Absent,
+            Ok(g) => Fetch::Failed(format!("HTTP {}", g.status)),
+            Err(e) => Fetch::Failed(e),
+        }
+    }
+
+    /// One GET, said on the console: the path under the base, then the status, the bytes and the time, or why it failed.
+    fn got(&self, url: &str, tag: Option<&str>) -> Result<crate::plain_http::Got, String> {
+        let t = std::time::Instant::now();
+        let r = crate::plain_http::get(url, tag);
+        let path = url.strip_prefix(self.base.as_str()).unwrap_or(url);
+        match &r {
+            Ok(g) => {
+                // Where the time went (2026-11-14): the wait for a connection, the dial or how long the connection was kept, the first byte, the body.
+                let p = g.phases;
+                let how = match p.kept {
+                    Some(idle) => format!("a connection kept {} ms", idle / 1000),
+                    None => format!("a new connection{}, dial {} ms", if p.retried { " (a kept one gave nothing)" } else { "" }, p.dial / 1000),
+                };
+                eprintln!("mahere: fetch {path}: {} {} bytes in {} ms ({how}, waited {} ms, first byte {} ms, body {} ms)", g.status, g.body.len(), t.elapsed().as_millis(), p.wait / 1000, p.first / 1000, p.body / 1000);
+            }
+            Err(e) => eprintln!("mahere: fetch {path} failed in {} ms: {e}", t.elapsed().as_millis()),
+        }
+        r
+    }
+}
+
 impl HttpStore {
     /// A file beside the cells by its path (an address document, `addr/<zip>.vsf`), or None when it is not there or the network is not.
     pub fn fetch_path(&self, path: &str) -> Option<Vec<u8>> {
@@ -1139,7 +1433,10 @@ impl HttpStore {
             _ => None,
         }
     }
+}
 
+#[cfg(not(target_os = "ferros"))]
+impl HttpStore {
     fn fetch_url(&self, url: &str) -> Fetch {
         match self.agent.get(url).call() {
             Ok(resp) => {
@@ -1394,6 +1691,49 @@ mod tests {
         assert!(!got.iter().any(|k| k.depth == 13), "no children of an absent cell");
         // No terrain for a cell with no base, in view or around it.
         assert!(dem.0.lock().unwrap().is_empty());
+    }
+
+    /// A cell holding one 128 KiB plane, there with every layer.
+    fn holding() -> Entry {
+        Entry { exists: true, present: PRESENT_WATER, layers: u8::MAX, water: Some(mahere_tiles::CovCell::new()), ..Entry::default() }
+    }
+
+    /// Over the budget, the coarse cells kept out of view go farthest first, the globe's depth-0 cells never.
+    #[test]
+    fn out_of_view_cells_go_farthest_first_past_the_budget() {
+        let mut r = Residency::new(Arc::new(Empty));
+        let (near_one, far_one, globe) = (CellKey::from_grid(3, 2, 0, 0), CellKey::from_grid(3, 2, 3, 3), CellKey::from_grid(3, 0, 0, 0));
+        for k in [near_one, far_one, globe] {
+            r.pool.map.insert(k, holding());
+        }
+        let plane = holding().bytes();
+        r.set_budget(2 * plane);
+        r.want(Vec::new(), (0, 0));
+        assert!(r.pool.map.contains_key(&near_one) && r.pool.map.contains_key(&globe), "the nearer and the globe's stay");
+        assert!(!r.pool.map.contains_key(&far_one), "the farthest goes");
+    }
+
+    /// Over the budget, cells the view wants that have their parent to draw from wait: as many as fit are asked for, nearest first.
+    #[test]
+    fn wanted_cells_past_the_budget_wait_on_their_parent() {
+        let mut r = Residency::new(Arc::new(Empty));
+        let parent = CellKey::from_grid(3, 11, 8, 8);
+        r.pool.map.insert(parent, holding());
+        let children: Vec<CellKey> = (0..4).map(|q| parent.child(q)).collect();
+        // Room for the parent and one child with its terrain.
+        let (vec, dem, _) = r.costs();
+        r.set_budget(holding().bytes() + vec + dem);
+        let mut list = vec![parent];
+        list.extend(&children);
+        r.want(list, (0, 0));
+        assert_eq!(r.pending.len(), 1, "room for one child: {:?}", r.pending);
+        assert!(r.pending.iter().all(|k| children.contains(k)));
+        // Unbounded, all four are asked for.
+        r.set_budget(usize::MAX);
+        let mut list = vec![parent];
+        list.extend(&children);
+        r.want(list, (0, 0));
+        assert_eq!(r.pending.len(), 4);
     }
 
     #[test]

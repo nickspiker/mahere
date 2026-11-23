@@ -38,10 +38,19 @@ pub struct TwoFinger {
     pub cam0: Camera,
     /// Screen angle of the finger vector at capture.
     pub alpha0: f64,
+    /// The ground each finger came down on, which `MapCore::hold_two` keeps under it.
+    pub ga: (f64, f64),
+    pub gb: (f64, f64),
 }
 
 pub struct DeviceApp<G: MapGpu = NoGpu> {
     pub map: MapCore,
+    /// Why `tick` asked for a frame beyond the map's own (`MapCore::tick_why`), counted: a search landed, the panel dirty, the lettering landed.
+    pub tick_why: [u64; 3],
+    /// The panel asked to be painted again since a host that paints it itself last looked (`tick` takes its dirty flag): a GPU host's overlay repaints it on this as well as on its own key (ferros, 2026-11-12: a font pack arriving marked the panel dirty every tick until a paint loaded it, the GPU host never painted it for that, and the still map drew at the panel's rate).
+    pub panel_changed: bool,
+    /// Whether the map is lettered (place names laid out by the labeller and drawn over it): a host that draws the map itself without the lettering turns it off, and with it the labeller's layouts, its glyph atlases and the font packs only place names ask for (ferros's GPU map, 2026-11-12: lettered every time the view rested, never drawn, with the Chinese, Korean and Japanese packs, 37 MiB, loaded for it). On by default.
+    pub lettering: bool,
     /// The way of travel routes take (1 car, 2 bike, 3 foot), kept while no route mode is on; whether the search card is up, and whether the keyboard was last asked up for it.
     pub travel_pref: u8,
     pub searching: bool,
@@ -168,6 +177,9 @@ impl Persist {
 /// A gigabyte of cells until the slider says otherwise.
 pub const DEFAULT_CACHE_BUDGET: u64 = 1 << 30;
 
+/// The most the search's cache of cells' names may hold between searches: 32 MiB.
+const SEARCH_NAMES_BYTES: usize = 1 << 25;
+
 /// Free bytes on the volume holding `dir`, or none if it cannot be asked.
 #[cfg(target_os = "android")]
 fn free_bytes(dir: &str) -> Option<u64> {
@@ -208,11 +220,10 @@ impl<G: MapGpu> DeviceApp<G> {
             // The cells the device keeps, listed on the worker: the index is long on a phone that has looked around.
             job.cached = cells.keys(mahere_tiles::publish::Layer::Base);
             let mut cache = cache.lock().unwrap();
-            // A worker's cache of names: bounded, the phone's memory being what it is.
-            if cache.len() > 1024 {
-                cache.clear();
-            }
-            let _ = tx.send((mahere_engine::search::run(&job, &mut cache, &mahere_panel::labels::tier), addresses));
+            // A worker's cache of names: bounded by its bytes, the cells farthest from the view let go first (it was a thousand cells, whatever each held: half a gigabyte of name planes at the most).
+            let found = mahere_engine::search::run(&job, &mut cache, &mahere_panel::labels::tier);
+            mahere_engine::labels::trim_cache(&mut cache, SEARCH_NAMES_BYTES, job.cam.lat(), job.cam.lon());
+            let _ = tx.send((found, addresses));
         });
         self.search_rx = Some(rx);
     }
@@ -610,6 +621,33 @@ impl<G: MapGpu> DeviceApp<G> {
         }
     }
 
+    /// The panel painted for a `w` × `h` frame, its readouts from the camera as it stands (what a frame composes in front of the map: the CPU path over its canvas, ferros's GPU kernel from `Panel::overlay_rgba`).
+    pub fn paint_panel(&mut self, w: usize, h: usize) {
+        let c = self.map.cam;
+        let mut heading = c.bearing().to_degrees().rem_euclid(360.0);
+        if heading > 180.0 {
+            heading -= 360.0;
+        }
+        let cache = self.cache_stats();
+        let readouts = Readouts { lat: c.lat(), lon: c.lon(), gps_height: self.map.gps_sea_level(), elev: self.map.elevation_at(c.lat(), c.lon()), heading_deg: heading, m_per_px: 111_320.0 / c.ppd, frame_ms: self.map.last_frame_ms, resident: self.map.pool().map.len(), phone_heading: self.map.have_rotation.then(|| self.map.true_heading()), cache_used: cache.0, cache_max: cache.1, has_fix: self.map.gps.is_some(), contour_major_m: self.map.contour_major() };
+        let measure = self.map.measure_view(w, h, Panel::strip_samples(w));
+        self.sync_tracks();
+        let (mask, ctl, areas) = (self.map.layers(), self.controls(), self.areas.view(self.map.user.has_selection()));
+        let map = &self.map;
+        let orb = |n: usize| map.orb(n);
+        self.panel.paint(w, h, mask, ctl, &readouts, measure.as_ref(), &map.themes, &areas, Some(&orb));
+    }
+
+    /// Whether the camera has rested a quarter second, when labels are laid out; a camera that moved since the last look starts the quarter second again.
+    pub fn label_rest(&mut self) -> bool {
+        let c = self.map.cam;
+        let cam_key = (c.lat().to_bits(), c.lon().to_bits(), c.ppd.to_bits(), c.bearing().to_bits());
+        if cam_key != self.label_cam.0 {
+            self.label_cam = (cam_key, Instant::now());
+        }
+        self.label_cam.1.elapsed().as_millis() >= 250
+    }
+
     /// What the cache holds and the most the slider may allow: what is held plus the free space.
     pub fn cache_stats(&self) -> (u64, u64) {
         let used = self.cells_cache.as_ref().map_or(0, |c| c.cached_bytes());
@@ -632,6 +670,8 @@ impl<G: MapGpu> DeviceApp<G> {
             d0,
             cam0: self.map.cam,
             alpha0: (y1 - y0).atan2(x1 - x0),
+            ga: self.map.cam.screen_to_geo(x0, y0, self.w, self.h),
+            gb: self.map.cam.screen_to_geo(x1, y1, self.w, self.h),
         });
         self.dragging = false;
     }
@@ -642,12 +682,12 @@ impl<G: MapGpu> DeviceApp<G> {
         let d = ((x1 - x0).powi(2) + (y1 - y0).powi(2)).sqrt().max(1.0);
         let alpha = (y1 - y0).atan2(x1 - x0);
         // From the view at the gesture's start every time, so nothing accumulates: the scale, the turn by the fingers' angle (a rotation of the ball about the view axis, never a bearing), then the anchor.
-        let (geo_mid, cam0, d0, alpha0) = (t.geo_mid, t.cam0, t.d0, t.alpha0);
+        let (geo_mid, cam0, d0, alpha0, ga, gb) = (t.geo_mid, t.cam0, t.d0, t.alpha0, t.ga, t.gb);
         self.map.cam = cam0;
         self.map.set_ppd(cam0.ppd * d / d0);
         self.map.rotate_view(alpha0 - alpha);
-        let (mx, my) = ((x0 + x1) * 0.5, (y0 + y1) * 0.5);
-        self.map.place_anchor(geo_mid.0, geo_mid.1, mx, my, self.w, self.h);
+        // Each finger's ground held under it (2026-11-12: a turn about the camera point and the midpoint's ground put back left the fingers 5 pixels off theirs, a 45 degree twist a third of the screen from the view's centre at a region's scale; held, within a fiftieth of a pixel).
+        self.map.hold_two(geo_mid, ga, gb, (x0, y0), (x1, y1), self.w, self.h);
     }
 
     pub fn two_end(&mut self) {
@@ -796,7 +836,9 @@ impl<G: MapGpu> FluorApp for DeviceApp<G> {
                 // A press and release that never travelled is a tap: a new measurement to that point.
                 if self.dragging && self.two.is_none() && !self.had_two && self.travel < 12.0 {
                     // A label under the finger names what it letters first.
-                    let label = self.gpu.as_ref().and_then(|g| g.labeller().hit(&self.map.cam, self.w, self.h, ctx.cursor_x as f32, ctx.cursor_y as f32).cloned());
+                    // The lettering drawn: the GPU host's where it letters the map, else this app's own (ferros, whose GPU map draws this app's labeller's lettering too).
+                    let labeller = self.gpu.as_ref().map_or(&self.labeller, |g| g.labeller());
+                    let label = labeller.hit(&self.map.cam, self.w, self.h, ctx.cursor_x as f32, ctx.cursor_y as f32).cloned();
                     self.map.tap_label(ctx.cursor_x as f64, ctx.cursor_y as f64, self.w, self.h, label.as_ref());
                 }
                 self.dragging = false;
@@ -851,6 +893,10 @@ impl<G: MapGpu> FluorApp for DeviceApp<G> {
                 self.apply_controls(ctl, mask);
                 EventResponse::Handled
             }
+            // Escape steps back, as Android's back button does (`nativeBack`): ferros's back tap arrives as Escape (ferros WINDOWS.md "The helm"). The panel one page up, then closed; with it closed already, nothing more here.
+            FEvent::KeyboardInput { event } if event.state == ElementState::Pressed && event.logical_key == fluor::event::Key::Named(fluor::event::NamedKey::Escape) => {
+                if self.panel.back() { EventResponse::Handled } else { EventResponse::Pass }
+            }
             FEvent::KeyboardInput { event } if self.searching && event.state == ElementState::Pressed => {
                 use fluor::event::{Key, NamedKey};
                 match &event.logical_key {
@@ -868,8 +914,11 @@ impl<G: MapGpu> FluorApp for DeviceApp<G> {
         }
     }
 
+    /// The CPU path draws on change only: a cell, the lettering or a font pack arriving, the camera, a touch (`tick` and the input say so).
+    /// A frame every pass while the residency was unsettled redrew the same screen over and over while cells came in tens of seconds apart (ferros, 2026-11-11: frames of seconds, the four cores and the heap's one lock taken from the loaders and the network).
+    /// A GPU host draws while unsettled as before: its frame is cheap.
     fn wake_at(&self) -> Option<Instant> {
-        if self.map.converged() { None } else { Some(Instant::now()) }
+        if self.gpu.is_none() || self.map.converged() { None } else { Some(Instant::now()) }
     }
 
     fn tick(&mut self, ctx: &mut Context) -> bool {
@@ -890,7 +939,7 @@ impl<G: MapGpu> FluorApp for DeviceApp<G> {
         let mut more = false;
         if self.gpu.is_none() {
             let finished = self.areas.poll();
-            if self.panel.fonts_due() {
+            if self.panel.fonts_arrived() {
                 self.panel.invalidate();
             }
             if self.panel.is_open() && (finished || (self.areas.downloading() && self.areas_shown.elapsed().as_millis() >= 250)) {
@@ -901,9 +950,20 @@ impl<G: MapGpu> FluorApp for DeviceApp<G> {
                 let view = self.updates_view();
                 self.panel.set_updates(view);
             }
-            more = self.panel.take_dirty() || self.labeller.poll() || self.labeller.pending(&self.map, self.w, self.h);
+            // The lettering is asked for here as well as in the frame, so a view come to rest (a quarter second after the camera stopped) or cells arrived are lettered without a frame drawn to ask; the layout landing is the frame.
+            if self.lettering && mahere_panel::labels::Labeller::wanted(&self.map) {
+                let at_rest = self.label_rest();
+                self.labeller.ask(&mut self.map, self.w, self.h, self.panel.label_font_px(), at_rest);
+            }
+            let (dirty, lettered) = (self.panel.take_dirty(), self.lettering && self.labeller.poll());
+            self.tick_why[1] += dirty as u64;
+            self.panel_changed |= dirty;
+            self.tick_why[2] += lettered as u64;
+            more = dirty || lettered;
         }
-        self.map.tick(self.w, self.h) || found || more || self.search_rx.is_some()
+        self.tick_why[0] += found as u64;
+        // A search under way is no frame: its result landing is (`found`).
+        self.map.tick(self.w, self.h) || found || more
     }
 
     /// The keyboard up while the search page is, down when it goes (fluor's one-shot ask, read after every touch and every frame).
@@ -924,28 +984,12 @@ impl<G: MapGpu> FluorApp for DeviceApp<G> {
         // The map's frame, then its lettering letter by letter over it (laid out a quarter second after the camera rests), then the panel over both: the desktop's CPU path.
         self.frame.clear();
         self.frame.extend_from_slice(&self.map.canvas);
-        let c = self.map.cam;
-        let cam_key = (c.lat().to_bits(), c.lon().to_bits(), c.ppd.to_bits(), c.bearing().to_bits());
-        if cam_key != self.label_cam.0 {
-            self.label_cam = (cam_key, Instant::now());
-        }
+        let at_rest = self.label_rest();
         if mahere_panel::labels::Labeller::wanted(&self.map) {
-            let at_rest = self.label_cam.1.elapsed().as_millis() >= 250;
             self.labeller.ask(&mut self.map, w, h, self.panel.label_font_px(), at_rest);
             self.labeller.draw_cpu(&mut self.frame, &self.map.cam, w, h);
         }
-        let mut heading = c.bearing().to_degrees().rem_euclid(360.0);
-        if heading > 180.0 {
-            heading -= 360.0;
-        }
-        let cache = self.cache_stats();
-        let readouts = Readouts { lat: c.lat(), lon: c.lon(), gps_height: self.map.gps_sea_level(), elev: self.map.elevation_at(c.lat(), c.lon()), heading_deg: heading, m_per_px: 111_320.0 / c.ppd, frame_ms: self.map.last_frame_ms, resident: self.map.pool().map.len(), phone_heading: self.map.have_rotation.then(|| self.map.true_heading()), cache_used: cache.0, cache_max: cache.1, has_fix: self.map.gps.is_some(), contour_major_m: self.map.contour_major() };
-        let measure = self.map.measure_view(w, h, Panel::strip_samples(w));
-        self.sync_tracks();
-        let (mask, ctl, areas) = (self.map.layers(), self.controls(), self.areas.view(self.map.user.has_selection()));
-        let map = &self.map;
-        let orb = |n: usize| map.orb(n);
-        self.panel.paint(w, h, mask, ctl, &readouts, measure.as_ref(), &map.themes, &areas, Some(&orb));
+        self.paint_panel(w, h);
         self.panel.composite_rgb(&mut self.frame, w, h);
         // ANativeWindow RGBA_8888 lands R in the low byte: swap R/B vs the desktop path or Puget Sound renders brown and the pin orange. fluor's ferros host takes fluor's own order, as the desktop does.
         let n = (w * h).min(target.len()).min(self.frame.len());
@@ -1126,6 +1170,9 @@ impl<G: MapGpu> DeviceApp<G> {
             areas,
             share_file: None,
             areas_shown: Instant::now(),
+            tick_why: [0; 3],
+            panel_changed: false,
+            lettering: true,
             updater: {
                 let mut u = mahere_update::Updater::new(std::path::PathBuf::from(dir.unwrap_or_default()));
                 u.auto = settings.is_none_or(|s| s.auto_update);

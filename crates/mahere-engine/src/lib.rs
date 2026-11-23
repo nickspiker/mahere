@@ -4,6 +4,7 @@ pub mod areas;
 pub mod colour;
 pub mod ink;
 pub mod labels;
+pub mod plain_http;
 pub mod plan;
 pub mod probe;
 pub mod raster;
@@ -13,6 +14,7 @@ pub mod geocode;
 pub mod search;
 pub mod sh;
 pub mod theme;
+pub mod viewplan;
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -25,6 +27,27 @@ use residency::{CellStore, Residency};
 
 pub const PPD_REF: f64 = 6000.;
 pub const BG_RGB: u32 = 0x12141A;
+
+/// Where the view stands in the frame, for a host whose frame is not all on show: its centre's offset from the frame's middle (x right, y down, pixels) and the radius about that centre the host shows, which the globe's fit keeps inside (`MapCore::ppd_floor`).
+/// On ferros an app lives in a circle on the glass, tangent to the bottom of the camera cutout and the bottom of the screen, while its frame is the whole panel, so the circle's centre is half the cutout's height below the frame's middle (owner, 2026-11-12: "the earth isn't centered in the app circle").
+/// Unset (desktop, Android) the view is the frame's middle and the whole frame, as it always was.
+#[derive(Clone, Copy, Debug)]
+pub struct View {
+    pub dx: f64,
+    pub dy: f64,
+    pub radius: f64,
+}
+
+static VIEW: std::sync::OnceLock<View> = std::sync::OnceLock::new();
+
+/// The view's place in the frame, set once by the host before its first frame; false (nothing changed) for a second call.
+pub fn set_view(v: View) -> bool {
+    VIEW.set(v).is_ok()
+}
+
+fn view() -> View {
+    VIEW.get().copied().unwrap_or(View { dx: 0., dy: 0., radius: f64::INFINITY })
+}
 
 /// View state: the globe seen from far off, orthographically. The view is a rotation of the ball, kept as its basis in world coordinates (the unit sphere, x toward 0°N 0°E, z toward the north pole): screen right, screen up, and the axis toward the viewer, which is the camera point at the screen's centre. Latitude, longitude and bearing are read off it, never stored, so no pole is special: an unmarked ball (Nick 2026-10-10). ppd = pixels per degree of arc at the centre, so the whole globe is a disk of radius ppd·180/π pixels.
 #[derive(Clone, Copy)]
@@ -117,11 +140,18 @@ impl Camera {
         [cl * co, cl * so, sl]
     }
 
+    /// The screen point the view looks along, where the camera point lands: the frame's middle, or where the host put it (`set_view`).
+    pub fn centre(w: usize, h: usize) -> (f64, f64) {
+        let v = view();
+        (w as f64 * 0.5 + v.dx, h as f64 * 0.5 + v.dy)
+    }
+
     /// The view-space direction of a screen point on the globe, the limb for a point past it.
     pub fn view_dir(&self, px: f64, py: f64, w: usize, h: usize) -> [f64; 3] {
         let r = self.radius();
-        let mut x = (px - w as f64 * 0.5) / r;
-        let mut y = (h as f64 * 0.5 - py) / r;
+        let (cx, cy) = Camera::centre(w, h);
+        let mut x = (px - cx) / r;
+        let mut y = (cy - py) / r;
         let rho2 = x * x + y * y;
         if rho2 >= 1.0 {
             let k = (1.0 - 1e-9) / rho2.sqrt();
@@ -149,7 +179,8 @@ impl Camera {
                 y *= k;
             }
         }
-        (w as f64 * 0.5 + x, h as f64 * 0.5 - y)
+        let (cx, cy) = Camera::centre(w, h);
+        (cx + x, cy - y)
     }
 
     /// The ground under a screen point. Past the limb the point is taken at the limb, so a corner off the globe still names ground (the renderers paint the background there).
@@ -166,16 +197,18 @@ impl Camera {
 
     /// Whether a screen point lies on the globe.
     pub fn on_globe(&self, px: f64, py: f64, w: usize, h: usize) -> bool {
-        let sx = px - w as f64 * 0.5;
-        let sy = py - h as f64 * 0.5;
+        let (cx, cy) = Camera::centre(w, h);
+        let (sx, sy) = (px - cx, py - cy);
         let r = self.radius();
         sx * sx + sy * sy <= r * r
     }
 
-    /// Whether any of the screen lies off the globe.
+    /// Whether any of the screen lies off the globe: the frame's corner farthest from the view's centre is past the limb.
     pub fn limb_visible(&self, w: usize, h: usize) -> bool {
         let r = self.radius();
-        (w * w + h * h) as f64 * 0.25 > r * r
+        let v = view();
+        let (fx, fy) = (w as f64 * 0.5 + v.dx.abs(), h as f64 * 0.5 + v.dy.abs());
+        fx * fx + fy * fy > r * r
     }
 }
 
@@ -204,6 +237,9 @@ fn dot(a: [f64; 3], b: [f64; 3]) -> f64 {
 fn cross(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
     [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]]
 }
+
+/// Which way [`MapCore::turn_about`] turns the screen for a positive angle against the screen's own angles (y down): the sign that makes `hold_two`'s error shrink.
+const TURN_SIGN: f64 = -1.0;
 
 /// `v` turned about the unit axis `k` by `angle` (Rodrigues).
 fn rotate(v: [f64; 3], k: [f64; 3], angle: f64) -> [f64; 3] {
@@ -254,16 +290,33 @@ pub struct MapCore {
     pub canvas: Vec<u32>,
     canvas_w: usize,
     canvas_h: usize,
+    /// What the canvas holds when `overlay_marks` drew it last and nothing else has since: its size and the box its marks cover, so the next clears that box alone; None when it holds anything else (a CPU frame, nothing yet).
+    marks_at: Option<(usize, usize, PixelBox)>,
+    /// The box the marks being drawn have touched so far (each stroke's own box, as `draw_segment` answers it).
+    ink: PixelBox,
     vec_depth: u8,
     dem_depth: u8,
+    /// The depths the camera's scale asks for (`select_depth`, its hysteresis kept on these); `vec_depth` and `dem_depth` are them less `depth_short`.
+    vec_ideal: u8,
+    dem_ideal: u8,
+    /// How many depths coarser than the scale asks the plans are made: a host whose GPU holds fewer cells than a screen at the scale's depth names sets it (ferros: a block of the layer arena holds 20 to 104 cell planes, a 1080 x 2400 screen names 114 to 376 at its depth), so the cells asked for and kept are the ones it can draw; 0 by default.
+    pub depth_short: u8,
     home: Camera,
     /// Measured cost of the last `render` call in milliseconds.
     pub last_frame_ms: f32,
+    /// What the last traced frame reported ([`MapCore::trace_frame`]): the next is logged only when it differs.
+    last_trace: Option<FrameTrace>,
     /// Pixels the screen's top-right marks (the compass, the heading and the zoom) move down, below a host's own controls there (the desktop's window buttons, Nick 2026-10-17); 0 on the phone.
     pub marks_top: f32,
     pub last_straddle_blocks: usize,
+    /// The last `plan`'s µs: preparing the view (`prepare`), the plan itself (`plan::plan_frame`), the residency's want; zeros for a plan from the cache.
+    pub plan_us: [u64; 3],
+    /// Why `tick` asked for a frame, counted: cells arrived, the map marked dirty, a route or its refinement landed, the wants said again changed the pool (a host says them on its console to find what keeps a still map drawing).
+    pub tick_why: [u64; 4],
     /// Something changed since the last render (camera, sun, GPS). Reported by `tick` so shells that only draw on demand get a frame.
     dirty: bool,
+    /// The cells the last frame wanted and the view's centre it sorted them by: `tick` says them to the residency again while it is unsettled, so the wants go on (the once-a-second resend, the retry of a failed cell) without a frame drawn for them.
+    want_last: (Vec<mahere_tiles::CellKey>, (u64, u64)),
     /// Elevation range the last frame saw; the next frame's contour interval is fit to it (one loop, a frame late — close enough).
     last_range: ElevRange,
     /// The lighting environment (device frame); folded into `luts.light` with the bearing each time either changes.
@@ -278,6 +331,8 @@ pub struct MapCore {
     fit_globe: bool,
     /// When the map was made, until its first view is complete (then logged).
     started: Option<Instant>,
+    /// Since when the view has had cells missing, and how many arrived since: logged as the view's time to sharp once none is missing (ferros, 2026-11-14: "the map seems to be loading quite slow").
+    unsharp: Option<(Instant, u64)>,
     /// Degrees the device is turned clockwise from north (0 when no sensor feeds it); the lighting turns against it.
     pub device_heading: f32,
     /// The device's rotation matrix from the orientation sensor, world (east, north, up) = R · device (x right, y up the screen, z out of it); identity without a sensor.
@@ -305,6 +360,8 @@ pub struct MapCore {
     last_pin: Option<(f32, f32)>,
     /// The last plan and what it was for.
     plan_cache: Option<(PlanKey, Arc<plan::FramePlan>)>,
+    /// The last view plan (`plan_view`), the view it was for and the pool's version it was found over.
+    view_plan_cache: Option<(ViewKey, u64, Arc<viewplan::ViewPlan>)>,
     /// The current measurement, if a point was tapped.
     measure: Option<Measure>,
     /// The last plan came from the cache: the view and the cells were as before.
@@ -341,7 +398,7 @@ pub struct MapCore {
     /// What the last tap found at its point, for the measurement strip.
     tap_info: Vec<String>,
     /// Cells' names as labels last read them; None for a resident cell with none.
-    names_cache: rustc_hash::FxHashMap<mahere_tiles::CellKey, Option<std::sync::Arc<mahere_tiles::NameCell>>>,
+    names_cache: labels::NamesCache,
     /// The geoid of the depth-2 cell last looked in, centimetres per texel (one cell covers a few hundred kilometres).
     geoid_cell: Option<(mahere_tiles::CellKey, Arc<Vec<i16>>)>,
     /// Cells replaced by a newer copy since a label worker last asked, for it to forget their names.
@@ -373,6 +430,8 @@ pub struct MapCore {
 }
 
 type PlanKey = (u64, u64, u64, u64, usize, usize, u64, u8, u8);
+/// A view: the camera's latitude, longitude, scale and bearing (their bits), the frame's size, the two depths.
+type ViewKey = (u64, u64, u64, u64, usize, usize, u8, u8);
 
 impl MapCore {
     pub fn new(store: Arc<dyn CellStore>, home: Camera) -> MapCore {
@@ -408,19 +467,29 @@ impl MapCore {
             canvas: Vec::new(),
             canvas_w: 0,
             canvas_h: 0,
+            marks_at: None,
+            ink: PixelBox::EMPTY,
             vec_depth: VEC_BASE_DEPTH,
             dem_depth: DEM_BASE_DEPTH,
+            vec_ideal: VEC_BASE_DEPTH,
+            dem_ideal: DEM_BASE_DEPTH,
+            depth_short: 0,
             home,
             last_frame_ms: 0.0,
+            last_trace: None,
             marks_top: 0.0,
             last_straddle_blocks: 0,
+            plan_us: [0; 3],
+            tick_why: [0; 4],
             dirty: true,
+            want_last: (Vec::new(), (0, 0)),
             last_range: ElevRange::EMPTY,
             contours_on_screen: 32.0,
             contour_interval: 0.0,
             contour_hold: None,
             fit_globe: false,
             started: Some(Instant::now()),
+            unsharp: None,
             device_heading: 0.0,
             device_rot: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
             real_sun: false,
@@ -435,6 +504,7 @@ impl MapCore {
             layer_mask: LayerMask::default(),
             last_pin: None,
             plan_cache: None,
+            view_plan_cache: None,
             measure: None,
             plan_cached: false,
             themes: theme::builtin(),
@@ -488,7 +558,7 @@ impl MapCore {
 
     /// Pan by a screen-pixel delta: the ground at the centre goes that far across the screen, the globe turning under the camera.
     pub fn pan(&mut self, dx: f64, dy: f64, w: usize, h: usize) {
-        let (cx, cy) = (w as f64 * 0.5, h as f64 * 0.5);
+        let (cx, cy) = Camera::centre(w, h);
         let (lat, lon) = self.cam.screen_to_geo(cx, cy, w, h);
         self.place_anchor(lat, lon, cx + dx, cy + dy, w, h);
     }
@@ -524,9 +594,12 @@ impl MapCore {
         (n < 10).then_some(n as f32 / 10.0)
     }
 
-    /// The least pixels per degree a screen may show: the whole globe as a disk filling 94% of the shorter side.
+    /// The least pixels per degree a screen may show: the whole globe as a disk filling 94% of the largest disk about the view's centre that shows, inside the frame and the host's radius (`set_view`); unset, the shorter side.
+    /// The mins are that disk's geometry, the nearest of the frame's four edges and the host's circle, not a guard: with no view set they are the shorter side's half, as before.
     pub fn ppd_floor(w: usize, h: usize) -> f64 {
-        (0.47 * w.min(h) as f64 * core::f64::consts::PI / 180.0).max(1.0)
+        let v = view();
+        let fit = (w as f64 * 0.5 - v.dx.abs()).min(h as f64 * 0.5 - v.dy.abs()).min(v.radius);
+        (0.94 * fit * core::f64::consts::PI / 180.0).max(1.0)
     }
 
     /// Exact geo-anchored zoom: the geography under (ax, ay) stays there.
@@ -570,6 +643,53 @@ impl MapCore {
         self.camera_moved(w, h);
     }
 
+    /// Turn the ball by `angle` radians about the view direction of screen point (ax, ay): the ground there stays there and everything turns about it, as a twist of two fingers turns the map about their midpoint.
+    /// `rotate_view` turns about the camera point instead; a turn there followed by `place_anchor` leaves a twist off the camera point (2026-11-12: fingers turned 45 degrees about a point a third of the screen from the view's centre at a region's scale ended 5 pixels from their ground).
+    pub fn turn_about(&mut self, angle: f64, ax: f64, ay: f64, w: usize, h: usize) {
+        let b = self.cam.basis();
+        let axis = self.cam.view_dir(ax, ay, w, h);
+        let e = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+        let cols = [rotate(e[0], axis, angle), rotate(e[1], axis, angle), rotate(e[2], axis, angle)];
+        let mut nb = [[0.0; 3]; 3];
+        for i in 0..3 {
+            for k in 0..3 {
+                nb[i][k] = cols[0][i] * b[0][k] + cols[1][i] * b[1][k] + cols[2][i] * b[2][k];
+            }
+        }
+        self.cam = Camera::from_basis(nb, self.cam.ppd);
+        self.unlock_measure();
+        self.camera_moved(w, h);
+    }
+
+    /// Two fingers holding the ground they came down on: the ground under their midpoint at the start (`mid`) put under their midpoint now, then the ball turned about it until the line from finger a's ground to finger b's runs as the fingers do (`ga`, `gb`: the ground each came down on). The scale is the caller's (the fingers' distance against their first).
+    /// Two passes of the turn and the scale: off the camera point the ball's turn about the midpoint and the scale's ratio are not quite the screen's (the orthographic view foreshortens them), the second pass takes what the first left.
+    #[allow(clippy::too_many_arguments)]
+    pub fn hold_two(&mut self, mid: (f64, f64), ga: (f64, f64), gb: (f64, f64), a: (f64, f64), b: (f64, f64), w: usize, h: usize) {
+        let (mx, my) = ((a.0 + b.0) * 0.5, (a.1 + b.1) * 0.5);
+        let want = (b.1 - a.1).atan2(b.0 - a.0);
+        let want_d = (b.0 - a.0).hypot(b.1 - a.1);
+        for _ in 0..2 {
+            self.place_anchor(mid.0, mid.1, mx, my, w, h);
+            let (pa, pb) = (self.cam.geo_to_screen(ga.0, ga.1, w, h), self.cam.geo_to_screen(gb.0, gb.1, w, h));
+            let now = (pb.1 - pa.1).atan2(pb.0 - pa.0);
+            // The error the short way round, in (-pi, pi].
+            let err = (want - now + core::f64::consts::PI).rem_euclid(core::f64::consts::TAU) - core::f64::consts::PI;
+            self.turn_about(TURN_SIGN * err, mx, my, w, h);
+            // The scale too: off the camera point the screen's distance between the two grounds is foreshortened from the scale's ratio.
+            let (pa, pb) = (self.cam.geo_to_screen(ga.0, ga.1, w, h), self.cam.geo_to_screen(gb.0, gb.1, w, h));
+            let now_d = (pb.0 - pa.0).hypot(pb.1 - pa.1);
+            // WHY: two fingers past the limb take their ground at the limb, both at the same point when they lie on one ray from the ball's centre: no distance to scale by (a ppd of infinity or NaN would lose the camera).
+            if now_d > 0.0 {
+                self.set_ppd(self.cam.ppd * want_d / now_d);
+            }
+        }
+        self.place_anchor(mid.0, mid.1, mx, my, w, h);
+        // The two grounds' own midpoint on the screen onto the fingers' (on the ball the ground under their midpoint is not the midpoint of theirs: a pixel or so at a region's scale).
+        let (pa, pb) = (self.cam.geo_to_screen(ga.0, ga.1, w, h), self.cam.geo_to_screen(gb.0, gb.1, w, h));
+        let c = self.cam.screen_to_geo((pa.0 + pb.0) * 0.5, (pa.1 + pb.1) * 0.5, w, h);
+        self.place_anchor(c.0, c.1, mx, my, w, h);
+    }
+
     /// Turn the view by `delta` radians clockwise.
     pub fn rotate_view(&mut self, delta: f64) {
         self.cam.rotate_view(delta);
@@ -610,7 +730,7 @@ impl MapCore {
 
     /// The depth a mark is drawn at: one above what the view wants, so a texel is one to two pixels wide (the view's own depth puts texels under a pixel, for the supersampled render, and a mark there would be a sprinkle).
     fn draw_depth(&self) -> u8 {
-        select_depth(self.cam.ppd, self.vec_depth, VEC_BASE_DEPTH).saturating_sub(1)
+        select_depth(self.cam.ppd, self.vec_ideal, VEC_BASE_DEPTH).saturating_sub(1)
     }
 
     pub fn set_tool(&mut self, tool: ink::Tool) {
@@ -930,6 +1050,14 @@ impl MapCore {
     }
 
     /// A view's wanted cells, with the globe's ten depth-0 cells always: the base set every view falls back to, loaded first on a fresh install with the ring round the globe (Nick 2026-10-22), and the geoid's source at every zoom (2026-10-19).
+    /// A frame's wants to the residency, kept for `tick` to say again while the residency is unsettled.
+    fn want_cells(&mut self, want: Vec<mahere_tiles::CellKey>, center: (u64, u64)) {
+        self.want_last.0.clear();
+        self.want_last.0.extend_from_slice(&want);
+        self.want_last.1 = center;
+        self.res.want(want, center);
+    }
+
     fn with_globe(&self, mut want: Vec<mahere_tiles::CellKey>) -> Vec<mahere_tiles::CellKey> {
         for d in 0..10u8 {
             let k = mahere_tiles::CellKey::from_grid(d, 0, 0, 0);
@@ -983,6 +1111,21 @@ impl MapCore {
             }
         }
         None
+    }
+
+    /// The most bytes the resident cells' planes may hold, the coarse cells out of view let go past it, farthest first ([`residency::Residency::set_budget`]).
+    pub fn set_pool_budget(&mut self, bytes: usize) {
+        self.res.set_budget(bytes);
+    }
+
+    /// Cells whose planes a GPU host wrote into its memory and released on the CPU, and which it has since let go of there: loaded again from the store ([`residency::Residency::forget`]).
+    pub fn forget_cells(&mut self, keys: &[mahere_tiles::CellKey]) {
+        self.res.forget(keys);
+    }
+
+    /// Every cell with a plane only a GPU host held, out of the pool to be loaded again whole: the host's memory of them is gone, or the CPU raster draws instead ([`residency::Residency::drop_released`]). How many went.
+    pub fn drop_released(&mut self) -> usize {
+        self.res.drop_released()
     }
 
     /// A host that draws with the GPU only: the loader stops packing the CPU raster's texels, saving a megabyte and the normal pass per cell.
@@ -1155,8 +1298,29 @@ impl MapCore {
         if arrived > 0 {
             self.refine_due = true;
         }
+        // The last frame's wants said again when the residency would re-send them (once a second while cells are missing): a host that draws only on change (the CPU path) gets them without drawing a frame for them (ferros, 2026-11-11: a frame drawn every pass while cells came in tens of seconds apart kept the four cores busy redrawing the same screen). A want that marks cells absent changed the pool, which is a frame.
+        let mut wanted = false;
+        if self.res.resend_due() && !self.want_last.0.is_empty() {
+            let version = self.res.pool_version;
+            let (list, center) = (self.want_last.0.clone(), self.want_last.1);
+            self.res.want(list, center);
+            wanted = self.res.pool_version != version;
+        }
         self.refine_route();
-        let changed = arrived > 0 || self.dirty || routed;
+        let changed = arrived > 0 || self.dirty || routed || wanted;
+        for (n, why) in self.tick_why.iter_mut().zip([arrived > 0, self.dirty, routed, wanted]) {
+            *n += why as u64;
+        }
+        // The view's time to sharp: from the first tick with a cell missing to the first with none, and the cells that arrived meanwhile (the network's own summary is plain_http's).
+        match (self.unsharp.as_mut(), self.res.converged()) {
+            (None, false) => self.unsharp = Some((Instant::now(), arrived as u64)),
+            (Some((_, n)), false) => *n += arrived as u64,
+            (Some(&mut (t, n)), true) => {
+                eprintln!("map: the view sharp in {} ms, {} cells arrived meanwhile", t.elapsed().as_millis(), n + arrived as u64);
+                self.unsharp = None;
+            }
+            (None, true) => {}
+        }
         // When the first view and the globe's base set are complete, how long that took and the loaders' share (2026-10-22: ten seconds on a relaunch with every cell on the phone).
         if let Some(t) = self.started.filter(|_| self.res.converged() && !self.res.pool.map.is_empty() && self.globe_loading().is_none()) {
             self.started = None;
@@ -1453,6 +1617,18 @@ impl MapCore {
         self.res.converged()
     }
 
+    /// The cells the last want named (the view's cells at its depths, the ancestors it falls back through, the rings around them, the globe's base set), sorted: what a GPU host keeps in its memory before cells no view wants.
+    pub fn desired_sorted(&self) -> Vec<mahere_tiles::CellKey> {
+        let mut d: Vec<mahere_tiles::CellKey> = self.res.desired.iter().copied().collect();
+        d.sort_unstable();
+        d
+    }
+
+    /// Cells in view the pool's budget keeps from being asked for, drawn from their parents meanwhile ([`residency::Residency::withheld`]).
+    pub fn withheld(&self) -> usize {
+        self.res.withheld()
+    }
+
     pub fn pending_cells(&self) -> usize {
         self.res.pending_count()
     }
@@ -1502,17 +1678,58 @@ impl MapCore {
                 // Residency still hears the want: it re-sends an unchanged missing list once a second.
                 let center = Coord::from_lat_lon(self.cam.lat(), self.cam.lon());
                 let (cu, cv) = center.uv();
-                self.res.want(self.with_globe(p.want.clone()), (cu, cv));
+                self.want_cells(self.with_globe(p.want.clone()), (cu, cv));
                 self.last_frame_ms = t0.elapsed().as_secs_f32() * 1000.0;
                 return p;
             }
         }
+        let t1 = Instant::now();
         let p = Arc::new(plan::plan_frame(w, h, &self.cam, &self.res.pool, self.dem_depth, self.vec_depth, &self.user));
         self.last_straddle_blocks = p.straddle_blocks;
+        let t2 = Instant::now();
         let center = Coord::from_lat_lon(self.cam.lat(), self.cam.lon());
         let (cu, cv) = center.uv();
-        self.res.want(self.with_globe(p.want.clone()), (cu, cv));
+        self.want_cells(self.with_globe(p.want.clone()), (cu, cv));
+        self.plan_us = [(t1 - t0).as_micros() as u64, (t2 - t1).as_micros() as u64, t2.elapsed().as_micros() as u64];
         self.plan_cache = Some((key, p.clone()));
+        self.last_frame_ms = t0.elapsed().as_secs_f32() * 1000.0;
+        p
+    }
+
+    /// Plan a view for a GPU that projects every pixel itself (`viewplan`, ferros's GPU map): the same preparation as `plan`, then the faces in view, the page table's boxes and stand-ins, the desired set and the elevation range. Residency is driven from its desired set; the same view over the same cells is the same plan.
+    /// The want is said before the stand-ins are found: it lets go of the cells out of view (a square of the page table's margin among them) and those over the budget, so a plan found first could name a cell gone by the time the host writes the frame (ferros 2026-11-12, on the 8a: the GPU map's slot write found no entry for a planned cell, a panic). Every cell the plan names is in the pool when this returns.
+    pub fn plan_view(&mut self, w: usize, h: usize) -> Arc<viewplan::ViewPlan> {
+        let t0 = Instant::now();
+        self.prepare(w, h);
+        let view: ViewKey = (self.cam.lat().to_bits(), self.cam.lon().to_bits(), self.cam.ppd.to_bits(), self.cam.bearing().to_bits(), w, h, self.dem_depth, self.vec_depth);
+        let center = Coord::from_lat_lon(self.cam.lat(), self.cam.lon());
+        let (cu, cv) = center.uv();
+        self.plan_cached = false;
+        // The same view wants the same cells: said again (residency re-sends an unchanged missing list once a second), then the plan kept when the pool is the one it was found over.
+        let mut said = false;
+        if let Some((k, version, p)) = &self.view_plan_cache {
+            if *k == view {
+                let (p, version) = (p.clone(), *version);
+                self.want_cells(self.with_globe(p.want.clone()), (cu, cv));
+                said = true;
+                if self.res.pool_version == version {
+                    self.plan_cached = true;
+                    self.last_frame_ms = t0.elapsed().as_secs_f32() * 1000.0;
+                    return p;
+                }
+            }
+        }
+        let t1 = Instant::now();
+        let (mut p, points) = viewplan::view_points(w, h, &self.cam, self.dem_depth, self.vec_depth);
+        let t2 = Instant::now();
+        if !said {
+            self.want_cells(self.with_globe(p.want.clone()), (cu, cv));
+        }
+        let t3 = Instant::now();
+        viewplan::stand_ins(&mut p, &points, &self.res.pool);
+        let p = Arc::new(p);
+        self.plan_us = [(t1 - t0).as_micros() as u64, ((t2 - t1) + t3.elapsed()).as_micros() as u64, (t3 - t2).as_micros() as u64];
+        self.view_plan_cache = Some((view, self.res.pool_version, p.clone()));
         self.last_frame_ms = t0.elapsed().as_secs_f32() * 1000.0;
         p
     }
@@ -1655,17 +1872,59 @@ impl MapCore {
 
     /// The screen-space marks (GPS pin, compass) on a cleared canvas, for a renderer that composites them itself. 0xRRGGBB over black; the ink's brightness is its coverage. `with_pin` false leaves the pin out for a renderer that draws it itself (the GPU, where the pin would otherwise force a full overlay upload on every pan).
     pub fn overlay(&mut self, w: usize, h: usize, with_pin: bool) -> &[u32] {
-        let mut scratch = std::mem::take(&mut self.canvas);
-        scratch.clear();
-        scratch.resize(w * h, 0);
-        self.canvas = scratch;
+        self.overlay_marks(w, h, with_pin, true).0
+    }
+
+    /// `overlay`, for a host that keeps the marks resident and sends only what changed (ferros's GPU map): the canvas, and the box of pixels that may differ from what the last call left there (the marks it cleared and the marks it drew; the whole screen when the canvas held anything else). Only that box is cleared, so marks that cover a corner of the screen cost a corner. `with_ring` false leaves the globe's loading ring out for a renderer that draws it from `globe_ring` itself.
+    pub fn overlay_marks(&mut self, w: usize, h: usize, with_pin: bool, with_ring: bool) -> (&[u32], PixelBox) {
+        let cleared = match self.marks_at {
+            Some((mw, mh, b)) if (mw, mh) == (w, h) => {
+                for y in b.y0..b.y1 {
+                    self.canvas[y * w + b.x0..y * w + b.x1].fill(0);
+                }
+                b
+            }
+            _ => {
+                self.canvas.clear();
+                self.canvas.resize(w * h, 0);
+                PixelBox::screen(w, h)
+            }
+        };
+        self.ink = PixelBox::EMPTY;
         if with_pin {
             self.draw_gps(w, h);
         }
         self.draw_compass(w, h);
-        self.draw_globe_ring(w, h);
+        if with_ring {
+            self.draw_globe_ring(w, h);
+        }
         self.draw_pins(w, h);
+        self.marks_at = Some((w, h, self.ink));
+        (&self.canvas, cleared.union(self.ink))
+    }
+
+    /// The box the marks `overlay_marks` drew last cover (empty when none, or when the canvas holds something else).
+    pub fn marks_box(&self) -> PixelBox {
+        self.marks_at.map_or(PixelBox::EMPTY, |m| m.2)
+    }
+
+    /// The marks `overlay` drew last, as it left them (empty before the first): for a host that sums them again with a new panel and nothing of theirs changed.
+    pub fn marks_canvas(&self) -> &[u32] {
         &self.canvas
+    }
+
+    /// A stroke into the canvas (`draw_segment`), its box added to the marks'.
+    #[allow(clippy::too_many_arguments)]
+    fn seg(&mut self, w: usize, h: usize, x0: f32, y0: f32, x1: f32, y1: f32, half_w: f32, rgb: [u8; 3]) {
+        let b = draw_segment(&mut self.canvas, w, h, x0, y0, x1, y1, half_w, rgb);
+        self.ink = self.ink.union(b);
+    }
+
+    /// Seven-segment text into the canvas (`draw_seven_seg`), its box added to the marks'.
+    #[allow(clippy::too_many_arguments)]
+    fn seven(&mut self, w: usize, h: usize, text: &str, x: f32, y: f32, size: f32, rgb: [u8; 3]) {
+        let b = draw_seven_seg(&mut self.canvas, w, h, text, x, y, size, rgb);
+        self.ink = self.ink.union(b);
     }
 
     /// The route pins: the start green, the end and the destination red, the search's place blue, each a disc in a white ring.
@@ -1675,30 +1934,39 @@ impl MapCore {
             let Some((lat, lon)) = at else { continue };
             let (x, y) = self.cam.geo_to_screen(lat, lon, w, h);
             let (x, y) = (x as f32, y as f32);
-            draw_segment(&mut self.canvas, w, h, x, y, x, y, r, [255, 255, 255]);
-            draw_segment(&mut self.canvas, w, h, x, y, x, y, r * 0.72, colour);
+            self.seg(w, h, x, y, x, y, r, [255, 255, 255]);
+            self.seg(w, h, x, y, x, y, r * 0.72, colour);
         }
     }
 
     /// The ring round the globe while its base set loads: from the top, clockwise, closing as the ten depth-0 cells arrive, gone when they are all in (Nick 2026-10-22).
     fn draw_globe_ring(&mut self, w: usize, h: usize) {
-        let Some(done) = self.globe_loading() else { return };
-        if !self.cam.limb_visible(w, h) {
-            return;
-        }
-        const RING: [u8; 3] = [232, 232, 236];
-        let (cx, cy) = (w as f32 * 0.5, h as f32 * 0.5);
-        let r = self.cam.radius() as f32 + 0.015 * w.min(h) as f32;
-        let half_w = (0.004 * w.min(h) as f32).max(1.5);
-        let sweep = done.max(0.01) * core::f32::consts::TAU;
-        let steps = ((r * sweep) as usize / 3).clamp(8, 1440);
-        let at = |a: f32| (cx + r * a.sin(), cy - r * a.cos());
+        let Some(g) = self.globe_ring(w, h) else { return };
+        let [cx, cy] = g.centre;
+        let steps = ((g.radius * g.sweep) as usize / 3).clamp(8, 1440);
+        let at = |a: f32| (cx + g.radius * a.sin(), cy - g.radius * a.cos());
         let mut prev = at(0.0);
         for i in 1..=steps {
-            let p = at(i as f32 / steps as f32 * sweep);
-            draw_segment(&mut self.canvas, w, h, prev.0, prev.1, p.0, p.1, half_w, RING);
+            let p = at(i as f32 / steps as f32 * g.sweep);
+            self.seg(w, h, prev.0, prev.1, p.0, p.1, g.half_w, g.rgb);
             prev = p;
         }
+    }
+
+    /// The globe's loading ring as it stands (`draw_globe_ring` draws it as strokes; ferros's GPU map from these few numbers in its kernel, so a ring that follows the globe's every pinch costs no pixels sent): None when it does not show (the base set in, or the limb off the screen).
+    pub fn globe_ring(&self, w: usize, h: usize) -> Option<GlobeRing> {
+        let done = self.globe_loading()?;
+        if !self.cam.limb_visible(w, h) {
+            return None;
+        }
+        let (cx, cy) = Camera::centre(w, h);
+        Some(GlobeRing {
+            centre: [cx as f32, cy as f32],
+            radius: self.cam.radius() as f32 + 0.015 * w.min(h) as f32,
+            half_w: (0.004 * w.min(h) as f32).max(1.5),
+            sweep: done.max(0.01) * core::f32::consts::TAU,
+            rgb: [232, 232, 236],
+        })
     }
 
     /// The GPS pin on screen: centre and accuracy radius in pixels, for a renderer that draws it itself.
@@ -1787,8 +2055,11 @@ impl MapCore {
                 self.light_version += 1;
             }
         }
-        self.vec_depth = select_depth(self.cam.ppd, self.vec_depth, VEC_BASE_DEPTH);
-        self.dem_depth = select_depth(self.cam.ppd, self.dem_depth, DEM_BASE_DEPTH);
+        self.vec_ideal = select_depth(self.cam.ppd, self.vec_ideal, VEC_BASE_DEPTH);
+        self.dem_ideal = select_depth(self.cam.ppd, self.dem_ideal, DEM_BASE_DEPTH);
+        // WHY saturating: at the globe the scale asks for depth 1 or 2 and a short host can be shorter than that; there is no depth under 0 (MIN_DEPTH).
+        self.vec_depth = self.vec_ideal.saturating_sub(self.depth_short);
+        self.dem_depth = self.dem_ideal.saturating_sub(self.depth_short);
         self.luts.dem_depth = self.dem_depth;
         // Contours: fit N levels to the previous frame's elevation span.
         let interval = if let Some(held) = self.contour_hold {
@@ -1811,6 +2082,7 @@ impl MapCore {
     pub fn render(&mut self, w: usize, h: usize) {
         let t0 = Instant::now();
         self.prepare(w, h);
+        self.marks_at = None;
         self.canvas.resize(w * h, BG_RGB);
         if w == 0 || h == 0 {
             return;
@@ -1819,7 +2091,8 @@ impl MapCore {
             // Every pixel's own frame: the pole in view coordinates and the disk, for the ball's lighting.
             let b = self.cam.basis();
             self.luts.pole = [b[0][2] as f32, b[1][2] as f32, b[2][2] as f32];
-            self.luts.disk = [w as f32 * 0.5, h as f32 * 0.5, self.cam.radius() as f32];
+            let (cx, cy) = Camera::centre(w, h);
+            self.luts.disk = [cx as f32, cy as f32, self.cam.radius() as f32];
         }
         let (stats, want) = raster::render_frame(
             &mut self.canvas,
@@ -1859,12 +2132,54 @@ impl MapCore {
         // Residency: request what the lattice says we need, nearest-first.
         let center = Coord::from_lat_lon(self.cam.lat(), self.cam.lon());
         let (cu, cv) = center.uv();
-        self.res.want(self.with_globe(want), (cu, cv));
+        if trace() {
+            self.trace_frame(&want, w, h);
+        }
+        self.want_cells(self.with_globe(want), (cu, cv));
 
         self.draw_gps(w, h);
         self.draw_compass(w, h);
         self.draw_measure(w, h);
         self.last_frame_ms = t0.elapsed().as_secs_f32() * 1000.0;
+    }
+
+    /// The frame as the residency sees it, logged when it changes (ferros, or MAHERE_TRACE): the camera, the depths, and each terrain cell the frame wants at its depth: resident with terrain, confirmed absent, arrived empty, or not arrived; of those without terrain, how many a coarser cell stands in for and how many have nothing at any depth (drawn as the dark mesh).
+    fn trace_frame(&mut self, want: &[mahere_tiles::CellKey], w: usize, h: usize) {
+        let pool = &self.res.pool;
+        let mut t = FrameTrace { dem_depth: self.dem_depth, vec_depth: self.vec_depth, pool: pool.map.len() as u32, ..FrameTrace::default() };
+        for k in want.iter().filter(|k| k.depth == self.dem_depth) {
+            t.wanted += 1;
+            match pool.map.get(k) {
+                Some(e) if e.dem.is_some() => {
+                    t.terrain += 1;
+                    continue;
+                }
+                Some(e) if e.is_absent() => t.absent += 1,
+                Some(_) => t.empty += 1,
+                None => t.pending += 1,
+            }
+            let below = (k.depth > raster::MIN_DEPTH).then(|| raster::probe(pool, k.depth - 1, k.prefix >> 2, |e| e.dem.is_some())).flatten();
+            match below {
+                Some((_, d, _)) => {
+                    t.stand_in += 1;
+                    t.stand_in_depth = t.stand_in_depth.max(d);
+                }
+                None => t.nothing += 1,
+            }
+        }
+        for e in pool.map.values() {
+            t.pool_terrain += e.dem.is_some() as u32;
+            t.pool_absent += e.is_absent() as u32;
+        }
+        if self.last_trace == Some(t) {
+            return;
+        }
+        let c = &self.cam;
+        eprintln!(
+            "map frame {w} x {h}: camera {:.5} {:.5} ppd {:.1} bearing {:.3}; depths terrain {} vectors {}; {} terrain cells wanted: {} with terrain, {} absent, {} arrived empty, {} not arrived; of the rest {} drawn from a coarser cell (finest depth {}), {} with nothing at any depth (the dark mesh); pool {} cells, {} with terrain, {} absent",
+            c.lat(), c.lon(), c.ppd, c.bearing(), t.dem_depth, t.vec_depth, t.wanted, t.terrain, t.absent, t.empty, t.pending, t.stand_in, t.stand_in_depth, t.nothing, t.pool, t.pool_terrain, t.pool_absent
+        );
+        self.last_trace = Some(t);
     }
 
     /// The measurement for a CPU frontend: the line from origin to target and a crosshair on the target.
@@ -1873,25 +2188,25 @@ impl MapCore {
         const INK: [u8; 3] = [255, 196, 64];
         let (ox, oy) = m.origin_px;
         let (tx, ty) = m.target_px;
-        draw_segment(&mut self.canvas, w, h, ox, oy, tx, ty, 1.3, INK);
+        self.seg(w, h, ox, oy, tx, ty, 1.3, INK);
         for (dx0, dy0, dx1, dy1) in [(-12., 0., 12., 0.), (0., -12., 0., 12.)] {
-            draw_segment(&mut self.canvas, w, h, tx + dx0, ty + dy0, tx + dx1, ty + dy1, 1.6, INK);
+            self.seg(w, h, tx + dx0, ty + dy0, tx + dx1, ty + dy1, 1.6, INK);
         }
     }
 
     /// Whether the view is zoomed past the finest data under the crosshair: the cell there at the view's depth is known to be absent (a 404 from the bucket, or under a cell that was). A cell still loading is not past anything.
     pub fn past_data(&self) -> bool {
-        if self.zoom_depth() > self.vec_depth {
+        if self.zoom_depth() > self.vec_ideal {
             return true;
         }
-        let key = mahere_tiles::CellKey::containing(Coord::from_lat_lon(self.cam.lat(), self.cam.lon()), self.vec_depth);
+        let key = mahere_tiles::CellKey::containing(Coord::from_lat_lon(self.cam.lat(), self.cam.lon()), self.vec_ideal);
         self.res.pool.map.get(&key).is_some_and(|e| e.present == 0 && e.is_absent())
     }
 
     /// The depth the zoom asks for: the view's depth, counting on past the finest any cell is baked to (so z keeps climbing as the map magnifies past its detail).
     pub fn zoom_depth(&self) -> u8 {
         let ideal = raster::select_depth(self.cam.ppd, 0, 30);
-        if self.vec_depth == raster::VEC_BASE_DEPTH { ideal.max(self.vec_depth) } else { self.vec_depth }
+        if self.vec_ideal == raster::VEC_BASE_DEPTH { ideal.max(self.vec_ideal) } else { self.vec_ideal }
     }
 
     /// North arrow, top-right, with the view's heading below it: degrees the screen's up is turned from true north, clockwise positive, -180..180. No letters.
@@ -1907,34 +2222,34 @@ impl MapCore {
         let len = 26.0;
         let (tx, ty) = (cx + nx * len, cy + ny * len);
         let (bx, by) = (cx - nx * len * 0.6, cy - ny * len * 0.6);
-        draw_segment(&mut self.canvas, w, h, bx, by, tx, ty, 1.4, INK);
+        self.seg(w, h, bx, by, tx, ty, 1.4, INK);
         // Arrow head: two barbs back from the tip.
         let (px, py) = (-ny, nx);
         for sgn in [-1.0f32, 1.0] {
             let hx = tx - nx * 9.0 + px * sgn * 6.0;
             let hy = ty - ny * 9.0 + py * sgn * 6.0;
-            draw_segment(&mut self.canvas, w, h, tx, ty, hx, hy, 1.4, INK);
+            self.seg(w, h, tx, ty, hx, hy, 1.4, INK);
         }
         let mut deg = self.cam.bearing().to_degrees().rem_euclid(360.0);
         if deg > 180.0 {
             deg -= 360.0;
         }
         let text = format!("{}", deg.round() as i64);
-        draw_seven_seg(&mut self.canvas, w, h, &text, cx, cy + len + 30.0, 18.0, INK);
+        self.seven(w, h, &text, cx, cy + len + 30.0, 18.0, INK);
         // The zoom: the depth of the cells the view is drawn from, under the heading (Nick 2026-10-10: to see the level and when it changes).
         // Amber past the data (Nick 2026-10-16): the cell under the crosshair at this depth is known not to exist, on the device or in the bucket; white while it is there or still on its way.
         const AMBER: [u8; 3] = [255, 168, 0];
         let zoom_ink = if self.past_data() { AMBER } else { INK };
         let zoom = format!("z{}", self.zoom_depth());
-        draw_seven_seg(&mut self.canvas, w, h, &zoom, cx, cy + len + 58.0, 18.0, zoom_ink);
+        self.seven(w, h, &zoom, cx, cy + len + 58.0, 18.0, zoom_ink);
         // With Detail on, its legend under the zoom: a bar in each depth's colour, the depth beside it, finest at the top.
         if self.luts.mask.debug {
             let n = raster::DETAIL_COLOURS.len();
             for (k, col) in raster::DETAIL_COLOURS.iter().enumerate().rev() {
                 let y = cy + len + 84.0 + (n - 1 - k) as f32 * 22.0;
-                draw_segment(&mut self.canvas, w, h, cx - 22.0, y, cx - 8.0, y, 5.0, *col);
+                self.seg(w, h, cx - 22.0, y, cx - 8.0, y, 5.0, *col);
                 let d = raster::DETAIL_FIRST as usize + k;
-                draw_seven_seg(&mut self.canvas, w, h, &format!("{d}"), cx + 14.0, y + 7.0, 14.0, INK);
+                self.seven(w, h, &format!("{d}"), cx + 14.0, y + 7.0, 14.0, INK);
             }
         }
     }
@@ -1944,14 +2259,14 @@ impl MapCore {
         self.vec_depth
     }
 
-    /// GPS pin: accuracy ring, crosshair, seven-segment elevation readout.
-    /// The where-I-am marker on the CPU's canvas: each pixel it covers has half the code range added, wrapping, so it shows on any ground ([`marker_coverage`]).
+    /// The where-I-am marker on the CPU's canvas: each pixel it covers has half the code range added, wrapping, so it shows on any ground ([`marker_coverage`]); its pixels join the marks' box.
     fn draw_gps(&mut self, w: usize, h: usize) {
         let Some(m) = self.marker(w, h) else { return };
         let span = 2.0 * (w * h) as f32 / (w + h).max(1) as f32;
         let reach = (span / 24.0).max(if m.accuracy_px > span / 16.0 { m.accuracy_px } else { 0.0 }) + 2.0;
         let (x0, x1) = ((m.x - reach).floor().max(0.0) as usize, ((m.x + reach).ceil().max(0.0) as usize).min(w));
         let (y0, y1) = ((m.y - reach).floor().max(0.0) as usize, ((m.y + reach).ceil().max(0.0) as usize).min(h));
+        self.ink = self.ink.union(PixelBox { x0, y0, x1, y1 });
         for y in y0..y1 {
             for x in x0..x1 {
                 let cov = marker_coverage(x as f32 + 0.5 - m.x, y as f32 + 0.5 - m.y, &m, span);
@@ -1966,6 +2281,29 @@ impl MapCore {
 
 // Keep TEX re-exported for frontends/tests that size things off cells.
 pub use mahere_tiles::TEX as CELL_TEX;
+
+/// Whether the residency's working is logged: always on ferros (no other way to see it there yet), elsewhere with MAHERE_TRACE set.
+pub(crate) fn trace() -> bool {
+    cfg!(target_os = "ferros") || std::env::var_os("MAHERE_TRACE").is_some()
+}
+
+/// One frame's residency, as [`MapCore::trace_frame`] logs it.
+#[derive(Clone, Copy, Default, PartialEq)]
+struct FrameTrace {
+    dem_depth: u8,
+    vec_depth: u8,
+    wanted: u32,
+    terrain: u32,
+    absent: u32,
+    empty: u32,
+    pending: u32,
+    stand_in: u32,
+    stand_in_depth: u8,
+    nothing: u32,
+    pool: u32,
+    pool_terrain: u32,
+    pool_absent: u32,
+}
 const _: () = assert!(TEX == 256);
 
 /// The where-I-am marker's styles, by their number.
@@ -2030,7 +2368,54 @@ pub fn wrap_half(p: u32, cov: f32) -> u32 {
     mix(16) | mix(8) | mix(0)
 }
 
-/// Anti-aliased stroke (screen-space overlay layer: GPS pin etc.).
+/// A box of screen pixels, columns `x0..x1` of rows `y0..y1`; empty when either range is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PixelBox {
+    pub x0: usize,
+    pub y0: usize,
+    pub x1: usize,
+    pub y1: usize,
+}
+
+impl PixelBox {
+    pub const EMPTY: PixelBox = PixelBox { x0: 0, y0: 0, x1: 0, y1: 0 };
+
+    /// The whole `w` × `h` screen.
+    pub fn screen(w: usize, h: usize) -> PixelBox {
+        PixelBox { x0: 0, y0: 0, x1: w, y1: h }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.x0 >= self.x1 || self.y0 >= self.y1
+    }
+
+    /// The least box holding both.
+    pub fn union(self, o: PixelBox) -> PixelBox {
+        if self.is_empty() {
+            return o;
+        }
+        if o.is_empty() {
+            return self;
+        }
+        PixelBox { x0: self.x0.min(o.x0), y0: self.y0.min(o.y0), x1: self.x1.max(o.x1), y1: self.y1.max(o.y1) }
+    }
+
+    pub fn area(&self) -> usize {
+        if self.is_empty() { 0 } else { (self.x1 - self.x0) * (self.y1 - self.y0) }
+    }
+}
+
+/// The globe's loading ring (`MapCore::globe_ring`): an arc about `centre` of `radius` pixels from the top clockwise thru `sweep` radians, `half_w` either side of it, in `rgb` (gamma-2 bytes, as every mark).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct GlobeRing {
+    pub centre: [f32; 2],
+    pub radius: f32,
+    pub half_w: f32,
+    pub sweep: f32,
+    pub rgb: [u8; 3],
+}
+
+/// Anti-aliased stroke (screen-space overlay layer: GPS pin etc.); the box of pixels it may have touched (empty when it is off the canvas).
 #[allow(clippy::too_many_arguments)]
 pub fn draw_segment(
     canvas: &mut [u32],
@@ -2042,7 +2427,7 @@ pub fn draw_segment(
     y1: f32,
     half_w: f32,
     rgb: [u8; 3],
-) {
+) -> PixelBox {
     let pad = half_w + 1.0;
     let bx0 = (x0.min(x1) - pad).floor().max(0.) as usize;
     let by0 = (y0.min(y1) - pad).floor().max(0.) as usize;
@@ -2050,7 +2435,7 @@ pub fn draw_segment(
     let bx1 = ((x0.max(x1) + pad).ceil() as isize).clamp(0, w as isize) as usize;
     let by1 = ((y0.max(y1) + pad).ceil() as isize).clamp(0, h as isize) as usize;
     if bx0 >= bx1 || by0 >= by1 {
-        return;
+        return PixelBox::EMPTY;
     }
     let dx = x1 - x0;
     let dy = y1 - y0;
@@ -2079,9 +2464,11 @@ pub fn draw_segment(
             }
         }
     }
+    PixelBox { x0: bx0, y0: by0, x1: bx1, y1: by1 }
 }
 
-/// Seven-segment digits via strokes: field-readable numerals, zero font deps.
+/// Seven-segment digits via strokes: field-readable numerals, zero font deps. The box of pixels its strokes may have touched.
+#[allow(clippy::too_many_arguments)]
 pub fn draw_seven_seg(
     canvas: &mut [u32],
     w: usize,
@@ -2091,7 +2478,8 @@ pub fn draw_seven_seg(
     y: f32,
     size: f32,
     rgb: [u8; 3],
-) {
+) -> PixelBox {
+    let mut touched = PixelBox::EMPTY;
     const GLYPHS: [u8; 10] = [
         0b0111111, 0b0000110, 0b1011011, 0b1001111, 0b1100110, 0b1101101, 0b1111101, 0b0000111,
         0b1111111, 0b1101111,
@@ -2111,7 +2499,7 @@ pub fn draw_seven_seg(
         let (x0, x1) = (cx, cx + sw);
         let (y0, ym, y1) = (y - size, y - size * 0.5, y);
         if ch == 'z' {
-            draw_segment(canvas, w, h, x1, y0, x0, y1, hw, rgb);
+            touched = touched.union(draw_segment(canvas, w, h, x1, y0, x0, y1, hw, rgb));
         }
         let lines = [
             (x0, y0, x1, y0),
@@ -2124,11 +2512,12 @@ pub fn draw_seven_seg(
         ];
         for (i, &(ax, ay, bx, by)) in lines.iter().enumerate() {
             if segs >> i & 1 == 1 {
-                draw_segment(canvas, w, h, ax, ay, bx, by, hw, rgb);
+                touched = touched.union(draw_segment(canvas, w, h, ax, ay, bx, by, hw, rgb));
             }
         }
         cx += sw + size * 0.28;
     }
+    touched
 }
 
 #[cfg(test)]
@@ -2140,6 +2529,66 @@ mod tests {
         fn get(&self, _key: mahere_tiles::CellKey) -> residency::Fetch {
             residency::Fetch::Absent
         }
+    }
+
+    /// Two fingers twisted and pinched away from the camera point hold the ground each came down on (`hold_two`), at a town's scale, a region's and the globe's; the turn about the camera point and the midpoint put back (the device app's solve until 2026-11-12) left them pixels off at a region's.
+    #[test]
+    fn two_fingers_hold_their_ground() {
+        let (w, h) = (1080usize, 2400usize);
+        for &(lat, lon, ppd) in &[(46.2, -121.5, 6000.0), (46.2, -121.5, 60.0), (20.0, -150.0, 6.0)] {
+            for &(cx, cy, r, turn, spread) in &[(300.0, 1800.0, 250.0, 45.0f64, 1.0f64), (800.0, 1000.0, 150.0, -60.0, 1.5), (540.0, 1200.0, 200.0, 90.0, 1.25)] {
+                let cam0 = Camera::new(lat, lon, ppd, 0.3);
+                let mut map = MapCore::new(Arc::new(Empty), cam0);
+                // At the globe only a gesture on the ball: off it, a finger's ground is the limb's.
+                if ppd < 10.0 && (cx - 540.0f64).hypot(cy - 1200.0) + r > 0.9 * map.cam.radius() {
+                    continue;
+                }
+                let (a, b) = ((cx - r, cy), (cx + r, cy));
+                let (ga, gb) = (map.cam.screen_to_geo(a.0, a.1, w, h), map.cam.screen_to_geo(b.0, b.1, w, h));
+                let mid = map.cam.screen_to_geo(cx, cy, w, h);
+                let t = turn.to_radians();
+                let (na, nb) = ((cx - r * spread * t.cos(), cy - r * spread * t.sin()), (cx + r * spread * t.cos(), cy + r * spread * t.sin()));
+                map.set_ppd(cam0.ppd * spread);
+                map.rotate_view(-t);
+                map.hold_two(mid, ga, gb, na, nb, w, h);
+                for (g, n) in [(ga, na), (gb, nb)] {
+                    let p = map.cam.geo_to_screen(g.0, g.1, w, h);
+                    assert!((p.0 - n.0).hypot(p.1 - n.1) < 0.1, "ppd {ppd}, fingers about ({cx}, {cy}) turned {turn}: a finger's ground at {p:?}, the finger at {n:?}");
+                }
+            }
+        }
+    }
+
+    /// Marks kept on the canvas and cleared by their own box are what a cleared canvas draws, and the box `overlay_marks` answers holds every pixel that changed: a host that sends only that box keeps a resident copy right.
+    #[test]
+    fn marks_redrawn_in_their_box_are_a_clean_canvas() {
+        let (w, h) = (320, 480);
+        let mut kept = MapCore::new(Arc::new(Empty), Camera::new(10.0, 20.0, 1.0, 0.0));
+        let mut changed = 0;
+        for k in 0..12u32 {
+            // The globe turning, zooming and coming in close (the ring shows, then not), the ring left to the host on every other.
+            let cam = Camera::new(10.0 + k as f64 * 3.0, 20.0 - k as f64, (1u64 << (k / 2)) as f64, k as f64 * 0.4);
+            let ring = k % 2 == 0;
+            kept.cam = cam;
+            let before = kept.marks_canvas().to_vec();
+            let (now, dirty) = kept.overlay_marks(w, h, true, ring);
+            let now = now.to_vec();
+            let mut fresh = MapCore::new(Arc::new(Empty), cam);
+            let clean = fresh.overlay_marks(w, h, true, ring).0.to_vec();
+            assert!(now == clean, "pass {k}: the kept canvas is not a clean one's");
+            assert_eq!(kept.marks_box(), fresh.marks_box());
+            if before.len() == now.len() {
+                for (i, (a, b)) in before.iter().zip(&now).enumerate() {
+                    if a != b {
+                        changed += 1;
+                        let (x, y) = (i % w, i / w);
+                        assert!(x >= dirty.x0 && x < dirty.x1 && y >= dirty.y0 && y < dirty.y1, "pass {k}: ({x}, {y}) changed outside {dirty:?}");
+                    }
+                }
+                assert!(dirty.area() < w * h, "pass {k}: the whole screen sent for marks in a corner");
+            }
+        }
+        assert!(changed > 0);
     }
 
     /// The zoom turns amber past the data: where no cell exists under the crosshair once the view has looked, and past the finest depth any cell is baked to, where it keeps counting.
@@ -2637,7 +3086,8 @@ impl MapCore {
                 return Some((g.lat, g.lon));
             }
         }
-        Some(self.cam.screen_to_geo(w as f64 * 0.5, h as f64 * 0.5, w, h))
+        let (cx, cy) = Camera::centre(w, h);
+        Some(self.cam.screen_to_geo(cx, cy, w, h))
     }
 
     /// The measurement for a `w × h` screen with a profile of `samples` points, if one is set.

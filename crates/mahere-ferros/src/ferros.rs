@@ -1,21 +1,149 @@
 //! The ferros side of Mahere: the grants, the vault's secret, the GPS fix, and the touch server's contacts into the device app's two-finger solve, the rest going to fluor's ferros shell as its pointer.
 
+use fluor::host::EventResponse;
+use fluor::host::app::{Context, FluorApp};
 use fluor::host::ferros::{Caps, Contact, FerrosShell, run_app_with};
 use mahere_device::{DeviceApp, NoGpu};
 use mahere_engine::GpsFix;
 use std::sync::{Arc, Mutex};
 
-/// The grant slots, in the spawn's order (slot 0 is the console): the display endpoint, the touch endpoint, this process's surface, the ira. The vault scope (`--store`) and the entropy follow, found by kete and ferros_rt by asking each grant; `--use gps` comes last, when the person grants it.
+/// The grant slots, in the spawn's order (slot 0 is the console): the display endpoint, the touch endpoint, this process's surface, the ira. The vault scope (`--store`) and the entropy follow, found by kete and ferros_rt by asking each grant; then `--use gps`, when the person grants it, and `--use udp`, the ip server (the network: the cells from the bucket behind the vault).
 const DISPLAY: u64 = 1;
 const TOUCH: u64 = 2;
 const SURFACE: u64 = 3;
 const IRA: u64 = 4;
 const GPS: u64 = 7;
+const UDP: u64 = 8;
+/// The GPU service and Mahere's block of the layer arena, after the network: the map drawn on the GPU (`gpu.rs`). As a kist these are the kernel's to hand every kist, the slots after its eight wants (ferros_sys::gpu `kist_slots(8)`, ferros GPU-KISTS.md plan step 1, 2026-11-12); a development spawn gives them with `--use gpu --dma layers`.
+const GPU: u64 = 9;
+const LAYERS: u64 = 10;
+/// A second surface (the kernel's third GPU slot for a kist; `--dma surface` after the layers in a development spawn): the mailbox's other buffer, so the GPU draws one frame while the display shows the last (`gpu.rs`).
+const SURFACE2: u64 = 11;
 
-type Shell = FerrosShell<DeviceApp<NoGpu>>;
+type Shell = FerrosShell<App>;
+
+/// The touch-device app, its map drawn on the GPU when the GPU's grants are there (`FluorApp::render_own`: the kernel's frame, the panel and the marks composed in it, shown as it is), else on the CPU raster as before.
+/// A GPU map that fails (a block of the arena too small for the screen, the service refusing, the kernel faulting) is said on the console and let go, and the CPU raster draws from that frame on: the map is never left black (2026-11-12, the 8a: a 32 MiB block, the circle black).
+pub struct App {
+    pub inner: DeviceApp<NoGpu>,
+    gpu: Option<crate::gpu::GpuMap>,
+    /// The ticks that asked for a frame and all of them since the last line, and when that line was said (`tick`): what keeps a still map drawing, on the console every ten seconds while it does.
+    ticks: [u64; 2],
+    ticks_said: std::time::Instant,
+    /// The heap's most in MiB at the last line (a still map says it again only when it moved).
+    heap_said: usize,
+}
+
+impl FluorApp for App {
+    type UserEvent = ();
+    fn title(&self) -> &str {
+        self.inner.title()
+    }
+    fn init(&mut self, ctx: &mut Context) {
+        self.inner.init(ctx)
+    }
+    fn on_resize(&mut self, width: u32, height: u32, ctx: &mut Context) {
+        self.inner.on_resize(width, height, ctx)
+    }
+    fn on_event(&mut self, event: &fluor::event::Event, ctx: &mut Context) -> EventResponse {
+        self.inner.on_event(event, ctx)
+    }
+    fn wake_at(&self) -> Option<std::time::Instant> {
+        // A frame planned and not yet drawn (the GPU pipeline's last): one more draw, now, so it reaches the glass when the map comes to rest.
+        if self.gpu.as_ref().is_some_and(|g| g.owes_frame()) {
+            return Some(std::time::Instant::now());
+        }
+        self.inner.wake_at()
+    }
+    fn tick(&mut self, ctx: &mut Context) -> bool {
+        let more = self.inner.tick(ctx);
+        self.ticks[0] += more as u64;
+        self.ticks[1] += 1;
+        if self.ticks_said.elapsed().as_secs() >= 10 {
+            let (held, most) = crate::heap::take();
+            let pool: usize = self.inner.map.pool().map.values().map(|e| e.bytes()).sum();
+            let heap = format!("the heap {} MiB held, {} at most since the last line; the pool's cells {} MiB", held >> 20, most >> 20, pool >> 20);
+            if self.ticks[0] > 0 {
+                let (m, d) = (self.inner.map.tick_why, self.inner.tick_why);
+                println!("mahere: {} of {} ticks asked for a frame in {} s (cells arrived {}, the map dirty {}, a route {}, the wants said again {}; a search {}, the panel {}, the lettering {}); {heap}", self.ticks[0], self.ticks[1], self.ticks_said.elapsed().as_secs(), m[0], m[1], m[2], m[3], d[0], d[1], d[2]);
+            } else if most >> 20 != self.heap_said {
+                println!("mahere: {heap}");
+            }
+            self.heap_said = most >> 20;
+            self.ticks = [0; 2];
+            self.inner.map.tick_why = [0; 4];
+            self.inner.tick_why = [0; 3];
+            self.ticks_said = std::time::Instant::now();
+        }
+        more
+    }
+    fn wants_keyboard(&mut self) -> Option<bool> {
+        self.inner.wants_keyboard()
+    }
+    fn render(&mut self, target: &mut [u32], ctx: &mut Context) {
+        self.inner.render(target, ctx)
+    }
+    fn render_own(&mut self, ctx: &mut Context) -> bool {
+        let Some(g) = self.gpu.as_mut() else { return false };
+        let (w, h) = (ctx.viewport.width_px as usize, ctx.viewport.height_px as usize);
+        match g.draw(&mut self.inner, w, h) {
+            Ok(()) => true,
+            Err(e) => {
+                // This frame and every one after on the CPU raster (fluor draws the scratch when this answers false, and the whole frame, the app saying no smaller damage).
+                println!("mahere: the GPU map stopped: {e}; the map draws on the CPU from now on");
+                self.gpu = None;
+                // The planes that lived only in the GPU's slots are read again for the CPU raster, under its budget.
+                self.inner.map.drop_released();
+                self.inner.map.set_pool_budget(POOL_BUDGET);
+                false
+            }
+        }
+    }
+    fn own_frame(&self) -> Option<&[u32]> {
+        self.gpu.as_ref().and_then(|g| g.frame())
+    }
+    fn own_surface(&self) -> Option<u64> {
+        self.gpu.as_ref().and_then(|g| g.own_surface())
+    }
+    fn opaque(&self) -> bool {
+        self.gpu.is_some()
+    }
+    fn own_baked(&self) -> bool {
+        self.gpu.as_ref().is_some_and(|g| g.baked())
+    }
+    fn cursor_for(&self, x: fluor::coord::Coord, y: fluor::coord::Coord, ctx: &Context) -> fluor::event::CursorIcon {
+        self.inner.cursor_for(x, y, ctx)
+    }
+}
+
+/// The most the decoded cells may hold on the CPU path, 192 MiB of the heap's 640 (build.rs): a full screen on the Pro's panel wants 130 to 290 cells of about 2 MiB each (the terrain packed for the CPU raster 1 MiB, seven vector planes 128 KiB each), measured on the desktop 2026-11-11 (mahere-device example `ferros_mem`: the globe 134 cells and 252 MiB, a city 283 cells and 592 MiB). Past it the finest cells farthest from the view's centre wait, drawn from their parents (residency `set_budget`): 100 cells at the globe, 89 at the city. The rest of the heap is the rest of the app, and at the globe it is most of it: the frames (46 MiB), the glyph atlas (32 MiB, 64 while a layout copies it), font packs (60 to 100 MiB with five Han faces and their vault writes), names, the lettering, cells in flight, the thread stacks; 600 MiB in all at the globe on the desktop with this budget (750 at its peak), 340 at the city (385). A GPU host takes the planes off the CPU, and then they count for nothing here.
+const POOL_BUDGET: usize = (1 << 27) + (1 << 26);
+/// The decoded cells' most when the GPU draws the map, 128 MiB: a cell's planes leave the CPU once written into its GPU slot (arena.rs `Slots`; the owner on the 8a, 2026-11-13: "it's almost fuzzy now"), so the pool holds the cells on their way in (about 2 MiB each: the terrain packed with its normals, the vector planes) and, for every cell, its metadata and its elevation (256 KiB: the plan's elevation range and the readouts), and the GPU's 488 slots of 1 MiB at 1080 x 2400 are the cells' cache. Before, the planes stayed on the CPU too: at 192 MiB the pool held 101 cells and the map drew from coarse stand-ins, at 384 MiB 211 cells with the arc at 674 MiB of its 692 MiB ceiling.
+const GPU_POOL_BUDGET: usize = 1 << 27;
+
+/// The bottom of the camera cutout in panel rows, husky's then akita's: ferros_sys `CUTOUT_BOTTOM` and `CUTOUT_BOTTOM_AKITA`, measured on the glass (2026-11-08), copied as `sys` is because ferros_sys is not a published crate.
+const CUTOUT_BOTTOM: f64 = 118.5610;
+const CUTOUT_BOTTOM_AKITA: f64 = 101.8303;
+
+/// The map's view in the circle an app lives in (owner, 2026-11-12, on the Pro: "the earth isn't centered in the app circle"): the circle is tangent to the bottom of the camera cutout and the bottom of the screen (ferros WINDOWS.md), while this app's frame is the whole panel, so its centre is half the cutout's height below the frame's middle.
+/// No display op answers the circle (the display computes it for its clip and its hairline from the board's cutout, ferros_sys `active_circle`), so it is computed here the same way: the panel's size from op 5, the board from the kernel's facts.
+fn place_view() {
+    let mut r = [0u8; 16];
+    if sys::call(DISPLAY, &[5], &mut r) < 4 {
+        println!("mahere: the display did not say its size; the view stays at the frame's middle");
+        return;
+    }
+    let (w, h) = (u16::from_le_bytes([r[0], r[1]]) as f64, u16::from_le_bytes([r[2], r[3]]) as f64);
+    let board = sys::board();
+    let cut = if board == 2 { CUTOUT_BOTTOM_AKITA } else { CUTOUT_BOTTOM };
+    let radius = (h - cut) * 0.5;
+    let (cx, cy) = (w * 0.5, cut + radius);
+    mahere_engine::set_view(mahere_engine::View { dx: cx - w * 0.5, dy: cy - h * 0.5, radius });
+    println!("mahere: the view in the app's circle on the {w} x {h} panel (board {board}): centre ({cx}, {cy}), radius {radius}");
+}
 
 /// The kernel, as this process reaches it (ferros KERNEL.md, the process ABI): the call, the ira key, the grants page. Inlined as fluor's and kete's are: ferros_sys is no_std and not a published crate.
-mod sys {
+pub(crate) mod sys {
     use core::arch::asm;
 
     pub const ERR: u64 = u64::MAX;
@@ -55,6 +183,35 @@ mod sys {
         svc(CALL, cap(slot), off(msg.as_ptr()), msg.len() as u64, off(reply.as_mut_ptr()), reply.len() as u64)
     }
 
+    /// The spawn input from byte `start` into `buf`; how many bytes came (0 at its end).
+    pub fn input(start: u64, buf: &mut [u8]) -> u64 {
+        svc(8, start, off(buf.as_mut_ptr()), buf.len() as u64, 0, 0)
+    }
+
+    /// A DMA region's base as this process sees it (the kernel's SYS_DMA, 7): 0 or ERR without one.
+    pub fn dma(slot: u64) -> u64 {
+        svc(7, cap(slot), 0, 0, 0, 0)
+    }
+
+    /// A DMA region's size (SYS_DMA with x1 = 1, ferros since 2026-11-11), or None from a kernel before, which answers its base (past `most`).
+    pub fn dma_size(slot: u64, most: u64) -> Option<u64> {
+        let n = svc(7, cap(slot), 1, 0, 0, 0);
+        (n != ERR && n <= most).then_some(n)
+    }
+
+    /// Ask the kernel to grow this process's GPU block (the grant at `slot`) to 2^`log` bytes in place, its base and contents kept (SYS_DMA with x1 = 2, ferros since 2026-11-13, ferros_sys `gpu_block_ask`): its size after, or None (more than the frame pool can give or past the kernel's ceiling, said on its console; or a kernel from before, which answers the base, past `most`).
+    pub fn gpu_block_ask(slot: u64, log: u32, most: u64) -> Option<u64> {
+        let n = svc(7, cap(slot), 2, log as u64, 0, 0);
+        (n != ERR && n <= most).then_some(n)
+    }
+
+    /// The board (the kernel's SYS_FACTS, 12, fact 84: 1 husky, 2 akita), read as ferros_sys `akita` reads it: no capability, and the facts cost an I2C read of the battery gauge, so once.
+    pub fn board() -> u64 {
+        let mut b = [0u8; 85 * 8];
+        svc(12, off(b.as_mut_ptr()), b.len() as u64, 0, 0, 0);
+        u64::from_le_bytes(b[84 * 8..85 * 8].try_into().unwrap())
+    }
+
     /// A 32-byte key for `domain` rooted in the device's ira (ferros_sys `ira_key`): the same on every boot, never the ira itself; None without an Ira grant or an ira this boot.
     pub fn ira_key(slot: u64, domain: &str) -> Option<[u8; 32]> {
         let mut out = [0u8; 32];
@@ -83,8 +240,35 @@ pub fn run() {
             None
         }
     };
-    // The size comes from the shell at once (`on_resize` as it is made): the panel's, the frame being the whole panel.
-    let app: DeviceApp<NoGpu> = DeviceApp::open(0, 0, store, None);
+    // The network before the app opens its cell stores: with it the cells come from the vault, then the bucket over plain HTTP, kept in the vault as they come (as on every other platform); without it from the vault alone.
+    if sys::grant_count() > UDP {
+        match crate::net::IpNet::open(UDP) {
+            Ok(net) => {
+                mahere_engine::plain_http::set_dial(Arc::new(net));
+                println!("mahere: the network at slot {UDP}; cells from {} behind the vault", mahere_engine::residency::DEFAULT_CELLS_URL);
+            }
+            Err(e) => println!("mahere: no network: {e}; cells from the vault alone"),
+        }
+    } else {
+        println!("mahere: no network grant (slot {UDP}); cells from the vault alone");
+    }
+    // The size comes from the shell at once (`on_resize` as it is made): the panel's, the frame being the whole panel; the view's centre, the app circle's, before any frame.
+    place_view();
+    let mut inner: DeviceApp<NoGpu> = DeviceApp::open(0, 0, store, None);
+    inner.map.set_pool_budget(POOL_BUDGET);
+    // The development spawn's input byte: bits 0 and 1 the bench (below), bit 2 full screen; bit 3 (8) takes 32 MiB of the GPU's block whatever it is (one frame region at the 8a's or the Pro's screen, the frames not pipelined), bit 4 (16) 16 MiB (no frame region fits: the CPU raster draws), for proving on the device what a small block does.
+    let mut first = [0u8; 1];
+    let byte = if sys::input(0, &mut first) == 1 { first[0] } else { 0 };
+    let most = if byte & 16 != 0 { 16 << 20 } else if byte & 8 != 0 { 32 << 20 } else { usize::MAX };
+    if most != usize::MAX {
+        println!("mahere: the GPU's block taken as {} MiB at most (the spawn's input byte)", most >> 20);
+    }
+    // The GPU map letters the map from the labeller as the CPU raster does (`letters.rs`).
+    let mut app = App { inner, gpu: crate::gpu::GpuMap::open(GPU, LAYERS, SURFACE, SURFACE2, most), ticks: [0; 2], ticks_said: std::time::Instant::now(), heap_said: 0 };
+    // The GPU map's cells hold their planes in its slots, the CPU only those on their way in (`GPU_POOL_BUDGET`).
+    if app.gpu.is_some() {
+        app.inner.map.set_pool_budget(GPU_POOL_BUDGET);
+    }
     let fixes: Arc<Mutex<Option<GpsFix>>> = Arc::new(Mutex::new(None));
     if sys::grant_count() > GPS {
         let fixes = fixes.clone();
@@ -94,20 +278,56 @@ pub fn run() {
     }
     let mut touch = Touch { fingers: Vec::with_capacity(16) };
     let caps = Caps { display: DISPLAY, touch: TOUCH, surface: SURFACE };
+    // The bench, two fingers that pan and pinch the map on their own, a frame a pass (`bench_fingers`), for measuring frames while the map moves with nobody at the panel; 1 where the view is, 2 zoomed in to a town's scale (2^12 pixels a degree) first.
+    // Bit 2 (4) with either: the window full screen first (the display's op 43, the person's own toggle on the quick row), the glass's circle and bars gone, for measuring the display's publish without them.
+    let (mode, full) = (byte & 3, byte & 4 != 0);
+    let bench = mode == 1 || mode == 2;
+    if bench {
+        println!("mahere: bench: two fingers pan and pinch the map every frame{}", if mode == 2 { ", zoomed in to a town's scale first" } else { "" });
+    }
+    let mut pass = 0u64;
     let r = run_app_with(app, caps, 1.0, None, move |shell: &mut Shell, contacts: &[Contact]| {
         let fix = fixes.lock().unwrap().take();
         if let Some(f) = fix {
-            shell.app().on_gps(f);
+            shell.app().inner.on_gps(f);
             shell.request_redraw();
         }
         for c in contacts {
             touch.contact(shell, c);
+        }
+        if bench {
+            let app = &mut shell.app().inner;
+            if pass == 1 && full {
+                let mut r = [0u8; 4];
+                sys::call(DISPLAY, &[43], &mut r);
+                println!("mahere: bench: full screen {}", if r[0] == 0 { "toggled" } else { "refused (no app in front)" });
+            }
+            if pass == 0 && mode == 2 {
+                let c = app.map.cam;
+                app.map.cam = mahere_engine::Camera::new(c.lat(), c.lon(), (1u32 << 12) as f64, c.bearing());
+                app.map.camera_moved(app.w, app.h);
+            }
+            let (w, h) = (app.w as f64, app.h as f64);
+            for c in bench_fingers(pass, w, h) {
+                touch.contact(shell, &c);
+            }
+            pass += 1;
         }
     });
     match r {
         Ok(()) => println!("mahere: closed"),
         Err(e) => println!("mahere: {e}"),
     }
+}
+
+/// The bench's two fingers at pass `k`: down at the first, then moving every pass along a closed path (a period of 2^9 passes, about four seconds at 120 frames a second) that pans the map across a quarter of the screen and pinches it between half and one and a half times its scale, as a hand would; up never.
+fn bench_fingers(k: u64, w: f64, h: f64) -> Vec<Contact> {
+    let t = (k % (1 << 9)) as f64 / (1 << 9) as f64 * core::f64::consts::TAU;
+    let (cx, cy) = (w * (0.5 + 0.125 * t.sin()), h * (0.5 + 0.125 * (2.0 * t).sin()));
+    let r = w * (0.25 + 0.125 * t.cos());
+    let at = |id: u8, phase: u8, x: f64, y: f64| Contact { id, phase, x: x as u16, y: y as u16 };
+    let phase = if k == 0 { 0 } else { 1 };
+    vec![at(40, phase, cx - r, cy), at(41, phase, cx + r, cy)]
 }
 
 /// The `gps` endpoint's fix, once a second: op 0 FIX, 33 bytes (ferros payloads/gps): valid, the fix count, its age, latitude and longitude in 2⁻²³ degrees, altitude (m), error (m), speed and track. A new fix (its count moved on) goes to the frame loop. The altitude goes nowhere: its datum (ellipsoid or sea level) is the chip's and not yet known.
@@ -174,7 +394,7 @@ impl Touch {
         if c.phase == 2 {
             self.fingers.retain(|f| f.0 != c.id);
         }
-        let app = shell.app();
+        let app = &mut shell.app().inner;
         if action == Action::Down {
             app.first_down = (x0, y0);
         }

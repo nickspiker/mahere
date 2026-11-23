@@ -2031,9 +2031,14 @@ version = "0.6.1"
 dependencies = [
  "fluor",
  "getrandom 0.2.17",
+ "mahere-coord",
  "mahere-device",
  "mahere-engine",
+ "mahere-panel",
  "mahere-store",
+ "mahere-tiles",
+ "rayon",
+ "valhall",
 ]
 
 [[package]]
@@ -4160,6 +4165,10 @@ dependencies = [
  "js-sys",
  "wasm-bindgen",
 ]
+
+[[package]]
+name = "valhall"
+version = "0.1.0"
 
 [[package]]
 name = "version_check"
