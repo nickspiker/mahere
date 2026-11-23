@@ -42,6 +42,16 @@ pub fn open_with_secret(secret: [u8; 32]) -> Result<Arc<FlatStorage>, String> {
     FlatStorage::open_device_shared(APP, secret).map_err(|e| format!("vault open: {e:?}"))
 }
 
+/// Where a desktop app keeps what lives only while it runs (the single-instance lock and the port a later launch knocks on), as Photon's storage::runtime_dir: never beside the vault (Rule -1: process-lifetime artifacts live in the runtime directory). The session's own XDG_RUNTIME_DIR on Linux; elsewhere the user's temporary directory (per user on macOS and Windows).
+pub fn runtime_dir() -> std::path::PathBuf {
+    #[cfg(unix)]
+    if let Some(d) = std::env::var_os("XDG_RUNTIME_DIR").filter(|d| !d.is_empty()) {
+        return std::path::PathBuf::from(d).join("mahere");
+    }
+    let who = std::env::var("USER").or_else(|_| std::env::var("USERNAME")).unwrap_or_default();
+    std::env::temp_dir().join(if who.is_empty() { "mahere".to_string() } else { format!("mahere-{who}") })
+}
+
 fn dirs_config() -> Option<String> {
     // Windows has no HOME, as a rule: its per-user application data (2026-10-16, the first Windows build).
     std::env::var("XDG_CONFIG_HOME")

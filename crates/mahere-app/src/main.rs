@@ -4,6 +4,7 @@
 //! Chrome, desktop input mapping, and the bg-layer blit live here; all map state and rendering live in the engine (shared with the Android shell).
 
 mod gpu;
+mod instance;
 
 use fluor::coord::Coord as Px;
 use fluor::event::{CursorIcon, ElementState, Event as FEvent, MouseButton, MouseScrollDelta};
@@ -17,7 +18,12 @@ use mahere_engine::{Camera, MapCore};
 use mahere_panel::{Controls, Panel, Readouts};
 use std::time::Instant;
 
+/// The one user event: bring the window forward (a later launch knocked).
+struct Show;
+
 struct MahereApp {
+    /// One Mahere at a time on this machine (`instance`): the lock, and the loopback a later launch knocks on.
+    instance: Option<instance::Instance>,
     map: MapCore,
     chrome: DefaultChrome,
     /// The app orb as decoded, put back in the chrome when no light mode shows its ball there; and the light version the ball was last drawn for.
@@ -175,6 +181,7 @@ impl MahereApp {
         );
         let app_orb = chrome.app_icon.clone();
         MahereApp {
+            instance: None,
             map,
             chrome,
             app_orb,
@@ -462,7 +469,21 @@ impl FluorApp for MahereApp {
         self.window_rect = Some((x, y, w, h));
     }
 
-    type UserEvent = ();
+    /// A later launch asked this one to come forward.
+    type UserEvent = Show;
+
+    fn set_event_proxy(&mut self, proxy: std::sync::Arc<dyn fluor::host::WakeSender<Show>>) {
+        if let Some(i) = self.instance.as_mut() {
+            i.serve(move || {
+                let _ = proxy.send(Show);
+            });
+        }
+    }
+
+    /// Forward, where the user left it: a second launch never moves the window.
+    fn on_user_event(&mut self, _: Show, _: &mut Context) -> EventResponse {
+        EventResponse::Raise
+    }
 
     fn title(&self) -> &str {
         mahere_panel::APP_NAME
@@ -1071,6 +1092,8 @@ fn main() {
         println!("OK");
         return;
     }
+    // One copy at a time: a second launch brings the running window forward and exits, before it could open the vault the first is writing.
+    let instance = instance::claim();
     let vault = mahere_store::open(None).ok();
     // A local bake (argv[1], or data/cells) serves directly; otherwise cells come from the bucket through the vault, like the phone.
     let local = std::env::args().nth(1).map(std::path::PathBuf::from).unwrap_or_else(|| "data/cells".into());
@@ -1172,6 +1195,7 @@ fn main() {
     }
     app.store = vault;
     app.cells = cells;
+    app.instance = instance;
     run_app(app).expect("fluor event loop failed");
 }
 
