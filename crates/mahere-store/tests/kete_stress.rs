@@ -10,7 +10,7 @@ fn fresh_store(tag: &str) -> (Arc<mahere_store::FlatStorage>, std::path::PathBuf
         .as_nanos();
     let dir = std::env::temp_dir().join(format!("kete-stress-{tag}-{nanos}"));
     std::fs::create_dir_all(&dir).unwrap();
-    let store = mahere_store::open(Some(&dir.to_string_lossy())).expect("open");
+    let store = mahere_store::open(Some(&dir.to_string_lossy())).expect("open").vault().clone();
     (store, dir)
 }
 
@@ -86,7 +86,7 @@ fn overwrite_visibility_gauntlet() {
     // 5. Overwritten values must survive a real reopen (drop every handle).
     store.write_device("persist", b"final-form").unwrap();
     drop(store);
-    let store2 = mahere_store::open(Some(&dir.to_string_lossy())).expect("reopen");
+    let store2 = mahere_store::open(Some(&dir.to_string_lossy())).expect("reopen").vault().clone();
     assert_eq!(
         store2.read_device("persist").unwrap().as_deref(),
         Some(b"final-form".as_slice()),

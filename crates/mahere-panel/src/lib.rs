@@ -844,6 +844,10 @@ pub struct Panel {
     cache_max: u64,
     /// The ruler strip's close button (centre and radius) while a measurement is shown, and whether a tap just hit it.
     strip_close: Option<(f32, f32, f32)>,
+    /// A notice along the top of the map and the label of its one button (a desktop's unsaved session: "Open Photon"), where the button was painted, and whether it was tapped since the host last asked.
+    notice: Option<(String, String)>,
+    notice_btn: Option<(f32, f32, f32, f32)>,
+    notice_tapped: bool,
     clear_measure: bool,
     /// The areas pages' rows from the last paint (centre y, half height, the row), what they asked, and what was shown.
     area_rows: Vec<(f32, f32, AreaRow)>,
@@ -1038,7 +1042,7 @@ impl Panel {
         let pills = Pills::new(hits + 1000);
         let interval = Slider::new(&mut hits, 0.0, 0.0, 10.0, 10.0, 0.0);
         let text_slider = Slider::new(&mut hits, 0.0, 0.0, 10.0, 10.0, text_pos(1.0));
-        Panel { fonts: None, font_cursor: Default::default(), open: false, dirty: true, ru: 1.0, stack: vec![Page::Layers], theme_rows: Vec::new(), edit_rows: Vec::new(), edit_scroll: 0.0, edit_extent: 0.0, press: None, sliders: Vec::new(), field_vals: [0.0; 4], held: None, edits: Vec::new(), hits, shown: vec![true; LAYERS.len()], group_open: GROUPS_OPEN, group_rows: Vec::new(), tree: Vec::new(), layer_open: None, field_open: None, theme_now: None, interval, interval_held: false, text_slider, text_pending: None, ru_request: None, label_scale: 1.0, touch: false, checks, text: TextRenderer::new(), buf: Vec::new(), w: 0, h: 0, font: 16.0, gear: (0.0, 0.0, 0.0), panel_w: 0.0, theme_row: (0.0, 0.0, 0.0), slider: (0.0, 0.0, 0.0), slider_held: false, cache_max: CACHE_MIN + 1, strip_close: None, clear_measure: false, area_rows: Vec::new(), area_acts: Vec::new(), areas: AreasView::default(), update_rows: Vec::new(), update_acts: Vec::new(), updates: UpdatesView::default(), host_orb: None, safe: None, layers_scroll: 0.0, layers_extent: 0.0, layers_press: None, layers_band: (0.0, 0.0), orb_icon: fluor::host::icon::Icon::from_vsf_bytes(APP_ORB_VSF).ok(), orb_scaled: (0, Vec::new()), locate_btn: None, tool_btn: None, toolbox_open: false, tool_rows: Vec::new(), pills, auto_check, travel, toolbox, marker_choice, colour_of_track: false, theme_list, area_list, search_list, track_list, tracks: TracksView::default(), tracks_version: 0, track_rows: Vec::new(), track_acts: Vec::new(), copy_btns: Vec::new(), copied: None, query: String::new(), search_box: None, query_dirty: false, search_pending: false, found: Vec::new(), picked: None, search_act: None, search_rows: Vec::new(), search_acts: Vec::new(), search_field: None, route_pills: Vec::new(), swap: false, card_top: None }
+        Panel { fonts: None, font_cursor: Default::default(), open: false, dirty: true, ru: 1.0, stack: vec![Page::Layers], theme_rows: Vec::new(), edit_rows: Vec::new(), edit_scroll: 0.0, edit_extent: 0.0, press: None, sliders: Vec::new(), field_vals: [0.0; 4], held: None, edits: Vec::new(), hits, shown: vec![true; LAYERS.len()], group_open: GROUPS_OPEN, group_rows: Vec::new(), tree: Vec::new(), layer_open: None, field_open: None, theme_now: None, interval, interval_held: false, text_slider, text_pending: None, ru_request: None, label_scale: 1.0, touch: false, checks, text: TextRenderer::new(), buf: Vec::new(), w: 0, h: 0, font: 16.0, gear: (0.0, 0.0, 0.0), panel_w: 0.0, theme_row: (0.0, 0.0, 0.0), slider: (0.0, 0.0, 0.0), slider_held: false, cache_max: CACHE_MIN + 1, strip_close: None, notice: None, notice_btn: None, notice_tapped: false, clear_measure: false, area_rows: Vec::new(), area_acts: Vec::new(), areas: AreasView::default(), update_rows: Vec::new(), update_acts: Vec::new(), updates: UpdatesView::default(), host_orb: None, safe: None, layers_scroll: 0.0, layers_extent: 0.0, layers_press: None, layers_band: (0.0, 0.0), orb_icon: fluor::host::icon::Icon::from_vsf_bytes(APP_ORB_VSF).ok(), orb_scaled: (0, Vec::new()), locate_btn: None, tool_btn: None, toolbox_open: false, tool_rows: Vec::new(), pills, auto_check, travel, toolbox, marker_choice, colour_of_track: false, theme_list, area_list, search_list, track_list, tracks: TracksView::default(), tracks_version: 0, track_rows: Vec::new(), track_acts: Vec::new(), copy_btns: Vec::new(), copied: None, query: String::new(), search_box: None, query_dirty: false, search_pending: false, found: Vec::new(), picked: None, search_act: None, search_rows: Vec::new(), search_acts: Vec::new(), search_field: None, route_pills: Vec::new(), swap: false, card_top: None }
     }
 
     pub fn is_open(&self) -> bool {
@@ -1105,6 +1109,20 @@ impl Panel {
             out.push([0.0, floor - f * 3.2, f * 11.0, floor]);
         }
         out
+    }
+
+    /// A notice along the top of the map with one button (the words, the button's label), or none. Repaints only when it changes.
+    pub fn set_notice(&mut self, notice: Option<(&str, &str)>) {
+        let n = notice.map(|(w, b)| (w.to_string(), b.to_string()));
+        if n != self.notice {
+            self.notice = n;
+            self.dirty = true;
+        }
+    }
+
+    /// Whether the notice's button was tapped since the last ask.
+    pub fn take_notice_tap(&mut self) -> bool {
+        std::mem::take(&mut self.notice_tapped)
     }
 
     pub fn set_host_orb(&mut self, orb: Option<(f32, f32, f32)>) {
@@ -1810,6 +1828,10 @@ impl Panel {
             self.copied = Some(what.clone());
             return true;
         }
+        if self.notice_btn.is_some_and(|r| inside(r)) {
+            self.notice_tapped = true;
+            return true;
+        }
         if let Some((cx, cy, cr)) = self.strip_close {
             if (x - cx).powi(2) + (y - cy).powi(2) <= (cr * 1.4).powi(2) {
                 self.clear_measure = true;
@@ -2205,6 +2227,14 @@ impl Panel {
         self.strip_close = None;
         self.copy_btns.clear();
         self.pills.begin();
+        self.notice_btn = None;
+        if let Some((words, button)) = self.notice.clone() {
+            // Along the top, level with the orb, right of it: the words, then the button lit beside them.
+            let (gx, gy, gr) = self.gear;
+            let x0 = gx + gr + font * 5.5;
+            let words_box = self.pills.draw_fit(&mut canvas, &mut self.text, x0, gy, &words, false, font * 0.8, None);
+            self.notice_btn = Some(self.pills.draw_fit(&mut canvas, &mut self.text, words_box.0 + words_box.2 + font * 0.5, gy, &button, true, font * 0.8, None));
+        }
         self.route_pills.clear();
         self.search_rows.clear();
         self.search_acts.clear();

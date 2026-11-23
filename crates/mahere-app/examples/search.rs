@@ -8,7 +8,7 @@ fn main() {
     let (lat, lon, ppd, query) = (num(1), num(2), num(3), a[4].clone());
     let (w, h) = (a.get(5).and_then(|s| s.parse().ok()).unwrap_or(1280usize), a.get(6).and_then(|s| s.parse().ok()).unwrap_or(800usize));
     let vault = mahere_store::open(None).expect("vault");
-    let (store, layers, cells) = mahere_store::cell_stores(None, Some(vault));
+    let (store, layers, cells) = mahere_store::cell_stores(None, Some(vault.vault().clone()));
     let cells = cells.expect("cells");
     let keys = cells.keys(Layer::Base);
     let map = MapCore::layered(store, layers, Camera::new(lat, lon, ppd, 0.0));

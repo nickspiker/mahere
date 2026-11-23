@@ -265,6 +265,50 @@ impl VaultCells {
         }
     }
 
+    /// The cells an older vault keeps (a desktop's from before Photon's device secret keyed it), copied in on a thread of their own with their last use, a few dozen to a batch: an area downloaded there is still on the device, and nothing is fetched again. A cell kept here already is skipped, so a start that stopped part way goes on; the older vault is left as it is.
+    pub fn take_vault(self: &Arc<Self>, old: Arc<FlatStorage>) {
+        let cells = self.clone();
+        let spawned = std::thread::Builder::new().name("older cells into the vault".into()).spawn(move || {
+            let t = std::time::Instant::now();
+            let Ok(Some(b)) = old.read_device(&cells_index_key()) else { return };
+            let wanted: Vec<((u8, u64), (i64, u32))> = {
+                let ix = cells.index.lock().unwrap();
+                decode_cell_index(&b).into_iter().filter(|(k, _)| !ix.entries.contains_key(k)).collect()
+            };
+            if wanted.is_empty() {
+                return;
+            }
+            let mut moved = 0usize;
+            for chunk in wanted.chunks(32) {
+                let mut batch: Vec<(String, Vec<u8>)> = Vec::with_capacity(chunk.len() * 2);
+                let mut landed = Vec::with_capacity(chunk.len());
+                for &((packed, raw), (seen, _)) in chunk {
+                    let depth = packed & 63;
+                    let (key, code) = (CellKey { depth, prefix: raw >> (60 - 2 * depth as u32) }, packed >> 6);
+                    let Ok(Some(bytes)) = old.read_device_bulk(&cell_key(key, code)) else { continue };
+                    landed.push((key, code, bytes.len(), seen));
+                    batch.push((cell_key(key, code), bytes));
+                    if let Ok(Some(tag)) = old.read_device_bulk(&tag_key(key, code)) {
+                        batch.push((tag_key(key, code), tag));
+                    }
+                }
+                if let Err(e) = cells.vault.write_device_bulk(&batch) {
+                    eprintln!("cells: the copy from the older vault stopped ({e:?}), the next start goes on");
+                    break;
+                }
+                for (key, code, len, seen) in landed {
+                    cells.touch(key, code, len, seen);
+                }
+                moved += chunk.len();
+            }
+            cells.flush();
+            eprintln!("cells: {moved} cells copied from the older vault in {:.1} s", t.elapsed().as_secs_f32());
+        });
+        if let Err(e) = spawned {
+            eprintln!("cells: the copy from the older vault did not start: {e}");
+        }
+    }
+
     /// [`Self::take_files`] for one tree: its files read a few dozen at a time, written to the vault as one batch, then deleted.
     fn take_tree(&self, root: &Path, hex: bool) {
         let t = std::time::Instant::now();

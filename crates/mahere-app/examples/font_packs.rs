@@ -22,7 +22,7 @@ fn main() {
     let lon: f64 = a.get(3).and_then(|s| s.parse().ok()).unwrap_or(116.40);
     let ppd: f64 = a.get(4).and_then(|s| s.parse().ok()).unwrap_or(2000.0);
     let vault = mahere_store::open(Some(&format!("{out}/fontcheck-vault"))).expect("vault");
-    let cache = mahere_store::VaultCells::open(vault.clone());
+    let cache = mahere_store::VaultCells::open(vault.vault().clone());
     let tiered = |c: Arc<dyn mahere_engine::residency::CellCache>, l: Layer| -> Arc<dyn mahere_engine::residency::CellStore> { Arc::new(TieredStore::new(c, Arc::new(HttpStore::layer(DEFAULT_CELLS_URL, l)))) };
     let layers = LayerStores { dem: tiered(cache.layer(Layer::Dem), Layer::Dem), img: tiered(cache.layer(Layer::Img), Layer::Img), nir: tiered(cache.layer(Layer::Nir), Layer::Nir) };
     let mut map = MapCore::layered(tiered(cache.clone(), Layer::Base), Some(layers), Camera::new(lat, lon, ppd, 0.0));
@@ -35,7 +35,7 @@ fn main() {
         std::thread::sleep(std::time::Duration::from_millis(5));
         map.tick(w, h);
     }
-    let fonts = mahere_panel::fonts::FontPacks::new(mahere_store::VaultFonts::new(Some(vault.clone())), mahere_update::AUTHOR_PUBKEY);
+    let fonts = mahere_panel::fonts::FontPacks::new(mahere_store::VaultFonts::new(Some(vault.vault().clone())), mahere_update::AUTHOR_PUBKEY);
     let mut labels = mahere_panel::labels::Labeller::new();
     labels.set_fonts(fonts.clone());
     let shot = |labels: &mahere_panel::labels::Labeller, map: &mut MapCore, name: &str| {

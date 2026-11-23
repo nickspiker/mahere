@@ -88,7 +88,7 @@ pub struct DeviceApp<G: MapGpu = NoGpu> {
     /// Re-anchor the next CursorMoved instead of panning (finger handoff after a pinch would otherwise jump by the stale delta).
     pub suppress_move: bool,
     pub centered_once: bool,
-    pub store: Option<std::sync::Arc<mahere_store::FlatStorage>>,
+    pub store: Option<std::sync::Arc<mahere_store::Store>>,
     /// The dated cell cache, flushed at the pause moment.
     pub cells_cache: Option<std::sync::Arc<mahere_store::VaultCells>>,
     pub recorder: Option<std::sync::Arc<std::sync::Mutex<mahere_store::TrackRecorder>>>,
@@ -160,7 +160,7 @@ impl Persist {
         let _ = self.tx.send(Box::new(job));
     }
 
-    pub fn settings(&self, store: std::sync::Arc<mahere_store::FlatStorage>, s: mahere_store::Settings) {
+    pub fn settings(&self, store: std::sync::Arc<mahere_store::Store>, s: mahere_store::Settings) {
         let was_pending = self.pending_settings.lock().unwrap().replace(s).is_some();
         if !was_pending {
             let pending = self.pending_settings.clone();
@@ -1034,14 +1034,14 @@ fn capital(s: &str) -> String {
 
 impl<G: MapGpu> DeviceApp<G> {
     /// The app as a device starts it: the view, settings, themes, areas and fonts from `store` (the platform's vault: Android's under its files directory, ferros's the process's vault scope), and `dir`, the platform's own directory where it has one (Android's files directory: hand-pushed `cells-local`, the plain cell files of 2026-10-18 to 2026-10-25, the share sheet's files, staged updates; ferros has none).
-    pub fn open(width: u32, height: u32, store: Option<std::sync::Arc<mahere_store::FlatStorage>>, dir: Option<&str>) -> DeviceApp<G> {
+    pub fn open(width: u32, height: u32, store: Option<std::sync::Arc<mahere_store::Store>>, dir: Option<&str>) -> DeviceApp<G> {
         // How long each step of the start takes, in the log (2026-10-18: 74 s of black screen before the first cell).
         let t0 = std::time::Instant::now();
         let lap = |what: &str| eprintln!("start: {what} at {} ms", t0.elapsed().as_millis());
         lap("vault open");
         // Cells stream from the bucket through the vault; `cells-local` (pushed by hand) overrides for offline development.
         let local = dir.map(|d| std::path::PathBuf::from(format!("{d}/cells-local"))).filter(|l| l.is_dir());
-        let (cell_store, layer_stores, cells_cache) = mahere_store::cell_stores(local.as_deref(), store.clone());
+        let (cell_store, layer_stores, cells_cache) = mahere_store::cell_stores(local.as_deref(), store.as_ref().map(|s| s.vault().clone()));
         // The plain cell files of 2026-10-18 to 2026-10-25 move into the vault on a thread of their own.
         if let (Some(c), Some(d)) = (&cells_cache, dir) {
             c.take_files(&mahere_store::cells_dir(Some(d)));
@@ -1062,7 +1062,7 @@ impl<G: MapGpu> DeviceApp<G> {
         eprintln!("camera: {:.5} {:.5} ppd {:.1} bearing {:.3}", cam.lat(), cam.lon(), cam.ppd, cam.bearing());
         let mut areas = mahere_engine::areas::Areas::new(cell_store.clone());
         // Address documents: the vault's copies, else the bucket's; an area's download takes the ZIPs it covers.
-        let docs = std::sync::Arc::new(mahere_store::VaultDocs::new(store.clone()));
+        let docs = std::sync::Arc::new(mahere_store::VaultDocs::new(store.as_ref().map(|s| s.vault().clone())));
         areas.set_docs(docs.clone());
         if let Some(l) = &layer_stores {
             areas.set_layer_stores(vec![l.dem.clone(), l.img.clone()]);
@@ -1119,7 +1119,7 @@ impl<G: MapGpu> DeviceApp<G> {
             map.set_marker(s.marker_on, s.marker_style);
         }
         let recorder = store.clone().map(|s| std::sync::Arc::new(std::sync::Mutex::new(mahere_store::TrackRecorder::new(s))));
-        let fonts = mahere_panel::fonts::FontPacks::new(mahere_store::VaultFonts::new(store.clone()), mahere_update::AUTHOR_PUBKEY);
+        let fonts = mahere_panel::fonts::FontPacks::new(mahere_store::VaultFonts::new(store.as_ref().map(|s| s.vault().clone())), mahere_update::AUTHOR_PUBKEY);
         // Each renderer loads only the packs its own text wants; a document is let go once one has loaded it, read again from the vault for another that wants it later.
         fonts.set_renderers(1);
         let mut app = DeviceApp {

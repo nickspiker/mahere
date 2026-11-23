@@ -37,7 +37,7 @@ struct MahereApp {
     /// Right-button drag: rotate about the screen centre.
     rotating: bool,
     last_cursor: (f64, f64),
-    store: Option<std::sync::Arc<mahere_store::FlatStorage>>,
+    store: Option<std::sync::Arc<mahere_store::Store>>,
     /// The UI scale kept from the last launch, handed to fluor once; the scale last kept.
     zoom_restore: Option<f32>,
     /// The window's place and size: the last the user settled it at (saved with the session), and the saved one to restore once at launch.
@@ -165,6 +165,32 @@ impl MahereApp {
                     }
                 }
             }
+        }
+    }
+
+    /// Photon's attestation, if it has one now: bind the store, bring in the files a desktop kept before, and load the person's data over this session's (what they saved wins; what this session made where they had nothing is kept).
+    fn try_attest(&mut self) {
+        let Some(store) = self.store.clone() else { return };
+        if store.attested() || mahere_store::attest_from_photon(&store).is_none() {
+            return;
+        }
+        let n = mahere_store::adopt_user_files(&store, &mahere_store::user_dir());
+        eprintln!("store: attested; {n} ink cells and areas brought in from files");
+        self.map.set_themes(mahere_store::themes::load_all(&store));
+        self.areas.set_store(std::sync::Arc::new(mahere_store::VaultAreas::new(store.clone())));
+        self.map.set_user_store(std::sync::Arc::new(mahere_store::VaultUser::new(store.clone())));
+        if let Some(t) = mahere_store::load_label_scale(&store) {
+            self.panel.set_label_scale(t);
+        }
+        self.chrome.invalidate_bg();
+    }
+
+    /// The notice while nobody is attested, and its button.
+    fn notice(&mut self) {
+        let unsaved = self.store.as_ref().is_some_and(|s| !s.attested());
+        self.panel.set_notice(unsaved.then_some(("Not signed in with Photon: this session isn't being saved", "Open Photon")));
+        if self.panel.take_notice_tap() {
+            launch_photon();
         }
     }
 
@@ -731,6 +757,10 @@ impl FluorApp for MahereApp {
                 EventResponse::Handled
             }
             FEvent::Focused(focused) => {
+                // Back from Photon (or anywhere): a person attested meanwhile is picked up on the edge, never polled.
+                if *focused {
+                    self.try_attest();
+                }
                 if self.chrome.set_focused(*focused) {
                     ctx.window.request_redraw();
                 }
@@ -900,6 +930,7 @@ impl FluorApp for MahereApp {
     }
 
     fn tick(&mut self, ctx: &mut Context) -> bool {
+        self.notice();
         {
             let (w, h) = Self::dims(ctx);
             // A copy button: the text onto the system clipboard.
@@ -1095,6 +1126,16 @@ fn main() {
     // One copy at a time: a second launch brings the running window forward and exits, before it could open the vault the first is writing.
     let instance = instance::claim();
     let vault = mahere_store::open(None).ok();
+    // The person Photon has attested on this machine, if any: their data is read and saved under them, the files a desktop kept before brought in. Nobody attested, the session is held in RAM and the map says so.
+    let user_dir = mahere_store::user_dir();
+    if let Some(s) = &vault {
+        if mahere_store::attest_from_photon(s).is_some() {
+            let n = mahere_store::adopt_user_files(s, &user_dir);
+            eprintln!("store: attested{}", if n > 0 { format!("; {n} ink cells and areas brought in from files") } else { String::new() });
+        } else {
+            eprintln!("store: nobody attested by Photon; this session is held, not saved");
+        }
+    }
     // A local bake (argv[1], or data/cells) serves directly; otherwise cells come from the bucket through the vault, like the phone.
     let local = std::env::args().nth(1).map(std::path::PathBuf::from).unwrap_or_else(|| "data/cells".into());
     if local.is_dir() {
@@ -1102,10 +1143,13 @@ fn main() {
     } else {
         eprintln!("cells: {} (kept in the vault)", DEFAULT_CELLS_URL);
     }
-    let (store, layer_stores, cells) = mahere_store::cell_stores(local.is_dir().then_some(local.as_path()), vault.clone());
+    let (store, layer_stores, cells) = mahere_store::cell_stores(local.is_dir().then_some(local.as_path()), vault.as_ref().map(|s| s.vault().clone()));
     // The plain cell files a Mahere of 2026-10-18 to 2026-10-25 kept move into the vault on a thread of their own.
     if let Some(c) = &cells {
         c.take_files(&mahere_store::cells_dir(None));
+        if let Some(s) = &vault {
+            mahere_store::take_older_cells(s, c);
+        }
     }
     let mut session = vault.as_ref().and_then(|s| mahere_store::load_session(s));
     // MAHERE_AT=lat,lon,ppd[,bearing°]: open there instead of the saved view (a place to look at again, a report to reproduce); the session's route and window stay.
@@ -1133,11 +1177,18 @@ fn main() {
     if let Some(s) = session {
         map.restore_route(s.route_mode, s.travel, s.pin_a, s.pin_b, s.nav_to);
     }
-    // The user's own cells, as files beside the data; the areas as files under them.
-    let user_dir = mahere_store::user_dir();
-    let _ = std::fs::create_dir_all(user_dir.join("areas"));
-    areas.set_store(std::sync::Arc::new(DirAreas(user_dir.join("areas"))));
-    map.set_user_store(std::sync::Arc::new(DirUser(user_dir)));
+    // The user's own cells and areas, in the vault under the person; as files beside the data only when there is no vault at all.
+    match &vault {
+        Some(s) => {
+            areas.set_store(std::sync::Arc::new(mahere_store::VaultAreas::new(s.clone())));
+            map.set_user_store(std::sync::Arc::new(mahere_store::VaultUser::new(s.clone())));
+        }
+        None => {
+            let _ = std::fs::create_dir_all(user_dir.join("areas"));
+            areas.set_store(std::sync::Arc::new(DirAreas(user_dir.join("areas"))));
+            map.set_user_store(std::sync::Arc::new(DirUser(user_dir.clone())));
+        }
+    }
     // MAHERE_AREA=<file>: a shared area document taken in at start.
     if let Some(bytes) = std::env::var("MAHERE_AREA").ok().and_then(|f| std::fs::read(f).ok()) {
         match areas.import(&bytes) {
@@ -1152,7 +1203,7 @@ fn main() {
     if let Some(v) = &vault {
         map.set_themes(mahere_store::themes::load_all(v));
     }
-    let docs = std::sync::Arc::new(mahere_store::VaultDocs::new(vault.clone()));
+    let docs = std::sync::Arc::new(mahere_store::VaultDocs::new(vault.as_ref().map(|s| s.vault().clone())));
     areas.set_docs(docs.clone());
     // MAHERE_FIX=lat,lon[,accuracy m] and MAHERE_TRACK=lat,lon;lat,lon;…: a GPS fix and a recorded track on a computer that has neither, to look at the marker and the track's line.
     if let Some(v) = std::env::var("MAHERE_FIX").ok().map(|f| f.split(',').filter_map(|x| x.trim().parse::<f64>().ok()).collect::<Vec<_>>()).filter(|v| v.len() >= 2) {
@@ -1174,7 +1225,7 @@ fn main() {
     let mut app = MahereApp::new(map, areas);
     app.docs = Some(docs);
     // Font packs (Nick 2026-10-16): names in scripts the binary lacks draw in their own face once its pack, signed by the author, is fetched.
-    let fonts = mahere_panel::fonts::FontPacks::new(mahere_store::VaultFonts::new(vault.clone()), mahere_update::AUTHOR_PUBKEY);
+    let fonts = mahere_panel::fonts::FontPacks::new(mahere_store::VaultFonts::new(vault.as_ref().map(|s| s.vault().clone())), mahere_update::AUTHOR_PUBKEY);
     // Each renderer loads only the packs its own text wants; a document is let go once one has loaded it, read again from the vault for another that wants it later.
     fonts.set_renderers(1);
     app.panel.set_fonts(fonts.clone());
@@ -1318,4 +1369,18 @@ fn updates_view(u: &mahere_update::Updater) -> mahere_panel::UpdatesView {
 fn capital(s: &str) -> String {
     let mut c = s.chars();
     c.next().map_or(String::new(), |f| f.to_uppercase().collect::<String>() + c.as_str())
+}
+
+/// Photon, started for the person to sign in: the session it leaves (tohu's) is what the desktop's vault is kept under.
+fn launch_photon() {
+    #[cfg(target_os = "macos")]
+    let r = std::process::Command::new("open").args(["-a", "Photon Messenger"]).spawn();
+    #[cfg(not(target_os = "macos"))]
+    let r = std::process::Command::new("photon-messenger").spawn().or_else(|_| {
+        let home = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")).unwrap_or_default();
+        std::process::Command::new(std::path::Path::new(&home).join(".local/bin/photon-messenger")).spawn()
+    });
+    if let Err(e) = r {
+        eprintln!("Photon did not start: {e}");
+    }
 }

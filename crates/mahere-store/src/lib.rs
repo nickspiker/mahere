@@ -12,6 +12,8 @@ use vsf::types::{EtType, Tensor};
 use vsf::VsfType;
 
 mod cells;
+mod store;
+pub use store::Store;
 pub use cells::{VaultCellLayer, VaultCells};
 
 /// Tests that open a vault take this first: kete's vault directory is one setting for the process, and two tests pointing it at their own directories at once open each other's vaults.
@@ -20,26 +22,119 @@ static VAULT_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 pub const APP: kete::App<'static> = kete::App { id: "mahere", dir: "mahere" };
 
-/// Open THE mahere vault (shared registry underneath — concurrent opens receive the same engine). `base`: Android passes filesDir; desktop passes None (XDG config/data dirs).
-pub fn open(base: Option<&str>) -> Result<Arc<FlatStorage>, String> {
-    let secret_path = match base {
-        Some(b) => {
-            kete::set_vault_dirs_override(format!("{b}/vault"), format!("{b}/vault-shadow"));
-            format!("{b}/device.key")
-        }
-        None => {
-            let dir = dirs_config().ok_or("no config dir")?;
-            std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-            format!("{dir}/device.key")
-        }
-    };
-    let secret = load_or_mint_secret(&secret_path)?;
-    FlatStorage::open_device_shared(APP, secret).map_err(|e| format!("vault open: {e:?}"))
+/// Open THE mahere vault as the [`Store`] (Nick 2026-10-22; ported 2026-11-23 from the vault branch that never reached main). Desktop: the vault's secret is the machine's own (tohu's device secret), and the person's data waits for Photon's attestation ([`attest_from_photon`]). Android passes filesDir, where Rust has no device fact to read, and keeps the minted key the app's private storage has always held, the person's data in the device scope.
+/// A desktop vault from before (its secret a random `device.key` beside it) has its person's data brought into the store once someone is attested; its files are left as they are.
+pub fn open(base: Option<&str>) -> Result<Arc<Store>, String> {
+    if let Some(b) = base {
+        kete::set_vault_dirs_override(format!("{b}/vault"), format!("{b}/vault-shadow"));
+        let secret = load_or_mint_secret(&format!("{b}/device.key"))?;
+        let vault = FlatStorage::open_device_shared(APP, secret).map_err(|e| format!("vault open: {e:?}"))?;
+        return Ok(Store::device(vault));
+    }
+    open_desktop()
 }
 
-/// Open THE mahere vault with a device secret the platform holds itself, where nothing is kept beside the rings: on ferros the vault is the process's scope of the kernel's, and the secret is derived from the device's ira for Mahere (mahere-ferros), the same every boot, never stored.
-pub fn open_with_secret(secret: [u8; 32]) -> Result<Arc<FlatStorage>, String> {
-    FlatStorage::open_device_shared(APP, secret).map_err(|e| format!("vault open: {e:?}"))
+#[cfg(not(any(target_os = "android", target_os = "ferros")))]
+fn open_desktop() -> Result<Arc<Store>, String> {
+    let dir = dirs_config().ok_or("no config dir")?;
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let secret = tohu::device::device_secret().map_err(|e| format!("device secret: {e}"))?;
+    let key_file = std::path::PathBuf::from(&dir).join("device.key");
+    let older = std::fs::read(&key_file).ok().and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok()).filter(|s| *s != secret);
+    let vault = FlatStorage::open_device_shared(APP, secret).map_err(|e| format!("vault open: {e:?}"))?;
+    let store = Store::new(vault);
+    store.set_older(older.map(|s| (s, key_file)));
+    Ok(store)
+}
+
+#[cfg(any(target_os = "android", target_os = "ferros"))]
+fn open_desktop() -> Result<Arc<Store>, String> {
+    Err("a phone opens its vault with its own directory or secret".into())
+}
+
+/// Open THE mahere vault with a device secret the platform holds itself, where nothing is kept beside the rings: on ferros the vault is the process's scope of the kernel's, and the secret is derived from the device's ira for Mahere (mahere-ferros), the same every boot, never stored. The person's data in the device scope.
+pub fn open_with_secret(secret: [u8; 32]) -> Result<Arc<Store>, String> {
+    let vault = FlatStorage::open_device_shared(APP, secret).map_err(|e| format!("vault open: {e:?}"))?;
+    Ok(Store::device(vault))
+}
+
+/// The older vault's cells into `cells` on a thread of their own ([`VaultCells::take_vault`]), when there is an older vault.
+pub fn take_older_cells(store: &Store, cells: &Arc<VaultCells>) {
+    let Some(secret) = store.older_secret() else { return };
+    match FlatStorage::open_device_shared(APP, secret) {
+        Ok(old) => cells.take_vault(old),
+        Err(e) => eprintln!("cells: the older vault did not open ({e:?}); its cells are fetched again as they are needed"),
+    }
+}
+
+/// Photon's attestation, if it has left one for the stack's apps (tohu's session): bind the store to that person, writing what this session held. Some(entries written) when the store is now attested; None while nobody is.
+#[cfg(not(any(target_os = "android", target_os = "ferros")))]
+pub fn attest_from_photon(store: &Store) -> Option<usize> {
+    if store.attested() {
+        return Some(0);
+    }
+    let session = tohu::session()?;
+    match store.attest(session.vault_seed) {
+        Ok(n) => {
+            // The vault from before belongs to whoever uses this machine: its data comes in now, under them, and only now is it marked done.
+            if let Some((old, key_file)) = store.take_older() {
+                import_older(store, old, &key_file);
+            }
+            Some(n)
+        }
+        Err(e) => {
+            eprintln!("store: attest refused: {e:?}");
+            None
+        }
+    }
+}
+
+/// The older vault's person data into the attested store, once, where the person has nothing newer, and the key file renamed so the next start does not copy again. The older vault's files stay.
+#[cfg(not(any(target_os = "android", target_os = "ferros")))]
+fn import_older(store: &Store, old_secret: [u8; 32], key_file: &std::path::Path) {
+    let Ok(old) = FlatStorage::open_device_shared(APP, old_secret) else {
+        eprintln!("store: the older vault did not open; left as it is");
+        return;
+    };
+    let mut copied = 0usize;
+    let mut copy = |key: String| {
+        if let Ok(Some(v)) = old.read_device(&key) {
+            if !v.is_empty() && matches!(store.read(&key), Ok(None)) && store.write(&key, &v).is_ok() {
+                copied += 1;
+            }
+        }
+    };
+    for key in [session_key(), settings_key(), ui_scale_key(), label_scale_key(), user_index_key(), area_index_key(), themes::index_key(), track_index_key()] {
+        copy(key);
+    }
+    if let Ok(Some(ix)) = old.read_device(&user_index_key()) {
+        for &(depth, raw) in decode_cell_index(&ix).keys() {
+            copy(user_key(mahere_tiles::CellKey { depth, prefix: raw >> (60 - 2 * depth as u32) }));
+        }
+    }
+    if let Ok(Some(ix)) = old.read_device(&area_index_key()) {
+        for n in decode_names(&ix) {
+            copy(area_key(&n));
+        }
+    }
+    if let Ok(Some(ix)) = old.read_device(&themes::index_key()) {
+        for n in themes::decode_index(&ix) {
+            copy(themes::theme_key(&n));
+        }
+    }
+    // Tracks: every indexed recording's chunks and count (since 2026-11-21 the recorder keeps an index).
+    if let Ok(Some(ix)) = old.read_device(&track_index_key()) {
+        for start in decode_track_index(&ix) {
+            copy(track_count_key(start));
+            let n = old.read_device(&track_count_key(start)).ok().flatten().and_then(|b| vsf::parse(&b, &mut 0).ok()).and_then(|v| v.as_u64()).unwrap_or(0);
+            for c in 0..n as u32 {
+                copy(track_chunk_key(start, c));
+            }
+        }
+    }
+    drop(copy);
+    let _ = std::fs::rename(key_file, key_file.with_extension("key.imported"));
+    eprintln!("store: {copied} entries brought in from the older vault (its files are kept)");
 }
 
 /// Where a desktop app keeps what lives only while it runs (the single-instance lock and the port a later launch knocks on), as Photon's storage::runtime_dir: never beside the vault (Rule -1: process-lifetime artifacts live in the runtime directory). The session's own XDG_RUNTIME_DIR on Linux; elsewhere the user's temporary directory (per user on macOS and Windows).
@@ -140,7 +235,7 @@ fn track_count_key(start: i64) -> String {
     vault_key(&[name("track"), VsfType::e(EtType::e6(start)), name("chunks")])
 }
 
-pub fn save_session(store: &FlatStorage, s: &Session) -> Result<(), StorageError> {
+pub fn save_session(store: &Store, s: &Session) -> Result<(), StorageError> {
     // One tensor of floats: the view and sun, then the route and the window, a place or a rect that is not there as NaN (a session from before them is six long).
     let pt = |p: Option<(f64, f64)>| p.map_or([f64::NAN; 2], |(a, b)| [a, b]);
     let win = s.window.map_or([f64::NAN; 4], |(x, y, w, h)| [x as f64, y as f64, w as f64, h as f64]);
@@ -150,11 +245,11 @@ pub fn save_session(store: &FlatStorage, s: &Session) -> Result<(), StorageError
     v.extend(pt(s.nav_to));
     v.extend(win);
     let t = VsfType::t_f6(Tensor::new(vec![v.len()], v));
-    store.write_device(&session_key(), &t.flatten())
+    store.write(&session_key(), &t.flatten())
 }
 
-pub fn load_session(store: &FlatStorage) -> Option<Session> {
-    let bytes = store.read_device(&session_key()).ok()??;
+pub fn load_session(store: &Store) -> Option<Session> {
+    let bytes = store.read(&session_key()).ok()??;
     let mut ptr = 0usize;
     let v = vsf::parse(&bytes, &mut ptr).ok()?;
     let d = tensor_f64(v)?;
@@ -215,12 +310,12 @@ fn ui_scale_key() -> String {
 }
 
 /// The desktop's UI scale (fluor's RU multiplier: its Cmd/Ctrl keys and scroll, and the panel's text size), kept between launches (Nick 2026-10-25). The phone keeps its own in its settings.
-pub fn save_ui_scale(store: &FlatStorage, ru: f32) -> Result<(), StorageError> {
-    store.write_device(&ui_scale_key(), &VsfType::f5(ru).flatten())
+pub fn save_ui_scale(store: &Store, ru: f32) -> Result<(), StorageError> {
+    store.write(&ui_scale_key(), &VsfType::f5(ru).flatten())
 }
 
-pub fn load_ui_scale(store: &FlatStorage) -> Option<f32> {
-    let bytes = store.read_device(&ui_scale_key()).ok()??;
+pub fn load_ui_scale(store: &Store) -> Option<f32> {
+    let bytes = store.read(&ui_scale_key()).ok()??;
     let mut ptr = 0usize;
     match vsf::parse(&bytes, &mut ptr).ok()? {
         VsfType::f5(v) if v.is_finite() && v > 0.0 => Some(v),
@@ -233,12 +328,12 @@ fn label_scale_key() -> String {
 }
 
 /// The map's lettering's size over the UI scale, kept between launches on every platform (Nick 2026-10-25).
-pub fn save_label_scale(store: &FlatStorage, t: f32) -> Result<(), StorageError> {
-    store.write_device(&label_scale_key(), &VsfType::f5(t).flatten())
+pub fn save_label_scale(store: &Store, t: f32) -> Result<(), StorageError> {
+    store.write(&label_scale_key(), &VsfType::f5(t).flatten())
 }
 
-pub fn load_label_scale(store: &FlatStorage) -> Option<f32> {
-    let bytes = store.read_device(&label_scale_key()).ok()??;
+pub fn load_label_scale(store: &Store) -> Option<f32> {
+    let bytes = store.read(&label_scale_key()).ok()??;
     let mut ptr = 0usize;
     match vsf::parse(&bytes, &mut ptr).ok()? {
         VsfType::f5(v) if v.is_finite() && v > 0.0 => Some(v),
@@ -250,7 +345,7 @@ fn settings_key() -> String {
     vault_key(&[name("settings")])
 }
 
-pub fn save_settings(store: &FlatStorage, s: &Settings) -> Result<(), StorageError> {
+pub fn save_settings(store: &Store, s: &Settings) -> Result<(), StorageError> {
     let flags = (s.real_sun as u64) | (s.follow_heading as u64) << 1 | (s.lock_to_fix as u64) << 2 | (!s.compressed as u64) << 3 | (s.real_light as u64) << 4 | (s.ruler as u64) << 5 | (!s.marker_on as u64) << 6;
     // The pen's colour is stored one more than its packed RGBA, so 0 says there is none.
     let pen = s.pen_rgba.map_or(0, |c| u32::from_be_bytes(c) as u64 + 1);
@@ -258,11 +353,11 @@ pub fn save_settings(store: &FlatStorage, s: &Settings) -> Result<(), StorageErr
     let hold = s.contour_hold.map_or(0, |m| (m * 1000.0).round().max(1.0) as u64);
     let track = s.track_rgba.map_or(0, |c| u32::from_be_bytes(c) as u64 + 1);
     let t = VsfType::t_u6(Tensor::new(vec![13], vec![s.cache_budget, s.layer_bits, flags, s.theme, (s.ui_ru * 1000.0).round() as u64, s.tool as u64, pen, s.travel as u64, !s.auto_update as u64, s.record as u64, hold, track, s.marker_style as u64]));
-    store.write_device(&settings_key(), &t.flatten())
+    store.write(&settings_key(), &t.flatten())
 }
 
-pub fn load_settings(store: &FlatStorage) -> Option<Settings> {
-    let bytes = store.read_device(&settings_key()).ok()??;
+pub fn load_settings(store: &Store) -> Option<Settings> {
+    let bytes = store.read(&settings_key()).ok()??;
     let mut ptr = 0usize;
     let d = match vsf::parse(&bytes, &mut ptr).ok()? {
         VsfType::t_u6(t) => t.data,
@@ -299,7 +394,7 @@ pub struct Fix {
 
 /// Chunked track recorder: fixes flushed every CHUNK fixes as one VSF document of columns (coordinates, times, heights in centimetres, accuracies, speeds, bearings), the columns that change little from fix to fix coded in VSF as series, so a crash costs at most one chunk and a day's hike never rewrites more than a small object per flush.
 pub struct TrackRecorder {
-    store: Arc<FlatStorage>,
+    store: Arc<Store>,
     /// Eagle Time of the recording's start: the track's identity.
     start: i64,
     buf: Vec<Fix>,
@@ -375,7 +470,7 @@ fn chunk_fixes(plain: &[u8], unix: bool) -> Option<Vec<Fix>> {
 }
 
 impl TrackRecorder {
-    pub fn new(store: Arc<FlatStorage>) -> TrackRecorder {
+    pub fn new(store: Arc<Store>) -> TrackRecorder {
         TrackRecorder { store, start: et_now(), buf: Vec::new(), chunk: 0 }
     }
 
@@ -392,14 +487,14 @@ impl TrackRecorder {
         }
         let fixes = std::mem::take(&mut self.buf);
         let Some(doc) = chunk_doc(&fixes) else { return };
-        if self.store.write_device(&track_chunk_key(self.start, self.chunk), &doc).is_ok() {
+        if self.store.write(&track_chunk_key(self.start, self.chunk), &doc).is_ok() {
             // A track enters the index with its first chunk: a recording stopped before a fix leaves nothing to list.
             if self.chunk == 0 {
                 index_track(&self.store, self.start);
             }
             self.chunk += 1;
             // VSF all the way down: the counter is a u, not naked LE bytes.
-            let _ = self.store.write_device(&track_count_key(self.start), &VsfType::u(self.chunk as usize, false).flatten());
+            let _ = self.store.write(&track_count_key(self.start), &VsfType::u(self.chunk as usize, false).flatten());
         }
     }
 
@@ -422,9 +517,9 @@ impl TrackRecorder {
 }
 
 /// One recorded chunk's fixes. A chunk in an older form is written again in today's as it is read, so the forms before die out on the devices that hold them: zstd around the document with UNIX times (to 2026-11-21; this reader is all that is left of zstd, and goes once the recordings are rewritten), and before that latitude, longitude, the map's elevation and unix seconds as f64s, read with the place and time only (its height was the map's, not the receiver's).
-pub fn track_chunk(store: &FlatStorage, start: i64, chunk: u32) -> Option<Vec<Fix>> {
+pub fn track_chunk(store: &Store, start: i64, chunk: u32) -> Option<Vec<Fix>> {
     let key = track_chunk_key(start, chunk);
-    let bytes = store.read_device(&key).ok()??;
+    let bytes = store.read(&key).ok()??;
     if bytes.starts_with("RÅ<".as_bytes()) {
         return chunk_fixes(&bytes, false);
     }
@@ -436,14 +531,14 @@ pub fn track_chunk(store: &FlatStorage, start: i64, chunk: u32) -> Option<Vec<Fi
         old.chunks_exact(4).map(|f| Fix { coord: mahere_coord::Coord::from_lat_lon(f[0], f[1]).raw(), et: et_of_unix_ms((f[3] * 1000.0) as i64), height_m: None, accuracy_m: 0.0, v_accuracy_m: None, speed_ms: None, bearing_deg: None }).collect()
     };
     if let Some(doc) = chunk_doc(&fixes) {
-        let _ = store.write_device(&key, &doc);
+        let _ = store.write(&key, &doc);
     }
     Some(fixes)
 }
 
 /// Chunk count for a recorded track session (width-agnostic VSF read).
-pub fn track_chunks(store: &FlatStorage, start: i64) -> Option<u32> {
-    let bytes = store.read_device(&track_count_key(start)).ok()??;
+pub fn track_chunks(store: &Store, start: i64) -> Option<u32> {
+    let bytes = store.read(&track_count_key(start)).ok()??;
     let mut ptr = 0usize;
     let v = vsf::parse(&bytes, &mut ptr).ok()?;
     v.as_u64().and_then(|n| u32::try_from(n).ok())
@@ -458,10 +553,14 @@ fn track_recovered_key() -> String {
 }
 
 /// Every recorded track by its start (Eagle Time, its identity), oldest first: the index the recorder keeps (Nick 2026-11-21: a track "doesn't save to map and disappears when you're done"; the vault keys are hashes, so without it no track could be found again).
-pub fn tracks(store: &FlatStorage) -> Vec<i64> {
-    let Some(b) = store.read_device(&track_index_key()).ok().flatten() else { return Vec::new() };
-    let Ok((header, end)) = vsf::VsfHeader::decode(&b) else { return Vec::new() };
-    let Ok(sections) = header.sections(&b, end) else { return Vec::new() };
+pub fn tracks(store: &Store) -> Vec<i64> {
+    store.read(&track_index_key()).ok().flatten().map_or_else(Vec::new, |b| decode_track_index(&b))
+}
+
+/// The track index's starts from its document, oldest first.
+fn decode_track_index(b: &[u8]) -> Vec<i64> {
+    let Ok((header, end)) = vsf::VsfHeader::decode(b) else { return Vec::new() };
+    let Ok(sections) = header.sections(b, end) else { return Vec::new() };
     let mut out: Vec<i64> = sections
         .into_iter()
         .filter(|s| s.name == "tracks")
@@ -478,16 +577,16 @@ pub fn tracks(store: &FlatStorage) -> Vec<i64> {
     out
 }
 
-fn write_track_index(store: &FlatStorage, starts: &[i64]) {
+fn write_track_index(store: &Store, starts: &[i64]) {
     // The starts as one field of many values, never a field a track.
     let mut s = vsf::VsfSection::new("tracks");
     s.add_field_multi("start", starts.iter().map(|&t| VsfType::e(EtType::e6(t))).collect());
     if let Ok(b) = VsfBuilder::new().add_section_direct(s).build() {
-        let _ = store.write_device(&track_index_key(), &b);
+        let _ = store.write(&track_index_key(), &b);
     }
 }
 
-fn index_track(store: &FlatStorage, start: i64) {
+fn index_track(store: &Store, start: i64) {
     let mut starts = tracks(store);
     if !starts.contains(&start) {
         starts.push(start);
@@ -509,44 +608,44 @@ pub fn display_unix_secs(et: i64) -> i64 {
 }
 
 /// A recorded track's fixes, every chunk in order.
-pub fn track_fixes(store: &FlatStorage, start: i64) -> Vec<Fix> {
+pub fn track_fixes(store: &Store, start: i64) -> Vec<Fix> {
     (0..track_chunks(store, start).unwrap_or(0)).filter_map(|c| track_chunk(store, start, c)).flatten().collect()
 }
 
 /// A recorded track gone: its chunks, its count and its place in the index.
-pub fn delete_track(store: &FlatStorage, start: i64) {
+pub fn delete_track(store: &Store, start: i64) {
     let mut keys: Vec<String> = (0..track_chunks(store, start).unwrap_or(0)).map(|c| track_chunk_key(start, c)).collect();
     keys.push(track_count_key(start));
-    let _ = store.delete_device_batch(&keys);
+    let _ = store.delete_batch(&keys);
     let starts: Vec<i64> = tracks(store).into_iter().filter(|&s| s != start).collect();
     write_track_index(store, &starts);
 }
 
 /// A track written whole from its fixes, under a start of its own: chunks, count and index, as the recorder would have written it.
-fn write_track(store: &FlatStorage, start: i64, fixes: &[Fix]) -> bool {
+fn write_track(store: &Store, start: i64, fixes: &[Fix]) -> bool {
     let mut n = 0u32;
     for part in fixes.chunks(CHUNK_FIXES) {
         let Some(doc) = chunk_doc(part) else { return false };
-        if store.write_device(&track_chunk_key(start, n), &doc).is_err() {
+        if store.write(&track_chunk_key(start, n), &doc).is_err() {
             return false;
         }
         n += 1;
     }
-    let _ = store.write_device(&track_count_key(start), &VsfType::u(n as usize, false).flatten());
+    let _ = store.write(&track_count_key(start), &VsfType::u(n as usize, false).flatten());
     index_track(store, start);
     true
 }
 
 /// Recordings made before the index (to 2026-11-21) found again, once: every chunk in the vault that is a chunk of fixes and holds no fix an indexed track has, grouped into tracks where a fix follows the last within half an hour, each written as a track of its own under its first fix's time. Reads the whole vault, so it runs once (its marker in the vault) and off the interface's thread. The tracks found.
-pub fn recover_tracks(store: &FlatStorage) -> usize {
-    if matches!(store.read_device(&track_recovered_key()), Ok(Some(_))) {
+pub fn recover_tracks(store: &Store) -> usize {
+    if matches!(store.read(&track_recovered_key()), Ok(Some(_))) {
         return 0;
     }
     let mut known: Vec<i64> = tracks(store).into_iter().flat_map(|s| track_fixes(store, s)).map(|f| f.et).collect();
     known.sort_unstable();
     let mut chunks: Vec<Vec<Fix>> = Vec::new();
-    for addr in store.live_addrs().unwrap_or_default() {
-        let Ok(Some(b)) = store.read_device_addr(&addr) else { continue };
+    for addr in store.vault().live_addrs().unwrap_or_default() {
+        let Ok(Some(b)) = store.vault().read_device_addr(&addr) else { continue };
         let fixes = if b.starts_with("RÅ<".as_bytes()) {
             chunk_fixes(&b, false)
         } else if b.starts_with(&[0x28, 0xB5, 0x2F, 0xFD]) {
@@ -575,7 +674,7 @@ pub fn recover_tracks(store: &FlatStorage) -> usize {
             found += 1;
         }
     }
-    let _ = store.write_device(&track_recovered_key(), &VsfType::u(found, false).flatten());
+    let _ = store.write(&track_recovered_key(), &VsfType::u(found, false).flatten());
     found
 }
 
@@ -759,17 +858,17 @@ mod tests {
             )
             .build()
             .unwrap();
-        store2.write_device(&track_chunk_key(key, 9), &zstd::encode_all(&old[..], 3).unwrap()).unwrap();
+        store2.write(&track_chunk_key(key, 9), &zstd::encode_all(&old[..], 3).unwrap()).unwrap();
         let fixes = track_chunk(&store2, key, 9).unwrap();
         assert_eq!((fixes[0].coord, fixes[0].et, fixes[0].accuracy_m), (7, et_of_unix_ms(1_791_900_000_000), 3.5));
-        assert!(store2.read_device(&track_chunk_key(key, 9)).unwrap().unwrap().starts_with("RÅ<".as_bytes()), "rewritten as VSF");
+        assert!(store2.read(&track_chunk_key(key, 9)).unwrap().unwrap().starts_with("RÅ<".as_bytes()), "rewritten as VSF");
         assert_eq!(track_chunk(&store2, key, 9), Some(fixes));
 
         // The recorded track is in the index and reads back whole; a recording from before the index is found once, as a track of its own under its first fix; a deleted track leaves the index and its chunks.
         assert_eq!(tracks(&store2), vec![key]);
         assert_eq!(track_fixes(&store2, key).len(), 200);
         let lost: Vec<Fix> = (0..3).map(|i| Fix { coord: mahere_coord::Coord::from_lat_lon(47.0, -121.0 + i as f64 * 1e-4).raw(), et: et_of_unix_ms(1_700_000_000_000 + i * 1000), height_m: None, accuracy_m: 4.0, v_accuracy_m: None, speed_ms: Some(1.0), bearing_deg: None }).collect();
-        store2.write_device(&track_chunk_key(12345, 0), &chunk_doc(&lost).unwrap()).unwrap();
+        store2.write(&track_chunk_key(12345, 0), &chunk_doc(&lost).unwrap()).unwrap();
         assert_eq!(recover_tracks(&store2), 1);
         assert_eq!(recover_tracks(&store2), 0, "once");
         let first = lost[0].et;
@@ -963,7 +1062,7 @@ fn signature(b: &[u8]) -> String {
 
 /// The user's own cells (ink and selection) in the vault, keyed `d` user, `u` depth, `wm` cell, with an index document (`d` user, `d` index) naming every one, so they all load at start.
 pub struct VaultUser {
-    store: Arc<FlatStorage>,
+    store: Arc<Store>,
     index: std::sync::Mutex<std::collections::HashMap<(u8, u64), (i64, u32)>>,
 }
 
@@ -976,29 +1075,29 @@ fn user_index_key() -> String {
 }
 
 impl VaultUser {
-    pub fn new(store: Arc<FlatStorage>) -> VaultUser {
-        let index = store.read_device(&user_index_key()).ok().flatten().map(|b| decode_cell_index(&b)).unwrap_or_default();
+    pub fn new(store: Arc<Store>) -> VaultUser {
+        let index = store.read(&user_index_key()).ok().flatten().map(|b| decode_cell_index(&b)).unwrap_or_default();
         VaultUser { store, index: std::sync::Mutex::new(index) }
     }
 
     fn flush(&self) {
         let bytes = encode_cell_index(&self.index.lock().unwrap());
         if let Some(b) = bytes {
-            let _ = self.store.write_device(&user_index_key(), &b);
+            let _ = self.store.write(&user_index_key(), &b);
         }
     }
 }
 
 impl mahere_engine::ink::UserStore for VaultUser {
     fn put(&self, key: mahere_tiles::CellKey, bytes: &[u8]) {
-        if self.store.write_device(&user_key(key), bytes).is_ok() {
+        if self.store.write(&user_key(key), bytes).is_ok() {
             self.index.lock().unwrap().insert((key.depth, key.raw()), (et_now(), bytes.len() as u32));
             self.flush();
         }
     }
 
     fn delete(&self, key: mahere_tiles::CellKey) {
-        let _ = self.store.write_device(&user_key(key), &[]);
+        let _ = self.store.write(&user_key(key), &[]);
         self.index.lock().unwrap().remove(&(key.depth, key.raw()));
         self.flush();
     }
@@ -1008,18 +1107,55 @@ impl mahere_engine::ink::UserStore for VaultUser {
         keys.into_iter()
             .filter_map(|(depth, raw)| {
                 let key = mahere_tiles::CellKey { depth, prefix: raw >> (60 - 2 * depth as u32) };
-                let bytes = self.store.read_device(&user_key(key)).ok().flatten()?;
+                let bytes = self.store.read(&user_key(key)).ok().flatten()?;
                 (!bytes.is_empty()).then_some((key, bytes))
             })
             .collect()
     }
 }
 
+/// The desktop's ink, selections and areas from before they lived in the vault (plain files under `dir`: a cell each by its hex name, or its older base64url name, `.vsf` or `.vsf.zst`; areas under `areas/`), brought into the store under the person and the files removed. Only once attested: before, the store holds in RAM and the files would be lost with the session. How many came in.
+pub fn adopt_user_files(store: &Arc<Store>, dir: &std::path::Path) -> usize {
+    use mahere_engine::areas::AreaStore;
+    use mahere_engine::ink::UserStore;
+    if !store.attested() {
+        return 0;
+    }
+    let mut n = 0;
+    let user = VaultUser::new(store.clone());
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for e in entries.flatten() {
+            let path = e.path();
+            if !path.is_file() {
+                continue;
+            }
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else { continue };
+            let key = mahere_tiles::CellKey::from_file_name(name).or_else(|| mahere_tiles::CellKey::from_name(name.trim_end_matches(".zst").trim_end_matches(".vsf")));
+            let (Some(key), Ok(bytes)) = (key, std::fs::read(&path)) else { continue };
+            user.put(key, &bytes);
+            let _ = std::fs::remove_file(&path);
+            n += 1;
+        }
+    }
+    let areas = VaultAreas::new(store.clone());
+    if let Ok(entries) = std::fs::read_dir(dir.join("areas")) {
+        for e in entries.flatten() {
+            let path = e.path();
+            let Ok(bytes) = std::fs::read(&path) else { continue };
+            let Some(area) = mahere_tiles::area::Area::decode(&bytes) else { continue };
+            areas.put(&area.name, &bytes);
+            let _ = std::fs::remove_file(&path);
+            n += 1;
+        }
+    }
+    n
+}
+
 // ==================== AREAS ====================
 
 /// The user's areas in the vault: one document each under (`d` area, `x` name), an index document (`d` area, `d` index) naming them.
 pub struct VaultAreas {
-    store: Arc<FlatStorage>,
+    store: Arc<Store>,
     names: std::sync::Mutex<Vec<String>>,
 }
 
@@ -1032,15 +1168,15 @@ fn area_index_key() -> String {
 }
 
 impl VaultAreas {
-    pub fn new(store: Arc<FlatStorage>) -> VaultAreas {
-        let names = store.read_device(&area_index_key()).ok().flatten().map(|b| decode_names(&b)).unwrap_or_default();
+    pub fn new(store: Arc<Store>) -> VaultAreas {
+        let names = store.read(&area_index_key()).ok().flatten().map(|b| decode_names(&b)).unwrap_or_default();
         VaultAreas { store, names: std::sync::Mutex::new(names) }
     }
 
     fn flush(&self) {
         let names = self.names.lock().unwrap().clone();
         if let Some(b) = encode_names(&names) {
-            let _ = self.store.write_device(&area_index_key(), &b);
+            let _ = self.store.write(&area_index_key(), &b);
         }
     }
 }
@@ -1068,7 +1204,7 @@ fn decode_names(data: &[u8]) -> Vec<String> {
 
 impl mahere_engine::areas::AreaStore for VaultAreas {
     fn put(&self, area_name: &str, bytes: &[u8]) {
-        if self.store.write_device(&area_key(area_name), bytes).is_ok() {
+        if self.store.write(&area_key(area_name), bytes).is_ok() {
             let mut names = self.names.lock().unwrap();
             if !names.iter().any(|n| n == area_name) {
                 names.push(area_name.to_string());
@@ -1079,14 +1215,14 @@ impl mahere_engine::areas::AreaStore for VaultAreas {
     }
 
     fn delete(&self, area_name: &str) {
-        let _ = self.store.write_device(&area_key(area_name), &[]);
+        let _ = self.store.write(&area_key(area_name), &[]);
         self.names.lock().unwrap().retain(|n| n != area_name);
         self.flush();
     }
 
     fn load_all(&self) -> Vec<Vec<u8>> {
         let names = self.names.lock().unwrap().clone();
-        names.iter().filter_map(|n| self.store.read_device(&area_key(n)).ok().flatten()).filter(|b| !b.is_empty()).collect()
+        names.iter().filter_map(|n| self.store.read(&area_key(n)).ok().flatten()).filter(|b| !b.is_empty()).collect()
     }
 }
 
@@ -1141,6 +1277,15 @@ mod index_tests {
         let cells = VaultCells::open(vault);
         assert!(cells.has(a, 0) && !cells.has(a, 3) && cells.has(b, 0) && cells.has(old, 0), "the index came back");
         assert!(matches!(cells.get(a), Fetch::Bytes(x) if x == b"base a"));
+        // A vault under another secret takes this one's cells in as an older vault, the cell it has already left alone.
+        let newer = VaultCells::open(FlatStorage::open_device_shared(APP, [10u8; 32]).unwrap());
+        newer.put(b, b"newer b");
+        newer.take_vault(FlatStorage::open_device_shared(APP, [9u8; 32]).unwrap());
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        assert!(matches!(newer.get(a), Fetch::Bytes(x) if x == b"base a"), "the older vault's cells come in");
+        assert_eq!(newer.tag(a).as_deref(), Some("\"t1\""));
+        assert!(matches!(newer.get(b), Fetch::Bytes(x) if x == b"newer b"), "what it kept already stays");
+        assert!(newer.has(old, 0) && !newer.has(a, 3));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1159,17 +1304,17 @@ mod index_tests {
 /// Themes on disk: one VSF document per theme in the vault under (`d` theme, `x` name), colours authored in VSF RGB at gamma 2 as Photon authors its palette and kept that way: the renderers convert to the display at their one encode. The built-ins are written on first launch so a user can edit them in place; an index document (`d` theme, `d` index) lists the names.
 pub mod themes {
     use super::{name, vault_key};
-    use kete::FlatStorage;
+    use crate::Store;
     use mahere_engine::LayerMask;
     use mahere_engine::theme::Theme;
     use vsf::types::Tensor;
     use vsf::{VsfBuilder, VsfType};
 
-    fn theme_key(theme_name: &str) -> String {
+    pub(crate) fn theme_key(theme_name: &str) -> String {
         vault_key(&[name("theme"), VsfType::x(theme_name.to_string())])
     }
 
-    fn index_key() -> String {
+    pub(crate) fn index_key() -> String {
         vault_key(&[name("theme"), name("index")])
     }
 
@@ -1338,19 +1483,24 @@ pub mod themes {
         })
     }
 
-    fn write_index(store: &FlatStorage, names: &[String]) {
+    fn write_index(store: &Store, names: &[String]) {
         let joined: Vec<VsfType> = names.iter().map(|n| VsfType::x(n.clone())).collect();
         let mut section = vsf::VsfSection::new("themes");
         section.add_field_multi("names", joined);
         if let Ok(b) = VsfBuilder::new().add_section_direct(section).build() {
-            let _ = store.write_device(&index_key(), &b);
+            let _ = store.write(&index_key(), &b);
         }
     }
 
-    pub fn names(store: &FlatStorage) -> Vec<String> {
-        let Ok(Some(bytes)) = store.read_device(&index_key()) else { return Vec::new() };
-        let Ok((header, end)) = vsf::VsfHeader::decode(&bytes) else { return Vec::new() };
-        let Ok(sections) = header.sections(&bytes, end) else { return Vec::new() };
+    pub fn names(store: &Store) -> Vec<String> {
+        let Ok(Some(bytes)) = store.read(&index_key()) else { return Vec::new() };
+        decode_index(&bytes)
+    }
+
+    /// The theme index's names from its document.
+    pub(crate) fn decode_index(bytes: &[u8]) -> Vec<String> {
+        let Ok((header, end)) = vsf::VsfHeader::decode(bytes) else { return Vec::new() };
+        let Ok(sections) = header.sections(bytes, end) else { return Vec::new() };
         let mut out = Vec::new();
         for s in sections {
             for f in s.fields {
@@ -1366,9 +1516,9 @@ pub mod themes {
         out
     }
 
-    pub fn save(store: &FlatStorage, t: &Theme) {
+    pub fn save(store: &Store, t: &Theme) {
         if let Some(b) = encode(t) {
-            let _ = store.write_device(&theme_key(&t.name), &b);
+            let _ = store.write(&theme_key(&t.name), &b);
             let mut list = names(store);
             if !list.iter().any(|n| *n == t.name) {
                 list.push(t.name.clone());
@@ -1377,13 +1527,13 @@ pub mod themes {
         }
     }
 
-    pub fn load(store: &FlatStorage, theme_name: &str) -> Option<Theme> {
-        let bytes = store.read_device(&theme_key(theme_name)).ok()??;
+    pub fn load(store: &Store, theme_name: &str) -> Option<Theme> {
+        let bytes = store.read(&theme_key(theme_name)).ok()??;
         decode(&bytes)
     }
 
     /// The built-ins into the vault where they are missing or an older revision, then every theme the vault holds, in index order, as authored (VSF RGB): the renderers convert to the display at their one encode.
-    pub fn load_all(store: &FlatStorage) -> Vec<Theme> {
+    pub fn load_all(store: &Store) -> Vec<Theme> {
         // Each theme read once (2026-10-21: themes took 2.9 s of a Pixel 3a's start, each read twice), a built-in written back only when a newer revision ships.
         let t0 = std::time::Instant::now();
         let listed = names(store);
@@ -1407,8 +1557,8 @@ pub mod themes {
     }
 
     /// Remove a theme document and its index entry.
-    pub fn delete(store: &FlatStorage, theme_name: &str) {
-        let _ = store.delete_device(&theme_key(theme_name));
+    pub fn delete(store: &Store, theme_name: &str) {
+        let _ = store.delete(&theme_key(theme_name));
         let list: Vec<String> = names(store).into_iter().filter(|n| n != theme_name).collect();
         write_index(store, &list);
     }

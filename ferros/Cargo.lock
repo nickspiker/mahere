@@ -1663,6 +1663,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "ihi"
+version = "0.0.48"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e820ef1c51d912e9c78a84cf71319ee3b758c66a264c96bdd2c8d6f2ab4c6969"
+dependencies = [
+ "blake3",
+ "i256",
+ "sha2",
+ "sha3",
+]
+
+[[package]]
 name = "image"
 version = "0.25.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1830,7 +1842,7 @@ dependencies = [
  "log",
  "manifestus",
  "rand",
- "tohu",
+ "tohu 0.0.3",
  "vsf 0.11.0",
 ]
 
@@ -2093,6 +2105,7 @@ dependencies = [
  "mahere-panel",
  "mahere-tiles",
  "rand",
+ "tohu 0.0.3 (registry+https://github.com/rust-lang/crates.io-index)",
  "ureq",
  "vsf 0.10.2",
  "zstd",
@@ -3966,11 +3979,26 @@ dependencies = [
  "base64",
  "blake3",
  "chacha20poly1305 0.11.0",
- "ihi",
+ "ihi 0.0.48",
  "jni 0.21.1",
  "libc",
  "rand",
  "vsf 0.11.0",
+]
+
+[[package]]
+name = "tohu"
+version = "0.0.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3d50206f52e870b9b5303bbe1836efafcab7ee90566112531a1e9cfb659a51d7"
+dependencies = [
+ "base64",
+ "blake3",
+ "chacha20poly1305 0.11.0",
+ "ihi 0.0.48 (registry+https://github.com/rust-lang/crates.io-index)",
+ "jni 0.21.1",
+ "rand",
+ "vsf 0.10.2",
 ]
 
 [[package]]

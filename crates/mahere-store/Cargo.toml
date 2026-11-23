@@ -29,3 +29,7 @@ zstd = { version = "0.13", default-features = false }
 # target_os = "ferros" is a device running ferros, as a process of its kernel (a JSON target, docs/STD-TARGET.md in the ferros repo): rustc does not know the name, so the cfg is declared here.
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_os, values("ferros"))'] }
+
+# The machine's own device secret and the session Photon leaves for the stack's apps (a desktop's vault and its person, 2026-10-22).
+[target.'cfg(not(any(target_os = "android", target_os = "ferros")))'.dependencies]
+tohu = { version = "0.0.3" }

@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 fn main() {
     let vault = mahere_store::open(None).expect("vault");
-    let (store, layers, _) = mahere_store::cell_stores(None, Some(vault));
+    let (store, layers, _) = mahere_store::cell_stores(None, Some(vault.vault().clone()));
     let dem: Arc<dyn mahere_engine::residency::CellStore> = layers.map_or(store.clone(), |l| l.dem);
     let trips: Vec<(&str, (f64, f64), (f64, f64))> = vec![
         ("Harper to SE Cottonwood", (47.51892, -122.52005), (47.50952, -122.52059)),
