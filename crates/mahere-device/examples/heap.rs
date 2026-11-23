@@ -1,4 +1,4 @@
-// What Mahere's heap holds on a ferros device, measured on the desktop: the device app at the Pro's panel (1344 x 2992), composed as the device's CPU path composes it (the map, its lettering over it, the panel over both), with a counting allocator under it. For mahere-ferros's build.rs, which sets the ferros heap from it.
+// What Mahere's heap holds on a ferros device, measured on the desktop: the device app at the Pro's panel (1344 x 2992), composed as the device's CPU path composes it (the map, its lettering over it, the panel over both), with a counting allocator under it. It sized the ferros heap Mahere declared until 2026-11-23, when the owner ruled out fixed ceilings (a process gets memory as it uses it, up to what the device has); it still says what Mahere uses.
 // cargo run --release -p mahere-device --example heap -- <cells dir> [lat lon]
 // The cells dir is a local bake (data/cells); with "" the map streams from the bucket (a ferros device reads the same cells from its vault).
 use std::alloc::{GlobalAlloc, Layout, System};
