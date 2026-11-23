@@ -135,6 +135,8 @@ fn main() {
     gpu.sync(&device, &queue, map.pool_mut(), false);
     let sync_ms = t.elapsed().as_secs_f32() * 1000.0;
     let overlay = map.overlay(w, h, true).to_vec();
+    // What the panel's controls and the compass cover, for the lettering to leave clear (empty without a panel).
+    let mut keep_out: Vec<[f32; 4]> = Vec::new();
     // MAHERE_PANEL=1 lays the open control panel over the GPU frame (the CPU frame has none, so the diff below is then meaningless).
     let panel_mode = std::env::var("MAHERE_PANEL").unwrap_or_default();
     if panel_mode == "1" || panel_mode == "closed" || panel_mode == "themes" || panel_mode == "pen" || panel_mode == "areas" || panel_mode == "area" || panel_mode == "updates" || panel_mode == "tracks" || panel_mode == "track" {
@@ -208,6 +210,8 @@ fn main() {
         panel.paint(w, h, map.layers(), controls, &readouts, measure.as_ref(), &map.themes, &areas, None);
         // The areas view is compared on paint, so the page is painted once more with it known.
         panel.paint(w, h, map.layers(), controls, &readouts, measure.as_ref(), &map.themes, &areas, None);
+        keep_out = panel.label_keep_out();
+        keep_out.push(map.compass_box(w, h));
         let rgba = panel.overlay_rgba(&overlay, w, h);
         gpu.set_overlay_rgba(&device, &queue, w as u32, h as u32, &rgba);
     } else {
@@ -254,6 +258,7 @@ fn main() {
         if let Some(v) = std::env::var("MAHERE_LABEL_SIZE").ok().and_then(|s| s.parse::<f32>().ok()) {
             map.themes[t].label_look[0] = v;
         }
+        labeller.set_keep_out(keep_out.clone());
         labeller.update(&mut map, w, h, font);
         if let Ok(p) = std::env::var("MAHERE_LABEL_PAN") {
             let v: Vec<f64> = p.split(',').map(|x| x.parse().unwrap()).collect();

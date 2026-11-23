@@ -334,6 +334,7 @@ impl GpuHost {
         // Labels: laid out again when the view rests; every frame each letter is a quad at its label's place on the map now.
         let t_labels = std::time::Instant::now();
         if mahere_panel::labels::Labeller::wanted(map) {
+            self.labeller.keep_clear(panel, map, w as usize, h as usize);
             self.labeller.ask(map, w as usize, h as usize, panel.label_font_px(), !in_motion);
             let a = self.labeller.atlas();
             self.map.set_atlas(&self.device, &self.queue, a.side as u32, &a.rg, a.version);

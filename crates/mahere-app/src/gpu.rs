@@ -186,6 +186,7 @@ impl Gpu {
             self.style_version = Some(map.style_version());
         }
         if mahere_panel::labels::Labeller::wanted(map) {
+            labeller.keep_clear(panel, map, w, h);
             labeller.ask(map, w, h, font_px, !in_motion);
             let a = labeller.atlas();
             self.map.set_atlas(&self.device, &self.queue, a.side as u32, &a.rg, a.version);

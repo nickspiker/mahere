@@ -953,6 +953,7 @@ impl<G: MapGpu> FluorApp for DeviceApp<G> {
             // The lettering is asked for here as well as in the frame, so a view come to rest (a quarter second after the camera stopped) or cells arrived are lettered without a frame drawn to ask; the layout landing is the frame.
             if self.lettering && mahere_panel::labels::Labeller::wanted(&self.map) {
                 let at_rest = self.label_rest();
+                self.labeller.keep_clear(&self.panel, &self.map, self.w, self.h);
                 self.labeller.ask(&mut self.map, self.w, self.h, self.panel.label_font_px(), at_rest);
             }
             let (dirty, lettered) = (self.panel.take_dirty(), self.lettering && self.labeller.poll());
@@ -986,6 +987,7 @@ impl<G: MapGpu> FluorApp for DeviceApp<G> {
         self.frame.extend_from_slice(&self.map.canvas);
         let at_rest = self.label_rest();
         if mahere_panel::labels::Labeller::wanted(&self.map) {
+            self.labeller.keep_clear(&self.panel, &self.map, w, h);
             self.labeller.ask(&mut self.map, w, h, self.panel.label_font_px(), at_rest);
             self.labeller.draw_cpu(&mut self.frame, &self.map.cam, w, h);
         }

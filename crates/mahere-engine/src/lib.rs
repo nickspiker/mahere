@@ -2230,6 +2230,12 @@ impl MapCore {
         w as f32 - 92.0 * Self::marks_scale(w, h)
     }
 
+    /// The screen the compass, the heading and the zoom cover, for the labeller to leave clear.
+    pub fn compass_box(&self, w: usize, h: usize) -> [f32; 4] {
+        let s = Self::marks_scale(w, h);
+        [Self::marks_left(w, h), self.marks_top + 40.0 * s, w as f32, self.marks_top + 190.0 * s]
+    }
+
     fn draw_compass(&mut self, w: usize, h: usize) {
         let s = Self::marks_scale(w, h);
         if (w as f32) < 120.0 * s || (h as f32) < 160.0 * s + self.marks_top {

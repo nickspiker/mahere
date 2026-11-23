@@ -1005,6 +1005,30 @@ impl Panel {
         self.safe.map_or(self.h as f32, |c| c.bottom_at(x0).min(c.bottom_at(x1)))
     }
 
+    /// The screen the panel's controls covered at its last paint, for the labeller to leave clear ([`labels::Labeller::set_keep_out`]): the orb and its name, the open column, the locate button and the toolbox, the strip or card, and the scale bar while the column is shut.
+    pub fn label_keep_out(&self) -> Vec<[f32; 4]> {
+        let (w, h, f) = (self.w as f32, self.h as f32, self.font);
+        let (gx, gy, gr) = self.gear;
+        let mut out = vec![[gx - gr, gy - gr, gx + gr + f * 5.0, gy + gr]];
+        if self.open {
+            out.push([0.0, 0.0, self.panel_w, h]);
+        }
+        if let Some((x, y, r)) = self.locate_btn {
+            out.push([x - r, y - r, x + r, y + r]);
+        }
+        if let Some((x, y, bw, bh)) = self.tool_btn {
+            out.push([x, y, x + bw, y + bh]);
+        }
+        if let Some(t) = self.card_top {
+            out.push([0.0, t, w, h]);
+        }
+        if !self.open {
+            let floor = self.safe_floor(0.0, w);
+            out.push([0.0, floor - f * 3.2, f * 11.0, floor]);
+        }
+        out
+    }
+
     pub fn set_host_orb(&mut self, orb: Option<(f32, f32, f32)>) {
         if self.host_orb != orb {
             self.host_orb = orb;

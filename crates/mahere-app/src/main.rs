@@ -1029,6 +1029,7 @@ impl FluorApp for MahereApp {
         // On the GPU the labels are in the frame already.
         if self.gpu.is_none() && mahere_panel::labels::Labeller::wanted(&self.map) {
             let at_rest = self.label_cam.1.elapsed().as_millis() >= 250;
+            self.labeller.keep_clear(&self.panel, &self.map, w, h);
             self.labeller.ask(&mut self.map, w, h, self.panel.label_font_px(), at_rest);
             self.labeller.draw_cpu_with_track(&mut map, &self.map, w, h);
         }

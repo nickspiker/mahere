@@ -385,6 +385,8 @@ struct LabelJob {
     key: ViewKey,
     /// The font packs fetched so far, for the worker to load before it lays out.
     fonts: Option<std::sync::Arc<crate::fonts::FontPacks>>,
+    /// The screen the host's controls cover: taken before any name.
+    keep_out: Vec<[f32; 4]>,
 }
 
 /// The worker's side: the text renderer, the master atlas, the advances measured, the last layout's names (placed first again), and the cells' names read so far.
@@ -422,6 +424,9 @@ pub struct Labeller {
     fonts_laid: usize,
     /// The text size the last layout was asked at: a new one lays the view out again (2026-10-25: the UI scale changed and the map's lettering stayed at the old size until the camera moved).
     font_asked: f32,
+    /// The screen the host's own controls cover (the open panel, the orb, the buttons, the compass: [`Labeller::set_keep_out`]), no label placed in it; and what the last layout asked was laid round.
+    keep_out: Vec<[f32; 4]>,
+    keep_asked: Vec<[f32; 4]>,
     /// How many layouts have landed: a host that keeps a frame planned and waiting (ferros's GPU map) plans it again when this moves.
     landed: u64,
 }
@@ -668,7 +673,7 @@ impl Labeller {
                 }
             })
             .expect("labels thread");
-        Labeller { tx, rx, shown: Lettering::default(), busy: false, asked: None, last: std::time::Instant::now(), fonts: None, fonts_laid: 0, font_asked: 0.0, landed: 0 }
+        Labeller { tx, rx, shown: Lettering::default(), busy: false, asked: None, last: std::time::Instant::now(), fonts: None, fonts_laid: 0, font_asked: 0.0, landed: 0, keep_out: Vec::new(), keep_asked: Vec::new() }
     }
 
     /// The font packs to draw names in scripts the binary lacks (Nick 2026-10-16): a layout that needed one asks for it, and one arriving lays the view out again.
@@ -697,7 +702,19 @@ impl Labeller {
         let family = map.themes.get(map.theme).and_then(|t| mahere_engine::theme::LABEL_FONTS.iter().position(|f| *f == t.label_font)).unwrap_or(0) as u8;
         let key = Self::view_key(map, w, h);
         let names = map.layers().labels.then(|| map.name_job(w, h));
-        LabelJob { names, cam: map.cam, w, h, font, palette, look, amount, family, route: map.route_points().map_or(Vec::new(), |p| p.to_vec()), key, fonts: self.fonts.clone() }
+        LabelJob { names, cam: map.cam, w, h, font, palette, look, amount, family, route: map.route_points().map_or(Vec::new(), |p| p.to_vec()), key, fonts: self.fonts.clone(), keep_out: self.keep_out.clone() }
+    }
+
+    /// The screen the host's controls cover now ([`crate::Panel::label_keep_out`] and the compass, [`mahere_engine::MapCore::compass_box`]): the next layout places no name there, and a change lays the names out again.
+    pub fn set_keep_out(&mut self, boxes: Vec<[f32; 4]>) {
+        self.keep_out = boxes;
+    }
+
+    /// The host's controls as the panel and the map have them now: the panel's ([`crate::Panel::label_keep_out`]) and the compass's.
+    pub fn keep_clear(&mut self, panel: &crate::Panel, map: &mahere_engine::MapCore, w: usize, h: usize) {
+        let mut k = panel.label_keep_out();
+        k.push(map.compass_box(w, h));
+        self.set_keep_out(k);
     }
 
     /// Ask the worker for a layout when one is due: the view rests, the lettering is stale, none is running, and every cell is in or a second has passed since the last ask (so cells still arriving never hold the labels back). Never waits.
@@ -709,7 +726,8 @@ impl Labeller {
             return;
         }
         let key = Self::view_key(map, w, h);
-        let fonts_new = self.fonts_new() || (font - self.font_asked).abs() > 0.01;
+        // The host's controls moving (the panel opening or closing) lays the names out again round them, as new fonts do.
+        let fonts_new = self.fonts_new() || (font - self.font_asked).abs() > 0.01 || self.keep_out != self.keep_asked;
         if self.busy || !at_rest || (!fonts_new && (self.shown.drawn_for == Some(key) || self.asked == Some(key))) {
             return;
         }
@@ -723,6 +741,7 @@ impl Labeller {
             self.last = std::time::Instant::now();
             self.fonts_laid = self.fonts.as_ref().map_or(0, |f| f.arrived());
             self.font_asked = font;
+            self.keep_asked = self.keep_out.clone();
         }
     }
 
@@ -872,7 +891,7 @@ impl Letterer {
         self.han = han;
         self.text.set_han(han);
         let gathered = t.elapsed();
-        let laid = self.layout(&texels, &job.cam, w, h, font, &previous);
+        let laid = self.layout(&texels, &job.cam, w, h, font, &previous, &job.keep_out);
         let kept = self.keep(&laid, &job.cam, w, h);
         self.previous = kept.iter().map(|k| ident(&k.name)).collect();
         // The packs the names it shows need, fetched for the next layout; never those of names measured and left out.
@@ -1077,7 +1096,7 @@ impl Letterer {
         key
     }
 
-    fn layout(&mut self, texels: &NamedTexels, cam: &mahere_engine::Camera, w: usize, h: usize, font: f32, previous: &HashSet<u64>) -> Vec<Laid> {
+    fn layout(&mut self, texels: &NamedTexels, cam: &mahere_engine::Camera, w: usize, h: usize, font: f32, previous: &HashSet<u64>, keep_out: &[[f32; 4]]) -> Vec<Laid> {
         enum Shape<'a> {
             Point([f32; 2]),
             Area(&'a [[f32; 2]]),
@@ -1119,6 +1138,8 @@ impl Letterer {
             }
         }
         let mut room = Room::new(w, h, cam);
+        // The host's controls hold their ground first: no name under the panel, the orb, the buttons or the compass (2026-11-22, the Pro: names showed through the open panel's rows).
+        room.take(keep_out);
         let mut out = Vec::new();
         let pad = font * self.look[3];
         for (_, _, _, _, n, shape) in todo {
