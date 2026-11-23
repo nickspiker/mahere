@@ -32,6 +32,9 @@ pub struct App {
     ticks_said: std::time::Instant,
     /// The heap's most in MiB at the last line (a still map says it again only when it moved).
     heap_said: usize,
+    /// The device's app scale as last followed (preference 14), None before the first frame; and whether the panel was being pinched at the last tick (its end writes the scale back).
+    scale_seen: Option<u8>,
+    panel_pinching: bool,
 }
 
 impl FluorApp for App {
@@ -56,7 +59,34 @@ impl FluorApp for App {
         self.inner.wake_at()
     }
     fn tick(&mut self, ctx: &mut Context) -> bool {
-        let more = self.inner.tick(ctx);
+        let mut more = self.inner.tick(ctx);
+        // The person's app scale, followed as every kist follows it: the panel, its buttons and the map's lettering laid out at 2^(s/64), from the first frame and at every change (a settings page, a pinch in the deck).
+        let s = sys::pref(sys::PREF_SCALE);
+        if self.scale_seen != Some(s) {
+            self.scale_seen = Some(s);
+            let ru = (2.0f32).powf(s as i8 as f32 / 64.0);
+            println!("mahere: the app scale {}/64 of an octave: the panel at {ru:.3}", s as i8);
+            self.inner.ui_ru = ru;
+            self.inner.panel.set_ru(ru);
+            more = true;
+        }
+        // A pinch on the panel is the person's app scale (owner, 2026-11-20: "settings pages should modify that, same with apps"): at its end, the nearest 64th of an octave written for every kist.
+        let pinching = self.inner.ui_pinch.is_some() && self.inner.pinch_on_panel;
+        if self.panel_pinching && !pinching {
+            // WHY the bound: the kernel takes only ±64 (an octave each way, its pref_valid); a pinch past it is written as the reach, the kernel's own range.
+            let to = (self.inner.ui_ru.log2() * (1 << 6) as f32).round().clamp(-64.0, 64.0) as i8;
+            if Some(to as u8) != self.scale_seen {
+                if sys::set_scale(to) == 0 {
+                    self.scale_seen = Some(to as u8);
+                    let ru = (2.0f32).powf(to as f32 / 64.0);
+                    self.inner.ui_ru = ru;
+                    self.inner.panel.set_ru(ru);
+                } else {
+                    println!("mahere: the pinch's scale stays in Mahere: the kernel took no app scale from it");
+                }
+            }
+        }
+        self.panel_pinching = pinching;
         self.ticks[0] += more as u64;
         self.ticks[1] += 1;
         if self.ticks_said.elapsed().as_secs() >= 10 {
@@ -172,6 +202,20 @@ pub(crate) mod sys {
         b
     }
 
+    /// A device preference as this process's copy holds it now: the kernel keeps the first block of them at arc offset G#FC0, a byte each (ferros_sys `pref`), and every app sees a change on its next frame.
+    pub fn pref(index: u64) -> u8 {
+        // SAFETY: the preferences page is mapped in every process's arc for its life; index is one of the kernel's preference numbers (under 32), inside the block.
+        unsafe { core::ptr::read_volatile((arc_base() + 0xFC0 + index) as *const u8) }
+    }
+
+    /// The person's app scale written (SYS_SET_PREF, 11) with the display grant, which the kernel takes for preference 14 alone (ferros 1ace323c): what a pinch on the panel ends at, for every kist. 0 when kept.
+    pub fn set_scale(s: i8) -> u64 {
+        svc(11, cap(super::DISPLAY), PREF_SCALE, s as u8 as u64, 0, 0)
+    }
+
+    /// Preference 14, the app scale every kist follows (ferros, owner 2026-11-20: "if the user sets the RU high, they want all their kists to render that"): a signed byte of 64ths of an octave, the factor 2^(s/64).
+    pub const PREF_SCALE: u64 = 14;
+
     #[inline(always)]
     fn off<T: ?Sized>(p: *const T) -> u64 {
         (p as *const u8 as u64).wrapping_sub(arc_base())
@@ -271,7 +315,7 @@ pub fn run() {
         println!("mahere: the GPU's block taken as {} MiB at most (the spawn's input byte)", most >> 20);
     }
     // The GPU map letters the map from the labeller as the CPU raster does (`letters.rs`).
-    let mut app = App { inner, gpu: crate::gpu::GpuMap::open(GPU, LAYERS, SURFACE, SURFACE2, most), ticks: [0; 2], ticks_said: std::time::Instant::now(), heap_said: 0 };
+    let mut app = App { inner, gpu: crate::gpu::GpuMap::open(GPU, LAYERS, SURFACE, SURFACE2, most), ticks: [0; 2], ticks_said: std::time::Instant::now(), heap_said: 0, scale_seen: None, panel_pinching: false };
     // The GPU map's cells hold their planes in its slots, the CPU only those on their way in (`GPU_POOL_BUDGET`).
     if app.gpu.is_some() {
         app.inner.map.set_pool_budget(GPU_POOL_BUDGET);
