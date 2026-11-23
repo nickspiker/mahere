@@ -35,6 +35,32 @@ pub struct App {
     /// The device's app scale as last followed (preference 14), None before the first frame; and whether the panel was being pinched at the last tick (its end writes the scale back).
     scale_seen: Option<u8>,
     panel_pinching: bool,
+    /// The device's theme as last followed (preference 5), None before the first frame.
+    theme_seen: Option<u8>,
+}
+
+/// A device theme as fluor's look, as ferros_fluor::look_of makes it (ferros 8c6f2b51; that crate's own path to fluor does not resolve from beside this tree, so its mapping is followed here, the table itself taken from ferros_theme): the words in its text colours, the controls in its button row, a field on its plane (black while typed in), and its ground, accent and ring.
+fn look_of(t: &ferros_theme::Theme) -> fluor::theme::Look {
+    use fluor::theme::{dark, fmt, from_gamma2, vsf};
+    let ink = |gamma2: u32| dark(fmt(vsf(from_gamma2(gamma2 & 0x00FF_FFFF))));
+    let [fill, held, light, shadow] = t.button;
+    fluor::theme::Look {
+        text: ink(t.text),
+        label: ink(t.text2),
+        field: ink(t.plane),
+        field_hover: ink(t.plane),
+        field_active: ink(0),
+        light_edge: ink(light),
+        shadow_edge: ink(shadow),
+        selection: ink(held),
+        button: ink(fill),
+        button_hover: ink(held),
+        button_active: ink(fill),
+        button_held: ink(held),
+        ground: ink(0),
+        accent: ink(t.lit),
+        ring: ink(t.ring),
+    }
 }
 
 impl App {
@@ -85,6 +111,17 @@ impl FluorApp for App {
             println!("mahere: the app scale {}/64 of an octave: the panel at {ru:.3}", s as i8);
             self.inner.ui_ru = ru;
             self.inner.panel.set_ru(ru);
+            more = true;
+        }
+        // The device's theme, followed as every kist follows it: fluor's look from its row, which the panel's words, ground and controls are drawn in (`mahere_panel`'s `hue`).
+        let t = sys::pref(sys::PREF_THEME);
+        if self.theme_seen != Some(t) {
+            self.theme_seen = Some(t);
+            // WHY the bound: the preference is the kernel's byte, and a newer kernel may name a theme this build's table does not have yet; the last row stands in, as ferros_sys::theme::current reads it.
+            let row = &ferros_theme::THEMES[(t as usize).min(ferros_theme::THEMES.len() - 1)];
+            fluor::theme::set_look(look_of(row));
+            println!("mahere: the device theme {} ({})", t, row.name);
+            self.inner.panel.invalidate();
             more = true;
         }
         // A pinch on the panel is the person's app scale (owner, 2026-11-20: "settings pages should modify that, same with apps"): at its end, the nearest 64th of an octave written for every kist.
@@ -231,6 +268,9 @@ pub(crate) mod sys {
         svc(11, cap(super::DISPLAY), PREF_SCALE, s as u8 as u64, 0, 0)
     }
 
+    /// Preference 5, the device's theme: a row of ferros_theme's table.
+    pub const PREF_THEME: u64 = 5;
+
     /// Preference 14, the app scale every kist follows (ferros, owner 2026-11-20: "if the user sets the RU high, they want all their kists to render that"): a signed byte of 64ths of an octave, the factor 2^(s/64).
     pub const PREF_SCALE: u64 = 14;
 
@@ -333,7 +373,7 @@ pub fn run() {
         println!("mahere: the GPU's block taken as {} MiB at most (the spawn's input byte)", most >> 20);
     }
     // The GPU map letters the map from the labeller as the CPU raster does (`letters.rs`).
-    let mut app = App { inner, gpu: crate::gpu::GpuMap::open(GPU, LAYERS, SURFACE, SURFACE2, most), ticks: [0; 2], ticks_said: std::time::Instant::now(), heap_said: 0, scale_seen: None, panel_pinching: false };
+    let mut app = App { inner, gpu: crate::gpu::GpuMap::open(GPU, LAYERS, SURFACE, SURFACE2, most), ticks: [0; 2], ticks_said: std::time::Instant::now(), heap_said: 0, scale_seen: None, panel_pinching: false, theme_seen: None };
     // The GPU map's cells hold their planes in its slots, the CPU only those on their way in (`GPU_POOL_BUDGET`).
     if app.gpu.is_some() {
         app.inner.map.set_pool_budget(GPU_POOL_BUDGET);

@@ -483,6 +483,84 @@ const fn ink(rgb: u32, alpha: u8) -> u32 {
     (theme::dark(theme::fmt(theme::vsf(rgb))) & 0x00FF_FFFF) | ((alpha as u32) << 24)
 }
 
+/// The panel's colours: its own palette, or, once a platform has set a look of its own (ferros: the device theme as fluor's look, which its host sets and follows, preference 5; owner 2026-11-20: every kist in the device theme), drawn from that look, so the panel's words, ground and controls are the device's. Without one (desktop, Android) every colour is the palette's, as it always was.
+#[cfg(target_os = "ferros")]
+mod hue {
+    use super::*;
+
+    /// Whether ferros's host has set the device theme's look yet: fluor counts each change, and the default palette is none. Only the ferros build takes fluor from source, where the runtime look is (the published fluor has none yet).
+    fn themed() -> bool {
+        theme::look_generation() != 0
+    }
+
+    /// A look's colour at an opacity of the panel's own (the colour's darkness kept, its alpha replaced).
+    fn at(c: u32, alpha: u8) -> u32 {
+        (c & 0x00FF_FFFF) | ((alpha as u32) << 24)
+    }
+
+    pub fn text() -> u32 {
+        if themed() { theme::look().text } else { theme::TEXTBOX_TEXT }
+    }
+    pub fn readout() -> u32 {
+        if themed() { theme::look().text } else { READOUT }
+    }
+    pub fn readout_dim() -> u32 {
+        if themed() { theme::look().label } else { READOUT_DIM }
+    }
+    pub fn panel_bg() -> u32 {
+        if themed() { at(theme::look().field, 222) } else { PANEL_BG }
+    }
+    pub fn gear_bg() -> u32 {
+        if themed() { at(theme::look().field, 230) } else { GEAR_BG }
+    }
+    pub fn panel_dim() -> u32 {
+        if themed() { at(theme::look().field, 170) } else { PANEL_DIM }
+    }
+    pub fn footer_bg() -> u32 {
+        if themed() { at(theme::look().field, 236) } else { FOOTER_BG }
+    }
+    pub fn slider_track() -> u32 {
+        if themed() { theme::look().button } else { SLIDER_TRACK }
+    }
+    pub fn slider_fill() -> u32 {
+        if themed() { theme::look().accent } else { SLIDER_FILL }
+    }
+}
+
+/// The panel's colours everywhere but ferros: its own palette.
+#[cfg(not(target_os = "ferros"))]
+mod hue {
+    use super::*;
+
+    pub fn text() -> u32 {
+        theme::TEXTBOX_TEXT
+    }
+    pub fn readout() -> u32 {
+        READOUT
+    }
+    pub fn readout_dim() -> u32 {
+        READOUT_DIM
+    }
+    pub fn panel_bg() -> u32 {
+        PANEL_BG
+    }
+    pub fn gear_bg() -> u32 {
+        GEAR_BG
+    }
+    pub fn panel_dim() -> u32 {
+        PANEL_DIM
+    }
+    pub fn footer_bg() -> u32 {
+        FOOTER_BG
+    }
+    pub fn slider_track() -> u32 {
+        SLIDER_TRACK
+    }
+    pub fn slider_fill() -> u32 {
+        SLIDER_FILL
+    }
+}
+
 /// The label look's sliders, low and high: size, glow, smoothing, spacing (`Theme::label_look`).
 const LOOK_RANGE: [(f32, f32); 4] = [(0.3, 2.0), (0.0, 0.4), (0.0, 2.0), (0.0, 1.0)];
 
@@ -869,7 +947,7 @@ impl Pills {
     /// A button sized to its label, left edge at `x`, middle at `y_mid`.
     #[allow(clippy::too_many_arguments)]
     fn draw_fit(&mut self, canvas: &mut Canvas, text: &mut TextRenderer, x: f32, y_mid: f32, label: &str, lit: bool, font: f32, clip: Option<paint::Clip>) -> (f32, f32, f32, f32) {
-        let w = text.measure_text(label, &TextStyle::new(font, READOUT)) + font * 1.8;
+        let w = text.measure_text(label, &TextStyle::new(font, hue::readout())) + font * 1.8;
         let h = font * 1.5;
         self.draw(canvas, text, (x, y_mid - h * 0.5, w, h), label, lit, font, clip)
     }
@@ -2079,7 +2157,7 @@ impl Panel {
         }
         let font = self.font;
         let (gx, gy, gr) = self.gear;
-        let ink_col = theme::TEXTBOX_TEXT;
+        let ink_col = hue::text();
         // The orb where the settings live: the light as a ball when a mode has one, the app orb otherwise, the app's name beside it. A host that draws its own orb (a desktop's chrome) draws both there instead.
         if self.host_orb.is_none() {
             let size = (gr * 2.0) as usize;
@@ -2112,13 +2190,13 @@ impl Panel {
             let mut canvas = Canvas::new(&mut self.buf, w, h, &mut damage);
             // The name, level with the orb's centre; topmost first, so the text, then a dark edge under it to read over any map.
             let style = TextStyle::new(font * 1.05, ink_col);
-            let shade = TextStyle::new(font * 1.05, GEAR_BG);
+            let shade = TextStyle::new(font * 1.05, hue::gear_bg());
             let (nx, ny) = (gx + gr + font * 0.5, gy);
             self.text.draw_text_left(&mut canvas, APP_NAME, nx, ny, &style, None, None);
             for (ox, oy) in [(-1.0, 0.0), (1.0, 0.0), (0.0, -1.0), (0.0, 1.0), (1.0, 1.0)] {
                 self.text.draw_text_left(&mut canvas, APP_NAME, nx + ox, ny + oy, &shade, None, None);
             }
-            paint::circle_filled(&mut canvas, gx as isize, gy as isize, gr as isize, GEAR_BG, None, None);
+            paint::circle_filled(&mut canvas, gx as isize, gy as isize, gr as isize, hue::gear_bg(), None, None);
         }
         let (page, rail) = (self.page(), self.rail_w());
         let floor = self.safe_floor(0.0, w as f32);
@@ -2226,7 +2304,7 @@ impl Panel {
                 Page::Area(i) => self.area_rows = Self::paint_area(&mut canvas, &mut self.text, &mut self.pills, font, rail, cw, self.gear, &self.areas, i, &mut self.sliders, self.field_vals[0] as u8),
                 Page::Layers => {}
             }
-            paint::fill_rect(&mut canvas, 0, 0, self.panel_w as isize, h as isize, PANEL_BG, None, None);
+            paint::fill_rect(&mut canvas, 0, 0, self.panel_w as isize, h as isize, hue::panel_bg(), None, None);
             return &self.buf;
         }
         // Topmost first: the footer (its slider and readouts, then its own background), then the list clipped to its band, then the column's background.
@@ -2236,8 +2314,8 @@ impl Panel {
         let x = font * 0.9;
         let right = self.panel_w - font * 0.9;
         let mut y = self.slider.1 + font * 1.4;
-        let small = TextStyle::new(font * 0.82, READOUT);
-        let dim = TextStyle::new(font * 0.72, READOUT_DIM);
+        let small = TextStyle::new(font * 0.82, hue::readout());
+        let dim = TextStyle::new(font * 0.72, hue::readout_dim());
         let rows: [(&str, String); 7] = [
             ("position", format!("{:.5}  {:.5}", r.lat, r.lon)),
             ("elevation", r.elev.map_or("\u{2014}".into(), |e| format!("{} m", e.round() as i64))),
@@ -2295,24 +2373,24 @@ impl Panel {
             y += font * 1.05;
         }
         // The footer's own ground and a hairline along its top, so it reads apart from the list.
-        paint::fill_rect(&mut canvas, 0, footer_top as isize, self.panel_w as isize, 1.max((font / 24.0) as isize), READOUT_DIM, None, None);
-        paint::fill_rect(&mut canvas, 0, footer_top as isize, self.panel_w as isize, (h as f32 - footer_top) as isize, FOOTER_BG, None, None);
+        paint::fill_rect(&mut canvas, 0, footer_top as isize, self.panel_w as isize, 1.max((font / 24.0) as isize), hue::readout_dim(), None, None);
+        paint::fill_rect(&mut canvas, 0, footer_top as isize, self.panel_w as isize, (h as f32 - footer_top) as isize, hue::footer_bg(), None, None);
         let clip = Some(paint::Clip::new(0, band_top.max(0.0) as usize, self.panel_w as usize, footer_top.max(0.0) as usize));
         // Where the list runs past the footer, a thin bar at the column's edge shows where in it the view is.
         if self.layers_extent > 0.0 {
             let span = footer_top - band_top;
             let len = span * span / (span + self.layers_extent);
             let at = band_top + (span - len) * (self.layers_scroll / self.layers_extent);
-            paint::fill_rect(&mut canvas, (self.panel_w - font * 0.25) as isize, at as isize, (font * 0.12).max(2.0) as isize, len as isize, READOUT_DIM, None, None);
+            paint::fill_rect(&mut canvas, (self.panel_w - font * 0.25) as isize, at as isize, (font * 0.12).max(2.0) as isize, len as isize, hue::readout_dim(), None, None);
         }
         // The theme row: the current theme's name and a chevron.
         let (tx, ty, _) = self.theme_row;
         let current = themes.get(ctl.theme).map_or("Trail", |t| t.name.as_str());
-        self.text.draw_text_left(&mut canvas, &format!("Theme   {current}  \u{203a}"), tx, ty, &TextStyle::new(font, theme::TEXTBOX_TEXT), clip, None);
+        self.text.draw_text_left(&mut canvas, &format!("Theme   {current}  \u{203a}"), tx, ty, &TextStyle::new(font, hue::text()), clip, None);
         self.theme_now = themes.get(ctl.theme).cloned();
-        let row_ink = TextStyle::new(font * 0.9, theme::TEXTBOX_TEXT);
-        let dim = TextStyle::new(font * 0.72, READOUT_DIM);
-        let small = TextStyle::new(font * 0.8, READOUT);
+        let row_ink = TextStyle::new(font * 0.9, hue::text());
+        let dim = TextStyle::new(font * 0.72, hue::readout_dim());
+        let small = TextStyle::new(font * 0.8, hue::readout());
         for &(cy, hh, kind) in &self.tree {
             if cy + hh < band_top || cy - hh > footer_top {
                 continue;
@@ -2404,7 +2482,7 @@ impl Panel {
                 continue;
             }
             let marker = if self.group_open[gi] { "\u{25be}" } else { "\u{25b8}" };
-            self.text.draw_text_left(&mut canvas, &format!("{marker}  {}", GROUPS[gi].0), tx, cy, &TextStyle::new(font, theme::TEXTBOX_TEXT).weight(600), clip, None);
+            self.text.draw_text_left(&mut canvas, &format!("{marker}  {}", GROUPS[gi].0), tx, cy, &TextStyle::new(font, hue::text()).weight(600), clip, None);
         }
         for (i, (l, cb)) in self.checks.iter_mut().enumerate() {
             if !self.shown[i] {
@@ -2417,16 +2495,16 @@ impl Panel {
             }
             // The pages at the foot are rows to open, not boxes to tick (Nick 2026-10-26: "random checkboxes next to things like updates").
             if matches!(l, Layer::Areas | Layer::Tracks | Layer::Updates) {
-                self.text.draw_text_left(&mut canvas, cb.label(), b.x + self.font * 0.3, b.y + b.h * 0.5, &TextStyle::new(self.font * 0.9, theme::TEXTBOX_TEXT), clip, None);
+                self.text.draw_text_left(&mut canvas, cb.label(), b.x + self.font * 0.3, b.y + b.h * 0.5, &TextStyle::new(self.font * 0.9, hue::text()), clip, None);
                 continue;
             }
             // Greyed: a wash of the panel colour over the row, painted first so it lies on top.
             if inert(&mask, &ctl, *l) {
-                paint::fill_rect(&mut canvas, b.x as isize, b.y as isize, b.w as isize, b.h as isize, PANEL_DIM, clip, None);
+                paint::fill_rect(&mut canvas, b.x as isize, b.y as isize, b.w as isize, b.h as isize, hue::panel_dim(), clip, None);
             }
             cb.render_content_into(&mut canvas, &mut self.text, clip, None);
         }
-        paint::fill_rect(&mut canvas, 0, 0, self.panel_w as isize, h as isize, PANEL_BG, None, None);
+        paint::fill_rect(&mut canvas, 0, 0, self.panel_w as isize, h as isize, hue::panel_bg(), None, None);
         &self.buf
     }
 
@@ -2530,7 +2608,7 @@ impl Panel {
             // The card: what is there, a line each, and where three ways (degrees, degrees-minutes-seconds, the world code on as many lines as its words take), each with its copy button.
             let (lat, lon) = m.target;
             let words = vsf::types::WorldCoord::from_lat_lon(lat, lon).to_words();
-            let lines = Self::wrap_words(text, &words, &TextStyle::new(font * 0.8, READOUT), w as f32 - font * 2.0 - font * 3.2).len();
+            let lines = Self::wrap_words(text, &words, &TextStyle::new(font * 0.8, hue::readout()), w as f32 - font * 2.0 - font * 3.2).len();
             return font * 2.2 + (m.info.len() + 2 + lines) as f32 * font * 1.05;
         }
         font * 6.5 + m.info.len() as f32 * font * 1.05
@@ -2553,8 +2631,8 @@ impl Panel {
         let px = (d / m_per_px) as f32;
         let label = if d >= 1000.0 { format!("{} km", d / 1000.0) } else if d >= 1.0 { format!("{} m", d) } else { format!("{} cm", d * 100.0) };
         let t = (font * 0.16).max(2.0);
-        let style = TextStyle::new(font * 0.75, theme::TEXTBOX_TEXT);
-        let shade = TextStyle::new(font * 0.75, GEAR_BG);
+        let style = TextStyle::new(font * 0.75, hue::text());
+        let shade = TextStyle::new(font * 0.75, hue::gear_bg());
         let ty = y - font * 0.55;
         // Above it, the heavier contours' spacing while contours draw (Nick 2026-10-24: so we know what's going on).
         let major = contour_major_m.filter(|m| m.is_finite() && *m > 0.0).map(|m| format!("Contours {}", length_text(m as f64)));
@@ -2568,16 +2646,16 @@ impl Panel {
         // The bar and its end ticks, then the dark edge under them.
         let (xi, yi, pi, ti) = (x0 as isize, y as isize, px as isize, t as isize);
         let tick = (font * 0.35) as isize;
-        paint::fill_rect(canvas, xi, yi - ti / 2, pi, ti, theme::TEXTBOX_TEXT, None, None);
-        paint::fill_rect(canvas, xi, yi - tick, ti, tick + ti / 2, theme::TEXTBOX_TEXT, None, None);
-        paint::fill_rect(canvas, xi + pi - ti, yi - tick, ti, tick + ti / 2, theme::TEXTBOX_TEXT, None, None);
-        paint::fill_rect(canvas, xi - 2, yi - tick - 2, pi + 4, tick + ti / 2 + 4, GEAR_BG, None, None);
+        paint::fill_rect(canvas, xi, yi - ti / 2, pi, ti, hue::text(), None, None);
+        paint::fill_rect(canvas, xi, yi - tick, ti, tick + ti / 2, hue::text(), None, None);
+        paint::fill_rect(canvas, xi + pi - ti, yi - tick, ti, tick + ti / 2, hue::text(), None, None);
+        paint::fill_rect(canvas, xi - 2, yi - tick - 2, pi + 4, tick + ti / 2 + 4, hue::gear_bg(), None, None);
     }
 
     /// A rounded button with its word centred, lit when it is the one on; text first, then the body under it.
     /// The locate button: a crosshair (four arms and a dot) on the gear's dark disc, dim without a fix.
     fn paint_locate(canvas: &mut Canvas, x: f32, y: f32, r: f32, live: bool) {
-        let ink = if live { theme::TEXTBOX_TEXT } else { READOUT_DIM };
+        let ink = if live { hue::text() } else { hue::readout_dim() };
         let (xi, yi) = (x as isize, y as isize);
         let t = (r * 0.12).max(2.0) as isize;
         let (inner, outer) = ((r * 0.32) as isize, (r * 0.72) as isize);
@@ -2586,7 +2664,7 @@ impl Panel {
         paint::fill_rect(canvas, xi + inner, yi - t / 2, outer - inner, t, ink, None, None);
         paint::fill_rect(canvas, xi - t / 2, yi - outer, t, outer - inner, ink, None, None);
         paint::fill_rect(canvas, xi - t / 2, yi + inner, t, outer - inner, ink, None, None);
-        paint::circle_filled(canvas, xi, yi, r as isize, GEAR_BG, None, None);
+        paint::circle_filled(canvas, xi, yi, r as isize, hue::gear_bg(), None, None);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2598,13 +2676,13 @@ impl Panel {
         let margin = font;
         // The close button, top right of the strip: a cross in a disc.
         let (cx, cy, cr) = (w as f32 - font * 0.9, strip_top + font * 0.9, font * 0.55);
-        text.draw_text_center(canvas, "\u{00d7}", cx, cy, &TextStyle::new(font * 1.1, READOUT), None, None);
-        paint::circle_filled(canvas, cx as isize, cy as isize, cr as isize, GEAR_BG, None, None);
-        let point = TextStyle::new(font * 0.9, theme::TEXTBOX_TEXT);
+        text.draw_text_center(canvas, "\u{00d7}", cx, cy, &TextStyle::new(font * 1.1, hue::readout()), None, None);
+        paint::circle_filled(canvas, cx as isize, cy as isize, cr as isize, hue::gear_bg(), None, None);
+        let point = TextStyle::new(font * 0.9, hue::text());
         if m.route {
             // Below the way-of-travel row: what to tap, the route's summary, then its turns as many as fit.
             for (k, line) in m.info.iter().take(ROUTE_LINES).enumerate() {
-                let style = if k == 0 { point.clone() } else { TextStyle::new(font * 0.8, READOUT) };
+                let style = if k == 0 { point.clone() } else { TextStyle::new(font * 0.8, hue::readout()) };
                 text.draw_text_left(canvas, line, margin, strip_top + font * 2.0 + font * 0.5 + k as f32 * font * 1.05, &style, None, None);
             }
             if !m.profile.is_empty() {
@@ -2615,10 +2693,10 @@ impl Panel {
                     (Some(a), Some(b)) => format!("   {:+} m", (b - a).round() as i64),
                     _ => String::new(),
                 };
-                text.draw_text_right(canvas, &format!("{} \u{2192} {}{rise}", e(m.elev_origin), e(m.elev_target)), w as f32 - margin, ceil_y - font * 0.25, &TextStyle::new(font * 0.75, READOUT_DIM), None, None);
+                text.draw_text_right(canvas, &format!("{} \u{2192} {}{rise}", e(m.elev_origin), e(m.elev_target)), w as f32 - margin, ceil_y - font * 0.25, &TextStyle::new(font * 0.75, hue::readout_dim()), None, None);
                 Self::paint_profile(canvas, text, w, font, ceil_y, h as f32 - font * 0.5, &m.profile);
             }
-            paint::fill_rect(canvas, 0, strip_top as isize, w as isize, band as isize, PANEL_BG, None, None);
+            paint::fill_rect(canvas, 0, strip_top as isize, w as isize, band as isize, hue::panel_bg(), None, None);
             return (cx, cy, cr);
         }
         for (k, line) in m.info.iter().enumerate() {
@@ -2627,7 +2705,7 @@ impl Panel {
         if !m.ruler {
             // A tap's card (Nick 2026-10-14: a little info at the bottom per tap): the lines, then the place in degrees, in degrees, minutes and seconds, and as its seven words, a copy button by each (Nick 2026-10-26).
             let (lat, lon) = m.target;
-            let style = TextStyle::new(font * 0.8, READOUT);
+            let style = TextStyle::new(font * 0.8, hue::readout());
             let mut y = strip_top + font * 0.9 + m.info.len() as f32 * font * 1.05;
             let words = vsf::types::WorldCoord::from_lat_lon(lat, lon).to_words();
             for (shown, copy) in [(degrees_text(lat, lon), format!("{lat:.6}, {lon:.6}")), (dms_text(lat, lon), dms_text(lat, lon))] {
@@ -2644,12 +2722,12 @@ impl Panel {
                 }
                 y += font * 1.05;
             }
-            paint::fill_rect(canvas, 0, strip_top as isize, w as isize, band as isize, PANEL_BG, None, None);
+            paint::fill_rect(canvas, 0, strip_top as isize, w as isize, band as isize, hue::panel_bg(), None, None);
             return (cx, cy, cr);
         }
         let top = strip_top + info_h;
         // Text first (topmost), then the profile, then the band under both.
-        let small = TextStyle::new(font * 0.9, READOUT);
+        let small = TextStyle::new(font * 0.9, hue::readout());
         let dist = if m.distance_m < 1000.0 { format!("{} m", m.distance_m.round() as i64) } else { format!("{:.2} km", m.distance_m / 1000.0) };
         text.draw_text_left(canvas, &format!("{dist}   {}°", m.bearing_deg.round() as i64), margin, top + font * 0.9, &small, None, None);
         let e = |v: Option<f32>| v.map_or("—".to_string(), |e| format!("{} m", e.round() as i64));
@@ -2659,7 +2737,7 @@ impl Panel {
         };
         text.draw_text_right(canvas, &format!("{} → {}{rise}", e(m.elev_origin), e(m.elev_target)), w as f32 - margin - font * 1.6, top + font * 0.9, &small, None, None);
         Self::paint_profile(canvas, text, w, font, top + font * 1.8, h as f32 - font * 0.5, &m.profile);
-        paint::fill_rect(canvas, 0, strip_top as isize, w as isize, band as isize, PANEL_BG, None, None);
+        paint::fill_rect(canvas, 0, strip_top as isize, w as isize, band as isize, hue::panel_bg(), None, None);
         (cx, cy, cr)
     }
 
@@ -2671,7 +2749,7 @@ impl Panel {
         }
         let span = (hi - lo).max(1.0);
         let margin = font;
-        let dim = TextStyle::new(font * 0.75, READOUT_DIM);
+        let dim = TextStyle::new(font * 0.75, hue::readout_dim());
         text.draw_text_left(canvas, &format!("{} m", hi.round() as i64), margin, ceil_y + font * 0.1, &dim, None, None);
         text.draw_text_left(canvas, &format!("{} m", lo.round() as i64), margin, floor_y - font * 0.1, &dim, None, None);
         let n = profile.len().max(1);
@@ -2693,7 +2771,7 @@ impl Panel {
         let x0 = ox + font * 0.9;
         let row = font * 1.6;
         let mut y = gear.1 + gear.2 + font * 0.9 + row * 0.5;
-        let title = TextStyle::new(font, theme::TEXTBOX_TEXT);
+        let title = TextStyle::new(font, hue::text());
         text.draw_text_left(canvas, "\u{2039}  Search", x0, y, &title, None, None);
         y += row * 1.3;
         let (fw, fh) = (cw - font * 1.8, font * 1.7);
@@ -2704,12 +2782,12 @@ impl Panel {
         let clip = Some(paint::Clip::new(0, 0, (ox + cw - font * 0.5).max(0.0) as usize, canvas.height));
         match picked.and_then(|i| found.get(i)) {
             Some(f) => {
-                text.draw_text_left(canvas, &f.name, x0, y + font * 0.5, &TextStyle::new(font * 0.95, theme::TEXTBOX_TEXT), clip, None);
-                text.draw_text_left(canvas, &f.detail, x0, y + font * 1.4, &TextStyle::new(font * 0.75, READOUT), clip, None);
+                text.draw_text_left(canvas, &f.name, x0, y + font * 0.5, &TextStyle::new(font * 0.95, hue::text()), clip, None);
+                text.draw_text_left(canvas, &f.detail, x0, y + font * 1.4, &TextStyle::new(font * 0.75, hue::readout()), clip, None);
                 // Each button as wide as its word, in a row that wraps where the panel is narrow.
                 let (mut px, mut py) = (x0, y + font * 2.8);
                 for (a, word) in [(0u8, "Go"), (1, "From here"), (2, "To here")] {
-                    let pw = text.measure_text(word, &TextStyle::new(font * 0.8, READOUT)) + font * 1.44;
+                    let pw = text.measure_text(word, &TextStyle::new(font * 0.8, hue::readout())) + font * 1.44;
                     if px + pw > x0 + fw && px > x0 {
                         px = x0;
                         py += font * 1.55;
@@ -2727,7 +2805,7 @@ impl Panel {
                 } else {
                     "Nothing in view by that name"
                 };
-                text.draw_text_left(canvas, say, x0, y + font * 0.6, &TextStyle::new(font * 0.8, READOUT), None, None);
+                text.draw_text_left(canvas, say, x0, y + font * 0.6, &TextStyle::new(font * 0.8, hue::readout()), None, None);
             }
             None => {
                 // The places found, a list down the rest of the page.
@@ -2960,13 +3038,13 @@ impl Panel {
         let t = ((ctl.cache_budget.saturating_sub(CACHE_MIN)) as f64 / (max - CACHE_MIN) as f64).clamp(0.0, 1.0) as f32;
         let used = (r.cache_used as f64 / max as f64).clamp(0.0, 1.0) as f32;
         let label = format!("cache  {}  \u{b7}  {} held", bytes_text(ctl.cache_budget), bytes_text(r.cache_used));
-        text.draw_text_left(canvas, &label, sx, sy - font * 1.0, &TextStyle::new(font * 0.75, READOUT_DIM), None, None);
+        text.draw_text_left(canvas, &label, sx, sy - font * 1.0, &TextStyle::new(font * 0.75, hue::readout_dim()), None, None);
         // Knob, then the budget's fill, then what is held, then the track under all of them.
         let th = (font * 0.28).max(3.0);
         paint::circle_filled(canvas, (sx + sw * t) as isize, sy as isize, (font * 0.45) as isize, SLIDER_KNOB, None, None);
-        paint::fill_rect(canvas, sx as isize, (sy - th * 0.5) as isize, (sw * t) as isize, th as isize, SLIDER_FILL, None, None);
+        paint::fill_rect(canvas, sx as isize, (sy - th * 0.5) as isize, (sw * t) as isize, th as isize, hue::slider_fill(), None, None);
         paint::fill_rect(canvas, sx as isize, (sy - th * 0.5) as isize, (sw * used) as isize, th as isize, SLIDER_USED, None, None);
-        paint::fill_rect(canvas, sx as isize, (sy - th * 0.5) as isize, sw as isize, th as isize, SLIDER_TRACK, None, None);
+        paint::fill_rect(canvas, sx as isize, (sy - th * 0.5) as isize, sw as isize, th as isize, hue::slider_track(), None, None);
     }
 }
 
@@ -2980,7 +3058,7 @@ impl Panel {
         let row = font * 1.6;
         let mut y = gear.1 + gear.2 + font * 0.9 + row * 0.5;
         let mut rows = Vec::new();
-        let title = TextStyle::new(font, theme::TEXTBOX_TEXT);
+        let title = TextStyle::new(font, hue::text());
         text.draw_text_left(canvas, "\u{2039}  Themes", x0, y, &title, None, None);
         rows.push((y, row * 0.5));
         y += row * 1.2;
@@ -3009,9 +3087,9 @@ impl Panel {
         let x0 = ox + font * 0.9;
         let row = font * 1.15;
         let top = gear.1 + gear.2 + font * 0.9 + font * 0.8;
-        let title = TextStyle::new(font, theme::TEXTBOX_TEXT);
-        let small = TextStyle::new(font * 0.8, READOUT);
-        let dim = TextStyle::new(font * 0.72, READOUT_DIM);
+        let title = TextStyle::new(font, hue::text());
+        let small = TextStyle::new(font * 0.8, hue::readout());
+        let dim = TextStyle::new(font * 0.72, hue::readout_dim());
         text.draw_text_left(canvas, &format!("\u{2039}  {}", t.name), x0, top, &title, None, None);
         let mut y = top + row * 1.3 - scroll;
         let mut rows = Vec::new();
@@ -3078,7 +3156,7 @@ impl Panel {
         y += font * 0.6;
         for (label, a) in actions {
             if y > top + row && y < h as f32 + row {
-                text.draw_text_left(canvas, label, x0, y, &TextStyle::new(font * 0.9, theme::TEXTBOX_TEXT), None, None);
+                text.draw_text_left(canvas, label, x0, y, &TextStyle::new(font * 0.9, hue::text()), None, None);
                 rows.push((y, row * 0.5, Row::Act(a)));
             }
             y += row * 1.2;
@@ -3093,9 +3171,9 @@ impl Panel {
         let _ = t;
         let x0 = ox + font * 0.9;
         let mut y = gear.1 + gear.2 + font * 0.9 + font * 0.8;
-        let title = TextStyle::new(font, theme::TEXTBOX_TEXT);
-        let small = TextStyle::new(font * 0.8, READOUT);
-        let dim = TextStyle::new(font * 0.72, READOUT_DIM);
+        let title = TextStyle::new(font, hue::text());
+        let small = TextStyle::new(font * 0.8, hue::readout());
+        let dim = TextStyle::new(font * 0.72, hue::readout_dim());
         text.draw_text_left(canvas, &format!("\u{2039}  {}", f.name()), x0, y, &title, None, None);
         y += font * 1.6;
         // The swatch: a colour as the map shows it unlit; a light as the colour it would make white ground.
@@ -3129,9 +3207,9 @@ impl Panel {
         let x0 = ox + font * 0.9;
         let row = font * 1.6;
         let mut y = gear.1 + gear.2 + font * 0.9 + row * 0.5;
-        let title = TextStyle::new(font, theme::TEXTBOX_TEXT);
-        let dim = TextStyle::new(font, READOUT_DIM);
-        let small = TextStyle::new(font * 0.75, READOUT_DIM);
+        let title = TextStyle::new(font, hue::text());
+        let dim = TextStyle::new(font, hue::readout_dim());
+        let small = TextStyle::new(font * 0.75, hue::readout_dim());
         let mut rows = Vec::new();
         text.draw_text_left(canvas, "\u{2039}  Updates", x0, y, &title, None, None);
         rows.push((y, row * 0.5, UpdateRow::Back));
@@ -3158,7 +3236,7 @@ impl Panel {
         if let Some(p) = u.progress {
             let w = cw - font * 1.8;
             paint::fill_rect(canvas, x0 as isize, y as isize, (w * p.clamp(0.0, 1.0)) as isize, (font * 0.35) as isize, SLIDER_USED, None, None);
-            paint::fill_rect(canvas, x0 as isize, y as isize, w as isize, (font * 0.35) as isize, SLIDER_TRACK, None, None);
+            paint::fill_rect(canvas, x0 as isize, y as isize, w as isize, (font * 0.35) as isize, hue::slider_track(), None, None);
             y += row * 0.8;
         }
         y += row * 0.4;
@@ -3177,9 +3255,9 @@ impl Panel {
         let right = ox + cw - font * 0.9;
         let row = font * 1.6;
         let mut y = gear.1 + gear.2 + font * 0.9 + row * 0.5;
-        let title = TextStyle::new(font, theme::TEXTBOX_TEXT);
-        let dim = TextStyle::new(font, READOUT_DIM);
-        let small = TextStyle::new(font * 0.75, READOUT_DIM);
+        let title = TextStyle::new(font, hue::text());
+        let dim = TextStyle::new(font, hue::readout_dim());
+        let small = TextStyle::new(font * 0.75, hue::readout_dim());
         let mut rows = Vec::new();
         text.draw_text_left(canvas, "\u{2039}  Areas", x0, y, &title, None, None);
         rows.push((y, row * 0.5, AreaRow::Back));
@@ -3214,9 +3292,9 @@ impl Panel {
         let sw = cw - font * 1.8;
         let row = font * 1.6;
         let mut y = gear.1 + gear.2 + font * 0.9 + row * 0.5;
-        let title = TextStyle::new(font, theme::TEXTBOX_TEXT);
-        let small = TextStyle::new(font * 0.8, READOUT);
-        let dim = TextStyle::new(font * 0.72, READOUT_DIM);
+        let title = TextStyle::new(font, hue::text());
+        let small = TextStyle::new(font * 0.8, hue::readout());
+        let dim = TextStyle::new(font * 0.72, hue::readout_dim());
         let mut rows = Vec::new();
         let Some(a) = areas.areas.get(i) else { return rows };
         text.draw_text_left(canvas, &format!("\u{2039}  {}", a.name), x0, y, &title, None, None);
@@ -3247,8 +3325,8 @@ impl Panel {
         if let Some((done, total, _)) = a.progress {
             let th = (font * 0.28).max(3.0);
             let t = if total > 0 { done as f32 / total as f32 } else { 0.0 };
-            paint::fill_rect(canvas, x0 as isize, (y - th * 0.5) as isize, (sw * t) as isize, th as isize, SLIDER_FILL, None, None);
-            paint::fill_rect(canvas, x0 as isize, (y - th * 0.5) as isize, sw as isize, th as isize, SLIDER_TRACK, None, None);
+            paint::fill_rect(canvas, x0 as isize, (y - th * 0.5) as isize, (sw * t) as isize, th as isize, hue::slider_fill(), None, None);
+            paint::fill_rect(canvas, x0 as isize, (y - th * 0.5) as isize, sw as isize, th as isize, hue::slider_track(), None, None);
             y += font * 0.9;
         }
         y += row * 0.6;
@@ -3273,9 +3351,9 @@ impl Panel {
         let x0 = ox + font * 0.9;
         let row = font * 1.6;
         let mut y = gear.1 + gear.2 + font * 0.9 + row * 0.5;
-        let title = TextStyle::new(font, theme::TEXTBOX_TEXT);
-        let label = TextStyle::new(font * 0.72, READOUT_DIM);
-        let value = TextStyle::new(font * 0.8, READOUT);
+        let title = TextStyle::new(font, hue::text());
+        let label = TextStyle::new(font * 0.72, hue::readout_dim());
+        let value = TextStyle::new(font * 0.8, hue::readout());
         let mut rows = Vec::new();
         text.draw_text_left(canvas, "\u{2039}  Tracks", x0, y, &title, None, None);
         rows.push((y, row * 0.5, TrackRow::Back));
@@ -3321,9 +3399,9 @@ impl Panel {
         let x0 = ox + font * 0.9;
         let row = font * 1.6;
         let mut y = gear.1 + gear.2 + font * 0.9 + row * 0.5;
-        let title = TextStyle::new(font, theme::TEXTBOX_TEXT);
-        let label = TextStyle::new(font * 0.72, READOUT_DIM);
-        let value = TextStyle::new(font * 0.8, READOUT);
+        let title = TextStyle::new(font, hue::text());
+        let label = TextStyle::new(font * 0.72, hue::readout_dim());
+        let value = TextStyle::new(font * 0.8, hue::readout());
         let mut rows = Vec::new();
         let Some(t) = tracks.tracks.get(i) else { return rows };
         text.draw_text_left(canvas, &format!("\u{2039}  {}", t.when), x0, y, &title, None, None);
@@ -3351,9 +3429,9 @@ impl Panel {
     fn paint_pen(canvas: &mut Canvas, text: &mut TextRenderer, font: f32, ox: f32, cw: f32, gear: (f32, f32, f32), sliders: &mut [Slider], vals: [f32; 4], title_word: &str) {
         let x0 = ox + font * 0.9;
         let mut y = gear.1 + gear.2 + font * 0.9 + font * 0.8;
-        let title = TextStyle::new(font, theme::TEXTBOX_TEXT);
-        let small = TextStyle::new(font * 0.8, READOUT);
-        let dim = TextStyle::new(font * 0.72, READOUT_DIM);
+        let title = TextStyle::new(font, hue::text());
+        let small = TextStyle::new(font * 0.8, hue::readout());
+        let dim = TextStyle::new(font * 0.72, hue::readout_dim());
         text.draw_text_left(canvas, &format!("\u{2039}  {title_word}"), x0, y, &title, None, None);
         y += font * 1.6;
         // The swatch: the colour at its opacity over the panel, as a stroke would sit over a dark ground.
@@ -3379,7 +3457,7 @@ fn pen_swatch(rgba: [u8; 4]) -> u32 {
     let a = rgba[3] as f32 / 255.0;
     let mix = |shift: u32| -> u32 {
         let s = ((full >> shift) & 255) as f32;
-        let bg = ((PANEL_BG >> shift) & 255) as f32;
+        let bg = ((hue::panel_bg() >> shift) & 255) as f32;
         ((bg + (s - bg) * a).round() as u32) << shift
     };
     0xFF00_0000 | mix(16) | mix(8) | mix(0)

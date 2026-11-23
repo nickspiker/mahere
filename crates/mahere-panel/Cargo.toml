@@ -11,3 +11,7 @@ mahere-engine = { path = "../mahere-engine" }
 mahere-tiles = { path = "../mahere-tiles" }
 fluor = { version = "0.0.7", default-features = false, features = ["std", "text", "icon", "packs"] }
 vsf = { version = "0.10" }
+
+# target_os = "ferros" is a ferros device (a JSON target, ferros docs/STD-TARGET.md): rustc does not know the name, so the cfg is declared here.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_os, values("ferros"))'] }
