@@ -1945,7 +1945,7 @@ checksum = "5d15f86d12da44cd8d4ec3c73984537eb7f4cadcb9776a575a0a8a05ca11005c"
 
 [[package]]
 name = "mahere-android"
-version = "0.6.1"
+version = "0.7.3"
 dependencies = [
  "fluor",
  "jni 0.21.1",
@@ -1969,7 +1969,7 @@ dependencies = [
 
 [[package]]
 name = "mahere-app"
-version = "0.6.1"
+version = "0.7.3"
 dependencies = [
  "bytemuck",
  "fluor",
@@ -1987,11 +1987,11 @@ dependencies = [
 
 [[package]]
 name = "mahere-coord"
-version = "0.6.1"
+version = "0.7.3"
 
 [[package]]
 name = "mahere-dem"
-version = "0.6.1"
+version = "0.7.3"
 dependencies = [
  "flate2",
  "las",
@@ -2002,7 +2002,7 @@ dependencies = [
 
 [[package]]
 name = "mahere-device"
-version = "0.6.1"
+version = "0.7.3"
 dependencies = [
  "fluor",
  "libc",
@@ -2015,7 +2015,7 @@ dependencies = [
 
 [[package]]
 name = "mahere-engine"
-version = "0.6.1"
+version = "0.7.3"
 dependencies = [
  "mahere-coord",
  "mahere-tiles",
@@ -2027,7 +2027,7 @@ dependencies = [
 
 [[package]]
 name = "mahere-ferros"
-version = "0.6.1"
+version = "0.7.3"
 dependencies = [
  "fluor",
  "getrandom 0.2.17",
@@ -2043,7 +2043,7 @@ dependencies = [
 
 [[package]]
 name = "mahere-gpu"
-version = "0.6.1"
+version = "0.7.3"
 dependencies = [
  "bytemuck",
  "mahere-engine",
@@ -2058,7 +2058,7 @@ dependencies = [
 
 [[package]]
 name = "mahere-osm"
-version = "0.6.1"
+version = "0.7.3"
 dependencies = [
  "mahere-coord",
  "osmpbf",
@@ -2068,7 +2068,7 @@ dependencies = [
 
 [[package]]
 name = "mahere-panel"
-version = "0.6.1"
+version = "0.7.3"
 dependencies = [
  "fluor",
  "mahere-engine",
@@ -2078,7 +2078,7 @@ dependencies = [
 
 [[package]]
 name = "mahere-store"
-version = "0.6.1"
+version = "0.7.3"
 dependencies = [
  "blake3",
  "kete",
@@ -2094,13 +2094,14 @@ dependencies = [
 
 [[package]]
 name = "mahere-tiles"
-version = "0.6.1"
+version = "0.7.3"
 dependencies = [
  "mahere-coord",
  "mahere-dem",
  "mahere-osm",
  "png 0.17.16",
  "rayon",
+ "tiff 0.9.1",
  "ureq",
  "vsf 0.10.2",
  "zstd",
@@ -2108,7 +2109,7 @@ dependencies = [
 
 [[package]]
 name = "mahere-update"
-version = "0.6.1"
+version = "0.7.3"
 dependencies = [
  "blake3",
  "ed25519-dalek",
