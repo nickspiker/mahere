@@ -51,6 +51,8 @@ pub(crate) struct Round {
     beads: [(f32, f32, f32); 4],
     /// The tool bead at the circle's foot, and its bloom's beads.
     tool: (f32, f32, f32),
+    /// Where the last paint drew it: raised above the cap while a readout shows.
+    tool_drawn: (f32, f32, f32),
     bloom_beads: Vec<(f32, f32, f32, Pick)>,
     /// The root menu's rows: centre y, half height, the page.
     root_rows: Vec<(f32, f32, Page)>,
@@ -445,7 +447,7 @@ impl Panel {
         for &(x, y, r) in self.round.beads.iter() {
             out.push([x - r, y - r, x + r, y + r]);
         }
-        let (tx, ty, tr) = self.round.tool;
+        let (tx, ty, tr) = self.round.tool_drawn;
         out.push([tx - tr, ty - tr, tx + tr, ty + tr]);
         for &(x, y, r, _) in &self.round.bloom_beads {
             out.push([x - r, y - r, x + r, y + r]);
@@ -533,7 +535,7 @@ impl Panel {
             Some(hh) => ty.min(c.cy + c.r - u * 1.3 - hh - tr - u * 0.4),
             None => ty,
         };
-        self.round.tool = (tx, ty, tr);
+        self.round.tool_drawn = (tx, ty, tr);
         if self.round.bloom {
             // The tap tools on an arc nearer the bead, the ink tools beyond, each fanned over the upper half.
             let inner = [Pick::Info, Pick::Ruler, Pick::Directions, Pick::Navigate];
@@ -881,7 +883,7 @@ impl Panel {
                 self.dirty = true;
                 return Some(true);
             }
-            if near(self.round.tool, 1.15) {
+            if near(self.round.tool_drawn, 1.15) {
                 self.round.bloom = true;
                 self.dirty = true;
                 return Some(true);
