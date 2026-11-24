@@ -130,8 +130,13 @@ while read -r line; do
     # A piece with no NAIP (north of the border) bakes its terrain and lines alone.
     NAIP_ARGS=""
     [ "$(echo "$line" | cut -d' ' -f3)" = - ] || NAIP_ARGS="--naip $(echo "$line" | cut -d' ' -f3 | tr ',' '\n' | sed "s|^|$STAGE/naip/|" | tr '\n' ' ')"
-    # shellcheck disable=SC2086
-    cap target/release/mahere-load --pbf "$STAGE/osm.pbf" --out "$OUT" --area "$DOC" --under "$name" --vec-base 14 --dem-base 14 --min 9 --dem $DEM $NAIP_ARGS > "$OUT/$MARK/$name.log" 2>&1 || true
+    # Three tries: a lidar source read over the network can time out part way (2026-11-23: NRCan's bucket at piece 38 of the Canadian pass), and a piece baked again merges over what it wrote.
+    for try in 1 2 3; do
+        # shellcheck disable=SC2086
+        cap target/release/mahere-load --pbf "$STAGE/osm.pbf" --out "$OUT" --area "$DOC" --under "$name" --vec-base 14 --dem-base 14 --min 9 --dem $DEM $NAIP_ARGS > "$OUT/$MARK/$name.log" 2>&1 || true
+        grep -q "cells written" "$OUT/$MARK/$name.log" && break
+        [ "$try" = 3 ] || { log "piece $name: try $try failed ($(grep -m1 -o 'Network Error[^"]*' "$OUT/$MARK/$name.log" || echo 'see its log')), again in a minute"; sleep 60; }
+    done
     if ! grep -q "cells written" "$OUT/$MARK/$name.log"; then
         tail -5 "$OUT/$MARK/$name.log"
         log "piece $name failed"
