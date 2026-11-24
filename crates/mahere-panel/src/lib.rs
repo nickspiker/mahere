@@ -5,6 +5,7 @@
 pub mod fonts;
 pub mod labels;
 pub mod place;
+mod circle;
 
 use fluor::canvas::{Canvas, Damage};
 use fluor::paint::{self, HitId, HIT_NONE};
@@ -58,6 +59,8 @@ pub struct Controls {
     pub clear_sel: bool,
     /// One-shot: the locate button was tapped, centre on the fix.
     pub locate: bool,
+    /// One-shot: the compass was tapped, north up.
+    pub north: bool,
     /// A tap measures (the ruler) rather than only telling what is there.
     pub ruler: bool,
     /// The contour interval fits each view; off, it holds where it was (Nick 2026-10-21).
@@ -614,6 +617,10 @@ enum Page {
     Search,
     /// Updates: this build, the release and dev channels' builds, automatic updates.
     Updates,
+    /// Where the view is, every way (ferros: the readouts the desktop column keeps at its foot).
+    Here,
+    /// The device's share: the cell cache and how the frames go (ferros).
+    Device,
 }
 
 /// What the Updates page shows (the host's updater, as text): this build, each channel's row (a short title, a small line under it, and whether a tap gets it), the line of what is happening, a download's progress, and whether updates are automatic.
@@ -860,6 +867,10 @@ pub struct Panel {
     host_orb: Option<(f32, f32, f32)>,
     /// ferros's safe circle when the host has told one ([`Panel::set_safe`]): every control laid out inside it.
     safe: Option<SafeCircle>,
+    /// Where the open page's own title row is measured from: the orb, or on ferros a place under the title on the arc ([`Self::on_title`]).
+    page_gear: (f32, f32, f32),
+    /// The circle's state on ferros (circle.rs).
+    round: circle::Round,
     /// The Layers page scrolls between the orb and the footer (Nick 2026-10-11): how far, how far it can, a press on it (where it started, whether it has moved), and the band it scrolls in (top, bottom, where the footer starts).
     layers_scroll: f32,
     layers_extent: f32,
@@ -1042,7 +1053,7 @@ impl Panel {
         let pills = Pills::new(hits + 1000);
         let interval = Slider::new(&mut hits, 0.0, 0.0, 10.0, 10.0, 0.0);
         let text_slider = Slider::new(&mut hits, 0.0, 0.0, 10.0, 10.0, text_pos(1.0));
-        Panel { fonts: None, font_cursor: Default::default(), open: false, dirty: true, ru: 1.0, stack: vec![Page::Layers], theme_rows: Vec::new(), edit_rows: Vec::new(), edit_scroll: 0.0, edit_extent: 0.0, press: None, sliders: Vec::new(), field_vals: [0.0; 4], held: None, edits: Vec::new(), hits, shown: vec![true; LAYERS.len()], group_open: GROUPS_OPEN, group_rows: Vec::new(), tree: Vec::new(), layer_open: None, field_open: None, theme_now: None, interval, interval_held: false, text_slider, text_pending: None, ru_request: None, label_scale: 1.0, touch: false, checks, text: TextRenderer::new(), buf: Vec::new(), w: 0, h: 0, font: 16.0, gear: (0.0, 0.0, 0.0), panel_w: 0.0, theme_row: (0.0, 0.0, 0.0), slider: (0.0, 0.0, 0.0), slider_held: false, cache_max: CACHE_MIN + 1, strip_close: None, notice: None, notice_btn: None, notice_tapped: false, clear_measure: false, area_rows: Vec::new(), area_acts: Vec::new(), areas: AreasView::default(), update_rows: Vec::new(), update_acts: Vec::new(), updates: UpdatesView::default(), host_orb: None, safe: None, layers_scroll: 0.0, layers_extent: 0.0, layers_press: None, layers_band: (0.0, 0.0), orb_icon: fluor::host::icon::Icon::from_vsf_bytes(APP_ORB_VSF).ok(), orb_scaled: (0, Vec::new()), locate_btn: None, tool_btn: None, toolbox_open: false, tool_rows: Vec::new(), pills, auto_check, travel, toolbox, marker_choice, colour_of_track: false, theme_list, area_list, search_list, track_list, tracks: TracksView::default(), tracks_version: 0, track_rows: Vec::new(), track_acts: Vec::new(), copy_btns: Vec::new(), copied: None, query: String::new(), search_box: None, query_dirty: false, search_pending: false, found: Vec::new(), picked: None, search_act: None, search_rows: Vec::new(), search_acts: Vec::new(), search_field: None, route_pills: Vec::new(), swap: false, card_top: None }
+        Panel { fonts: None, font_cursor: Default::default(), open: false, dirty: true, ru: 1.0, stack: vec![Page::Layers], theme_rows: Vec::new(), edit_rows: Vec::new(), edit_scroll: 0.0, edit_extent: 0.0, press: None, sliders: Vec::new(), field_vals: [0.0; 4], held: None, edits: Vec::new(), hits, shown: vec![true; LAYERS.len()], group_open: GROUPS_OPEN, group_rows: Vec::new(), tree: Vec::new(), layer_open: None, field_open: None, theme_now: None, interval, interval_held: false, text_slider, text_pending: None, ru_request: None, label_scale: 1.0, touch: false, checks, text: TextRenderer::new(), buf: Vec::new(), w: 0, h: 0, font: 16.0, gear: (0.0, 0.0, 0.0), panel_w: 0.0, theme_row: (0.0, 0.0, 0.0), slider: (0.0, 0.0, 0.0), slider_held: false, cache_max: CACHE_MIN + 1, strip_close: None, notice: None, notice_btn: None, notice_tapped: false, clear_measure: false, area_rows: Vec::new(), area_acts: Vec::new(), areas: AreasView::default(), update_rows: Vec::new(), update_acts: Vec::new(), updates: UpdatesView::default(), host_orb: None, safe: None, page_gear: (0.0, 0.0, 0.0), round: circle::Round::default(), layers_scroll: 0.0, layers_extent: 0.0, layers_press: None, layers_band: (0.0, 0.0), orb_icon: fluor::host::icon::Icon::from_vsf_bytes(APP_ORB_VSF).ok(), orb_scaled: (0, Vec::new()), locate_btn: None, tool_btn: None, toolbox_open: false, tool_rows: Vec::new(), pills, auto_check, travel, toolbox, marker_choice, colour_of_track: false, theme_list, area_list, search_list, track_list, tracks: TracksView::default(), tracks_version: 0, track_rows: Vec::new(), track_acts: Vec::new(), copy_btns: Vec::new(), copied: None, query: String::new(), search_box: None, query_dirty: false, search_pending: false, found: Vec::new(), picked: None, search_act: None, search_rows: Vec::new(), search_acts: Vec::new(), search_field: None, route_pills: Vec::new(), swap: false, card_top: None }
     }
 
     pub fn is_open(&self) -> bool {
@@ -1077,11 +1088,6 @@ impl Panel {
         }
     }
 
-    /// The highest row a box over columns `x0..x1` may reach and keep both its top corners inside the safe circle (0 without one). The edge falls away from the centre, so the lower of the two columns' edges is the one both corners clear.
-    fn safe_top(&self, x0: f32, x1: f32) -> f32 {
-        self.safe.map_or(0.0, |c| c.top_at(x0).max(c.top_at(x1)))
-    }
-
     /// The lowest row a box over columns `x0..x1` may reach and keep both its bottom corners inside the safe circle (the frame's bottom without one): the higher of the two columns' edges, for the same reason.
     fn safe_floor(&self, x0: f32, x1: f32) -> f32 {
         self.safe.map_or(self.h as f32, |c| c.bottom_at(x0).min(c.bottom_at(x1)))
@@ -1089,6 +1095,9 @@ impl Panel {
 
     /// The screen the panel's controls covered at its last paint, for the labeller to leave clear ([`labels::Labeller::set_keep_out`]): the orb and its name, the open column, the locate button and the toolbox, the strip or card, and the scale bar while the column is shut.
     pub fn label_keep_out(&self) -> Vec<[f32; 4]> {
+        if self.round_on() {
+            return self.round_keep_out();
+        }
         let (w, h, f) = (self.w as f32, self.h as f32, self.font);
         let (gx, gy, gr) = self.gear;
         let mut out = vec![[gx - gr, gy - gr, gx + gr + f * 5.0, gy + gr]];
@@ -1134,6 +1143,9 @@ impl Panel {
 
     /// Back, from the phone's back button or Escape: one page up the stack, the panel closed from its first page. False when the panel was already closed, for the host to do whatever back means outside it.
     pub fn back(&mut self) -> bool {
+        if self.round_on() {
+            return self.back_round();
+        }
         if !self.open {
             return false;
         }
@@ -1423,7 +1435,7 @@ impl Panel {
 
     /// Whether a tap's height is on a page's title row ("‹  Title" goes back, Nick 2026-10-14: the pen and field pages had no way back but the phone's own).
     fn on_title(&self, y: f32) -> bool {
-        let ty = self.gear.1 + self.gear.2 + self.font * 0.9 + self.font * 0.8;
+        let ty = self.page_gear.1 + self.page_gear.2 + self.font * 0.9 + self.font * 0.8;
         (y - ty).abs() <= self.font * 0.8
     }
 
@@ -1556,8 +1568,15 @@ impl Panel {
                 self.pop();
             }
             self.open = false;
+            self.round.root = false;
             self.dirty = true;
         }
+        self.round.bloom = false;
+    }
+
+    /// Whether the circle lays the screen out: ferros's safe circle set, and no host drawing its own orb.
+    fn round_on(&self) -> bool {
+        self.safe.is_some() && self.host_orb.is_none()
     }
 
     /// Sizes for a screen, every one a multiple of one unit, Photon's: the harmonic mean of the span (the screen's own harmonic mean of width and height) over 32 times the RU scale, and a thirteenth of the height, so the panel scales with the screen's shape, with the pinch, and never past what a short screen can hold. No clamps on the unit itself.
@@ -1568,31 +1587,41 @@ impl Panel {
         let span = if w + h > 0 { 2.0 * wf * hf / (wf + hf) } else { 0.0 };
         let unit = hm(span / 32.0 * self.ru, hf / 13.0);
         self.font = (unit * 0.5).max(6.0);
+        // On ferros the circle lays the screen out (circle.rs): the orb, its beads, the pages' title on the arc and their body.
+        if let (Some(c), None) = (self.safe, self.host_orb) {
+            self.layout_round(c, wf, hf, span);
+            return;
+        }
         let r = self.font * 1.15;
         let pad = self.font * 0.6;
-        // The orb in the top left, or on ferros at the safe circle's top, centred under the camera as every kist's orb is (Photon's OrbLayout).
-        self.gear = self.host_orb.unwrap_or_else(|| match self.safe {
-            Some(c) => (c.cx, c.top_at(c.cx) + pad + r, r),
-            None => (pad + r, pad + r, r),
-        });
+        // The orb in the top left.
+        self.gear = self.host_orb.unwrap_or((pad + r, pad + r, r));
+        self.page_gear = self.gear;
         let r = self.gear.2;
         // The column, or the whole screen for the search (Nick 2026-10-26: "Search needs to fill the screen left/right"): its field and the places found want the width.
         self.panel_w = if self.page() == Page::Search { w as f32 } else { (self.font * 13.0).min(w as f32 * 0.7) };
         let row = self.font * 1.7;
         let x0 = self.font * 0.8;
         // The footer: the cache slider and the readouts, fixed at the bottom, the layers scrolling above it.
-        // The column's top and bottom inside the safe circle on ferros (its edge lowest over the column's outer side), the frame's own elsewhere; below the orb either way.
-        let footer_top = (self.safe_floor(0.0, self.panel_w) - self.font * FOOTER_LINES).max(self.gear.1 + r + row * 3.0);
-        let band_top = (self.gear.1 + r + self.font * 0.5).max(self.safe_top(0.0, self.panel_w) + self.font * 0.3);
+        let footer_top = (hf - self.font * FOOTER_LINES).max(self.gear.1 + r + row * 3.0);
+        let band_top = self.gear.1 + r + self.font * 0.5;
         self.layers_band = (band_top, footer_top);
-        let scroll = self.layers_scroll;
         // The theme row sits first, then the layers.
-        let theme_y = self.gear.1 + r + self.font * 0.9 + row * 0.5 - scroll;
+        let theme_y = self.gear.1 + r + self.font * 0.9 + row * 0.5 - self.layers_scroll;
         self.theme_row = (x0, theme_y, row * 0.5);
-        let top = theme_y + row * 0.8;
-        // The tree: each group's header, then its rows while it is open, indented; the pages after, a row apart. A row out of the tree is parked off the page and not drawn.
+        self.layout_layers(0.0, self.panel_w, theme_y + row * 0.8, true);
+        // The cache slider at the footer's top: a track the width of the column.
+        self.slider = (x0, footer_top + self.font * 1.9, self.panel_w - x0 * 2.0);
+    }
+
+    /// The Layers page's tree from `top` down a column `col_w` wide from `col_x`, inside the band [`Self::layers_band`] holds: each group's header, then its rows while it is open, indented. With `pages` the rows that open Areas, Tracks and Updates follow it (the column's foot; on ferros the root menu has them). A row out of the tree is parked off the page and not drawn.
+    fn layout_layers(&mut self, col_x: f32, col_w: f32, top: f32, pages: bool) {
+        let row = self.font * 1.7;
+        let x0 = col_x + self.font * 0.8;
         let indent = self.font * 1.2;
-        let full = self.panel_w - x0 * 1.5;
+        let full = col_w - self.font * 1.2;
+        let scroll = self.layers_scroll;
+        let footer_top = self.layers_band.1;
         let mut y = top;
         self.group_rows.clear();
         for v in self.shown.iter_mut() {
@@ -1680,7 +1709,7 @@ impl Panel {
         }
         y += row * 0.5;
         for (i, (l, cb)) in self.checks.iter_mut().enumerate() {
-            if GROUPS.iter().any(|(_, ls)| ls.contains(l)) || nested(*l) {
+            if GROUPS.iter().any(|(_, ls)| ls.contains(l)) || nested(*l) || !pages {
                 if !self.shown[i] {
                     cb.set_rect(-10_000.0, -10_000.0, 1.0, 1.0);
                 }
@@ -1697,8 +1726,6 @@ impl Panel {
         if self.layers_scroll > self.layers_extent {
             self.layers_scroll = self.layers_extent;
         }
-        // The cache slider at the footer's top: a track the width of the column.
-        self.slider = (x0, footer_top + self.font * 1.9, self.panel_w - x0 * 2.0);
     }
 
     /// Whether a point on the Layers page is on a row the list shows (inside the band it scrolls in).
@@ -1809,6 +1836,12 @@ impl Panel {
     /// A tap at screen (x, y): true if the panel took it. The orb toggles the panel; a row flips its layer in `mask`.
     pub fn tap(&mut self, x: f32, y: f32, w: usize, h: usize, mask: &mut LayerMask, ctl: &mut Controls, _themes: &[Theme]) -> bool {
         self.layout(w, h);
+        // On ferros the circle answers first (circle.rs); a page's body falls through to the page.
+        if self.round_on() {
+            if let Some(taken) = self.tap_round(x, y, ctl) {
+                return taken;
+            }
+        }
         let inside = |r: (f32, f32, f32, f32)| x >= r.0 && x <= r.0 + r.2 && y >= r.1 && y <= r.1 + r.3;
         // The toolbox's list takes the next tap: a row picks, anywhere else only closes it.
         if self.toolbox_open {
@@ -2107,6 +2140,11 @@ impl Panel {
                 }
                 return true;
             }
+            Page::Here => return true,
+            Page::Device => {
+                self.slider_press(x, y, ctl);
+                return true;
+            }
             Page::Layers => {}
         }
         // An inline slider takes the press at once, as the footer's does: a field's, or the contour interval's.
@@ -2154,6 +2192,10 @@ impl Panel {
     /// Paint for a `w × h` screen: the orb always (the app orb, or the light as a ball when `orb` gives one) with the app's name, unless the host draws its own; the column when open. Returns the buffer in fluor's pixel convention.
     #[allow(clippy::too_many_arguments)]
     pub fn paint(&mut self, w: usize, h: usize, mask: LayerMask, ctl: Controls, r: &Readouts, measure: Option<&MeasureView>, themes: &[Theme], areas: &AreasView, orb: Option<&dyn Fn(usize) -> Option<Vec<[u8; 4]>>>) -> &[u32] {
+        // A released turn of the circle's pages snaps a step a frame.
+        if self.round_on() {
+            self.step_turn(w);
+        }
         self.layout(w, h);
         // Font packs (Nick 2026-10-16): what arrived loaded and painted; what the last paint's text lacked asked for.
         if let Some(f) = self.fonts.clone() {
@@ -2178,52 +2220,20 @@ impl Panel {
             return &self.buf;
         }
         let font = self.font;
-        let (gx, gy, gr) = self.gear;
-        let ink_col = hue::text();
-        // The orb where the settings live: the light as a ball when a mode has one, the app orb otherwise, the app's name beside it. A host that draws its own orb (a desktop's chrome) draws both there instead.
+        let gr = self.gear.2;
+        // The orb where the settings live, with the app's name beside it; a host that draws its own orb (a desktop's chrome) draws both there instead. On ferros the circle paints the screen its own way (circle.rs).
         if self.host_orb.is_none() {
-            let size = (gr * 2.0) as usize;
-            let ball: Option<Vec<u32>> = orb.and_then(|f| f(size)).map(|img| {
-                img.iter().map(|p| if p[3] == 0 { 0 } else { (theme::dark(theme::fmt(((p[0] as u32) << 16) | ((p[1] as u32) << 8) | p[2] as u32)) & 0x00FF_FFFF) | 0xFF00_0000 }).collect()
-            });
-            let px: Vec<u32> = match ball {
-                Some(b) => b,
-                None => self.orb_pixels(size).to_vec(),
-            };
-            let (x0, y0) = ((gx - gr) as isize, (gy - gr) as isize);
-            let rr = gr * gr;
-            if px.len() == size * size {
-                for py in 0..size {
-                    for qx in 0..size {
-                        let (dx, dy) = (qx as f32 + 0.5 - gr, py as f32 + 0.5 - gr);
-                        let p = px[py * size + qx];
-                        if dx * dx + dy * dy > rr || p == 0 {
-                            continue;
-                        }
-                        let (x, y) = (x0 + qx as isize, y0 + py as isize);
-                        if x < 0 || y < 0 || x as usize >= w || y as usize >= h {
-                            continue;
-                        }
-                        self.buf[y as usize * w + x as usize] = p;
-                    }
-                }
+            if self.safe.is_some() {
+                return self.paint_round(mask, ctl, r, measure, themes, areas, orb);
             }
-            let mut damage = Damage::new();
-            let mut canvas = Canvas::new(&mut self.buf, w, h, &mut damage);
-            // The name, level with the orb's centre; topmost first, so the text, then a dark edge under it to read over any map.
-            let style = TextStyle::new(font * 1.05, ink_col);
-            let shade = TextStyle::new(font * 1.05, hue::gear_bg());
-            let (nx, ny) = (gx + gr + font * 0.5, gy);
-            self.text.draw_text_left(&mut canvas, APP_NAME, nx, ny, &style, None, None);
-            for (ox, oy) in [(-1.0, 0.0), (1.0, 0.0), (0.0, -1.0), (0.0, 1.0), (1.0, 1.0)] {
-                self.text.draw_text_left(&mut canvas, APP_NAME, nx + ox, ny + oy, &shade, None, None);
-            }
-            paint::circle_filled(&mut canvas, gx as isize, gy as isize, gr as isize, hue::gear_bg(), None, None);
+            self.paint_orb(orb, true);
         }
         let (page, rail) = (self.page(), self.rail_w());
         let floor = self.safe_floor(0.0, w as f32);
         let mut damage = Damage::new();
-        let mut canvas = Canvas::new(&mut self.buf, w, h, &mut damage);
+        // The buffer is taken while the page paints into it, so the painting can call methods of the panel; it goes back before every return.
+        let mut buf = std::mem::take(&mut self.buf);
+        let mut canvas = Canvas::new(&mut buf, w, h, &mut damage);
         self.strip_close = None;
         self.copy_btns.clear();
         self.pills.begin();
@@ -2294,6 +2304,8 @@ impl Panel {
         if !self.open {
             // The scale bar, bottom left; the open panel shows the scale itself.
             Self::paint_scale(&mut canvas, &mut self.text, font, font * 0.8, bottom - font * 0.8, r.m_per_px, (w as f32 * 0.3).min(font * 10.0), r.contour_major_m);
+            drop(canvas);
+            self.buf = buf;
             return &self.buf;
         }
         if page != Page::Layers {
@@ -2301,7 +2313,7 @@ impl Panel {
             let cw = self.panel_w - rail;
             let current = themes.get(ctl.theme);
             match page {
-                Page::Themes => self.theme_rows = Self::paint_themes(&mut canvas, &mut self.text, &mut self.pills, &mut self.theme_list, font, rail, cw, self.gear, themes, ctl.theme),
+                Page::Themes => self.theme_rows = Self::paint_themes(&mut canvas, &mut self.text, &mut self.pills, &mut self.theme_list, font, rail, cw, self.gear, themes, ctl.theme, true),
                 Page::Edit => {
                     if let Some(t) = current {
                         let (rows, extent) = Self::paint_edit(&mut canvas, &mut self.text, font, rail, cw, self.gear, h, t, self.edit_scroll);
@@ -2311,10 +2323,10 @@ impl Panel {
                 }
                 Page::Field(f) => Self::paint_field(&mut canvas, &mut self.text, font, rail, cw, self.gear, f, &mut self.sliders, self.field_vals, current),
                 Page::Pen => Self::paint_pen(&mut canvas, &mut self.text, font, rail, cw, self.gear, &mut self.sliders, self.field_vals, if self.colour_of_track { "Track colour" } else { "Pen colour" }),
-                Page::Areas => self.area_rows = Self::paint_areas(&mut canvas, &mut self.text, &mut self.pills, &mut self.area_list, font, rail, cw, self.gear, &self.areas),
-                Page::Tracks => self.track_rows = Self::paint_tracks(&mut canvas, &mut self.text, &mut self.track_list, font, rail, cw, self.gear, &self.tracks, ctl.record),
+                Page::Areas => self.area_rows = Self::paint_areas(&mut canvas, &mut self.text, &mut self.pills, &mut self.area_list, font, rail, cw, self.gear, &self.areas, true),
+                Page::Tracks => self.track_rows = Self::paint_tracks(&mut canvas, &mut self.text, &mut self.track_list, font, rail, cw, self.gear, &self.tracks, ctl.record, true),
                 Page::Track(i) => self.track_rows = Self::paint_track(&mut canvas, &mut self.text, &mut self.pills, font, rail, cw, self.gear, &self.tracks, i),
-                Page::Updates => self.update_rows = Self::paint_updates(&mut canvas, &mut self.text, &mut self.pills, &mut self.auto_check, font, rail, cw, self.gear, &self.updates),
+                Page::Updates => self.update_rows = Self::paint_updates(&mut canvas, &mut self.text, &mut self.pills, &mut self.auto_check, font, rail, cw, self.gear, &self.updates, true),
                 Page::Search => {
                     // The field: a fluor textbox, focused, holding the query as typed.
                     let (fx, fy, fw, fh) = (rail + font * 0.9, self.gear.1 + self.gear.2 + font * 0.9 + font * 1.6 * 1.3, cw - font * 1.8, font * 1.7);
@@ -2326,24 +2338,29 @@ impl Panel {
                         tb.set_text(&self.query, &mut self.text);
                     }
                     tb.set_focused(true);
-                    let card = Self::paint_search_page(&mut canvas, &mut self.text, &mut self.pills, &mut self.search_list, tb, font, rail, cw, floor as usize, self.gear, &self.found, self.picked, self.search_pending, self.query.trim().is_empty());
+                    let card = Self::paint_search_page(&mut canvas, &mut self.text, &mut self.pills, &mut self.search_list, tb, font, rail, cw, floor as usize, self.gear, &self.found, self.picked, self.search_pending, self.query.trim().is_empty(), true);
                     self.search_field = Some(card.field);
                     self.search_rows = card.rows;
                     self.search_acts = card.acts;
                 }
                 Page::Area(i) => self.area_rows = Self::paint_area(&mut canvas, &mut self.text, &mut self.pills, font, rail, cw, self.gear, &self.areas, i, &mut self.sliders, self.field_vals[0] as u8),
-                Page::Layers => {}
+                Page::Here | Page::Device | Page::Layers => {}
             }
             paint::fill_rect(&mut canvas, 0, 0, self.panel_w as isize, h as isize, hue::panel_bg(), None, None);
+            drop(canvas);
+            self.buf = buf;
             return &self.buf;
         }
-        // Topmost first: the footer (its slider and readouts, then its own background), then the list clipped to its band, then the column's background.
-        let (band_top, footer_top) = self.layers_band;
-        self.cache_max = r.cache_max;
-        Self::paint_slider(&mut canvas, &mut self.text, font, self.slider, &ctl, r);
-        let x = font * 0.9;
-        let right = self.panel_w - font * 0.9;
-        let mut y = self.slider.1 + font * 1.4;
+        self.paint_layers(&mut canvas, mask, ctl, r, themes, true);
+        drop(canvas);
+        self.buf = buf;
+        &self.buf
+    }
+
+    /// The readouts (where the view is, three ways with copy buttons, its elevation, the GPS's height, the headings, the scale, the frame) down from `y0` between `x` and `right`; the bottom of the last line. The desktop column's footer, and on ferros the Here page.
+    fn paint_readouts(&mut self, canvas: &mut Canvas, x: f32, right: f32, y0: f32, r: &Readouts) -> f32 {
+        let (h, font) = (self.h, self.font);
+        let mut y = y0;
         let small = TextStyle::new(font * 0.82, hue::readout());
         let dim = TextStyle::new(font * 0.72, hue::readout_dim());
         let rows: [(&str, String); 7] = [
@@ -2367,21 +2384,21 @@ impl Panel {
                 // The place: its label with a copy button, the degrees under it; then the same in degrees, minutes and seconds (Nick 2026-10-26). The copies: the degrees signed and plain, the rest as shown.
                 let dms = dms_text(r.lat, r.lon);
                 for (label, shown, what) in [("position", value.clone(), format!("{:.6}, {:.6}", r.lat, r.lon)), ("d\u{b0} m\u{2032} s\u{2033}", dms.clone(), dms)] {
-                    let lw = self.text.draw_text_left(&mut canvas, label, x, y, &dim, None, None);
-                    Self::paint_copy(&mut canvas, &mut self.text, &mut self.pills, &mut self.copy_btns, x + lw + font * 0.4, y, font * 0.85, what);
+                    let lw = self.text.draw_text_left(canvas, label, x, y, &dim, None, None);
+                    Self::paint_copy(canvas, &mut self.text, &mut self.pills, &mut self.copy_btns, x + lw + font * 0.4, y, font * 0.85, what);
                     y += font * 0.95;
-                    self.text.draw_text_right(&mut canvas, &shown, right, y, &small, None, None);
+                    self.text.draw_text_right(canvas, &shown, right, y, &small, None, None);
                     y += line;
                 }
                 continue;
             }
-            self.text.draw_text_left(&mut canvas, label, x, y, &dim, None, None);
-            self.text.draw_text_right(&mut canvas, value, right, y, &small, None, None);
+            self.text.draw_text_left(canvas, label, x, y, &dim, None, None);
+            self.text.draw_text_right(canvas, value, right, y, &small, None, None);
             y += line;
         }
         // The world code is seven words: under its label, wrapped to the column so none is cut.
         let words = vsf::types::WorldCoord::from_lat_lon(r.lat, r.lon).to_words();
-        let max_w = self.panel_w - x * 2.0;
+        let max_w = right - x;
         let mut world_lines: Vec<String> = Vec::new();
         for word in words.split_whitespace() {
             match world_lines.last_mut() {
@@ -2392,31 +2409,47 @@ impl Panel {
                 _ => world_lines.push(word.to_string()),
             }
         }
-        let lw = self.text.draw_text_left(&mut canvas, "world", x, y, &dim, None, None);
-        Self::paint_copy(&mut canvas, &mut self.text, &mut self.pills, &mut self.copy_btns, x + lw + font * 0.4, y, font * 0.85, words.clone());
+        let lw = self.text.draw_text_left(canvas, "world", x, y, &dim, None, None);
+        Self::paint_copy(canvas, &mut self.text, &mut self.pills, &mut self.copy_btns, x + lw + font * 0.4, y, font * 0.85, words.clone());
         y += font * 0.9;
         for l in &world_lines {
             if y > h as f32 {
                 break;
             }
-            self.text.draw_text_left(&mut canvas, l, x, y, &small, None, None);
+            self.text.draw_text_left(canvas, l, x, y, &small, None, None);
             y += font * 1.05;
         }
-        // The footer's own ground and a hairline along its top, so it reads apart from the list.
-        paint::fill_rect(&mut canvas, 0, footer_top as isize, self.panel_w as isize, 1.max((font / 24.0) as isize), hue::readout_dim(), None, None);
-        paint::fill_rect(&mut canvas, 0, footer_top as isize, self.panel_w as isize, (h as f32 - footer_top) as isize, hue::footer_bg(), None, None);
+        y
+    }
+
+    /// The Layers page's list as [`Self::layout_layers`] laid it out, clipped to its band; with `column` the desktop column's theme row, footer (the cache slider and the readouts) and ground.
+    fn paint_layers(&mut self, canvas: &mut Canvas, mask: LayerMask, ctl: Controls, r: &Readouts, themes: &[Theme], column: bool) {
+        let (h, font) = (self.h, self.font);
+        // Topmost first: the footer (its slider and readouts, then its own background), then the list clipped to its band, then the column's background.
+        let (band_top, footer_top) = self.layers_band;
+        if column {
+            self.cache_max = r.cache_max;
+            Self::paint_slider(canvas, &mut self.text, font, self.slider, &ctl, r);
+            let y = self.slider.1 + font * 1.4;
+            self.paint_readouts(canvas, font * 0.9, self.panel_w - font * 0.9, y, r);
+            // The footer's own ground and a hairline along its top, so it reads apart from the list.
+            paint::fill_rect(canvas, 0, footer_top as isize, self.panel_w as isize, 1.max((font / 24.0) as isize), hue::readout_dim(), None, None);
+            paint::fill_rect(canvas, 0, footer_top as isize, self.panel_w as isize, (h as f32 - footer_top) as isize, hue::footer_bg(), None, None);
+        }
         let clip = Some(paint::Clip::new(0, band_top.max(0.0) as usize, self.panel_w as usize, footer_top.max(0.0) as usize));
         // Where the list runs past the footer, a thin bar at the column's edge shows where in it the view is.
         if self.layers_extent > 0.0 {
             let span = footer_top - band_top;
             let len = span * span / (span + self.layers_extent);
             let at = band_top + (span - len) * (self.layers_scroll / self.layers_extent);
-            paint::fill_rect(&mut canvas, (self.panel_w - font * 0.25) as isize, at as isize, (font * 0.12).max(2.0) as isize, len as isize, hue::readout_dim(), None, None);
+            paint::fill_rect(canvas, (self.panel_w - font * 0.25) as isize, at as isize, (font * 0.12).max(2.0) as isize, len as isize, hue::readout_dim(), None, None);
         }
         // The theme row: the current theme's name and a chevron.
         let (tx, ty, _) = self.theme_row;
-        let current = themes.get(ctl.theme).map_or("Trail", |t| t.name.as_str());
-        self.text.draw_text_left(&mut canvas, &format!("Theme   {current}  \u{203a}"), tx, ty, &TextStyle::new(font, hue::text()), clip, None);
+        if column {
+            let current = themes.get(ctl.theme).map_or("Trail", |t| t.name.as_str());
+            self.text.draw_text_left(canvas, &format!("Theme   {current}  \u{203a}"), tx, ty, &TextStyle::new(font, hue::text()), clip, None);
+        }
         self.theme_now = themes.get(ctl.theme).cloned();
         let row_ink = TextStyle::new(font * 0.9, hue::text());
         let dim = TextStyle::new(font * 0.72, hue::readout_dim());
@@ -2432,17 +2465,17 @@ impl Panel {
                 TreeRow::Check(i) => {
                     if !settings_of(self.checks[i].0).is_empty() {
                         let m = if self.layer_open == Some(self.checks[i].0) { "\u{25be}" } else { "\u{2026}" };
-                        self.text.draw_text_left(&mut canvas, m, self.panel_w - font * 1.6, cy, &row_ink, clip, None);
+                        self.text.draw_text_left(canvas, m, self.panel_w - font * 1.6, cy, &row_ink, clip, None);
                     }
                 }
                 TreeRow::Field(f) => {
                     let x = self.layer_open.map_or(tx, col);
                     let vals = self.theme_now.as_ref().map_or([0.0; 4], |t| t.get(f));
                     let open = self.field_open == Some(f);
-                    self.text.draw_text_left(&mut canvas, &format!("{}  {}", if open { "\u{25be}" } else { "\u{25b8}" }, f.name()), x, cy, &row_ink, clip, None);
+                    self.text.draw_text_left(canvas, &format!("{}  {}", if open { "\u{25be}" } else { "\u{25b8}" }, f.name()), x, cy, &row_ink, clip, None);
                     if let Some(c) = field_swatch(f, vals) {
                         let s = font * 0.9;
-                        paint::fill_rect(&mut canvas, (self.panel_w - font * 2.2) as isize, (cy - s * 0.5) as isize, (font * 1.4) as isize, s as isize, c, clip, None);
+                        paint::fill_rect(canvas, (self.panel_w - font * 2.2) as isize, (cy - s * 0.5) as isize, (font * 1.4) as isize, s as isize, c, clip, None);
                     }
                 }
                 TreeRow::Interval => {
@@ -2450,35 +2483,35 @@ impl Panel {
                     let auto = if ctl.contour_auto { "  (auto)" } else { "" };
                     let m = ctl.contour_interval;
                     let v = interval_text(m);
-                    self.text.draw_text_left(&mut canvas, "Interval", x, cy - font * 0.55, &dim, clip, None);
-                    self.text.draw_text_left(&mut canvas, &format!("{v}{auto}"), x + font * 4.5, cy - font * 0.55, &small, clip, None);
+                    self.text.draw_text_left(canvas, "Interval", x, cy - font * 0.55, &dim, clip, None);
+                    self.text.draw_text_left(canvas, &format!("{v}{auto}"), x + font * 4.5, cy - font * 0.55, &small, clip, None);
                     if !self.interval_held {
                         self.interval.set_value(interval_pos(m));
                     }
                     // Sliders take no clip: one only part in the band is left out.
                     if cy - hh >= band_top && cy + hh <= footer_top {
-                        self.interval.render_content_into(&mut canvas, None, HIT_NONE);
+                        self.interval.render_content_into(canvas, None, HIT_NONE);
                     }
                 }
                 TreeRow::TextSize => {
                     let shown = self.text_pending.unwrap_or(self.ru);
-                    self.text.draw_text_left(&mut canvas, "Interface size", tx, cy - font * 0.55, &dim, clip, None);
-                    self.text.draw_text_left(&mut canvas, &format!("{}%", (shown * 100.0).round() as i64), tx + font * 4.5, cy - font * 0.55, &small, clip, None);
+                    self.text.draw_text_left(canvas, "Interface size", tx, cy - font * 0.55, &dim, clip, None);
+                    self.text.draw_text_left(canvas, &format!("{}%", (shown * 100.0).round() as i64), tx + font * 4.5, cy - font * 0.55, &small, clip, None);
                     if self.text_pending.is_none() {
                         self.text_slider.set_value(text_pos(self.ru));
                     }
                     if cy - hh >= band_top && cy + hh <= footer_top {
-                        self.text_slider.render_content_into(&mut canvas, None, HIT_NONE);
+                        self.text_slider.render_content_into(canvas, None, HIT_NONE);
                     }
                 }
                 TreeRow::Slider(k) => {
                     if let (Some(f), Some(sl)) = (self.field_open, self.sliders.get_mut(k)) {
                         let x = self.layer_open.map_or(tx, col);
                         let (label, val) = slider_text(f, k, self.field_vals);
-                        self.text.draw_text_left(&mut canvas, label, x, cy - font * 0.55, &dim, clip, None);
-                        self.text.draw_text_left(&mut canvas, &val, x + font * 4.5, cy - font * 0.55, &small, clip, None);
+                        self.text.draw_text_left(canvas, label, x, cy - font * 0.55, &dim, clip, None);
+                        self.text.draw_text_left(canvas, &val, x + font * 4.5, cy - font * 0.55, &small, clip, None);
                         if cy - hh >= band_top && cy + hh <= footer_top {
-                            sl.render_content_into(&mut canvas, None, HIT_NONE);
+                            sl.render_content_into(canvas, None, HIT_NONE);
                         }
                     }
                 }
@@ -2489,18 +2522,18 @@ impl Panel {
                         (_, true) => "Waiting for a fix".to_string(),
                         _ => format!("{} saved  \u{203a}", self.tracks.tracks.len()),
                     };
-                    self.text.draw_text_left(&mut canvas, &line, x, cy, &dim, clip, None);
+                    self.text.draw_text_left(canvas, &line, x, cy, &dim, clip, None);
                 }
                 TreeRow::TrackColour => {
                     let x = self.layer_open.map_or(tx, col);
-                    self.text.draw_text_left(&mut canvas, "\u{25b8}  Colour", x, cy, &row_ink, clip, None);
+                    self.text.draw_text_left(canvas, "\u{25b8}  Colour", x, cy, &row_ink, clip, None);
                     let s = font * 0.9;
-                    paint::fill_rect(&mut canvas, (self.panel_w - font * 2.2) as isize, (cy - s * 0.5) as isize, (font * 1.4) as isize, s as isize, pen_swatch(ctl.track_rgba), clip, None);
+                    paint::fill_rect(canvas, (self.panel_w - font * 2.2) as isize, (cy - s * 0.5) as isize, (font * 1.4) as isize, s as isize, pen_swatch(ctl.track_rgba), clip, None);
                 }
                 TreeRow::MarkerStyle => {
                     self.marker_choice.set_selected(ctl.marker_style as usize);
                     if cy - hh >= band_top && cy + hh <= footer_top {
-                        self.marker_choice.render_content_into(&mut canvas, &mut self.text, clip, None);
+                        self.marker_choice.render_content_into(canvas, &mut self.text, clip, None);
                     }
                 }
                 TreeRow::Group(_) => {}
@@ -2512,7 +2545,7 @@ impl Panel {
                 continue;
             }
             let marker = if self.group_open[gi] { "\u{25be}" } else { "\u{25b8}" };
-            self.text.draw_text_left(&mut canvas, &format!("{marker}  {}", GROUPS[gi].0), tx, cy, &TextStyle::new(font, hue::text()).weight(600), clip, None);
+            self.text.draw_text_left(canvas, &format!("{marker}  {}", GROUPS[gi].0), tx, cy, &TextStyle::new(font, hue::text()).weight(600), clip, None);
         }
         for (i, (l, cb)) in self.checks.iter_mut().enumerate() {
             if !self.shown[i] {
@@ -2525,17 +2558,64 @@ impl Panel {
             }
             // The pages at the foot are rows to open, not boxes to tick (Nick 2026-10-26: "random checkboxes next to things like updates").
             if matches!(l, Layer::Areas | Layer::Tracks | Layer::Updates) {
-                self.text.draw_text_left(&mut canvas, cb.label(), b.x + self.font * 0.3, b.y + b.h * 0.5, &TextStyle::new(self.font * 0.9, hue::text()), clip, None);
+                self.text.draw_text_left(canvas, cb.label(), b.x + self.font * 0.3, b.y + b.h * 0.5, &TextStyle::new(self.font * 0.9, hue::text()), clip, None);
                 continue;
             }
             // Greyed: a wash of the panel colour over the row, painted first so it lies on top.
             if inert(&mask, &ctl, *l) {
-                paint::fill_rect(&mut canvas, b.x as isize, b.y as isize, b.w as isize, b.h as isize, hue::panel_dim(), clip, None);
+                paint::fill_rect(canvas, b.x as isize, b.y as isize, b.w as isize, b.h as isize, hue::panel_dim(), clip, None);
             }
-            cb.render_content_into(&mut canvas, &mut self.text, clip, None);
+            cb.render_content_into(canvas, &mut self.text, clip, None);
         }
-        paint::fill_rect(&mut canvas, 0, 0, self.panel_w as isize, h as isize, hue::panel_bg(), None, None);
-        &self.buf
+        if column {
+            paint::fill_rect(canvas, 0, 0, self.panel_w as isize, h as isize, hue::panel_bg(), None, None);
+        }
+    }
+
+    /// The orb where the settings live, at [`Self::gear`]: the light as a ball when a mode has one, the app orb otherwise; with `name`, the app's name beside it (the desktop and phone; on ferros the beads sit there).
+    fn paint_orb(&mut self, orb: Option<&dyn Fn(usize) -> Option<Vec<[u8; 4]>>>, name: bool) {
+        let (w, h, font) = (self.w, self.h, self.font);
+        let (gx, gy, gr) = self.gear;
+        let size = (gr * 2.0) as usize;
+        let ball: Option<Vec<u32>> = orb.and_then(|f| f(size)).map(|img| {
+            img.iter().map(|p| if p[3] == 0 { 0 } else { (theme::dark(theme::fmt(((p[0] as u32) << 16) | ((p[1] as u32) << 8) | p[2] as u32)) & 0x00FF_FFFF) | 0xFF00_0000 }).collect()
+        });
+        let px: Vec<u32> = match ball {
+            Some(b) => b,
+            None => self.orb_pixels(size).to_vec(),
+        };
+        let (x0, y0) = ((gx - gr) as isize, (gy - gr) as isize);
+        let rr = gr * gr;
+        if px.len() == size * size {
+            for py in 0..size {
+                for qx in 0..size {
+                    let (dx, dy) = (qx as f32 + 0.5 - gr, py as f32 + 0.5 - gr);
+                    let p = px[py * size + qx];
+                    if dx * dx + dy * dy > rr || p == 0 {
+                        continue;
+                    }
+                    let (x, y) = (x0 + qx as isize, y0 + py as isize);
+                    if x < 0 || y < 0 || x as usize >= w || y as usize >= h {
+                        continue;
+                    }
+                    self.buf[y as usize * w + x as usize] = p;
+                }
+            }
+        }
+        let mut damage = Damage::new();
+        let mut canvas = Canvas::new(&mut self.buf, w, h, &mut damage);
+        if name {
+            let ink_col = hue::text();
+            // The name, level with the orb's centre; topmost first, so the text, then a dark edge under it to read over any map.
+            let style = TextStyle::new(font * 1.05, ink_col);
+            let shade = TextStyle::new(font * 1.05, hue::gear_bg());
+            let (nx, ny) = (gx + gr + font * 0.5, gy);
+            self.text.draw_text_left(&mut canvas, APP_NAME, nx, ny, &style, None, None);
+            for (ox, oy) in [(-1.0, 0.0), (1.0, 0.0), (0.0, -1.0), (0.0, 1.0), (1.0, 1.0)] {
+                self.text.draw_text_left(&mut canvas, APP_NAME, nx + ox, ny + oy, &shade, None, None);
+            }
+        }
+        paint::circle_filled(&mut canvas, gx as isize, gy as isize, gr as isize, hue::gear_bg(), None, None);
     }
 
     /// One painted pixel as premultiplied visible (r, g, b, a): fluor stores accumulated darkness with `dark ≤ α`, so the premultiplied channel is `α − dark`; Android's theme bytes are R↔B swapped.
@@ -2796,13 +2876,15 @@ impl Panel {
 
     /// The search page: the title, the field (the textbox, drawn by fluor), then the places found a row each (what it is and how far, small), or the one picked with Go, From here and To here. Returns the rects that take taps.
     #[allow(clippy::too_many_arguments)]
-    fn paint_search_page(canvas: &mut Canvas, text: &mut TextRenderer, pills: &mut Pills, list: &mut List, tb: &mut Textbox, font: f32, ox: f32, cw: f32, h: usize, gear: (f32, f32, f32), found: &[SearchRow], picked: Option<usize>, pending: bool, empty: bool) -> SearchCard {
+    fn paint_search_page(canvas: &mut Canvas, text: &mut TextRenderer, pills: &mut Pills, list: &mut List, tb: &mut Textbox, font: f32, ox: f32, cw: f32, h: usize, gear: (f32, f32, f32), found: &[SearchRow], picked: Option<usize>, pending: bool, empty: bool, show_title: bool) -> SearchCard {
         let mut card = SearchCard::default();
         let x0 = ox + font * 0.9;
         let row = font * 1.6;
         let mut y = gear.1 + gear.2 + font * 0.9 + row * 0.5;
         let title = TextStyle::new(font, hue::text());
-        text.draw_text_left(canvas, "\u{2039}  Search", x0, y, &title, None, None);
+        if show_title {
+            text.draw_text_left(canvas, "\u{2039}  Search", x0, y, &title, None, None);
+        }
         y += row * 1.3;
         let (fw, fh) = (cw - font * 1.8, font * 1.7);
         card.field = (x0, y, fw, fh);
@@ -2947,6 +3029,11 @@ impl Panel {
 
     /// A move while the slider is held: the budget follows the finger. True while it does.
     pub fn drag(&mut self, x: f32, y: f32, ctl: &mut Controls) -> bool {
+        if self.round_on() {
+            if let Some(v) = self.drag_round(x, y) {
+                return v;
+            }
+        }
         if self.page() == Page::Layers {
             if let (Some(k), Some(f)) = (self.held, self.field_open) {
                 if let Some(sl) = self.sliders.get_mut(k) {
@@ -3033,6 +3120,10 @@ impl Panel {
 
     /// The finger lifted. A press on the Layers list that never moved opens or flips its row there; true when that changed something the host applies from `mask` and `ctl`.
     pub fn release(&mut self, mask: &mut LayerMask, ctl: &mut Controls) -> bool {
+        // A swipe that turned a page ends here, nothing under it pressed.
+        if self.round_on() && self.release_round() {
+            return false;
+        }
         self.slider_held = false;
         self.held = None;
         self.interval_held = false;
@@ -3083,13 +3174,15 @@ impl Panel {
     #[allow(clippy::too_many_arguments)]
     /// The Themes page: the title, the themes as a list with the current one picked, and a button to edit the current one. Returns the title's row and the button's.
     #[allow(clippy::too_many_arguments)]
-    fn paint_themes(canvas: &mut Canvas, text: &mut TextRenderer, pills: &mut Pills, list: &mut List, font: f32, ox: f32, panel_w: f32, gear: (f32, f32, f32), themes: &[Theme], current: usize) -> Vec<(f32, f32)> {
+    fn paint_themes(canvas: &mut Canvas, text: &mut TextRenderer, pills: &mut Pills, list: &mut List, font: f32, ox: f32, panel_w: f32, gear: (f32, f32, f32), themes: &[Theme], current: usize, show_title: bool) -> Vec<(f32, f32)> {
         let x0 = ox + font * 0.9;
         let row = font * 1.6;
         let mut y = gear.1 + gear.2 + font * 0.9 + row * 0.5;
         let mut rows = Vec::new();
         let title = TextStyle::new(font, hue::text());
-        text.draw_text_left(canvas, "\u{2039}  Themes", x0, y, &title, None, None);
+        if show_title {
+            text.draw_text_left(canvas, "\u{2039}  Themes", x0, y, &title, None, None);
+        }
         rows.push((y, row * 0.5));
         y += row * 1.2;
         list.set_font_size(font);
@@ -3233,7 +3326,7 @@ impl Panel {
     /// The areas list: the back row, a row to save the selection (dim without one), then every area with what is on the device.
     /// The Updates page: this build, then each channel's row (a tap gets its build, when it is not this one), the line of what is happening and a download's bar, and the automatic switch.
     #[allow(clippy::too_many_arguments)]
-    fn paint_updates(canvas: &mut Canvas, text: &mut TextRenderer, pills: &mut Pills, auto_check: &mut Checkbox, font: f32, ox: f32, cw: f32, gear: (f32, f32, f32), u: &UpdatesView) -> Vec<(f32, f32, UpdateRow)> {
+    fn paint_updates(canvas: &mut Canvas, text: &mut TextRenderer, pills: &mut Pills, auto_check: &mut Checkbox, font: f32, ox: f32, cw: f32, gear: (f32, f32, f32), u: &UpdatesView, show_title: bool) -> Vec<(f32, f32, UpdateRow)> {
         let x0 = ox + font * 0.9;
         let row = font * 1.6;
         let mut y = gear.1 + gear.2 + font * 0.9 + row * 0.5;
@@ -3241,7 +3334,9 @@ impl Panel {
         let dim = TextStyle::new(font, hue::readout_dim());
         let small = TextStyle::new(font * 0.75, hue::readout_dim());
         let mut rows = Vec::new();
-        text.draw_text_left(canvas, "\u{2039}  Updates", x0, y, &title, None, None);
+        if show_title {
+            text.draw_text_left(canvas, "\u{2039}  Updates", x0, y, &title, None, None);
+        }
         rows.push((y, row * 0.5, UpdateRow::Back));
         y += row * 1.1;
         text.draw_text_left(canvas, &format!("This build  {}", u.this), x0, y, &small, None, None);
@@ -3280,7 +3375,7 @@ impl Panel {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn paint_areas(canvas: &mut Canvas, text: &mut TextRenderer, pills: &mut Pills, list: &mut List, font: f32, ox: f32, cw: f32, gear: (f32, f32, f32), areas: &AreasView) -> Vec<(f32, f32, AreaRow)> {
+    fn paint_areas(canvas: &mut Canvas, text: &mut TextRenderer, pills: &mut Pills, list: &mut List, font: f32, ox: f32, cw: f32, gear: (f32, f32, f32), areas: &AreasView, show_title: bool) -> Vec<(f32, f32, AreaRow)> {
         let x0 = ox + font * 0.9;
         let right = ox + cw - font * 0.9;
         let row = font * 1.6;
@@ -3289,7 +3384,9 @@ impl Panel {
         let dim = TextStyle::new(font, hue::readout_dim());
         let small = TextStyle::new(font * 0.75, hue::readout_dim());
         let mut rows = Vec::new();
-        text.draw_text_left(canvas, "\u{2039}  Areas", x0, y, &title, None, None);
+        if show_title {
+            text.draw_text_left(canvas, "\u{2039}  Areas", x0, y, &title, None, None);
+        }
         rows.push((y, row * 0.5, AreaRow::Back));
         y += row * 1.2;
         if areas.has_selection {
@@ -3377,7 +3474,7 @@ impl Panel {
 
     /// The tracks page: the recording's numbers while one runs, then every saved track, newest first, a row each with its distance, time and average, a chevron to its page.
     #[allow(clippy::too_many_arguments)]
-    fn paint_tracks(canvas: &mut Canvas, text: &mut TextRenderer, list: &mut List, font: f32, ox: f32, cw: f32, gear: (f32, f32, f32), tracks: &TracksView, recording: bool) -> Vec<(f32, f32, TrackRow)> {
+    fn paint_tracks(canvas: &mut Canvas, text: &mut TextRenderer, list: &mut List, font: f32, ox: f32, cw: f32, gear: (f32, f32, f32), tracks: &TracksView, recording: bool, show_title: bool) -> Vec<(f32, f32, TrackRow)> {
         let x0 = ox + font * 0.9;
         let row = font * 1.6;
         let mut y = gear.1 + gear.2 + font * 0.9 + row * 0.5;
@@ -3385,7 +3482,9 @@ impl Panel {
         let label = TextStyle::new(font * 0.72, hue::readout_dim());
         let value = TextStyle::new(font * 0.8, hue::readout());
         let mut rows = Vec::new();
-        text.draw_text_left(canvas, "\u{2039}  Tracks", x0, y, &title, None, None);
+        if show_title {
+            text.draw_text_left(canvas, "\u{2039}  Tracks", x0, y, &title, None, None);
+        }
         rows.push((y, row * 0.5, TrackRow::Back));
         y += row * 1.2;
         if recording {

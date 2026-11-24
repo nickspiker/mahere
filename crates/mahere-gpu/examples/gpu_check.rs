@@ -139,11 +139,13 @@ fn main() {
     let mut keep_out: Vec<[f32; 4]> = Vec::new();
     // MAHERE_PANEL=1 lays the open control panel over the GPU frame (the CPU frame has none, so the diff below is then meaningless).
     let panel_mode = std::env::var("MAHERE_PANEL").unwrap_or_default();
-    if panel_mode == "1" || panel_mode == "closed" || panel_mode == "themes" || panel_mode == "pen" || panel_mode == "areas" || panel_mode == "area" || panel_mode == "updates" || panel_mode == "tracks" || panel_mode == "track" {
+    if std::env::var_os("MAHERE_PRESS").is_some() || panel_mode == "1" || panel_mode == "closed" || panel_mode == "themes" || panel_mode == "pen" || panel_mode == "areas" || panel_mode == "area" || panel_mode == "updates" || panel_mode == "tracks" || panel_mode == "track" {
         let mut panel = mahere_panel::Panel::new();
         if let Some((cx, cy, r)) = safe {
             let c = mahere_panel::SafeCircle { cx, cy, r };
             panel.set_safe(Some(c));
+            // The circle's compass bead shows the bearing, as on ferros.
+            map.marks = false;
         }
         // MAHERE_TOOLBOX=1 shows the toolbox's list open.
         if std::env::var_os("MAHERE_TOOLBOX").is_some() {
@@ -161,7 +163,7 @@ fn main() {
         }
         let mut controls = mahere_panel::Controls::default();
         controls.pen_rgba = [230, 40, 40, 160];
-        controls.record = panel_mode == "tracks";
+        controls.record = panel_mode == "tracks" || std::env::var_os("MAHERE_RECORD").is_some();
         if panel_mode == "pen" {
             panel.show_pen(controls.pen_rgba);
         }
@@ -207,6 +209,22 @@ fn main() {
             }
         }
         let measure = map.measure_view(w, h, mahere_panel::Panel::strip_samples(w));
+        // MAHERE_PRESS=x,y;x,y taps the panel at each point in turn, a frame painted before each so the panel knows where its controls are (ferros: the orb, a bead, a root row), what a tap asks of the map done as a host would.
+        if let Ok(spec) = std::env::var("MAHERE_PRESS") {
+            for p in spec.split(';') {
+                let v: Vec<f32> = p.split(',').map(|x| x.parse().unwrap()).collect();
+                panel.paint(w, h, map.layers(), controls, &readouts, measure.as_ref(), &map.themes, &areas, None);
+                let mut mask = map.layers();
+                let taken = panel.tap(v[0], v[1], w, h, &mut mask, &mut controls, &map.themes);
+                panel.release(&mut mask, &mut controls);
+                map.set_layers(mask);
+                println!("press {},{}: {}", v[0], v[1], if taken { "taken" } else { "the map's" });
+            }
+            // MAHERE_TURN=px holds the open page mid-swipe.
+            if let Some(t) = std::env::var("MAHERE_TURN").ok().and_then(|s| s.parse::<f32>().ok()) {
+                panel.show_turn(t);
+            }
+        }
         panel.paint(w, h, map.layers(), controls, &readouts, measure.as_ref(), &map.themes, &areas, None);
         // The areas view is compared on paint, so the page is painted once more with it known.
         panel.paint(w, h, map.layers(), controls, &readouts, measure.as_ref(), &map.themes, &areas, None);

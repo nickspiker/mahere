@@ -317,6 +317,8 @@ pub struct MapCore {
     last_trace: Option<FrameTrace>,
     /// Pixels the screen's top-right marks (the compass, the heading and the zoom) move down, below a host's own controls there (the desktop's window buttons, Nick 2026-10-17); 0 on the phone.
     pub marks_top: f32,
+    /// The screen's corner marks (the compass, the heading and the zoom) drawn: off where a host's own controls show the bearing (ferros: the circle's compass bead).
+    pub marks: bool,
     pub last_straddle_blocks: usize,
     /// The last `plan`'s µs: preparing the view (`prepare`), the plan itself (`plan::plan_frame`), the residency's want; zeros for a plan from the cache.
     pub plan_us: [u64; 3],
@@ -487,6 +489,7 @@ impl MapCore {
             last_frame_ms: 0.0,
             last_trace: None,
             marks_top: 0.0,
+            marks: true,
             last_straddle_blocks: 0,
             plan_us: [0; 3],
             tick_why: [0; 4],
@@ -2232,11 +2235,17 @@ impl MapCore {
 
     /// The screen the compass, the heading and the zoom cover, for the labeller to leave clear.
     pub fn compass_box(&self, w: usize, h: usize) -> [f32; 4] {
+        if !self.marks {
+            return [0.0; 4];
+        }
         let s = Self::marks_scale(w, h);
         [Self::marks_left(w, h), self.marks_top + 40.0 * s, w as f32, self.marks_top + 190.0 * s]
     }
 
     fn draw_compass(&mut self, w: usize, h: usize) {
+        if !self.marks {
+            return;
+        }
         let s = Self::marks_scale(w, h);
         if (w as f32) < 120.0 * s || (h as f32) < 160.0 * s + self.marks_top {
             return;

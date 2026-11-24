@@ -73,6 +73,8 @@ impl App {
         }
         let c = mahere_panel::SafeCircle { cx: w * 0.5 + v.dx as f32, cy: h * 0.5 + v.dy as f32, r: v.radius as f32 };
         self.inner.panel.set_safe(Some(c));
+        // The circle's compass bead shows the bearing: the map's own corner marks are not drawn.
+        self.inner.map.marks = false;
         // The marks below the circle's edge over their column (the compass's left edge, its barbs at their widest).
         self.inner.map.marks_top = c.top_at(mahere_engine::MapCore::marks_left(self.inner.w, self.inner.h));
         self.inner.map.mark_dirty();

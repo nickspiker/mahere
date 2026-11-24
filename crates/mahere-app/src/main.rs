@@ -426,7 +426,7 @@ impl MahereApp {
             mahere_engine::RouteMode::Directions => 1,
             mahere_engine::RouteMode::Navigate => 2,
         };
-        Controls { real_sun: self.map.real_sun, real_light: self.map.real_light, follow_heading: self.map.follow_heading, lock_to_fix: self.map.lock_to_fix, cache_budget: self.cache_budget, theme: self.map.theme, compressed: self.map.compressed(), tool: self.map.tool as u8, pen_rgba: self.map.pen_colour, track_rgba: self.map.track_rgba, marker_on: self.map.marker_on, marker_style: self.map.marker_style, travel: self.travel_pref, route, search: self.searching, record: false, clear_ink: false, clear_sel: false, locate: false, ruler: self.map.ruler, contour_auto: self.map.contour_hold.is_none(), contour_interval: self.map.contour_hold.unwrap_or(self.map.contour_interval) }
+        Controls { real_sun: self.map.real_sun, real_light: self.map.real_light, follow_heading: self.map.follow_heading, lock_to_fix: self.map.lock_to_fix, cache_budget: self.cache_budget, theme: self.map.theme, compressed: self.map.compressed(), tool: self.map.tool as u8, pen_rgba: self.map.pen_colour, track_rgba: self.map.track_rgba, marker_on: self.map.marker_on, marker_style: self.map.marker_style, travel: self.travel_pref, route, search: self.searching, record: false, clear_ink: false, clear_sel: false, locate: false, north: false, ruler: self.map.ruler, contour_auto: self.map.contour_hold.is_none(), contour_interval: self.map.contour_hold.unwrap_or(self.map.contour_interval) }
     }
 
     /// A search of the view for `query` over the cells the device keeps, on a thread of its own; the places come in through [`Self::poll_search`].
@@ -583,6 +583,9 @@ impl MahereApp {
         if ctl.locate {
             let (w, h) = self.chrome.dims();
             self.map.locate(w, h);
+        }
+        if ctl.north {
+            self.map.set_bearing(0.0);
         }
     }
 

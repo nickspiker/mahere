@@ -265,7 +265,7 @@ impl<G: MapGpu> DeviceApp<G> {
             mahere_engine::RouteMode::Off => 0,
             mahere_engine::RouteMode::Directions => 1,
             mahere_engine::RouteMode::Navigate => 2,
-        }, search: self.searching, record: self.recording, clear_ink: false, clear_sel: false, locate: false, ruler: self.map.ruler, contour_auto: self.map.contour_hold.is_none(), contour_interval: self.map.contour_hold.unwrap_or(self.map.contour_interval) }
+        }, search: self.searching, record: self.recording, clear_ink: false, clear_sel: false, locate: false, north: false, ruler: self.map.ruler, contour_auto: self.map.contour_hold.is_none(), contour_interval: self.map.contour_hold.unwrap_or(self.map.contour_interval) }
     }
 
     /// A pinch with the panel open: the finger distance's ratio to the last event's scales the interface when it began on the panel, the map's lettering when it began on the map (Nick 2026-10-25: by where the first finger came down).
@@ -432,6 +432,9 @@ impl<G: MapGpu> DeviceApp<G> {
         }
         if ctl.locate {
             self.map.locate(self.w, self.h);
+        }
+        if ctl.north {
+            self.map.set_bearing(0.0);
         }
         self.save_settings();
     }
@@ -895,7 +898,15 @@ impl<G: MapGpu> FluorApp for DeviceApp<G> {
             }
             // Escape steps back, as Android's back button does (`nativeBack`): ferros's back tap arrives as Escape (ferros WINDOWS.md "The helm"). The panel one page up, then closed; with it closed already, nothing more here.
             FEvent::KeyboardInput { event } if event.state == ElementState::Pressed && event.logical_key == fluor::event::Key::Named(fluor::event::NamedKey::Escape) => {
-                if self.panel.back() { EventResponse::Handled } else { EventResponse::Pass }
+                if self.panel.back() {
+                    // Back with a readout up clears it (ferros's circle).
+                    if self.panel.take_clear_measure() {
+                        self.map.clear_measure();
+                    }
+                    EventResponse::Handled
+                } else {
+                    EventResponse::Pass
+                }
             }
             FEvent::KeyboardInput { event } if self.searching && event.state == ElementState::Pressed => {
                 use fluor::event::{Key, NamedKey};
@@ -918,7 +929,8 @@ impl<G: MapGpu> FluorApp for DeviceApp<G> {
     /// A frame every pass while the residency was unsettled redrew the same screen over and over while cells came in tens of seconds apart (ferros, 2026-11-11: frames of seconds, the four cores and the heap's one lock taken from the loaders and the network).
     /// A GPU host draws while unsettled as before: its frame is cheap.
     fn wake_at(&self) -> Option<Instant> {
-        if self.gpu.is_none() || self.map.converged() { None } else { Some(Instant::now()) }
+        // A page of the circle turning or settling wants every frame, as the map does while it is unsettled on a GPU host.
+        if self.panel.animating() || (self.gpu.is_some() && !self.map.converged()) { Some(Instant::now()) } else { None }
     }
 
     fn tick(&mut self, ctx: &mut Context) -> bool {
