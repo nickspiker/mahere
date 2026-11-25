@@ -765,8 +765,8 @@ impl<G: MapGpu> FluorApp for DeviceApp<G> {
                     self.dragging = false;
                     return EventResponse::Handled;
                 }
-                // With the panel open the map takes no gesture: a tap on it closes the panel and nothing else, decided when the finger lifts.
-                if was_open {
+                // With the panel open the map takes no gesture: a tap on it closes the panel and nothing else, decided when the finger lifts. On ferros the split leaves the top half the map's.
+                if was_open && !self.panel.map_takes(ctx.cursor_x as f32, ctx.cursor_y as f32) {
                     self.close_on_lift = true;
                     self.pinched = false;
                     self.travel = 0.0;
@@ -871,7 +871,7 @@ impl<G: MapGpu> FluorApp for DeviceApp<G> {
                 } else if self.drawing {
                     self.map.extend_stroke(x, y, self.pressure as f64, self.w, self.h);
                     ctx.window.request_redraw();
-                } else if self.dragging && self.two.is_none() && !self.panel.is_open() {
+                } else if self.dragging && self.two.is_none() && (!self.panel.is_open() || self.panel.map_takes(x as f32, y as f32)) {
                     let (dx, dy) = (x - self.last_cursor.0, y - self.last_cursor.1);
                     self.travel += dx.abs() + dy.abs();
                     if self.travel >= 12.0 {

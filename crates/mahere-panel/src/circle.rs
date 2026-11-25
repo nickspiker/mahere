@@ -33,8 +33,6 @@ pub(crate) enum CapAct {
 /// The circle's state and the places its last layout and paint found.
 #[derive(Default)]
 pub(crate) struct Round {
-    /// The root menu is up (the orb opened it).
-    pub root: bool,
     /// The open page's offset while a swipe turns it, pixels (left negative): the finger's while it is down, the snap's after.
     pub turn: f32,
     /// The page a released turn lands on, relative to the open one: -1, 0 or +1.
@@ -54,8 +52,17 @@ pub(crate) struct Round {
     /// Where the last paint drew it: raised above the cap while a readout shows.
     tool_drawn: (f32, f32, f32),
     bloom_beads: Vec<(f32, f32, f32, Pick)>,
-    /// The root menu's rows: centre y, half height, the page.
-    root_rows: Vec<(f32, f32, Page)>,
+    /// The split (owner 2026-11-25: "the top half is the map and the bottom half is the rotating menu and settings circle"): the line at the circle's centre the open pages lie under, the radius of the ring of their names along the circle's foot, and the lowest row of a page's body, over the ring.
+    split: f32,
+    ring_r: f32,
+    body_floor: f32,
+    /// The names on the ring a tap goes to: centre, half width, how many pages from the open one.
+    ring_hits: Vec<(f32, f32, f32, i32)>,
+    /// A list page's scroll in the split's body, how far it can go, and a vertical drag's: whether one is under way and the scroll it began at.
+    scroll: f32,
+    extent: f32,
+    scrolling: bool,
+    scroll_from: f32,
     /// The title's height on the arc, the pages' body top, and the lowest row a full-width row keeps its corners inside the circle.
     title_y: f32,
     body_top: f32,
@@ -427,7 +434,14 @@ impl Panel {
         self.round.margin = m;
         self.round.floor = c.bottom_at(m).min(c.bottom_at(w - m)) - u / 4.;
         self.round.title_y = orb_y + orb_r + font * 1.1;
-        self.round.body_top = self.round.title_y + font * 1.3;
+        // The split at the circle's centre, the ring of names a unit inside the circle's foot; the search keeps the whole screen (its keyboard takes the foot).
+        self.round.split = c.cy;
+        self.round.ring_r = c.r - u * 1.05;
+        let search = self.page() == Page::Search;
+        self.round.body_top = if search { self.round.title_y + font * 1.3 } else { c.cy + font * 0.7 };
+        // Over the ring where its neighbours' names rise toward the sides (a page a third of the width along it, and a quarter more), less a line.
+        let rise = (w * (3. / 8.) / self.round.ring_r * 1.25).cos();
+        self.round.body_floor = if search { self.round.floor } else { c.cy + self.round.ring_r * rise - font * 1.2 };
         // The foot: the scale's arc lowest, its words over it, the tool bead over them.
         let foot = c.cy + c.r - u * 1.25;
         self.round.tool = (c.cx, foot - u * 3.3, u * 0.9);
@@ -439,7 +453,7 @@ impl Panel {
         // A page's own title row: under the arc's title for a page opened from another (it goes back), hidden above the body for a page the root opens (the arc names it).
         let nested = self.stack.len() > 1;
         self.page_gear = (c.cx, if nested { body_top - font * 0.9 } else { body_top - row * 1.2 - font * 0.9 }, 0.);
-        self.layers_band = (body_top, self.round.floor);
+        self.layers_band = (body_top, self.round.body_floor);
         self.theme_row = (m + dx + font * 0.8, -1.0e6, row * 0.5);
         self.layout_layers(m + dx, w - 2. * m, body_top + font * 0.3 - self.layers_scroll, false);
     }
@@ -466,6 +480,7 @@ impl Panel {
             let at = RING.iter().position(|p| *p == self.stack[0]).unwrap_or(0) as i32;
             self.stack = vec![RING[(at + r.settle).rem_euclid(RING.len() as i32) as usize]];
             self.layers_scroll = 0.;
+            r.scroll = 0.;
             self.sliders.clear();
         }
         r.turn = 0.;
@@ -476,7 +491,7 @@ impl Panel {
     /// The screen the circle's controls covered at its last paint, for the labeller to leave clear.
     pub(super) fn round_keep_out(&self) -> Vec<[f32; 4]> {
         let (w, h) = (self.w as f32, self.h as f32);
-        if self.open {
+        if self.open && self.page() == Page::Search {
             return vec![[0., 0., w, h]];
         }
         let (gx, gy, gr) = self.gear;
@@ -484,6 +499,11 @@ impl Panel {
         let mut out = vec![[gx - gr, gy - gr, gx + gr, gy + gr + u * 1.6]];
         for &(x, y, r) in self.round.beads.iter() {
             out.push([x - r, y - r, x + r, y + r]);
+        }
+        // Split, the map keeps the top half: the names leave the pages' half clear.
+        if self.open {
+            out.push([0., self.round.split, w, h]);
+            return out;
         }
         let (tx, ty, tr) = self.round.tool_drawn;
         out.push([tx - tr, ty - tr, tx + tr, ty + tr]);
@@ -517,17 +537,17 @@ impl Panel {
         self.notice_btn = None;
         self.locate_btn = None;
         self.tool_btn = None;
-        self.round.root_rows.clear();
+        self.round.ring_hits.clear();
         self.round.bloom_beads.clear();
         self.round.cap_beads.clear();
         self.round.cap_top = None;
         self.paint_recording(&mut canvas, &ctl);
         if !self.open {
             self.paint_round_map(&mut canvas, &ctl, r, measure);
-        } else if self.round.root {
-            self.paint_root(&mut canvas);
-        } else {
+        } else if self.page() == Page::Search {
             self.paint_round_page(&mut canvas, mask, ctl, r, themes);
+        } else {
+            self.paint_split(&mut canvas, mask, ctl, r, themes);
         }
         drop(canvas);
         self.buf = buf;
@@ -624,7 +644,7 @@ impl Panel {
     /// What a tap found, in the circle's bottom cap (the region under a chord, its lower edge the circle): the lines centred, each fitted to the chord at its height, a row of beads under them (copy the place, route there, close), then the cap's ground.
     fn paint_cap(&mut self, canvas: &mut Canvas, ctl: &Controls, m: &MeasureView) {
         let c = self.circle();
-        let (font, u, w) = (self.font, self.round.u, self.w as f32);
+        let (font, u) = (self.font, self.round.u);
         let bead_y = c.cy + c.r - u * 1.3;
         let top = bead_y - self.cap_height(m) + u * 0.6;
         self.round.cap_top = Some(top);
@@ -741,26 +761,60 @@ impl Panel {
         });
     }
 
-    /// The root menu: the pages' names down the circle's axis, centred in the body, the open page's lit; the map dimmed under it all.
-    fn paint_root(&mut self, canvas: &mut Canvas) {
+    /// The split: the map's beads over the top half as when it is shut; under the line, the open page's names on a ring along the circle's foot (the open one at the bottom, the neighbours turning in along it as a swipe turns the page, faded as cos² of their distance), the page's body above them (the neighbour's beside it while turning), and the half's own ground, opaque: the map is the top half's, not under the settings.
+    fn paint_split(&mut self, canvas: &mut Canvas, mask: LayerMask, ctl: Controls, r: &Readouts, themes: &[Theme]) {
         let c = self.circle();
-        let (font, u, w, h) = (self.font, self.round.u, self.w as f32, self.h as f32);
-        // A row a finger can take: about seven millimetres on the Pro at its own scale.
-        let row = font * 2.8;
-        let (gy, gr) = (self.gear.1, self.gear.2);
-        let (top, bottom) = (gy + gr + u, self.round.floor);
-        let y0 = (top + bottom) * 0.5 - row * ROOT.len() as f32 * 0.5;
+        let (font, w, u) = (self.font, self.w as f32, self.round.u);
+        let marks = [Mark::Search, Mark::Layers, Mark::Locate, Mark::Compass(r.heading_deg.to_radians() as f32)];
+        for (k, m) in marks.into_iter().enumerate() {
+            bead(canvas, &mut self.text, m, self.round.beads[k], k == 1, k == 2 && !r.has_fix, 0);
+        }
         let open = self.stack[0];
-        for (k, &(p, name)) in ROOT.iter().enumerate() {
-            let y = y0 + row * (k as f32 + 0.5);
-            self.round.root_rows.push((y, row * 0.5, p));
-            self.text.draw_text_center(canvas, name, c.cx, y, &TextStyle::new(font * 1.4, hue::text()).weight(600), None, None);
-            if p == open {
-                let half = font * 4.;
-                capsule(canvas, (c.cx - half, y), (c.cx + half, y), row * 0.36, part(hue::text(), 0.1));
+        let at = RING.iter().position(|p| *p == open).unwrap_or(0) as i32;
+        let n = RING.len() as i32;
+        // The names a third of the width apart along the ring, the open one at its foot (half a turn from the top); a page left of it is a turn back.
+        let ring_r = self.round.ring_r;
+        let step = w * (3. / 8.) / ring_r;
+        let turned = -self.round.turn / w;
+        for k in -2i32..=2 {
+            let o = k as f32 - turned;
+            if o.abs() >= 2.5 {
+                continue;
+            }
+            let p = RING[(at + k).rem_euclid(n) as usize];
+            let name = name_of(p);
+            let a = (std::f32::consts::PI * o / 5.).cos().powi(2);
+            let phi = std::f32::consts::PI - o * step;
+            let (x, y) = (c.cx + ring_r * phi.sin(), c.cy - ring_r * phi.cos());
+            let size = font * (1. + 0.25 * a);
+            let style = fitted(&mut self.text, name, size, hue::text(), w * 0.3, if k == 0 { 700 } else { 600 });
+            turned_text(canvas, &mut self.text, name, x, y, phi - std::f32::consts::PI, &style, size, a);
+            if k != 0 && o.abs() < 1.6 {
+                let half = self.text.measure_text(name, &style) * 0.5 + font * 0.5;
+                self.round.ring_hits.push((x, y, half, k));
             }
         }
-        paint::fill_rect(canvas, 0, 0, w as isize, h as isize, hue::panel_bg(), None, None);
+        // A mark over the open name: a short arc of the ring's own, a unit long.
+        arc(canvas, c.cx, c.cy, ring_r - font * 1.15, std::f32::consts::PI, u * 0.5 / ring_r, (u * 0.05).max(1.), part(hue::text(), 0.5));
+        // The ring's band hides whatever a body runs into it: the half's ground from the body's floor down, then the body over the rest.
+        let ground = (hue::panel_bg() & 0x00FF_FFFF) | 0xFF00_0000;
+        let (w_px, h_px) = (self.w as isize, self.h as isize);
+        // The full width: below the circle's foot the corners are the helm's, which floats over the frame, and a list running long would show there.
+        paint::fill_rect(canvas, 0, self.round.body_floor as isize, w_px, h_px - self.round.body_floor as isize, ground, None, None);
+        let dx = self.round.turn;
+        if dx != 0. {
+            let k = if dx < 0. { 1 } else { -1 };
+            let p = RING[(at + k).rem_euclid(n) as usize];
+            let ndx = dx + if dx < 0. { w } else { -w };
+            self.paint_body(canvas, p, ndx, mask, ctl, r, themes);
+        }
+        let p = self.page();
+        if p == Page::Layers && dx != 0. {
+            let m = self.round.margin;
+            self.layout_layers(m + dx, w - 2. * m, self.round.body_top + font * 0.3 - self.layers_scroll, false);
+        }
+        self.paint_body(canvas, p, dx, mask, ctl, r, themes);
+        paint::fill_rect(canvas, 0, self.round.split as isize, w_px, h_px - self.round.split as isize, ground, None, None);
     }
 
     /// A page: its title on the arc (the neighbours' fading in as a swipe turns), its body and the neighbour's while turning, the map dimmed under it all.
@@ -816,7 +870,12 @@ impl Panel {
         let (font, w, h) = (self.font, self.w as f32, self.h);
         let m = self.round.margin;
         let (ox, cw) = (m + dx, w - 2. * m);
-        let gear = self.page_gear;
+        // The pages of a list longer than the body scroll in it, clipped to it (the split's half holds about a dozen rows).
+        let scrolls = matches!(p, Page::Themes | Page::Areas | Page::Tracks);
+        let scroll = if scrolls && p == self.page() { self.round.scroll } else { 0. };
+        let gear = (self.page_gear.0, self.page_gear.1 - scroll, self.page_gear.2);
+        // WHY: the body's top and floor are laid out from the circle and sit inside the frame on every screen it has; PROOF: a negative bound would wrap in the cast to the clip's rows.
+        let clip = Some(paint::Clip::new(0, self.round.body_top.max(0.) as usize, self.w, self.round.body_floor.max(0.) as usize));
         let current = themes.get(ctl.theme);
         match p {
             Page::Layers => {
@@ -825,7 +884,7 @@ impl Panel {
                 }
                 self.paint_layers(canvas, mask, ctl, r, themes, false);
             }
-            Page::Themes => self.theme_rows = Self::paint_themes(canvas, &mut self.text, &mut self.pills, &mut self.theme_list, font, ox, cw, gear, themes, ctl.theme, false),
+            Page::Themes => self.theme_rows = Self::paint_themes(canvas, &mut self.text, &mut self.pills, &mut self.theme_list, font, ox, cw, gear, themes, ctl.theme, false, clip),
             Page::Edit => {
                 if let Some(t) = current {
                     let (rows, extent) = Self::paint_edit(canvas, &mut self.text, font, ox, cw, gear, h, t, self.edit_scroll);
@@ -835,9 +894,9 @@ impl Panel {
             }
             Page::Field(f) => Self::paint_field(canvas, &mut self.text, font, ox, cw, gear, f, &mut self.sliders, self.field_vals, current),
             Page::Pen => Self::paint_pen(canvas, &mut self.text, font, ox, cw, gear, &mut self.sliders, self.field_vals, if self.colour_of_track { "Track colour" } else { "Pen colour" }),
-            Page::Areas => self.area_rows = Self::paint_areas(canvas, &mut self.text, &mut self.pills, &mut self.area_list, font, ox, cw, gear, &self.areas, false),
+            Page::Areas => self.area_rows = Self::paint_areas(canvas, &mut self.text, &mut self.pills, &mut self.area_list, font, ox, cw, gear, &self.areas, false, clip),
             Page::Area(i) => self.area_rows = Self::paint_area(canvas, &mut self.text, &mut self.pills, font, ox, cw, gear, &self.areas, i, &mut self.sliders, self.field_vals[0] as u8),
-            Page::Tracks => self.track_rows = Self::paint_tracks(canvas, &mut self.text, &mut self.track_list, font, ox, cw, gear, &self.tracks, ctl.record, false),
+            Page::Tracks => self.track_rows = Self::paint_tracks(canvas, &mut self.text, &mut self.track_list, font, ox, cw, gear, &self.tracks, ctl.record, false, clip),
             Page::Track(i) => self.track_rows = Self::paint_track(canvas, &mut self.text, &mut self.pills, font, ox, cw, gear, &self.tracks, i),
             Page::Updates => self.update_rows = Self::paint_updates(canvas, &mut self.text, &mut self.pills, &mut self.auto_check, font, ox, cw, gear, &self.updates, false),
             Page::Search => {
@@ -873,6 +932,15 @@ impl Panel {
                 }
             }
         }
+        // How far the open list runs past the floor: its last row's foot, as it would sit unscrolled; none when it fits (a scroll has nothing to move).
+        if scrolls && p == self.page() {
+            let last = match p {
+                Page::Themes => self.theme_rows.last().map(|r| r.0 + r.1),
+                Page::Areas => self.area_rows.last().map(|r| r.0 + r.1),
+                _ => self.track_rows.last().map(|r| r.0 + r.1),
+            };
+            self.round.extent = last.map_or(0., |y| (y + font * 0.5 + scroll - self.round.body_floor).max(0.));
+        }
     }
 
     /// A tap on the circle's screen: Some(taken) when the circle answered it, None for a page's body, which the pages' own taps answer.
@@ -888,26 +956,23 @@ impl Panel {
             self.dirty = true;
             if let Some(&(_, _, _, p)) = self.round.bloom_beads.iter().find(|&&(bx, by, br, _)| near((bx, by, br), 1.15)) {
                 self.pick(p, ctl);
-                self.round.root = false;
             }
             return Some(true);
         }
         if near(self.gear, 1.1) {
-            match (self.open, self.round.root) {
-                (false, _) => {
-                    self.open = true;
-                    self.round.root = true;
+            if self.open {
+                self.close();
+            } else {
+                if self.page() == Page::Search {
+                    self.pop();
                 }
-                (true, true) => {
-                    self.open = false;
-                    self.round.root = false;
-                }
-                (true, false) => self.to_root(),
+                self.open = true;
             }
             self.dirty = true;
             return Some(true);
         }
-        if !self.open {
+        // The beads, the map's half's whether the pages are open under it or not.
+        if !self.open || self.page() != Page::Search {
             for (k, &b) in self.round.beads.iter().enumerate() {
                 if !near(b, 1.15) {
                     continue;
@@ -921,6 +986,8 @@ impl Panel {
                 self.dirty = true;
                 return Some(true);
             }
+        }
+        if !self.open {
             if near(self.round.tool_drawn, 1.15) {
                 self.round.bloom = true;
                 self.dirty = true;
@@ -957,20 +1024,36 @@ impl Panel {
             // The cap is the readout's, not the map's.
             return Some(self.round.cap_top.is_some_and(|t| y >= t));
         }
-        if self.round.root {
-            let Some(&(_, _, p)) = self.round.root_rows.iter().find(|&&(cy, hh, _)| (y - cy).abs() <= hh) else { return Some(false) };
-            self.open_page(p, ctl);
+        if self.page() == Page::Search {
+            // Its title on the arc closes it; the rest is the search's.
+            if y < self.round.body_top {
+                self.close();
+                self.dirty = true;
+                return Some(true);
+            }
+            return None;
+        }
+        // The split: the top half is the map's.
+        if y < self.round.split {
+            return Some(false);
+        }
+        // A name on the ring turns to its page.
+        if let Some(&(_, _, _, k)) = self.round.ring_hits.iter().find(|&&(hx, hy, half, _)| (x - hx).abs() <= half && (y - hy).abs() <= self.font) {
+            self.round.settle = k;
             self.dirty = true;
             return Some(true);
         }
-        // A page: its title on the arc opens the root; the body is the page's, and a press there may become a swipe.
         if y < self.round.body_top {
-            self.to_root();
-            self.dirty = true;
             return Some(true);
         }
+        // The body is the page's, and a press there may become a swipe.
         self.round.press = Some((x, y));
         None
+    }
+
+    /// Whether a touch at `(x, y)` is the map's while the pages are open: the split's top half (the beads and the orb answer before it).
+    pub fn map_takes(&self, _x: f32, y: f32) -> bool {
+        self.round_on() && self.open && self.page() != Page::Search && y < self.round.split
     }
 
     /// Open `p` as a page of its own (from the root or a bead), its search under way when it is the search.
@@ -979,9 +1062,9 @@ impl Panel {
             self.pop();
         }
         self.open = true;
-        self.round.root = false;
         self.stack = vec![p];
         self.layers_scroll = 0.;
+        self.round.scroll = 0.;
         self.sliders.clear();
         if p == Page::Search {
             ctl.tool = 0;
@@ -990,24 +1073,26 @@ impl Panel {
         }
     }
 
-    /// Up to the root menu, a search ended on the way.
-    fn to_root(&mut self) {
-        if self.page() == Page::Search {
-            self.pop();
-        }
-        self.round.root = true;
-        self.layers_press = None;
-        self.press = None;
-    }
-
     /// A move while pressed on a page's body: a sideways move turns the page (Some(true)); None leaves it to the page.
     pub(super) fn drag_round(&mut self, x: f32, y: f32) -> Option<bool> {
         let (px, py) = self.round.press?;
-        if !self.open || self.round.root || self.stack.len() != 1 || self.page() == Page::Search {
+        if !self.open || self.stack.len() != 1 || self.page() == Page::Search {
             return None;
         }
         let (dx, dy) = (x - px, y - py);
+        // A list page's vertical drag scrolls it, within its run past the floor (the list's own ends: a scroll past them shows nothing).
+        if self.round.scrolling {
+            self.round.scroll = (self.round.scroll_from - dy).clamp(0., self.round.extent);
+            self.dirty = true;
+            return Some(true);
+        }
         if !self.round.turning {
+            let lists = matches!(self.page(), Page::Themes | Page::Areas | Page::Tracks);
+            if lists && dy.abs() >= self.font * 0.6 && dy.abs() > dx.abs() {
+                self.round.scrolling = true;
+                self.round.scroll_from = self.round.scroll;
+                return Some(true);
+            }
             if dx.abs() < self.font * 0.6 || dx.abs() < 2. * dy.abs() {
                 return None;
             }
@@ -1026,6 +1111,10 @@ impl Panel {
     /// The finger lifted: a turn past a sixth of the width settles on the next page that way, a shorter one back where it was. True when a turn ended.
     pub(super) fn release_round(&mut self) -> bool {
         self.round.press = None;
+        if self.round.scrolling {
+            self.round.scrolling = false;
+            return true;
+        }
         if !self.round.turning {
             return false;
         }
@@ -1052,15 +1141,10 @@ impl Panel {
             }
             return false;
         }
-        if self.round.root {
-            self.round.root = false;
-            self.open = false;
-            return true;
-        }
         if self.stack.len() > 1 {
             self.pop();
         } else {
-            self.to_root();
+            self.close();
         }
         true
     }
@@ -1137,7 +1221,7 @@ mod timing {
         }
         println!("closed circle paint: {:.1} ms", t.elapsed().as_secs_f64() * 1000. / 4.);
         let m = MeasureView { origin_px: (0., 0.), target_px: (672., 1500.), distance_m: 0., bearing_deg: 0., elev_origin: None, elev_target: None, profile: Vec::new(), info: vec!["Water".into(), "-5177 m  \u{b7}  flat".into()], ruler: false, target: (19.2, 90.23), route: false };
-        let mut time = |p: &mut Panel, what: &str, m: Option<&MeasureView>| {
+        let time = |p: &mut Panel, what: &str, m: Option<&MeasureView>| {
             p.paint(1344, 2992, LayerMask::default(), ctl, &r, m, &[], &areas, None);
             let t = std::time::Instant::now();
             for _ in 0..4 {
@@ -1147,9 +1231,6 @@ mod timing {
         };
         time(&mut p, "with the cap", Some(&m));
         p.open = true;
-        p.round.root = true;
-        time(&mut p, "the root", None);
-        p.round.root = false;
-        time(&mut p, "the Layers page", None);
+        time(&mut p, "the split on Layers", None);
     }
 }

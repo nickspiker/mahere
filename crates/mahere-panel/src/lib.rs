@@ -1522,7 +1522,10 @@ impl Panel {
     }
 
     /// Whether a point is on the open panel's column (not the map beside it).
-    pub fn covers(&self, x: f32, _y: f32) -> bool {
+    pub fn covers(&self, x: f32, y: f32) -> bool {
+        if self.round_on() {
+            return self.open && !self.map_takes(x, y);
+        }
         self.open && x < self.panel_w
     }
 
@@ -1568,7 +1571,6 @@ impl Panel {
                 self.pop();
             }
             self.open = false;
-            self.round.root = false;
             self.dirty = true;
         }
         self.round.bloom = false;
@@ -2313,7 +2315,7 @@ impl Panel {
             let cw = self.panel_w - rail;
             let current = themes.get(ctl.theme);
             match page {
-                Page::Themes => self.theme_rows = Self::paint_themes(&mut canvas, &mut self.text, &mut self.pills, &mut self.theme_list, font, rail, cw, self.gear, themes, ctl.theme, true),
+                Page::Themes => self.theme_rows = Self::paint_themes(&mut canvas, &mut self.text, &mut self.pills, &mut self.theme_list, font, rail, cw, self.gear, themes, ctl.theme, true, None),
                 Page::Edit => {
                     if let Some(t) = current {
                         let (rows, extent) = Self::paint_edit(&mut canvas, &mut self.text, font, rail, cw, self.gear, h, t, self.edit_scroll);
@@ -2323,8 +2325,8 @@ impl Panel {
                 }
                 Page::Field(f) => Self::paint_field(&mut canvas, &mut self.text, font, rail, cw, self.gear, f, &mut self.sliders, self.field_vals, current),
                 Page::Pen => Self::paint_pen(&mut canvas, &mut self.text, font, rail, cw, self.gear, &mut self.sliders, self.field_vals, if self.colour_of_track { "Track colour" } else { "Pen colour" }),
-                Page::Areas => self.area_rows = Self::paint_areas(&mut canvas, &mut self.text, &mut self.pills, &mut self.area_list, font, rail, cw, self.gear, &self.areas, true),
-                Page::Tracks => self.track_rows = Self::paint_tracks(&mut canvas, &mut self.text, &mut self.track_list, font, rail, cw, self.gear, &self.tracks, ctl.record, true),
+                Page::Areas => self.area_rows = Self::paint_areas(&mut canvas, &mut self.text, &mut self.pills, &mut self.area_list, font, rail, cw, self.gear, &self.areas, true, None),
+                Page::Tracks => self.track_rows = Self::paint_tracks(&mut canvas, &mut self.text, &mut self.track_list, font, rail, cw, self.gear, &self.tracks, ctl.record, true, None),
                 Page::Track(i) => self.track_rows = Self::paint_track(&mut canvas, &mut self.text, &mut self.pills, font, rail, cw, self.gear, &self.tracks, i),
                 Page::Updates => self.update_rows = Self::paint_updates(&mut canvas, &mut self.text, &mut self.pills, &mut self.auto_check, font, rail, cw, self.gear, &self.updates, true),
                 Page::Search => {
@@ -3174,14 +3176,14 @@ impl Panel {
     #[allow(clippy::too_many_arguments)]
     /// The Themes page: the title, the themes as a list with the current one picked, and a button to edit the current one. Returns the title's row and the button's.
     #[allow(clippy::too_many_arguments)]
-    fn paint_themes(canvas: &mut Canvas, text: &mut TextRenderer, pills: &mut Pills, list: &mut List, font: f32, ox: f32, panel_w: f32, gear: (f32, f32, f32), themes: &[Theme], current: usize, show_title: bool) -> Vec<(f32, f32)> {
+    fn paint_themes(canvas: &mut Canvas, text: &mut TextRenderer, pills: &mut Pills, list: &mut List, font: f32, ox: f32, panel_w: f32, gear: (f32, f32, f32), themes: &[Theme], current: usize, show_title: bool, clip: Option<paint::Clip>) -> Vec<(f32, f32)> {
         let x0 = ox + font * 0.9;
         let row = font * 1.6;
         let mut y = gear.1 + gear.2 + font * 0.9 + row * 0.5;
         let mut rows = Vec::new();
         let title = TextStyle::new(font, hue::text());
         if show_title {
-            text.draw_text_left(canvas, "\u{2039}  Themes", x0, y, &title, None, None);
+            text.draw_text_left(canvas, "\u{2039}  Themes", x0, y, &title, clip, None);
         }
         rows.push((y, row * 0.5));
         y += row * 1.2;
@@ -3190,14 +3192,14 @@ impl Panel {
         list.set_selected(Some(current));
         let lh = list.extent();
         list.set_rect(ox + font * 0.3, y - row * 0.5, panel_w - font * 0.6, lh);
-        list.render_content_into(canvas, text, None, None);
+        list.render_content_into(canvas, text, clip, None);
         y += lh + row * 0.3;
         // Under the list, the editor on the current theme.
         let edit_label = match themes.get(current) {
             Some(t) => format!("\u{270e}  Edit {}", t.name),
             None => "\u{270e}  Edit".into(),
         };
-        pills.draw_fit(canvas, text, x0, y, &edit_label, false, font * 0.85, None);
+        pills.draw_fit(canvas, text, x0, y, &edit_label, false, font * 0.85, clip);
         rows.push((y, row * 0.5));
         rows
     }
@@ -3375,7 +3377,7 @@ impl Panel {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn paint_areas(canvas: &mut Canvas, text: &mut TextRenderer, pills: &mut Pills, list: &mut List, font: f32, ox: f32, cw: f32, gear: (f32, f32, f32), areas: &AreasView, show_title: bool) -> Vec<(f32, f32, AreaRow)> {
+    fn paint_areas(canvas: &mut Canvas, text: &mut TextRenderer, pills: &mut Pills, list: &mut List, font: f32, ox: f32, cw: f32, gear: (f32, f32, f32), areas: &AreasView, show_title: bool, clip: Option<paint::Clip>) -> Vec<(f32, f32, AreaRow)> {
         let x0 = ox + font * 0.9;
         let right = ox + cw - font * 0.9;
         let row = font * 1.6;
@@ -3385,14 +3387,14 @@ impl Panel {
         let small = TextStyle::new(font * 0.75, hue::readout_dim());
         let mut rows = Vec::new();
         if show_title {
-            text.draw_text_left(canvas, "\u{2039}  Areas", x0, y, &title, None, None);
+            text.draw_text_left(canvas, "\u{2039}  Areas", x0, y, &title, clip, None);
         }
         rows.push((y, row * 0.5, AreaRow::Back));
         y += row * 1.2;
         if areas.has_selection {
-            pills.draw_fit(canvas, text, x0, y, "+  Save selection", false, font * 0.85, None);
+            pills.draw_fit(canvas, text, x0, y, "+  Save selection", false, font * 0.85, clip);
         } else {
-            text.draw_text_left(canvas, "+  Save selection", x0, y, &dim, None, None);
+            text.draw_text_left(canvas, "+  Save selection", x0, y, &dim, clip, None);
         }
         rows.push((y, row * 0.5, AreaRow::Save));
         y += row * 1.2;
@@ -3406,7 +3408,7 @@ impl Panel {
         list.set_rows(areas.areas.iter().map(|a| ListRow::new(a.name.clone()).detail(status(a)).trail(Trail::Chevron)).collect());
         list.set_selected(None);
         list.set_rect(ox + font * 0.3, y - row * 0.5, cw - font * 0.6, list.extent());
-        list.render_content_into(canvas, text, None, None);
+        list.render_content_into(canvas, text, clip, None);
         let _ = (right, small);
         rows
     }
@@ -3474,7 +3476,7 @@ impl Panel {
 
     /// The tracks page: the recording's numbers while one runs, then every saved track, newest first, a row each with its distance, time and average, a chevron to its page.
     #[allow(clippy::too_many_arguments)]
-    fn paint_tracks(canvas: &mut Canvas, text: &mut TextRenderer, list: &mut List, font: f32, ox: f32, cw: f32, gear: (f32, f32, f32), tracks: &TracksView, recording: bool, show_title: bool) -> Vec<(f32, f32, TrackRow)> {
+    fn paint_tracks(canvas: &mut Canvas, text: &mut TextRenderer, list: &mut List, font: f32, ox: f32, cw: f32, gear: (f32, f32, f32), tracks: &TracksView, recording: bool, show_title: bool, clip: Option<paint::Clip>) -> Vec<(f32, f32, TrackRow)> {
         let x0 = ox + font * 0.9;
         let row = font * 1.6;
         let mut y = gear.1 + gear.2 + font * 0.9 + row * 0.5;
@@ -3483,42 +3485,42 @@ impl Panel {
         let value = TextStyle::new(font * 0.8, hue::readout());
         let mut rows = Vec::new();
         if show_title {
-            text.draw_text_left(canvas, "\u{2039}  Tracks", x0, y, &title, None, None);
+            text.draw_text_left(canvas, "\u{2039}  Tracks", x0, y, &title, clip, None);
         }
         rows.push((y, row * 0.5, TrackRow::Back));
         y += row * 1.2;
         if recording {
-            text.draw_text_left(canvas, "Recording now", x0, y, &title, None, None);
+            text.draw_text_left(canvas, "Recording now", x0, y, &title, clip, None);
             y += row * 0.8;
             match &tracks.live {
                 Some(n) if n.fixes > 0 => {
                     for (l, v) in track_lines(n) {
-                        text.draw_text_left(canvas, l, x0, y, &label, None, None);
-                        text.draw_text_left(canvas, &v, x0 + font * 5.2, y, &value, None, None);
+                        text.draw_text_left(canvas, l, x0, y, &label, clip, None);
+                        text.draw_text_left(canvas, &v, x0 + font * 5.2, y, &value, clip, None);
                         y += font * 0.95;
                     }
                 }
                 _ => {
-                    text.draw_text_left(canvas, "Waiting for a fix", x0, y, &value, None, None);
+                    text.draw_text_left(canvas, "Waiting for a fix", x0, y, &value, clip, None);
                     y += font * 0.95;
                 }
             }
             y += row * 0.4;
         }
         if tracks.shown.is_some() {
-            text.draw_text_left(canvas, "\u{2715}  Hide the shown track", x0, y, &value, None, None);
+            text.draw_text_left(canvas, "\u{2715}  Hide the shown track", x0, y, &value, clip, None);
             rows.push((y, row * 0.5, TrackRow::Hide));
             y += row;
         }
         if tracks.tracks.is_empty() {
-            text.draw_text_left(canvas, "No saved tracks yet", x0, y, &label, None, None);
+            text.draw_text_left(canvas, "No saved tracks yet", x0, y, &label, clip, None);
             return rows;
         }
         list.set_font_size(font);
         list.set_rows(tracks.tracks.iter().map(|t| ListRow::new(t.when.clone()).detail(track_brief(&t.numbers)).trail(Trail::Chevron)).collect());
         list.set_selected(tracks.shown);
         list.set_rect(ox + font * 0.3, y - row * 0.5, cw - font * 0.6, list.extent());
-        list.render_content_into(canvas, text, None, None);
+        list.render_content_into(canvas, text, clip, None);
         rows
     }
 

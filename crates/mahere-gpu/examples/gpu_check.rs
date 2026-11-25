@@ -220,6 +220,13 @@ fn main() {
                 map.set_layers(mask);
                 println!("press {},{}: {}", v[0], v[1], if taken { "taken" } else { "the map's" });
             }
+            // A turn a tap set going runs to its rest, a frame a paint.
+            for _ in 0..64 {
+                if !panel.animating() {
+                    break;
+                }
+                panel.paint(w, h, map.layers(), controls, &readouts, measure.as_ref(), &map.themes, &areas, None);
+            }
             // MAHERE_TURN=px holds the open page mid-swipe.
             if let Some(t) = std::env::var("MAHERE_TURN").ok().and_then(|s| s.parse::<f32>().ok()) {
                 panel.show_turn(t);
