@@ -95,8 +95,40 @@ fn shape(canvas: &mut Canvas, bx: [f32; 4], colour: u32, dist: impl Fn(f32, f32)
     let y1 = (bx[3].ceil().max(0.) as usize).min(h);
     for y in y0..y1 {
         for x in x0..x1 {
-            let k = cover(dist(x as f32 + 0.5, y as f32 + 0.5));
-            // Nothing a byte can hold: left as it is.
+            let d = dist(x as f32 + 0.5, y as f32 + 0.5);
+            // Two pixels out the logistic is under a byte's step, two in it is a byte's whole: nothing to work out either way.
+            if d > 2. {
+                continue;
+            }
+            let k = if d < -2. { 1. } else { cover(d) };
+            let i = y * w + x;
+            canvas.pixels[i] = canvas.pixels[i].under(part(colour, k), BlendMode::Normal);
+        }
+    }
+}
+
+/// The bottom cap's ground: inside `c`, below `top`, row by row, the circle's distance worked out only near its edge on each row (the cap is a third of a million pixels on the Pro; every one of them through the distance was most of a frame).
+fn cap_ground(canvas: &mut Canvas, c: SafeCircle, top: f32, colour: u32) {
+    let (w, h) = (canvas.width, canvas.height);
+    // WHY: the cap's top is laid out from the circle's foot and may sit above the frame's top on a short frame; PROOF: a negative row would wrap in the cast.
+    let y0 = (top - 2.).floor().max(0.) as usize;
+    for y in y0..h {
+        let py = y as f32 + 0.5;
+        let dy = py - c.cy;
+        let inside = c.r * c.r - dy * dy;
+        if inside <= 0. {
+            continue;
+        }
+        let half = inside.sqrt();
+        let along = cover(top - py);
+        // The row's span and a few pixels each side for the edge, on the frame.
+        let (lo, hi) = (c.cx - half - 3., c.cx + half + 3.);
+        let x0 = lo.floor().max(0.) as usize;
+        let x1 = (hi.ceil().max(0.) as usize).min(w);
+        for x in x0..x1 {
+            let px = x as f32 + 0.5;
+            let edge = (px - lo).min(hi - px);
+            let k = if edge > 6. { along } else { along.min(cover((px - c.cx).hypot(dy) - c.r)) };
             if k * 256. < 1. {
                 continue;
             }
@@ -158,8 +190,14 @@ fn polygon(canvas: &mut Canvas, pts: &[(f32, f32)], colour: u32) {
 fn arc(canvas: &mut Canvas, x: f32, y: f32, r: f32, mid: f32, spread: f32, half: f32, colour: u32) {
     let at = |a: f32| (x + r * a.sin(), y - r * a.cos());
     let (e0, e1) = (at(mid - spread), at(mid + spread));
-    let o = r + half + 2.;
-    shape(canvas, [x - o, y - o, x + o, y + o], colour, |px, py| {
+    // The box the arc itself spans (its points every 1/32 of the sweep, a chord's sag apart at most), not the whole circle's: the scale's arc is a sliver of a radius bigger than the frame.
+    let o = half + 2. + r * (spread / 32.).powi(2);
+    let mut bx = [f32::MAX, f32::MAX, f32::MIN, f32::MIN];
+    for k in 0..=32 {
+        let p = at(mid - spread + 2. * spread * k as f32 / 32.);
+        bx = [bx[0].min(p.0 - o), bx[1].min(p.1 - o), bx[2].max(p.0 + o), bx[3].max(p.1 + o)];
+    }
+    shape(canvas, bx, colour, |px, py| {
         let a = (px - x).atan2(y - py);
         let off = (a - mid + std::f32::consts::PI).rem_euclid(std::f32::consts::TAU) - std::f32::consts::PI;
         if off.abs() <= spread {
@@ -646,7 +684,7 @@ impl Panel {
             bead(canvas, &mut self.text, Mark::Cap(a), (x, bead_y, br), false, false, 0);
         }
         // The cap's ground: inside the circle, below its top.
-        shape(canvas, [0., top - 2., w, self.h as f32], hue::panel_bg(), |px, py| ((px - c.cx).hypot(py - c.cy) - c.r).max(top - py));
+        cap_ground(canvas, c, top, hue::panel_bg());
     }
 
     /// One line of the cap at `*y`, centred, fitted to the circle's chord there less the margins; with `copy` a tap on it copies that. `*y` moves to the next line.
@@ -1076,5 +1114,42 @@ impl Panel {
         self.round.turning = px != 0.;
         self.round.turn = px;
         self.dirty = true;
+    }
+}
+
+#[cfg(test)]
+mod timing {
+    use super::*;
+
+    /// How long the circle's closed screen takes to paint at the Pro's full size (run with --ignored --nocapture).
+    #[test]
+    #[ignore]
+    fn paint_time_at_the_pros_size() {
+        let mut p = Panel::new();
+        p.set_safe(Some(SafeCircle { cx: 672., cy: 1555.28, r: 1436.72 }));
+        let r = Readouts { m_per_px: 2000., ..Default::default() };
+        let ctl = Controls::default();
+        let areas = AreasView::default();
+        p.paint(1344, 2992, LayerMask::default(), ctl, &r, None, &[], &areas, None);
+        let t = std::time::Instant::now();
+        for _ in 0..4 {
+            p.paint(1344, 2992, LayerMask::default(), ctl, &r, None, &[], &areas, None);
+        }
+        println!("closed circle paint: {:.1} ms", t.elapsed().as_secs_f64() * 1000. / 4.);
+        let m = MeasureView { origin_px: (0., 0.), target_px: (672., 1500.), distance_m: 0., bearing_deg: 0., elev_origin: None, elev_target: None, profile: Vec::new(), info: vec!["Water".into(), "-5177 m  \u{b7}  flat".into()], ruler: false, target: (19.2, 90.23), route: false };
+        let mut time = |p: &mut Panel, what: &str, m: Option<&MeasureView>| {
+            p.paint(1344, 2992, LayerMask::default(), ctl, &r, m, &[], &areas, None);
+            let t = std::time::Instant::now();
+            for _ in 0..4 {
+                p.paint(1344, 2992, LayerMask::default(), ctl, &r, m, &[], &areas, None);
+            }
+            println!("{what}: {:.1} ms", t.elapsed().as_secs_f64() * 1000. / 4.);
+        };
+        time(&mut p, "with the cap", Some(&m));
+        p.open = true;
+        p.round.root = true;
+        time(&mut p, "the root", None);
+        p.round.root = false;
+        time(&mut p, "the Layers page", None);
     }
 }
