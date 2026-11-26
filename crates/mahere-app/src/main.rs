@@ -113,7 +113,12 @@ impl MahereApp {
                     }
                 }
             }
-            _ => self.chrome.flatten_into(target, w, h, Some(Clip::new(clip.x0, clip.y0, clip.x1, clip.y1))),
+            // On the CPU the map and the panel are the chrome's background layer: the chrome first, then the background LAST, under it (front to back, as every path here).
+            _ => {
+                let clip = Some(Clip::new(clip.x0, clip.y0, clip.x1, clip.y1));
+                self.chrome.flatten_chrome_into(target, w, h, clip);
+                self.chrome.flatten_bg_into(target, w, h, clip);
+            }
         }
         if self.spin.is_some() {
             let t5 = Instant::now();
@@ -756,9 +761,8 @@ impl FluorApp for MahereApp {
         self.map.camera_moved(width as usize, height as usize);
     }
 
-    fn hit_test_map(&self) -> Option<(&[HitId], usize, usize)> {
-        let (w, h) = self.chrome.dims();
-        Some((self.chrome.hit_test_map(), w, h))
+    fn hit_test_map(&mut self) -> Option<(&mut [HitId], usize, usize)> {
+        Some(self.chrome.hit_map_mut())
     }
 
     /// Hover tints are applied by the host's overlay pass from this table.
