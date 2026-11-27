@@ -60,7 +60,7 @@ fn main() {
     let lon: f64 = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(-120.661);
     let cache = mahere_store::VaultCells::open(mahere_store::open(Some(&vault_dir)).expect("vault").vault().clone());
     let tiered = |c: Arc<dyn mahere_engine::residency::CellCache>, l: Layer| -> Arc<dyn CellStore> { Arc::new(TieredStore::new(c, Arc::new(Counting(HttpStore::layer(DEFAULT_CELLS_URL, l), l)))) };
-    let layers = LayerStores { dem: tiered(cache.layer(Layer::Dem), Layer::Dem), img: tiered(cache.layer(Layer::Img), Layer::Img), nir: tiered(cache.layer(Layer::Nir), Layer::Nir) };
+    let layers = LayerStores { dem: tiered(cache.layer(Layer::Dem), Layer::Dem), img: tiered(cache.layer(Layer::Img), Layer::Img), nir: tiered(cache.layer(Layer::Nir), Layer::Nir), route: Some(tiered(cache.layer(Layer::Route), Layer::Route)) };
     let mut map = MapCore::layered(tiered(cache.clone(), Layer::Base), Some(layers), Camera::new(lat, lon, 12000.0, 0.0));
     let (w, h) = (1080usize, 2340usize);
     let report = |what: &str, (lines, all): (f32, f32), before: usize| eprintln!("{what}: lines {lines:.2} s, settled {all:.2} s, {} bucket requests", FETCHES.load(Ordering::Relaxed) - before);

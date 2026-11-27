@@ -15,7 +15,7 @@ fn main() {
     for travel in [mahere_engine::route::Travel::Car, mahere_engine::route::Travel::Foot] {
         for (name, a, b) in &trips {
             let t = std::time::Instant::now();
-            let new = mahere_engine::route::find_cached(store.clone(), dem.clone(), *a, *b, travel, Some(cache.clone()));
+            let new = mahere_engine::route::find_cached(store.clone(), None, dem.clone(), *a, *b, travel, Some(cache.clone()));
             let t_new = t.elapsed().as_secs_f64() * 1e3;
             let t = std::time::Instant::now();
             let old = mahere_engine::route::find_trixels(store.clone(), dem.clone(), *a, *b, travel);

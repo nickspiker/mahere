@@ -20,6 +20,8 @@ pub enum Layer {
     Dem,
     Img,
     Nir,
+    /// The route bundles (2026-11-27): not a layer of every cell but four sibling cells' routing in one document, at their parent's name ([`route_bundle`]); not in [`Layer::ALL`].
+    Route,
 }
 
 impl Layer {
@@ -31,6 +33,7 @@ impl Layer {
             Layer::Dem => "dem",
             Layer::Img => "img",
             Layer::Nir => "nir",
+            Layer::Route => "route",
         }
     }
 
@@ -218,6 +221,46 @@ pub fn decode_layers_with(base: Option<&[u8]>, dem: Option<&[u8]>, img: Option<&
 mod tests {
     use super::*;
 
+    /// A bundle holds each of its cells' routing under that cell, whatever order the cells came in, coded as the base coded it; a cell without routing is left out, and a bundle of none is none.
+    #[test]
+    fn a_route_bundle_gives_back_each_cells_routing() {
+        use mahere_osm::{RoadClass, Travel};
+        let (lat, lon) = (47.60f32, -122.33f32);
+        let road = |osm: i64, pts: Vec<(f32, f32)>| mahere_osm::Road { class: RoadClass::Residential, pts, weight: 0.5, uses: 0, name: 0, travel: Travel { way: osm, speed_kmh: 0, oneway: 0, ..Default::default() } };
+        let roads = [road(1, vec![(lat, lon - 0.01), (lat, lon + 0.01)]), road(2, vec![(lat - 0.01, lon), (lat + 0.01, lon)])];
+        let cells = crate::route::bake_routes(&roads, &[crate::Named::default()], &[], 14);
+        assert!(cells.len() >= 2, "the roads cross more than one cell: {}", cells.len());
+        // Each cell's base as a publish codes it, and one more with no routing.
+        let base = |c: &crate::route::RouteCell| {
+            let s = c.section().unwrap();
+            let mut out = VsfSection::new("route");
+            for f in s.fields {
+                let v = ac::code_field(&f.values, None).unwrap_or(f.values);
+                out.add_field_multi(f.name, v);
+            }
+            VsfBuilder::new().add_section_direct(out).build().unwrap()
+        };
+        let mut docs: Vec<(CellKey, Vec<u8>)> = cells.iter().map(|(k, c)| (*k, base(c))).collect();
+        let mut lines = VsfSection::new("line");
+        lines.add_field("ways", VsfType::u5(0));
+        // A cell the roads do not reach.
+        let bare = (1u64..).map(|d| CellKey { depth: 14, prefix: docs[0].0.prefix + d }).find(|k| !cells.contains_key(k)).unwrap();
+        docs.push((bare, VsfBuilder::new().add_section_direct(lines).build().unwrap()));
+        docs.reverse();
+        let refs: Vec<(CellKey, &[u8])> = docs.iter().map(|(k, b)| (*k, b.as_slice())).collect();
+        let bundle = route_bundle(&refs).unwrap().expect("routing to bundle");
+        let back = decode_route_bundle(&bundle);
+        assert_eq!(back.len(), cells.len(), "every cell with routing, and not the one without");
+        // Each as reading its base gives it.
+        for (key, r) in back {
+            let doc = &docs.iter().find(|(k, _)| *k == key).unwrap().1;
+            let mut want = crate::decode_route(doc).unwrap();
+            want.crossings = None;
+            assert!(r == want, "{key:?}: the bundle's routing is not the base's");
+        }
+        assert_eq!(route_bundle(&refs[..1]).unwrap(), None, "a bundle of no routing is none");
+    }
+
     /// A base's link names its layer by the first half of the layer's provenance hash; a layer it does not name has no name.
     #[test]
     fn a_link_names_its_layer() {
@@ -245,4 +288,70 @@ mod tests {
         assert!(!same_contents(&changed[&Layer::Dem], &first[&Layer::Dem]));
         assert_ne!(link_name(&changed[&Layer::Base], Layer::Dem), link_name(&first[&Layer::Base], Layer::Dem));
     }
+}
+
+/// The finest-but-coarsest depth whose cells a route reads from bundles: the depths past the route search's coarsest (8, mahere_engine's `ROUTE_MIN`), where a cell's crossings are never read. A route reads the coarsest depth's cells, crossings and all, from their bases.
+pub const BUNDLED_FROM: u8 = 9;
+
+/// A route bundle (Nick 2026-11-27: "bundle and pipelining"): the routing of four sibling cells at [`BUNDLED_FROM`] or finer in one document, published at their parent's name under `route/`, so a route search fetches a quarter as many documents and none of a base's lines, land, names or crossings (a cold 35 km route on ferros fetched 505 whole bases, 61 MB, in 141 s; routing alone in bundles of four is 167 documents, 29 MB). One `route` section a cell that has routing, each carrying its cell as a `cell` field (its depth `u` and world cell `wm`) beside the base's route fields as they were coded; a cell without routing has no section. None when none of `cells` (published bases, any order) has routing.
+pub fn route_bundle(cells: &[(CellKey, &[u8])]) -> Result<Option<Vec<u8>>, String> {
+    let mut b = VsfBuilder::new();
+    let mut any = false;
+    for &(key, base) in cells {
+        let (header, end) = vsf::VsfHeader::decode(base).map_err(|e| format!("{e:?}"))?;
+        let sections = header.sections(base, end).map_err(|e| format!("{e:?}"))?;
+        let Some(route) = sections.into_iter().find(|s| s.name == "route") else { continue };
+        let mut out = VsfSection::new("route");
+        out.add_field_multi("cell", vec![VsfType::u(key.depth as usize, false), VsfType::wm(vsf::types::WorldCell::from_raw(key.raw()))]);
+        for f in route.fields {
+            out.add_field_multi(f.name, f.values);
+        }
+        b = b.add_section_direct(out);
+        any = true;
+    }
+    if !any {
+        return Ok(None);
+    }
+    b.build().map(Some).map_err(|e| format!("{e:?}"))
+}
+
+/// A route bundle's cells and their routing ([`route_bundle`]); a section that names no cell, or whose routing does not decode, is left out.
+pub fn decode_route_bundle(bytes: &[u8]) -> Vec<(CellKey, crate::route::RouteCell)> {
+    route_bundle_cells(bytes).into_iter().filter_map(|(k, b)| Some((k, b.decode()?))).collect()
+}
+
+/// One cell's routing from a route bundle, still coded: decoded when a search reaches the cell ([`BundledRoute::decode`]), so a bundle fetched for one cell costs its three siblings no decoding until they are needed.
+pub struct BundledRoute(HashMap<String, Vec<VsfType>>);
+
+impl BundledRoute {
+    pub fn decode(self) -> Option<crate::route::RouteCell> {
+        crate::route::RouteCell::decode(&crate::uncoded(self.0))
+    }
+}
+
+/// A route bundle's cells, each with its routing still coded ([`route_bundle`]); a section that names no cell is left out.
+pub fn route_bundle_cells(bytes: &[u8]) -> Vec<(CellKey, BundledRoute)> {
+    let Ok((header, end)) = vsf::VsfHeader::decode(bytes) else { return Vec::new() };
+    let Ok(sections) = header.sections(bytes, end) else { return Vec::new() };
+    let mut out = Vec::new();
+    for s in sections.into_iter().filter(|s| s.name == "route") {
+        let fields: HashMap<String, Vec<VsfType>> = s.fields.into_iter().map(|f| (f.name, f.values)).collect();
+        // The cell by its values' types: the depth is the unsigned (written `u`, read back at its size, `u3`), the world cell the `wm`.
+        let (mut depth, mut cell) = (None, None);
+        for v in fields.get("cell").into_iter().flatten() {
+            match v {
+                VsfType::u(d, _) => depth = Some(*d as u8),
+                VsfType::u3(d) => depth = Some(*d),
+                VsfType::wm(w) => cell = Some(w.raw()),
+                _ => {}
+            }
+        }
+        let (Some(depth), Some(raw)) = (depth, cell) else { continue };
+        // WHY: the depth comes off the network; past 30 the shift below (60 less twice the depth) underflows and panics. A key has no depth past 30.
+        if depth > 30 {
+            continue;
+        }
+        out.push((CellKey { depth, prefix: raw >> (60 - 2 * depth as u32) }, BundledRoute(fields)));
+    }
+    out
 }

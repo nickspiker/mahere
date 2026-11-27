@@ -1376,14 +1376,17 @@ impl MapCore {
         let Some(travel) = self.travel else { return };
         let store = self.res.store();
         // The climb comes from the terrain, its own layer when cells come in layers.
-        let dem = self.res.layer_stores().map_or(store.clone(), |l| l.dem);
+        let layers = self.res.layer_stores();
+        let dem = layers.as_ref().map_or(store.clone(), |l| l.dem.clone());
+        // The cells past the coarsest depth from their route bundles, where cells come in layers.
+        let bundles = layers.and_then(|l| l.route);
         let (tx, rx) = std::sync::mpsc::channel();
         let cache = self.route_cache.clone();
         // What a route search did, on the console (2026-11-27: on ferros routes never came and nothing said why).
         eprintln!("route: asked by {} from {:.5},{:.5} to {:.5},{:.5}", travel.word(), from.0, from.1, to.0, to.1);
         std::thread::spawn(move || {
             let t = Instant::now();
-            let r = route::find_cached(store, dem, from, to, travel, Some(cache));
+            let r = route::find_cached(store, bundles, dem, from, to, travel, Some(cache));
             match &r {
                 Ok(route) => eprintln!("route: found {:.2} km, {:.0} min, in {} ms", route.metres / 1000., route.seconds / 60., t.elapsed().as_millis()),
                 Err(e) => eprintln!("route: none after {} ms: {e}", t.elapsed().as_millis()),
@@ -1405,10 +1408,12 @@ impl MapCore {
         self.refine_due = false;
         self.refine_at = Some(Instant::now());
         let (store, cache, route) = (self.res.store(), self.route_cache.clone(), r.clone());
-        let dem = self.res.layer_stores().map_or(store.clone(), |l| l.dem);
+        let layers = self.res.layer_stores();
+        let dem = layers.as_ref().map_or(store.clone(), |l| l.dem.clone());
+        let bundles = layers.and_then(|l| l.route);
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            let _ = tx.send(route::refine_route(store, dem, &route, Some(cache)));
+            let _ = tx.send(route::refine_route(store, bundles, dem, &route, Some(cache)));
         });
         self.refine_rx = Some(rx);
     }

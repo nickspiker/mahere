@@ -23,8 +23,8 @@ const RESOLVE_LEN: usize = 22;
 const STALL_S: u8 = 1 << 5;
 /// The most data one TCP receive asks for: 256 KiB, all one reply of the ip server carries (its RECV_MAX, the kernel's largest reply); the buffer holds the state byte ahead of it.
 const RECV_MOST: usize = 1 << 18;
-/// The most of a request one SEND carries: a call carries 4096 bytes (the kernel's limit), less the op and the handle.
-const SEND_MAX: usize = (1 << 12) - 2;
+/// The most of a request one SEND carries: a call carries 4096 bytes (the kernel's limit), less the op and the handle (two bytes since ferros 8089441c, 2026-11-27).
+const SEND_MAX: usize = (1 << 12) - 3;
 
 /// The ip server at grant slot `slot`, the lookups under way (one a host), the address said last for each host (a line on the console when it changes, not at every dial), and the RESOLVE calls and their microseconds since the network's last summary line.
 pub struct IpNet {
@@ -130,9 +130,8 @@ impl Dial for IpNet {
         let mut r = [0u8; 16];
         let n = self.call(&req, &mut r)?;
         match (n, r[0]) {
-            (2.., 0) => Ok(Box::new(IpConn { slot: self.slot, handle: r[1], rx: vec![0u8; 1 + RECV_MOST], at: 1, len: 1, state: 1, closed: false, abandoned: false })),
+            (3.., 0) => Ok(Box::new(IpConn { slot: self.slot, handle: u16::from_be_bytes([r[1], r[2]]), rx: vec![0u8; 1 + RECV_MOST], at: 1, len: 1, state: 1, closed: false, abandoned: false })),
             (_, 2) => Err(io::Error::new(io::ErrorKind::AddrNotAvailable, "no address yet")),
-            (_, 4) => Err(io::Error::other("the ip server has no free connection")),
             (_, 6) => Err(io::Error::other("the ip server has no memory for another connection")),
             _ => Err(io::Error::other("the ip server refused the connection")),
         }
@@ -149,7 +148,8 @@ impl Dial for IpNet {
 /// One connection on the ip server: its handle, the last reply (its state byte, then data read up to `at` of `len`), the state it said last, whether the server closed, whether it was let go without a close (kept too long: its handle may be another's).
 struct IpConn {
     slot: u64,
-    handle: u8,
+    /// ip's handle for it, two bytes on the wire (ops 4 to 7; ferros 8089441c, 2026-11-27: connections as many as memory holds).
+    handle: u16,
     rx: Vec<u8>,
     at: usize,
     len: usize,
@@ -174,8 +174,9 @@ impl IpConn {
 impl io::Read for IpConn {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         // Held until data, a change of the connection's state (it opened, the server closed, it failed), or STALL_S with nothing; the reply lands in `rx` whole, its data read from it until it is used up.
-        let mut ask = [6, self.handle, STALL_S, 0, 0, 0, 0];
-        ask[3..7].copy_from_slice(&(RECV_MOST as u32).to_be_bytes());
+        let h = self.handle.to_be_bytes();
+        let mut ask = [6, h[0], h[1], STALL_S, 0, 0, 0, 0];
+        ask[4..8].copy_from_slice(&(RECV_MOST as u32).to_be_bytes());
         while self.at == self.len {
             if self.closed {
                 return Ok(0);
@@ -226,8 +227,9 @@ impl io::Write for IpConn {
     /// What the connection's send buffer took (the ip server sends it as the peer's window allows); none taken is an error, never a retry loop (a request goes onto a fresh connection whose 256 KiB buffer is empty).
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         let part = &buf[..buf.len().min(SEND_MAX)];
-        let mut req = Vec::with_capacity(2 + part.len());
-        req.extend_from_slice(&[5, self.handle]);
+        let mut req = Vec::with_capacity(3 + part.len());
+        req.extend_from_slice(&[5]);
+        req.extend_from_slice(&self.handle.to_be_bytes());
         req.extend_from_slice(part);
         let mut r = [0u8; 16];
         let n = self.call(&req, &mut r)?;
@@ -252,6 +254,7 @@ impl Drop for IpConn {
             return;
         }
         let mut r = [0u8; 4];
-        let _ = self.call(&[7, self.handle], &mut r);
+        let h = self.handle.to_be_bytes();
+        let _ = self.call(&[7, h[0], h[1]], &mut r);
     }
 }

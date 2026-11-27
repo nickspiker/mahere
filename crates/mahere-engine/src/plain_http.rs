@@ -9,6 +9,8 @@
 //! Measured on the 8a over WiFi before (round trip 25 to 50 ms): a 2284-byte cell 811 ms in Mahere, its connection open 263 ms, the same cell 78 ms by httptest; 10 fetches a second at most.
 //! Now up to [`CONNECTIONS`] at once, each kept after its response for the next request to the same server (HTTP/1.1 persistent connections, RFC 9112 9.3), as ureq keeps them for the Android build.
 //! Measured after on the 8a (the same day): a cache check (304) 139 ms on a new connection, 54 ms on a kept one; zooming in on land 98 cells (30.6 MB) at 9.7 fetches and 3.0 MB/s in the busy spells (7.4 and 1.04 before), all eight busy at once, no failures. A fresh cell's first byte is now the bucket's (300 to 560 ms while Cloudflare fetches it from the origin).
+//!
+//! Pipelined (2026-11-27, Nick: "bundle and pipelining"): each connection its own thread, the requests for it written up to [`DEPTH`] ahead of the response being read, so the edge's quarter second to its first byte is waited for once for several cells. A cold 35 km route on the Pro had fetched 713 documents at about 8 a second, each waiting its turn for a connection and then a quarter second for its first byte.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
@@ -71,12 +73,15 @@ pub struct Phases {
     pub retried: bool,
 }
 
-/// Connections at once, busy or kept idle: eight of the ip server's sixteen, the rest left to the device's own (attest's fgtw, the kist installer) and other apps; four until 2026-11-14.
-/// Twenty loaders share them (residency `LOADERS`), each waiting for one as for a socket, a doorbell (a condition variable), not a poll.
-pub const CONNECTIONS: usize = 1 << 3;
+/// Connections at once: sixteen. The ip server held sixteen for the whole device until 2026-11-27, when it came to hold as many as memory does (ferros 8089441c, each open connection 1.25 MB of its memory: twenty here); the edge answers a connection's requests in order, so cells it must fetch from the bucket come faster across more connections than deeper on fewer. Eight until 2026-11-27, four until 2026-11-14.
+/// Twenty loaders and the route search's threads share them (residency `LOADERS`), each waiting for its response as for a socket, a doorbell (a channel), not a poll.
+pub const CONNECTIONS: usize = 1 << 4;
+
+/// Requests written on one connection before the first's response is read (HTTP/1.1 pipelining, RFC 9112 9.3.2; Nick 2026-11-27, "bundle and pipelining"): the edge's first byte, a quarter second on the Pro, is waited for once for several cells, not once for each. Measured from the desktop on a warm connection, sixteen cells the edge holds came in 405 ms pipelined against 1291 one at a time; ones it fetches from the bucket come as they would one at a time, the edge taking them in order.
+pub const DEPTH: usize = 1 << 2;
 
 /// How long an idle connection is kept for a next request: 16 s.
-/// WHY a bound: the ip server resets and frees a connection its app has not asked about for 32 s, and its handle goes to the next CONNECT of any app; a kept handle older than that could reach another app's connection. Half of it leaves the margin. No timer looks at the kept ones: whoever next asks for a connection lets the old ones go ([`Conn::abandon`]), and the ip server has freed them by then.
+/// WHY a bound: the ip server resets and frees a connection its app has not asked about for 32 s, and its handle goes to the next CONNECT of any app; a kept handle older than that could reach another app's connection. Half of it leaves the margin. A connection's thread lets it go ([`Conn::abandon`]) when nothing has come for it for this long.
 pub const KEEP: Duration = Duration::from_secs(1 << 4);
 
 /// The network's measures, summed between two summary lines.
@@ -93,93 +98,232 @@ struct Sums {
     first_kept_us: u64,
     first_fresh_us: u64,
     dial_us: u64,
-    busy_most: usize,
+    /// The most requests on one connection at once, sent and not yet answered.
+    deepest: usize,
 }
 
-/// The connections: how many are open (busy or idle), the idle ones, and the measures.
-pub struct Pool {
-    state: Mutex<PoolState>,
+/// A request waiting for its connection's thread: its bytes, where its response goes, when it was asked, and whether it has been sent once already on a connection that broke.
+struct Ask {
+    req: Vec<u8>,
+    reply: std::sync::mpsc::Sender<Result<Got, String>>,
+    asked: Instant,
+    retried: bool,
+}
+
+/// A request sent and not yet answered: when it went, how long its connection had been idle before it (None: dialled for it), and the dial's time.
+struct Sent {
+    ask: Ask,
+    at: Instant,
+    kept: Option<Duration>,
+    dial: Duration,
+}
+
+/// One connection's thread: the requests waiting for it, how many it holds (waiting and sent), and whether it has ended.
+struct Pipe {
+    host: String,
+    port: u16,
+    state: Mutex<PipeState>,
     wake: Condvar,
 }
 
-struct Idle {
-    host: String,
-    port: u16,
-    conn: BufReader<Box<dyn Conn>>,
-    since: Instant,
+#[derive(Default)]
+struct PipeState {
+    waiting: std::collections::VecDeque<Ask>,
+    held: usize,
+    ended: bool,
 }
 
-struct PoolState {
-    open: usize,
-    idle: Vec<Idle>,
-    sums: Sums,
-}
-
-/// What [`Pool::take`] gives: a kept connection (with how long it was idle), or the right to dial a new one.
-enum Took {
-    Kept(BufReader<Box<dyn Conn>>, Duration),
-    Dial,
+/// The connections, a thread each, and the measures.
+pub struct Pool {
+    pipes: Mutex<Vec<Arc<Pipe>>>,
+    wake: Condvar,
+    sums: Mutex<Sums>,
+    /// How long a connection is kept idle ([`KEEP`]; the host's tests give a short one).
+    keep: Duration,
 }
 
 impl Pool {
     pub const fn new() -> Pool {
-        Pool { state: Mutex::new(PoolState { open: 0, idle: Vec::new(), sums: Sums { since: None, fetches: 0, kept: 0, fresh: 0, retried: 0, failed: 0, bytes: 0, wait_us: 0, first_kept_us: 0, first_fresh_us: 0, dial_us: 0, busy_most: 0 } }), wake: Condvar::new() }
+        Pool::keeping(KEEP)
     }
 
-    /// A connection to `host:port`: a kept one when there is one and `reuse` allows it, else the right to dial (one of the [`CONNECTIONS`] taken), waiting while all are busy.
-    /// An idle one kept past [`KEEP`] is let go first; an idle one gives its place when all are open (with `reuse` false, one for the same server too).
-    fn take(&self, host: &str, port: u16, reuse: bool) -> Took {
-        let mut s = self.state.lock().unwrap();
+    const fn keeping(keep: Duration) -> Pool {
+        Pool { pipes: Mutex::new(Vec::new()), wake: Condvar::new(), sums: Mutex::new(Sums { since: None, fetches: 0, kept: 0, fresh: 0, retried: 0, failed: 0, bytes: 0, wait_us: 0, first_kept_us: 0, first_fresh_us: 0, dial_us: 0, deepest: 0 }), keep }
+    }
+
+    /// `ask` onto a connection to `host:port`: an idle one to it, else a new one while there are under [`CONNECTIONS`], else the one to it holding the fewest (its thread writes it when fewer than [`DEPTH`] are unanswered). Wide before deep (the Pro, 2026-11-27: filling one connection to its depth before opening the next kept three of eight open, and the edge answers a connection's requests in their order, a cell it must fetch holding up the ones behind it). With every connection another server's, an idle one is ended for it, or the request waits for one to end. Queued under the pool's lock, on a connection seen not to have ended, so none takes a request as it goes.
+    fn send(&'static self, dial: &Arc<dyn Dial>, host: &str, port: u16, ask: Ask) {
+        let mut ask = Some(ask);
+        let mut pipes = self.pipes.lock().unwrap();
         loop {
-            let now = Instant::now();
-            let before = s.idle.len();
-            s.idle.retain_mut(|c| {
-                let fresh = now.duration_since(c.since) < KEEP;
-                if !fresh {
-                    c.conn.get_mut().abandon();
+            pipes.retain(|p| !p.state.lock().unwrap().ended);
+            let held = |p: &Arc<Pipe>| p.state.lock().unwrap().held;
+            let least = pipes.iter().filter(|p| p.host == host && p.port == port).min_by_key(|p| held(p)).cloned();
+            let pipe = match least {
+                Some(p) if held(&p) == 0 || pipes.len() >= CONNECTIONS => p,
+                _ if pipes.len() < CONNECTIONS => {
+                    let p = Arc::new(Pipe { host: host.to_string(), port, state: Mutex::new(PipeState::default()), wake: Condvar::new() });
+                    let (pipe, dial) = (p.clone(), dial.clone());
+                    if let Err(e) = std::thread::Builder::new().name("http connection".into()).spawn(move || self.run(&*dial, &pipe)) {
+                        let _ = ask.take().unwrap().reply.send(Err(format!("{host}: no thread for a connection: {e}")));
+                        return;
+                    }
+                    pipes.push(p.clone());
+                    p
                 }
-                fresh
-            });
-            s.open -= before - s.idle.len();
-            if let Some(i) = s.idle.iter().rposition(|c| reuse && c.host == host && c.port == port) {
-                let c = s.idle.swap_remove(i);
-                s.note_busy();
-                return Took::Kept(c.conn, now.duration_since(c.since));
+                _ => {
+                    // Every connection another server's: an idle one ended for this one (its thread sees it and goes), or a wait for one to end.
+                    if let Some(idle) = pipes.iter().find(|p| p.state.lock().unwrap().held == 0) {
+                        idle.state.lock().unwrap().ended = true;
+                        idle.wake.notify_all();
+                    } else {
+                        pipes = self.wake.wait(pipes).unwrap();
+                    }
+                    continue;
+                }
+            };
+            let mut s = pipe.state.lock().unwrap();
+            if s.ended {
+                continue;
             }
-            if s.open < CONNECTIONS {
-                s.open += 1;
-                s.note_busy();
-                return Took::Dial;
-            }
-            if !s.idle.is_empty() {
-                // All open and one idle for another server: it is closed and its place taken (the oldest, at the front).
-                let c = s.idle.remove(0);
-                s.note_busy();
-                drop(s);
-                drop(c);
-                return Took::Dial;
-            }
-            s = self.wake.wait(s).unwrap();
+            s.waiting.push_back(ask.take().unwrap());
+            s.held += 1;
+            pipe.wake.notify_all();
+            return;
         }
     }
 
-    /// A connection's place given back (its connection closed or failed).
-    fn give(&self) {
-        self.state.lock().unwrap().open -= 1;
-        self.wake.notify_all();
+    /// A connection's thread: the requests waiting written, up to [`DEPTH`] unanswered, then the oldest's response read and handed back, until nothing has come for [`Pool::keep`]. A connection that breaks or that the server closes is dialled again and its unanswered requests sent on the new one, each once (a GET is safe to send again, RFC 9110 9.2.2); one that fails a second time is failed.
+    fn run(&self, dial: &dyn Dial, pipe: &Pipe) {
+        let (host, port) = (pipe.host.as_str(), pipe.port);
+        let mut conn: Option<BufReader<Box<dyn Conn>>> = None;
+        let mut sent: std::collections::VecDeque<Sent> = std::collections::VecDeque::new();
+        let mut idle_since = Instant::now();
+        loop {
+            // The requests to send: what waits, up to DEPTH unanswered; with none sent and none waiting, a wait for one, or the end after `keep`.
+            let mut to_send = Vec::new();
+            {
+                let mut s = pipe.state.lock().unwrap();
+                while s.waiting.is_empty() && sent.is_empty() && !s.ended {
+                    // WHY saturating: what is left of `keep`; past it the connection is let go, never a wait of less than nothing.
+                    let left = self.keep.saturating_sub(idle_since.elapsed());
+                    if left.is_zero() {
+                        s.ended = true;
+                        break;
+                    }
+                    s = pipe.wake.wait_timeout(s, left).unwrap().0;
+                }
+                if s.ended && sent.is_empty() {
+                    // Ended (idle past `keep`, or its place given to another server, both only while it held nothing).
+                    drop(s);
+                    if let Some(mut c) = conn.take() {
+                        c.get_mut().abandon();
+                    }
+                    self.wake.notify_all();
+                    return;
+                }
+                while sent.len() + to_send.len() < DEPTH {
+                    let Some(a) = s.waiting.pop_front() else { break };
+                    to_send.push(a);
+                }
+            }
+            // A connection for them: the one kept, or a new one.
+            let (kept, mut dialled) = (conn.as_ref().map(|_| idle_since.elapsed()), Duration::ZERO);
+            if conn.is_none() {
+                let t = Instant::now();
+                match dial.dial(host, port) {
+                    Ok(c) => {
+                        conn = Some(BufReader::new(c));
+                        dialled = t.elapsed();
+                    }
+                    Err(e) => {
+                        // No connection: everything this one holds fails, and it ends.
+                        let e = format!("{host}: {e}");
+                        let mut s = pipe.state.lock().unwrap();
+                        s.ended = true;
+                        s.held = 0;
+                        let all: Vec<Ask> = to_send.into_iter().chain(sent.drain(..).map(|s| s.ask)).chain(s.waiting.drain(..)).collect();
+                        drop(s);
+                        for a in all {
+                            let _ = a.reply.send(Err(e.clone()));
+                        }
+                        self.wake.notify_all();
+                        return;
+                    }
+                }
+            }
+            let c = conn.as_mut().unwrap();
+            let mut broken = false;
+            for ask in to_send {
+                broken = broken || c.get_mut().write_all(&ask.req).is_err();
+                sent.push_back(Sent { ask, at: Instant::now(), kept, dial: dialled });
+            }
+            {
+                let mut sums = self.sums.lock().unwrap();
+                sums.deepest = sums.deepest.max(sent.len());
+            }
+            // The oldest's response, unless the connection broke on the way.
+            let read = match broken {
+                true => Err(format!("{host}: sending the request failed")),
+                false => match c.fill_buf().map(|b| b.len()) {
+                    Ok(n) if n > 0 => {
+                        let (first, t) = (sent[0].at.elapsed(), Instant::now());
+                        read_response(c).map(|g| (g, first, t.elapsed())).map_err(|e| format!("{host}: {e}"))
+                    }
+                    Ok(_) => Err(format!("{host}: the connection closed before the response")),
+                    Err(e) => Err(format!("{host}: {e}")),
+                },
+            };
+            match read {
+                Ok((mut g, first, body)) => {
+                    let s = sent.pop_front().unwrap();
+                    g.phases = Phases { wait: s.at.duration_since(s.ask.asked).as_micros() as u64, dial: s.dial.as_micros() as u64, first: first.as_micros() as u64, body: body.as_micros() as u64, kept: s.kept.map(|d| d.as_micros() as u64), retried: s.ask.retried };
+                    // Kept for the next only when the server keeps it; the requests sent after it on a connection it closes go again on a new one.
+                    if !g.keep {
+                        conn = None;
+                        self.again(pipe, &mut sent);
+                    }
+                    let _ = s.ask.reply.send(Ok(g));
+                    pipe.state.lock().unwrap().held -= 1;
+                    self.wake.notify_all();
+                    idle_since = Instant::now();
+                }
+                Err(e) => {
+                    // The connection broke (a kept one the server closed meanwhile, RFC 9112 9.6, or the network): what it carried goes again on a new one, and a request already sent again fails, the network's failure said to its caller.
+                    conn = None;
+                    let (twice, once): (Vec<Sent>, Vec<Sent>) = sent.drain(..).partition(|s| s.ask.retried);
+                    sent.extend(once);
+                    self.again(pipe, &mut sent);
+                    if !twice.is_empty() {
+                        pipe.state.lock().unwrap().held -= twice.len();
+                        for s in twice {
+                            let _ = s.ask.reply.send(Err(e.clone()));
+                        }
+                        self.wake.notify_all();
+                    }
+                }
+            }
+        }
     }
 
-    /// A connection kept for the next request to `host:port`.
-    fn keep(&self, host: &str, port: u16, conn: BufReader<Box<dyn Conn>>) {
-        self.state.lock().unwrap().idle.push(Idle { host: host.to_string(), port, conn, since: Instant::now() });
-        self.wake.notify_all();
+    /// Requests sent on a connection that is gone, back to the front of the queue in their order, each marked as sent once already.
+    fn again(&self, pipe: &Pipe, sent: &mut std::collections::VecDeque<Sent>) {
+        let mut s = pipe.state.lock().unwrap();
+        for mut a in sent.drain(..).rev().map(|s| s.ask) {
+            a.retried = true;
+            s.waiting.push_front(a);
+        }
     }
 
-    /// A fetch's measures added; every 16 s (the next fetch to end after them, no timer) the summary on the console: fetches and bytes a second, connections kept and new, the most busy at once, the waits.
+    /// How many connections are open now.
+    fn open(&self) -> usize {
+        self.pipes.lock().unwrap().iter().filter(|p| !p.state.lock().unwrap().ended).count()
+    }
+
+    /// A fetch's measures added; every 16 s (the next fetch to end after them, no timer) the summary on the console: fetches and bytes a second, connections kept and new, the most requests on one at once, the waits.
     fn sum(&self, got: &Result<Got, String>, said: impl FnOnce() -> String) {
-        let mut s = self.state.lock().unwrap();
-        let idle_now = s.idle.len();
-        let sums = &mut s.sums;
+        let open = self.open();
+        let mut sums = self.sums.lock().unwrap();
         let now = Instant::now();
         let since = *sums.since.get_or_insert(now);
         sums.fetches += 1;
@@ -207,7 +351,7 @@ impl Pool {
         let secs = span.as_secs_f64();
         let ms = |us: u64, n: u64| if n == 0 { 0 } else { us / n / 1000 };
         let line = format!(
-            "mahere: the network, last {secs:.1} s: {} fetches ({:.1} a second, {} failed), {:.2} MB ({:.2} MB/s); {} on a kept connection (first byte {} ms on average), {} new (dial {} ms, first byte {} ms), {} sent again on a new one; the most busy at once {} of {CONNECTIONS}, {} idle now; waited for a connection {} ms on average{}",
+            "mahere: the network, last {secs:.1} s: {} fetches ({:.1} a second, {} failed), {:.2} MB ({:.2} MB/s); {} on a kept connection (first byte {} ms on average), {} new (dial {} ms, first byte {} ms), {} sent again on a new one; {open} of {CONNECTIONS} connections open, at most {} requests on one at once (of {DEPTH}); waited to be sent {} ms on average{}",
             sums.fetches,
             sums.fetches as f64 / secs,
             sums.failed,
@@ -219,26 +363,16 @@ impl Pool {
             ms(sums.dial_us, sums.fresh),
             ms(sums.first_fresh_us, sums.fresh),
             sums.retried,
-            sums.busy_most,
-            idle_now,
+            sums.deepest,
             ms(sums.wait_us, sums.fetches - sums.failed),
             {
                 let d = said();
                 if d.is_empty() { d } else { format!("; {d}") }
             },
         );
-        s.sums = Sums::default();
-        drop(s);
+        *sums = Sums::default();
+        drop(sums);
         eprintln!("{line}");
-    }
-}
-
-impl PoolState {
-    fn note_busy(&mut self) {
-        let busy = self.open - self.idle.len();
-        if busy > self.sums.busy_most {
-            self.sums.busy_most = busy;
-        }
     }
 }
 
@@ -273,83 +407,17 @@ pub fn split_url(url: &str) -> Option<(&str, u16, &str)> {
 /// `if_none_match`: the tag of the copy the caller holds, so an unchanged one costs a 304.
 pub fn get(url: &str, if_none_match: Option<&str>) -> Result<Got, String> {
     let dial = dial().ok_or("no network on this device")?;
-    let got = get_with(&*dial, &POOL, url, if_none_match);
+    let got = get_with(&dial, &POOL, url, if_none_match);
     POOL.sum(&got, || dial.said());
     got
 }
 
-/// [`get`] over `dial` and `pool` (the host's tests give their own).
-fn get_with(dial: &dyn Dial, pool: &Pool, url: &str, if_none_match: Option<&str>) -> Result<Got, String> {
+/// [`get`] over `dial` and `pool` (the host's tests give their own): the request queued on a connection, its response waited for.
+fn get_with(dial: &Arc<dyn Dial>, pool: &'static Pool, url: &str, if_none_match: Option<&str>) -> Result<Got, String> {
     let (host, port, path) = split_url(url).ok_or_else(|| format!("{url}: not a plain http URL"))?;
-    let req = request(host, path, if_none_match);
-    let t = Instant::now();
-    let took = pool.take(host, port, true);
-    let mut wait = t.elapsed();
-    let mut retried = false;
-    let (mut conn, mut kept, mut dialled) = match took {
-        Took::Kept(c, idle) => (c, Some(idle), Duration::ZERO),
-        Took::Dial => fresh(dial, pool, host, port)?,
-    };
-    loop {
-        let t = Instant::now();
-        // Sent, and its first byte waited for: on a kept connection a failure here is the server having closed it meanwhile (an idle connection is the server's to close, RFC 9112 9.6), and the request goes once more on a new one.
-        let first = conn.get_mut().write_all(&req).and_then(|_| conn.fill_buf().map(|b| b.len()));
-        let first = match first {
-            Ok(n) if n > 0 => t.elapsed(),
-            // WHY the retry is once and on a new connection: the server may have closed every idle one at once (its idle timeout), and a new one failing the same way is the network's failure, said to the caller.
-            _ if kept.is_some() && !retried => {
-                drop(conn);
-                pool.give();
-                retried = true;
-                let w = Instant::now();
-                let Took::Dial = pool.take(host, port, false) else { unreachable!("a take that may not reuse dials") };
-                wait += w.elapsed();
-                (conn, kept, dialled) = fresh(dial, pool, host, port)?;
-                continue;
-            }
-            Ok(_) => {
-                pool.give();
-                return Err(format!("{host}: the connection closed before the response"));
-            }
-            Err(e) => {
-                pool.give();
-                return Err(format!("{host}: sending the request: {e}"));
-            }
-        };
-        let t = Instant::now();
-        let r = read_response(&mut conn);
-        let body = t.elapsed();
-        return match r {
-            Ok(mut g) => {
-                g.phases = Phases { wait: wait.as_micros() as u64, dial: dialled.as_micros() as u64, first: first.as_micros() as u64, body: body.as_micros() as u64, kept: kept.map(|d| d.as_micros() as u64), retried };
-                // Kept only with nothing left over in its buffer (WHY: one request at a time, never pipelined, so a byte past the response is the server's mistake and would be read as the next response's start).
-                if g.keep && conn.buffer().is_empty() {
-                    pool.keep(host, port, conn);
-                } else {
-                    drop(conn);
-                    pool.give();
-                }
-                Ok(g)
-            }
-            Err(e) => {
-                drop(conn);
-                pool.give();
-                Err(format!("{host}: {e}"))
-            }
-        };
-    }
-}
-
-/// A new connection to `host:port` with its place in the pool already taken (given back when the dial fails), and how long the dial took.
-fn fresh(dial: &dyn Dial, pool: &Pool, host: &str, port: u16) -> Result<(BufReader<Box<dyn Conn>>, Option<Duration>, Duration), String> {
-    let t = Instant::now();
-    match dial.dial(host, port) {
-        Ok(c) => Ok((BufReader::new(c), None, t.elapsed())),
-        Err(e) => {
-            pool.give();
-            Err(format!("{host}: {e}"))
-        }
-    }
+    let (reply, answer) = std::sync::mpsc::channel();
+    pool.send(dial, host, port, Ask { req: request(host, path, if_none_match), reply, asked: Instant::now(), retried: false });
+    answer.recv().map_err(|_| format!("{host}: the connection's thread ended without an answer"))?
 }
 
 /// The request's bytes: HTTP/1.1, so the connection stays open for the next one unless the server says otherwise. A tag is sent only when it is printable ASCII (WHY: it is a stored copy of the server's header; a CR or LF in it would end the header early and write a header of its own).
@@ -540,17 +608,30 @@ mod tests {
         assert!(!String::from_utf8(request("h", "/", Some("a\r\nX: y"))).unwrap().contains("If-None-Match"));
     }
 
-    /// A connection that answers each request with the next of its canned responses, and nothing (the server's close) once they are used up; it counts the requests it was sent and whether it was let go without a close.
+    /// A connection that answers each request with the next of its canned responses, queued behind any it has not been read for yet (a pipelined request is answered after the ones before it), and nothing more (the server's close) once they are used up; it counts the requests sent to it, the most sent and not yet read at once, and whether it was let go without a close.
     struct Canned {
         responses: Vec<Vec<u8>>,
-        at: std::io::Cursor<Vec<u8>>,
+        queued: std::collections::VecDeque<u8>,
+        ends: std::collections::VecDeque<usize>,
+        read: usize,
         sent: Arc<AtomicUsize>,
+        deepest: Arc<AtomicUsize>,
         abandoned: Arc<AtomicUsize>,
     }
 
     impl Read for Canned {
         fn read(&mut self, b: &mut [u8]) -> std::io::Result<usize> {
-            self.at.read(b)
+            // A server takes a moment to answer, as one across a network does: requests queue behind it, and are pipelined.
+            std::thread::sleep(Duration::from_millis(1));
+            let n = b.len().min(self.queued.len());
+            for x in b.iter_mut().take(n) {
+                *x = self.queued.pop_front().unwrap();
+            }
+            self.read += n;
+            while self.ends.front().is_some_and(|&e| e <= self.read) {
+                self.ends.pop_front();
+            }
+            Ok(n)
         }
     }
 
@@ -558,8 +639,12 @@ mod tests {
         fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
             assert!(b.starts_with(b"GET /"));
             self.sent.fetch_add(1, Ordering::Relaxed);
-            let next = if self.responses.is_empty() { Vec::new() } else { self.responses.remove(0) };
-            self.at = std::io::Cursor::new(next);
+            if !self.responses.is_empty() {
+                let next = self.responses.remove(0);
+                self.queued.extend(&next);
+                self.ends.push_back(self.read + self.queued.len());
+            }
+            self.deepest.fetch_max(self.ends.len(), Ordering::Relaxed);
             Ok(b.len())
         }
         fn flush(&mut self) -> std::io::Result<()> {
@@ -578,12 +663,13 @@ mod tests {
         per_conn: Vec<Vec<u8>>,
         dials: AtomicUsize,
         sent: Arc<AtomicUsize>,
+        deepest: Arc<AtomicUsize>,
         abandoned: Arc<AtomicUsize>,
     }
 
     impl Server {
-        fn new(per_conn: &[&[u8]]) -> Server {
-            Server { per_conn: per_conn.iter().map(|r| r.to_vec()).collect(), dials: AtomicUsize::new(0), sent: Arc::default(), abandoned: Arc::default() }
+        fn new(per_conn: &[&[u8]]) -> Arc<Server> {
+            Arc::new(Server { per_conn: per_conn.iter().map(|r| r.to_vec()).collect(), dials: AtomicUsize::new(0), sent: Arc::default(), deepest: Arc::default(), abandoned: Arc::default() })
         }
     }
 
@@ -591,80 +677,97 @@ mod tests {
         fn dial(&self, host: &str, port: u16) -> std::io::Result<Box<dyn Conn>> {
             assert_eq!((host, port), ("example.org", 80));
             self.dials.fetch_add(1, Ordering::Relaxed);
-            Ok(Box::new(Canned { responses: self.per_conn.clone(), at: std::io::Cursor::new(Vec::new()), sent: self.sent.clone(), abandoned: self.abandoned.clone() }))
+            Ok(Box::new(Canned { responses: self.per_conn.clone(), queued: Default::default(), ends: Default::default(), read: 0, sent: self.sent.clone(), deepest: self.deepest.clone(), abandoned: self.abandoned.clone() }))
         }
     }
 
     const OK3: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\nvsf";
 
+    /// A pool for one test, alive for the test's threads (a connection's thread holds it).
+    fn pool() -> &'static Pool {
+        Box::leak(Box::new(Pool::new()))
+    }
+
+    fn get_on(server: &Arc<Server>, pool: &'static Pool, url: &str) -> Result<Got, String> {
+        get_with(&(server.clone() as Arc<dyn Dial>), pool, url, None)
+    }
+
     /// Three GETs one after another on one connection, kept between them.
     #[test]
     fn kept_between_requests() {
-        let (server, pool) = (Server::new(&[OK3, OK3, OK3]), Pool::new());
+        let (server, pool) = (Server::new(&[OK3, OK3, OK3]), pool());
         for k in 0..3 {
-            let g = get_with(&server, &pool, "http://example.org/mahere/cells/base/x.vsf?e=8", None).unwrap();
+            let g = get_on(&server, pool, "http://example.org/mahere/cells/base/x.vsf?e=8").unwrap();
             assert_eq!((g.status, &g.body[..], g.phases.kept.is_some()), (200, &b"vsf"[..], k > 0));
         }
         assert_eq!(server.dials.load(Ordering::Relaxed), 1);
-        assert_eq!(pool.state.lock().unwrap().open, 1);
+        assert_eq!(pool.open(), 1);
     }
 
     /// A kept connection the server closed meanwhile: the request goes again on a new one, once.
     #[test]
     fn closed_while_kept() {
-        let (server, pool) = (Server::new(&[OK3]), Pool::new());
-        get_with(&server, &pool, "http://example.org/a", None).unwrap();
-        let g = get_with(&server, &pool, "http://example.org/b", None).unwrap();
+        let (server, pool) = (Server::new(&[OK3]), pool());
+        get_on(&server, pool, "http://example.org/a").unwrap();
+        let g = get_on(&server, pool, "http://example.org/b").unwrap();
         assert!(g.phases.retried && g.phases.kept.is_none());
         assert_eq!((server.dials.load(Ordering::Relaxed), server.sent.load(Ordering::Relaxed)), (2, 3));
-        assert_eq!(pool.state.lock().unwrap().open, 1);
     }
 
-    /// `Connection: close` and a body to the close: never kept.
+    /// A request that fails on its second connection too is failed, not sent a third time.
+    #[test]
+    fn failed_twice() {
+        let (server, pool) = (Server::new(&[]), pool());
+        assert!(get_on(&server, pool, "http://example.org/a").unwrap_err().contains("closed before the response"));
+        assert_eq!((server.dials.load(Ordering::Relaxed), server.sent.load(Ordering::Relaxed)), (2, 2));
+    }
+
+    /// `Connection: close`: never kept, the next request on a new connection.
     #[test]
     fn closed_by_the_server() {
-        let (server, pool) = (Server::new(&[b"HTTP/1.1 200 OK\r\nContent-Length: 1\r\nConnection: close\r\n\r\nx"]), Pool::new());
-        get_with(&server, &pool, "http://example.org/a", None).unwrap();
-        get_with(&server, &pool, "http://example.org/b", None).unwrap();
+        let (server, pool) = (Server::new(&[b"HTTP/1.1 200 OK\r\nContent-Length: 1\r\nConnection: close\r\n\r\nx"]), pool());
+        get_on(&server, pool, "http://example.org/a").unwrap();
+        let g = get_on(&server, pool, "http://example.org/b").unwrap();
+        assert!(g.phases.kept.is_none() && !g.phases.retried);
         assert_eq!(server.dials.load(Ordering::Relaxed), 2);
-        assert_eq!(pool.state.lock().unwrap().open, 0);
     }
 
-    /// One kept past KEEP is let go without a word (its handle may be another's by now) and a new one dialled.
+    /// One idle past its keeping is let go without a word (its handle may be another's by now) and a new one dialled.
     #[test]
     fn kept_too_long() {
-        let (server, pool) = (Server::new(&[OK3, OK3]), Pool::new());
-        get_with(&server, &pool, "http://example.org/a", None).unwrap();
-        pool.state.lock().unwrap().idle[0].since -= KEEP;
-        let g = get_with(&server, &pool, "http://example.org/b", None).unwrap();
+        let (server, pool) = (Server::new(&[OK3, OK3]), &*Box::leak(Box::new(Pool::keeping(Duration::from_millis(1 << 5)))));
+        get_on(&server, pool, "http://example.org/a").unwrap();
+        std::thread::sleep(Duration::from_millis(1 << 7));
+        assert_eq!((pool.open(), server.abandoned.load(Ordering::Relaxed)), (0, 1));
+        let g = get_on(&server, pool, "http://example.org/b").unwrap();
         assert!(g.phases.kept.is_none() && !g.phases.retried);
-        assert_eq!((server.dials.load(Ordering::Relaxed), server.abandoned.load(Ordering::Relaxed)), (2, 1));
-        assert_eq!(pool.state.lock().unwrap().open, 1);
+        assert_eq!(server.dials.load(Ordering::Relaxed), 2);
     }
 
-    /// Never more than CONNECTIONS at once however many fetch, each kept and reused.
+    /// Never more than CONNECTIONS at once however many fetch, requests pipelined on them up to DEPTH, every one answered.
     #[test]
-    fn at_most_connections() {
+    fn at_most_connections_pipelined() {
         // Each connection good for every request (one may carry them all).
-        let (server, pool) = (Server::new(&[OK3; CONNECTIONS << 5]), Pool::new());
+        let (server, pool) = (Server::new(&[OK3; CONNECTIONS << 5]), pool());
         std::thread::scope(|s| {
             for _ in 0..(CONNECTIONS << 2) {
                 s.spawn(|| {
                     for _ in 0..8 {
-                        get_with(&server, &pool, "http://example.org/a", None).unwrap();
+                        assert_eq!(get_on(&server, pool, "http://example.org/a").unwrap().body, b"vsf");
                     }
                 });
             }
         });
-        let st = pool.state.lock().unwrap();
-        assert!(st.open <= CONNECTIONS && server.dials.load(Ordering::Relaxed) <= CONNECTIONS);
+        assert!(pool.open() <= CONNECTIONS && server.dials.load(Ordering::Relaxed) <= CONNECTIONS);
         assert_eq!(server.sent.load(Ordering::Relaxed), CONNECTIONS << 5);
+        let deepest = server.deepest.load(Ordering::Relaxed);
+        assert!(deepest > 1 && deepest <= DEPTH, "requests pipelined, at most DEPTH deep: {deepest}");
     }
 
     /// The whole GET over the registered dial.
     #[test]
     fn get_over_a_dial() {
-        set_dial(Arc::new(Server::new(&[OK3])));
+        set_dial(Server::new(&[OK3]));
         let g = get("http://example.org/mahere/cells/base/x.vsf?e=8", None).unwrap();
         assert_eq!((g.status, &g.body[..]), (200, &b"vsf"[..]));
     }

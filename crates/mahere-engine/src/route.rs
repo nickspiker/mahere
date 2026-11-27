@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use mahere_coord::{uv_to_lat_lon, Coord};
 use mahere_tiles::route::RouteCell;
+use mahere_tiles::publish::BUNDLED_FROM;
 use mahere_tiles::{tri_at, tri_idx, CellKey, TEX};
 
 use crate::residency::{CellStore, Fetch};
@@ -89,9 +90,9 @@ impl Route {
 }
 
 /// The route drawn again through the finer cells the device holds now, or None when no run got finer.
-pub fn refine_route(store: Arc<dyn CellStore>, dem: Arc<dyn CellStore>, route: &Route, cache: Option<Arc<RouteCache>>) -> Option<Route> {
+pub fn refine_route(store: Arc<dyn CellStore>, bundles: Option<Arc<dyn CellStore>>, dem: Arc<dyn CellStore>, route: &Route, cache: Option<Arc<RouteCache>>) -> Option<Route> {
     let again = route.again.as_ref()?;
-    let mut fine = Cells { store: store.clone(), got: HashMap::new(), cache: cache.clone(), local: true };
+    let mut fine = Cells { store: store.clone(), bundles: bundles.clone(), got: HashMap::new(), pending: HashMap::new(), cache: cache.clone(), local: true };
     let mut runs = again.runs.clone();
     let mut finer = false;
     for run in &mut runs {
@@ -102,7 +103,7 @@ pub fn refine_route(store: Arc<dyn CellStore>, dem: Arc<dyn CellStore>, route: &
     if !finer {
         return None;
     }
-    let mut cells = Cells { store, got: HashMap::new(), cache, local: true };
+    let mut cells = Cells { store, bundles, got: HashMap::new(), pending: HashMap::new(), cache, local: true };
     finish_runs(&mut cells, &dem, again.travel, again.from, again.to, again.a, again.b, again.seconds, runs).ok()
 }
 
@@ -216,7 +217,11 @@ static CROSS_EVERY_DEPTH: std::sync::atomic::AtomicBool = std::sync::atomic::Ato
 /// Cells' routing as the search reads it, each read once from the store, through the shared cache.
 struct Cells {
     store: Arc<dyn CellStore>,
+    /// The route bundles (four sibling cells' routing a document, [`mahere_tiles::publish::route_bundle`]), where the cells at [`BUNDLED_FROM`] or finer are read; None reads every cell from its base.
+    bundles: Option<Arc<dyn CellStore>>,
     got: HashMap<CellKey, Option<Arc<RouteCell>>>,
+    /// Cells a bundle brought beside the one asked for, their routing still coded until the search reaches them.
+    pending: HashMap<CellKey, mahere_tiles::publish::BundledRoute>,
     cache: Option<Arc<RouteCache>>,
     /// Only what the device holds, never the network: the line's refinement reads the fine cells there are, as the map draws what it has.
     local: bool,
@@ -227,45 +232,24 @@ impl Cells {
         if let Some(c) = self.got.get(&key) {
             return c.clone();
         }
+        if let Some(b) = self.pending.remove(&key) {
+            self.keep(key, b.decode());
+            return self.got.get(&key).cloned().flatten();
+        }
         if let Some(shared) = self.cache.as_ref().and_then(|c| c.0.lock().ok().and_then(|m| m.get(&key).cloned())) {
             self.got.insert(key, shared.clone());
             return shared;
         }
         // A cell the search lacks: its neighbours at its depth are fetched beside it, at once, since the search goes on into them (Nick 2026-11-21: navigation "abhorrently slow"; a phone with nothing kept fetched a 15 km route's 229 cells one after another, 36 of its 51 seconds).
-        if !self.local {
+        if self.local {
+            self.fetch(&[key]);
+        } else {
             self.prefetch_around(key);
-            if let Some(c) = self.got.get(&key) {
-                return c.clone();
-            }
         }
-        let t_read = std::time::Instant::now();
-        let fetched = if self.local { self.store.get_local(key) } else { self.store.get(key) };
-        let read_ns = t_read.elapsed().as_nanos() as u64;
-        let t_decode = std::time::Instant::now();
-        let c = match fetched {
-            Fetch::Bytes(b) => mahere_tiles::decode_route(&b).map(|r| Arc::new(prepare(r, key))),
-            _ => None,
-        };
-        if std::env::var_os("MAHERE_ROUTE_LOG").is_some() {
-            READ_NS.fetch_add(read_ns, std::sync::atomic::Ordering::Relaxed);
-            DECODE_NS.fetch_add(t_decode.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
-        }
-        self.got.insert(key, c.clone());
-        if let Some(cache) = &self.cache {
-            if let Ok(mut m) = cache.0.lock() {
-                if m.len() >= CACHE_CELLS {
-                    m.clear();
-                }
-                // Only what is there: an absent cell may arrive later.
-                if c.is_some() {
-                    m.insert(key, c.clone());
-                }
-            }
-        }
-        c
+        self.got.get(&key).cloned().flatten()
     }
 
-    /// The cell and its neighbours within [`PREFETCH_RING`] in its diamond, those not held yet, fetched on threads of their own and decoded into the search's cells.
+    /// The cell and its neighbours within [`PREFETCH_RING`] in its diamond, those not held yet, fetched together.
     fn prefetch_around(&mut self, key: CellKey) {
         let (cu, cv) = key.grid();
         let side = 1i64 << key.depth;
@@ -278,31 +262,103 @@ impl Cells {
                     continue;
                 }
                 let k = CellKey::from_grid(key.diamond(), key.depth, u as u64, v as u64);
-                if !self.got.contains_key(&k) {
+                if !self.got.contains_key(&k) && !self.pending.contains_key(&k) {
                     want.push(k);
                 }
             }
         }
+        self.fetch(&want);
+    }
+
+    /// `want` read on threads of their own and decoded into the search's cells (from the device alone when `local`): the cells at [`BUNDLED_FROM`] or finer from their bundles, a bundle answering for all four of its cells (one without routing has no section in it), then from their bases the coarser cells and those whose bundle is not there (an area published before its bundles).
+    fn fetch(&mut self, want: &[CellKey]) {
+        let t = std::time::Instant::now();
+        let local = self.local;
+        let read = move |s: &Arc<dyn CellStore>, k: CellKey| if local { s.get_local(k) } else { s.get(k) };
+        if let Some(bundles) = &self.bundles {
+            let mut parents: Vec<CellKey> = Vec::new();
+            for k in want.iter().filter(|k| k.depth >= BUNDLED_FROM && !self.pending.contains_key(k)) {
+                let p = k.parent();
+                if !parents.contains(&p) {
+                    parents.push(p);
+                }
+            }
+            // Each bundle's cells asked for decoded on its thread; the others kept coded.
+            type Opened = (CellKey, Vec<(CellKey, Option<RouteCell>)>, Vec<(CellKey, mahere_tiles::publish::BundledRoute)>);
+            let found: Vec<Opened> = std::thread::scope(|s| {
+                let hs: Vec<_> = parents
+                    .iter()
+                    .map(|&p| {
+                        s.spawn(move || {
+                            let Fetch::Bytes(b) = read(bundles, p) else { return None };
+                            let (mut asked, mut later) = (Vec::new(), Vec::new());
+                            for (k, r) in mahere_tiles::publish::route_bundle_cells(&b) {
+                                if want.contains(&k) {
+                                    asked.push((k, r.decode()));
+                                } else {
+                                    later.push((k, r));
+                                }
+                            }
+                            Some((p, asked, later))
+                        })
+                    })
+                    .collect();
+                hs.into_iter().filter_map(|h| h.join().ok().flatten()).collect()
+            });
+            for (p, asked, later) in found {
+                for (k, r) in asked {
+                    self.keep(k, r);
+                }
+                for (k, r) in later {
+                    if !self.got.contains_key(&k) {
+                        self.pending.insert(k, r);
+                    }
+                }
+                // A bundle answers for all four of its cells: one it has no section for has no routing.
+                for q in 0..4 {
+                    let k = p.child(q);
+                    if !self.got.contains_key(&k) && !self.pending.contains_key(&k) {
+                        self.keep(k, None);
+                    }
+                }
+            }
+        }
+        let rest: Vec<CellKey> = want.iter().copied().filter(|k| !self.got.contains_key(k) && !self.pending.contains_key(k)).collect();
         let store = &self.store;
         let got: Vec<(CellKey, Option<RouteCell>)> = std::thread::scope(|s| {
-            let hs: Vec<_> = want.iter().map(|&k| s.spawn(move || (k, match store.get(k) {
-                Fetch::Bytes(b) => mahere_tiles::decode_route(&b),
-                _ => None,
-            }))).collect();
+            let hs: Vec<_> = rest
+                .iter()
+                .map(|&k| {
+                    s.spawn(move || {
+                        (k, match read(store, k) {
+                            Fetch::Bytes(b) => mahere_tiles::decode_route(&b),
+                            _ => None,
+                        })
+                    })
+                })
+                .collect();
             hs.into_iter().filter_map(|h| h.join().ok()).collect()
         });
         for (k, r) in got {
-            let c = r.map(|r| Arc::new(prepare(r, k)));
-            if let (Some(cache), Some(_)) = (&self.cache, &c) {
-                if let Ok(mut m) = cache.0.lock() {
-                    if m.len() >= CACHE_CELLS {
-                        m.clear();
-                    }
-                    m.insert(k, c.clone());
-                }
-            }
-            self.got.insert(k, c);
+            self.keep(k, r);
         }
+        if std::env::var_os("MAHERE_ROUTE_LOG").is_some() {
+            READ_NS.fetch_add(t.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// A cell's routing kept in the search's cells, and in the shared cache when it has any (an absent cell may arrive later).
+    fn keep(&mut self, k: CellKey, r: Option<RouteCell>) {
+        let c = r.map(|r| Arc::new(prepare(r, k)));
+        if let (Some(cache), Some(_)) = (&self.cache, &c) {
+            if let Ok(mut m) = cache.0.lock() {
+                if m.len() >= CACHE_CELLS {
+                    m.clear();
+                }
+                m.insert(k, c.clone());
+            }
+        }
+        self.got.insert(k, c);
     }
 
     /// The ways on a trixel, by OSM id, with the cell's way record.
@@ -369,7 +425,7 @@ fn snap_down(cells: &mut Cells, lat: f64, lon: f64, travel: Travel) -> (T, Vec<(
 
 /// The best route from one point to another by stepping trixel to trixel: what [`find`] did before the graph (2026-10-25), kept to check the graph's routes against.
 pub fn find_trixels(store: Arc<dyn CellStore>, dem: Arc<dyn CellStore>, from: (f64, f64), to: (f64, f64), travel: Travel) -> Result<Route, String> {
-    let mut cells = Cells { store: store.clone(), got: HashMap::new(), cache: None, local: false };
+    let mut cells = Cells { store: store.clone(), bundles: None, got: HashMap::new(), pending: HashMap::new(), cache: None, local: false };
     let (a, b) = (T::of(from.0, from.1), T::of(to.0, to.1));
     if a.d != b.d {
         return Err("the ends are in different diamonds of the map; routes cross no diamond yet".into());
@@ -707,12 +763,12 @@ fn stand(cells: &mut Cells, t: T, osm: i64) -> Option<(Stand, Arc<RouteCell>, u1
 /// `dem` is where the terrain comes from for the climb (the base store itself for cells baked whole).
 pub fn find(store: Arc<dyn CellStore>, dem: Arc<dyn CellStore>, from: (f64, f64), to: (f64, f64), travel: Travel) -> Result<Route, String> {
     // A cache of its own, so the search's cells are not read again to draw the line, as the app's shared cache does for it.
-    find_cached(store, dem, from, to, travel, Some(Arc::new(RouteCache::default())))
+    find_cached(store, None, dem, from, to, travel, Some(Arc::new(RouteCache::default())))
 }
 
 /// [`find`] through a cache of cells kept across searches.
-pub fn find_cached(store: Arc<dyn CellStore>, dem: Arc<dyn CellStore>, from: (f64, f64), to: (f64, f64), travel: Travel, cache: Option<Arc<RouteCache>>) -> Result<Route, String> {
-    let mut cells = Cells { store: store.clone(), got: HashMap::new(), cache, local: false };
+pub fn find_cached(store: Arc<dyn CellStore>, bundles: Option<Arc<dyn CellStore>>, dem: Arc<dyn CellStore>, from: (f64, f64), to: (f64, f64), travel: Travel, cache: Option<Arc<RouteCache>>) -> Result<Route, String> {
+    let mut cells = Cells { store: store.clone(), bundles, got: HashMap::new(), pending: HashMap::new(), cache, local: false };
     let (a, starts) = snap_down(&mut cells, from.0, from.1, travel);
     let (b, ends) = snap_down(&mut cells, to.0, to.1, travel);
     if std::env::var_os("MAHERE_ROUTE_LOG").is_some() {
@@ -1129,7 +1185,7 @@ pub fn find_cached(store: Arc<dyn CellStore>, dem: Arc<dyn CellStore>, from: (f6
     }
     // Every run drawn through the finest cells the device holds (Nick 2026-10-26: "no cutting switchbacks"): the search's coarse corridors are its hierarchy, the line is the road.
     let t_fine = std::time::Instant::now();
-    let mut fine = Cells { store: store.clone(), got: HashMap::new(), cache: cells.cache.clone(), local: true };
+    let mut fine = Cells { store: store.clone(), bundles: cells.bundles.clone(), got: HashMap::new(), pending: HashMap::new(), cache: cells.cache.clone(), local: true };
     for run in &mut runs {
         refine(&mut fine, run);
     }

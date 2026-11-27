@@ -315,6 +315,8 @@ pub struct LayerStores {
     pub dem: Arc<dyn CellStore>,
     pub img: Arc<dyn CellStore>,
     pub nir: Arc<dyn CellStore>,
+    /// The route bundles, by the parent of the four cells each holds ([`mahere_tiles::publish::route_bundle`]): what a route search reads the cells past its coarsest depth from. None reads them from their bases.
+    pub route: Option<Arc<dyn CellStore>>,
 }
 
 /// Which layers the view wants loaded with each cell's base.
@@ -1657,7 +1659,7 @@ mod tests {
             vault.put(key, &kept_first);
             let edge = Arc::new(Edge { stale: stale.clone(), fresh: dem.clone(), plain: AtomicUsize::new(0), named: AtomicUsize::new(0) });
             let none: Arc<dyn CellStore> = Arc::new(Kept::default());
-            let layers = LayerStores { dem: Arc::new(TieredStore::new(vault.clone(), edge.clone())), img: none.clone(), nir: none };
+            let layers = LayerStores { dem: Arc::new(TieredStore::new(vault.clone(), edge.clone())), img: none.clone(), nir: none, route: None };
             // Two sessions' loads, with time for any check of the kept copy to run.
             // A base asked for alone takes the kept layer with it only when it is the one named, never fetching (2026-10-22: one decode on a relaunch).
             let alone = load_cell(bases.as_ref(), Some(&layers), 0, key, false, WANT_DEM);
@@ -1691,7 +1693,7 @@ mod tests {
         }
         let base = Arc::new(Counting::default());
         let dem = Arc::new(Counting::default());
-        let layers = LayerStores { dem: dem.clone(), img: Arc::new(Empty), nir: Arc::new(Empty) };
+        let layers = LayerStores { dem: dem.clone(), img: Arc::new(Empty), nir: Arc::new(Empty), route: None };
         let mut r = Residency::layered(base.clone(), Some(layers));
         let a = CellKey::from_grid(3, 12, 100, 100);
         r.want(vec![a], (0, 0));

@@ -953,8 +953,9 @@ pub(crate) fn decode_cell_index(data: &[u8]) -> std::collections::HashMap<(u8, u
 fn layer_name(word: &str, layer: u8) -> VsfType {
     match layer {
         0 => name(word),
-        1 => name(&format!("{word}img")),
-        3 => name(&format!("{word}dem")),
+        1 => name(&format!("{word}route")),
+        2 => name(&format!("{word}img")),
+        6 => name(&format!("{word}dem")),
         _ => name(&format!("{word}nir")),
     }
 }
@@ -983,7 +984,7 @@ pub fn cell_stores(local: Option<&std::path::Path>, vault: Option<Arc<FlatStorag
     use mahere_tiles::publish::Layer;
     if let Some(dir) = local {
         if dir.join("base").is_dir() {
-            let layers = LayerStores { dem: Arc::new(LayerDir(dir.to_path_buf(), Layer::Dem)), img: Arc::new(LayerDir(dir.to_path_buf(), Layer::Img)), nir: Arc::new(LayerDir(dir.to_path_buf(), Layer::Nir)) };
+            let layers = LayerStores { dem: Arc::new(LayerDir(dir.to_path_buf(), Layer::Dem)), img: Arc::new(LayerDir(dir.to_path_buf(), Layer::Img)), nir: Arc::new(LayerDir(dir.to_path_buf(), Layer::Nir)), route: Some(Arc::new(LayerDir(dir.to_path_buf(), Layer::Route))) };
             return (Arc::new(LayerDir(dir.to_path_buf(), Layer::Base)), Some(layers), None);
         }
         return (Arc::new(DirStore(dir.to_path_buf())), None, None);
@@ -992,7 +993,7 @@ pub fn cell_stores(local: Option<&std::path::Path>, vault: Option<Arc<FlatStorag
     #[cfg(target_os = "ferros")]
     if let (Some(v), None) = (&vault, mahere_engine::plain_http::dial()) {
         let cache = VaultCells::open(v.clone());
-        let layers = LayerStores { dem: cache.layer(Layer::Dem), img: cache.layer(Layer::Img), nir: cache.layer(Layer::Nir) };
+        let layers = LayerStores { dem: cache.layer(Layer::Dem), img: cache.layer(Layer::Img), nir: cache.layer(Layer::Nir), route: Some(cache.layer(Layer::Route)) };
         return (cache.clone(), Some(layers), Some(cache));
     }
     let remote = |l: Layer| Arc::new(HttpStore::layer(DEFAULT_CELLS_URL, l));
@@ -1003,10 +1004,11 @@ pub fn cell_stores(local: Option<&std::path::Path>, vault: Option<Arc<FlatStorag
                 dem: Arc::new(TieredStore::new(cache.layer(Layer::Dem), remote(Layer::Dem))),
                 img: Arc::new(TieredStore::new(cache.layer(Layer::Img), remote(Layer::Img))),
                 nir: Arc::new(TieredStore::new(cache.layer(Layer::Nir), remote(Layer::Nir))),
+                route: Some(Arc::new(TieredStore::new(cache.layer(Layer::Route), remote(Layer::Route)))),
             };
             (Arc::new(TieredStore::new(cache.clone(), remote(Layer::Base))), Some(layers), Some(cache))
         }
-        None => (remote(Layer::Base), Some(LayerStores { dem: remote(Layer::Dem), img: remote(Layer::Img), nir: remote(Layer::Nir) }), None),
+        None => (remote(Layer::Base), Some(LayerStores { dem: remote(Layer::Dem), img: remote(Layer::Img), nir: remote(Layer::Nir), route: Some(remote(Layer::Route)) }), None),
     }
 }
 
@@ -1277,7 +1279,7 @@ mod index_tests {
         }
         let vault = FlatStorage::open_device_shared(APP, [9u8; 32]).unwrap();
         let cells = VaultCells::open(vault);
-        assert!(cells.has(a, 0) && !cells.has(a, 3) && cells.has(b, 0) && cells.has(old, 0), "the index came back");
+        assert!(cells.has(a, 0) && !cells.has(a, crate::cells::layer_code(Layer::Dem)) && cells.has(b, 0) && cells.has(old, 0), "the index came back");
         assert!(matches!(cells.get(a), Fetch::Bytes(x) if x == b"base a"));
         // A vault under another secret takes this one's cells in as an older vault, the cell it has already left alone.
         let newer = VaultCells::open(FlatStorage::open_device_shared(APP, [10u8; 32]).unwrap());
@@ -1287,7 +1289,7 @@ mod index_tests {
         assert!(matches!(newer.get(a), Fetch::Bytes(x) if x == b"base a"), "the older vault's cells come in");
         assert_eq!(newer.tag(a).as_deref(), Some("\"t1\""));
         assert!(matches!(newer.get(b), Fetch::Bytes(x) if x == b"newer b"), "what it kept already stays");
-        assert!(newer.has(old, 0) && !newer.has(a, 3));
+        assert!(newer.has(old, 0) && !newer.has(a, crate::cells::layer_code(Layer::Dem)));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

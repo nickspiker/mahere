@@ -24,7 +24,7 @@ fn main() {
     let vault = mahere_store::open(Some(&format!("{out}/fontcheck-vault"))).expect("vault");
     let cache = mahere_store::VaultCells::open(vault.vault().clone());
     let tiered = |c: Arc<dyn mahere_engine::residency::CellCache>, l: Layer| -> Arc<dyn mahere_engine::residency::CellStore> { Arc::new(TieredStore::new(c, Arc::new(HttpStore::layer(DEFAULT_CELLS_URL, l)))) };
-    let layers = LayerStores { dem: tiered(cache.layer(Layer::Dem), Layer::Dem), img: tiered(cache.layer(Layer::Img), Layer::Img), nir: tiered(cache.layer(Layer::Nir), Layer::Nir) };
+    let layers = LayerStores { dem: tiered(cache.layer(Layer::Dem), Layer::Dem), img: tiered(cache.layer(Layer::Img), Layer::Img), nir: tiered(cache.layer(Layer::Nir), Layer::Nir), route: Some(tiered(cache.layer(Layer::Route), Layer::Route)) };
     let mut map = MapCore::layered(tiered(cache.clone(), Layer::Base), Some(layers), Camera::new(lat, lon, ppd, 0.0));
     let (w, h) = (1200usize, 900usize);
     for _ in 0..6000 {

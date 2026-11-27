@@ -2057,7 +2057,7 @@ pub fn section_fields(data: &[u8], name: &str) -> Option<HashMap<String, Vec<Vsf
 }
 
 /// A section's fields with every range-coded plane and table put back as the tensor it was written from; pyramids stay coded for their decoders.
-fn uncoded(mut fields: HashMap<String, Vec<VsfType>>) -> HashMap<String, Vec<VsfType>> {
+pub(crate) fn uncoded(mut fields: HashMap<String, Vec<VsfType>>) -> HashMap<String, Vec<VsfType>> {
     for values in fields.values_mut() {
         if let Some(v) = ac::uncode_field(values) {
             *values = vec![v];

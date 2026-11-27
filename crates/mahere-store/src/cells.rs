@@ -20,21 +20,33 @@ const FLUSH_EVERY: u32 = 256;
 /// How long the writer lets a burst of puts gather before it writes them as one batch.
 const GATHER: Duration = Duration::from_millis(40);
 
-/// A layer's code: in the index key's depth byte (depths stop at 30) and in the vault keys.
+/// A layer's code: the top three bits of the index key's depth byte (depths stop at 30, under 32), and in the vault keys. The four cell layers keep the bits they had when the byte held two of them above six (base, image, infrared, terrain: 0, 2, 4, 6 here), so an index written then reads as it was; the route bundles (2026-11-27) take 1.
 pub(crate) fn layer_code(layer: Layer) -> u8 {
     match layer {
         Layer::Base => 0,
-        Layer::Img => 1,
-        Layer::Nir => 2,
-        Layer::Dem => 3,
+        Layer::Route => 1,
+        Layer::Img => 2,
+        Layer::Nir => 4,
+        Layer::Dem => 6,
     }
+}
+
+/// An index key's depth byte: the depth with the layer's code above it.
+fn pack(depth: u8, code: u8) -> u8 {
+    depth | code << 5
+}
+
+/// The depth and the layer's code back from an index key's depth byte.
+fn unpack(packed: u8) -> (u8, u8) {
+    (packed & 31, packed >> 5)
 }
 
 fn layer_dir(code: u8) -> &'static str {
     match code {
         0 => "base",
-        1 => "img",
-        2 => "nir",
+        1 => "route",
+        2 => "img",
+        4 => "nir",
         _ => "dem",
     }
 }
@@ -98,7 +110,7 @@ impl VaultCells {
     }
 
     fn ix(key: CellKey, code: u8) -> (u8, u64) {
-        (key.depth | code << 6, key.raw())
+        (pack(key.depth, code), key.raw())
     }
 
     fn touch(&self, key: CellKey, code: u8, bytes: usize, seen: i64) {
@@ -165,8 +177,8 @@ impl VaultCells {
     /// The cells kept for one layer, any depth: what a search over the device reads (the base holds the names).
     pub fn keys(&self, layer: Layer) -> Vec<CellKey> {
         let code = layer_code(layer);
-        self.index.lock().unwrap().entries.keys().filter(|(packed, _)| packed >> 6 == code).map(|&(packed, raw)| {
-            let depth = packed & 63;
+        self.index.lock().unwrap().entries.keys().filter(|(packed, _)| unpack(*packed).1 == code).map(|&(packed, raw)| {
+            let depth = unpack(packed).0;
             CellKey { depth, prefix: raw >> (60 - 2 * depth as u32) }
         }).collect()
     }
@@ -179,7 +191,7 @@ impl VaultCells {
     /// Bytes of pinned cells on the device.
     pub fn pinned_bytes(&self) -> u64 {
         let pinned = self.pinned.lock().unwrap();
-        self.index.lock().unwrap().entries.iter().filter(|(k, _)| pinned.contains(&(k.0 & 63, k.1))).map(|(_, &(_, b))| b as u64).sum()
+        self.index.lock().unwrap().entries.iter().filter(|(k, _)| pinned.contains(&(unpack(k.0).0, k.1))).map(|(_, &(_, b))| b as u64).sum()
     }
 
     /// The cells the areas keep: the whole set, replacing the last.
@@ -192,16 +204,17 @@ impl VaultCells {
         let victims: Vec<(u8, u64)> = {
             let ix = self.index.lock().unwrap();
             let pinned = self.pinned.lock().unwrap();
-            let unpinned = |k: &(u8, u64)| !pinned.contains(&(k.0 & 63, k.1));
+            let unpinned = |k: &(u8, u64)| !pinned.contains(&(unpack(k.0).0, k.1));
             let mut total: u64 = ix.entries.iter().filter(|(k, _)| unpinned(k)).map(|(_, &(_, b))| b as u64).sum();
             let mut by_age: Vec<(&(u8, u64), &(i64, u32))> = ix.entries.iter().filter(|(k, _)| unpinned(k)).collect();
-            // The image layers go first (a map without its photo still reads), then the terrain, the base last, oldest first within each.
+            // The image layers go first (a map without its photo still reads), then the route bundles (a route reads the base's own routing without them), then the terrain, the base last, oldest first within each.
             let keep = |code: u8| match code {
-                0 => 2,
-                3 => 1,
+                0 => 3,
+                6 => 2,
+                1 => 1,
                 _ => 0,
             };
-            by_age.sort_by_key(|(k, v)| (keep(k.0 >> 6), v.0));
+            by_age.sort_by_key(|(k, v)| (keep(unpack(k.0).1), v.0));
             let mut out = Vec::new();
             for (k, &(_, b)) in by_age {
                 if total <= budget {
@@ -217,7 +230,7 @@ impl VaultCells {
         }
         let mut gone = Vec::with_capacity(victims.len() * 2);
         for &(packed, raw) in &victims {
-            let (depth, code) = (packed & 63, packed >> 6);
+            let (depth, code) = unpack(packed);
             let key = CellKey { depth, prefix: raw >> (60 - 2 * depth as u32) };
             gone.push(cell_key(key, code));
             gone.push(tag_key(key, code));
@@ -283,8 +296,8 @@ impl VaultCells {
                 let mut batch: Vec<(String, Vec<u8>)> = Vec::with_capacity(chunk.len() * 2);
                 let mut landed = Vec::with_capacity(chunk.len());
                 for &((packed, raw), (seen, _)) in chunk {
-                    let depth = packed & 63;
-                    let (key, code) = (CellKey { depth, prefix: raw >> (60 - 2 * depth as u32) }, packed >> 6);
+                    let (depth, code) = unpack(packed);
+                    let key = CellKey { depth, prefix: raw >> (60 - 2 * depth as u32) };
                     let Ok(Some(bytes)) = old.read_device_bulk(&cell_key(key, code)) else { continue };
                     landed.push((key, code, bytes.len(), seen));
                     batch.push((cell_key(key, code), bytes));
@@ -313,7 +326,7 @@ impl VaultCells {
     fn take_tree(&self, root: &Path, hex: bool) {
         let t = std::time::Instant::now();
         let mut files: Vec<(CellKey, u8, std::path::PathBuf)> = Vec::new();
-        for code in 0..4u8 {
+        for code in [0u8, 2, 4, 6] {
             let Ok(depths) = std::fs::read_dir(root.join(layer_dir(code))) else { continue };
             for d in depths.flatten() {
                 let Ok(groups) = std::fs::read_dir(d.path()) else { continue };
@@ -425,5 +438,24 @@ impl CellCache for VaultCellLayer {
 
     fn set_tag(&self, key: CellKey, tag: &str) {
         self.cells.set_tag_of(key, self.code, tag);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An index written when the layer's code sat two bits above six reads as the same layers now its code is three bits above five, and the route bundles' code is one of its own.
+    #[test]
+    fn index_keys_from_before_the_route_layer_read_the_same() {
+        for (layer, old) in [(Layer::Base, 0u8), (Layer::Img, 1), (Layer::Nir, 2), (Layer::Dem, 3)] {
+            for depth in [0u8, 9, 14, 30] {
+                assert_eq!(pack(depth, layer_code(layer)), depth | old << 6, "{layer:?} at depth {depth}");
+                assert_eq!(unpack(depth | old << 6), (depth, layer_code(layer)));
+            }
+        }
+        let codes: Vec<u8> = [Layer::Base, Layer::Route, Layer::Img, Layer::Nir, Layer::Dem].iter().map(|&l| layer_code(l)).collect();
+        assert!(codes.iter().enumerate().all(|(i, c)| !codes[..i].contains(c)), "every layer a code of its own: {codes:?}");
+        assert_eq!(layer_dir(layer_code(Layer::Route)), "route");
     }
 }

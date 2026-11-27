@@ -12,7 +12,7 @@ fn main() {
     let out = a.get(4).cloned().unwrap_or_else(|| "/tmp/claude-1000/early".into());
     let (w, h) = (900usize, 900usize);
     let http = |l: Layer| -> Arc<dyn mahere_engine::residency::CellStore> { Arc::new(HttpStore::layer(DEFAULT_CELLS_URL, l)) };
-    let layers = LayerStores { dem: http(Layer::Dem), img: http(Layer::Img), nir: http(Layer::Nir) };
+    let layers = LayerStores { dem: http(Layer::Dem), img: http(Layer::Img), nir: http(Layer::Nir), route: Some(http(Layer::Route)) };
     let mut map = MapCore::layered(http(Layer::Base), Some(layers), Camera::new(lat, lon, ppd, 0.0));
     map.set_gpu_only();
     let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor { backends: wgpu::Backends::VULKAN | wgpu::Backends::METAL, ..Default::default() });

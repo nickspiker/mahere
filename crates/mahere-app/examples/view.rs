@@ -15,7 +15,7 @@ fn main() {
     let dir = format!("{out}.vault");
     let cache = mahere_store::VaultCells::open(mahere_store::open(Some(&dir)).expect("vault").vault().clone());
     let tiered = |c: Arc<dyn mahere_engine::residency::CellCache>, l: Layer| -> Arc<dyn mahere_engine::residency::CellStore> { Arc::new(TieredStore::new(c, Arc::new(HttpStore::layer(DEFAULT_CELLS_URL, l)))) };
-    let layers = LayerStores { dem: tiered(cache.layer(Layer::Dem), Layer::Dem), img: tiered(cache.layer(Layer::Img), Layer::Img), nir: tiered(cache.layer(Layer::Nir), Layer::Nir) };
+    let layers = LayerStores { dem: tiered(cache.layer(Layer::Dem), Layer::Dem), img: tiered(cache.layer(Layer::Img), Layer::Img), nir: tiered(cache.layer(Layer::Nir), Layer::Nir), route: Some(tiered(cache.layer(Layer::Route), Layer::Route)) };
     let mut map = match std::env::var("CELLS") {
         Ok(dir) => {
             let (store, layers, _) = mahere_store::cell_stores(Some(std::path::Path::new(&dir)), None);
