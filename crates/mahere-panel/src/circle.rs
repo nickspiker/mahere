@@ -1296,17 +1296,47 @@ impl Panel {
                 self.text.draw_text_left(canvas, &s, x, y, &style, None, None);
             }
         }
-        // A twelfth of the orb's radius, on its edge.
-        let half = (gr / 24.).max(1.);
-        let rad = gr + half;
-        if f >= 1. {
-            ring(canvas, gx, gy, rad, half, fill);
-            return;
+        // One solid disc behind the orb, a twelfth of its radius wider: what shows past the orb is the stroke (owner 2026-11-27: "Draw the black and colour in one pass after the orb with a larger radius, solid circle, and the stroke will do the rest. makes a square pie edge too").
+        pie(canvas, gx, gy, gr, gr * (1. + 1. / 12.), f, fill, BLACK);
+    }
+}
+
+/// A disc of radius `r` about `(x, y)` under what is painted, `fill` from straight up clockwise over `f` of the turn and `rest` the remainder, the two meeting on straight radial edges; pixels inside `inner` (where something opaque lies in front) passed over.
+/// Each pixel's colour is the two's mix by how much of it lies on either side of the nearer edge, the logistic of [`cover`] across it, as the disc's rim is; the mix is of areas within the one pixel, a single layer, not one layer over another.
+#[allow(clippy::too_many_arguments)]
+fn pie(canvas: &mut Canvas, x: f32, y: f32, inner: f32, r: f32, f: f32, fill: u32, rest: u32) {
+    use std::f32::consts::{FRAC_PI_2, TAU};
+    let (w, h) = (canvas.width, canvas.height);
+    let sweep = f * TAU;
+    // WHY: the orb sits near the frame's top on ferros, and its disc may reach past an edge; PROOF: an unclipped box indexes outside the buffer, and a negative bound's cast would wrap.
+    let x0 = (x - r - 2.).floor().max(0.) as usize;
+    let y0 = (y - r - 2.).floor().max(0.) as usize;
+    let x1 = ((x + r + 2.).ceil().max(0.) as usize).min(w);
+    let y1 = ((y + r + 2.).ceil().max(0.) as usize).min(h);
+    for py in y0..y1 {
+        for px in x0..x1 {
+            let (dx, dy) = (px as f32 + 0.5 - x, py as f32 + 0.5 - y);
+            let rho = dx.hypot(dy);
+            if rho < inner - 2. || rho - r > 2. {
+                continue;
+            }
+            // The share of the pixel on `fill`'s side: the distance to the nearer radial edge (out to a quarter turn from it, past which it is the farthest a pixel of this disc can be), signed by the side.
+            let a = dx.atan2(-dy).rem_euclid(TAU);
+            let lit = if f >= 1. {
+                1.
+            } else if f <= 0. {
+                0.
+            } else if a < sweep {
+                cover(-rho * a.min(sweep - a).min(FRAC_PI_2).sin())
+            } else {
+                cover(rho * (a - sweep).min(TAU - a).min(FRAC_PI_2).sin())
+            };
+            let k = cover(rho - r);
+            let i = py * w + px;
+            // No channel carries: the two parts' coverages sum to the pixel's, at most 255 in each byte.
+            let c = part(fill, lit * k) + part(rest, (1. - lit) * k);
+            canvas.pixels[i] = canvas.pixels[i].under(c, BlendMode::Normal);
         }
-        if f > 0. {
-            arc(canvas, gx, gy, rad, f * std::f32::consts::PI, f * std::f32::consts::PI, half, fill);
-        }
-        ring(canvas, gx, gy, rad, half, BLACK);
     }
 }
 
