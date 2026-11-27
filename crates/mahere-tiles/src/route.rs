@@ -243,6 +243,18 @@ impl RouteCell {
         first.into_iter().chain(self.stack[lo..].iter().take_while(move |&&(t, _)| t == i).map(|&(_, w)| w))
     }
 
+    /// Whether way `way` runs through trixel `i` (the plane's or a stacked one): the test a walk along a way makes of every trixel around it before any lookup, most of them off the road.
+    pub fn on_way(&self, i: usize, way: u16) -> bool {
+        if self.way.get(i).copied() == Some(way) {
+            return true;
+        }
+        if self.stack.is_empty() {
+            return false;
+        }
+        let lo = self.stack.partition_point(|&(t, _)| t < i as u32);
+        self.stack[lo..].iter().take_while(|&&(t, _)| t == i as u32).any(|&(_, w)| w == way)
+    }
+
     pub fn is_join(&self, i: usize) -> bool {
         self.joins.binary_search(&(i as u32)).is_ok()
     }

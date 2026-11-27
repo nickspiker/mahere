@@ -19,8 +19,10 @@ pub const ROUTE_DEPTH: u8 = 14;
 pub const ROUTE_MIN: u8 = 8;
 
 /// How far from a trip's ends a depth's maze is walked, metres: beyond it the search climbs to the coarser depth, whose major roads carry the middle of the trip. Doubles a depth up; unbounded at the coarsest.
-fn reach(depth: u8) -> f64 {
-    if depth <= ROUTE_MIN { f64::MAX } else { 2000.0 * (1u32 << (ROUTE_DEPTH - depth)) as f64 }
+fn reach(depth: u8, travel: Travel) -> f64 {
+    // A car leaves the local streets (depths 12 to 14) at half the distance (2026-11-27, measured on five Washington trips: Seattle to Spokane 4.3 s to 3.3 s on the same road, Seattle to Leavenworth a minute faster, a city trip and a Kitsap one unchanged; halving the coarser depths too made the Leavenworth trip three minutes worse). A walker and a rider keep the whole reach: a long hike needs its trails far from either end.
+    let base = if travel == Travel::Car && depth >= 12 { 1000.0 } else { 2000.0 };
+    if depth <= ROUTE_MIN { f64::MAX } else { base * (1u32 << (ROUTE_DEPTH - depth)) as f64 }
 }
 
 /// The side of a diamond's trixel grid at a depth.
@@ -207,6 +209,9 @@ pub static READ_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64:
 pub static DECODE_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// Edge-to-edge jumps a search took by the cells' crossings, summed over a process (MAHERE_ROUTE_LOG, and the tests' proof they were used).
 pub static CROSSED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Crossings jumped at every depth, not only the coarsest: for the test that a jump finds the walk's route, on a town too small for the coarsest depth.
+static CROSS_EVERY_DEPTH: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Cells' routing as the search reads it, each read once from the store, through the shared cache.
 struct Cells {
@@ -544,52 +549,75 @@ enum Stand {
 /// One corridor's trixels with their distances along it to its two nodes, texel edges, sorted by trixel: a walk from each node through the corridor's own trixels and its two nodes' (as [`trace`] walks for one trixel).
 fn corridor_places(cell: &RouteCell, cor: u16) -> Vec<(u32, f32, f32)> {
     let c = cell.corridors[cor as usize - 1];
-    let walk = |from: u32| -> Vec<(usize, f32)> {
-        let mut dist: Vec<(usize, f32)> = Vec::new();
-        let at = |dist: &Vec<(usize, f32)>, j: usize| dist.iter().position(|d| d.0 == j);
-        let mut heap = BinaryHeap::new();
-        for s in cell.node_trixels(from, c.way) {
-            dist.push((s as usize, 0.0));
-            heap.push(Reverse((0u64, s as usize)));
-        }
-        while let Some(Reverse((dk, k))) = heap.pop() {
-            let d = dk as f32 / 256.0;
-            if at(&dist, k).is_some_and(|p| d > dist[p].1 + 1e-6) {
-                continue;
+    PLACES.with(|scratch| {
+        let mut s = scratch.borrow_mut();
+        let Places { generation, stamp, dist } = &mut *s;
+        if stamp[0].is_empty() {
+            for k in 0..2 {
+                stamp[k] = vec![0; mahere_tiles::TRI];
+                dist[k] = vec![0.; mahere_tiles::TRI];
             }
-            for j in cell_around(k) {
-                if cell.corridor_at(j, c.way) != cor && !cell.node_of(j, c.way).is_some_and(|n| n == c.a || n == c.b) {
+        }
+        *generation += 1;
+        let g = *generation;
+        // A walk from one node's trixels through the corridor's own and its two nodes', each trixel's distance in `dist[side]`, stamped with this call's generation (a trixel stamped otherwise is unreached); the trixels reached.
+        let mut walk = |side: usize, from: u32| -> Vec<usize> {
+            let (st, di) = (&mut stamp[side], &mut dist[side]);
+            let mut reached = Vec::new();
+            let mut heap = BinaryHeap::new();
+            for t in cell.node_trixels(from, c.way) {
+                let t = t as usize;
+                st[t] = g;
+                di[t] = 0.;
+                reached.push(t);
+                heap.push(Reverse((0u64, t)));
+            }
+            while let Some(Reverse((dk, k))) = heap.pop() {
+                let d = di[k];
+                if dk as f32 / 256. > d + 1e-3 {
                     continue;
                 }
-                let nd = d + (grid_m(cell_centre(k), cell_centre(j)) / mahere_tiles::texel_m(ROUTE_DEPTH)) as f32;
-                match at(&dist, j) {
-                    Some(p) if dist[p].1 <= nd => {}
-                    Some(p) => {
-                        dist[p].1 = nd;
-                        heap.push(Reverse(((nd * 256.0) as u64, j)));
+                for j in cell_around(k) {
+                    if !cell.on_way(j, c.way) || (cell.corridor_at(j, c.way) != cor && !cell.node_of(j, c.way).is_some_and(|n| n == c.a || n == c.b)) {
+                        continue;
                     }
-                    None => {
-                        dist.push((j, nd));
-                        heap.push(Reverse(((nd * 256.0) as u64, j)));
+                    let nd = d + (grid_m(cell_centre(k), cell_centre(j)) / mahere_tiles::texel_m(ROUTE_DEPTH)) as f32;
+                    if st[j] == g && di[j] <= nd {
+                        continue;
                     }
+                    if st[j] != g {
+                        reached.push(j);
+                    }
+                    st[j] = g;
+                    di[j] = nd;
+                    heap.push(Reverse(((nd * 256.0) as u64, j)));
                 }
             }
-        }
-        dist.sort_unstable_by_key(|d| d.0);
-        dist
-    };
-    let (from_a, from_b) = (walk(c.a), walk(c.b));
-    from_a
-        .into_iter()
-        .filter(|&(j, _)| cell.corridor_at(j, c.way) == cor)
-        .filter_map(|(j, da)| from_b.binary_search_by_key(&j, |d| d.0).ok().map(|k| (j as u32, da, from_b[k].1)))
-        .collect()
+            reached
+        };
+        let from_a = walk(0, c.a);
+        walk(1, c.b);
+        let mut out: Vec<(u32, f32, f32)> = from_a.into_iter().filter(|&j| stamp[1][j] == g && cell.corridor_at(j, c.way) == cor).map(|j| (j as u32, dist[0][j], dist[1][j])).collect();
+        out.sort_unstable_by_key(|p| p.0);
+        out
+    })
+}
+
+/// [`corridor_places`]' scratch, one a thread: a distance and a stamp per trixel of a cell for each of its two walks, reused call after call (a call's generation marks what it reached, so nothing is cleared between them; 2026-11-27: the walks searched a list for every trixel they touched, and a long route spent a tenth of its time there).
+struct Places {
+    generation: u32,
+    stamp: [Vec<u32>; 2],
+    dist: [Vec<f32>; 2],
+}
+
+thread_local! {
+    static PLACES: std::cell::RefCell<Places> = const { std::cell::RefCell::new(Places { generation: 0, stamp: [Vec::new(), Vec::new()], dist: [Vec::new(), Vec::new()] }) };
 }
 
 /// The shortest run of trixels from `from` to any of `to`, through the trixels of corridor `cor` of way `w` and the clusters at its ends, in texel edges; None when there is none.
 /// Any corridor trixel of the way may carry it, at four times the cost off its own: a hub (one run of trixels touching several nodes, a coarse cell's merged switchbacks) marks its trixels with its first corridor only, and the others share them (Nick 2026-10-26: the Snow Lake route jumped the switchbacks). Another node's trixels still block, so the run cannot stray past the two ends.
 fn trace(cell: &RouteCell, w: u16, cor: u16, from: usize, to: &[usize], ends: [u32; 2]) -> Option<(f64, Vec<usize>)> {
-    let allowed = |j: usize| cell.corridor_at(j, w) != 0 || cell.node_of(j, w).is_some_and(|n| n == ends[0] || n == ends[1]);
+    let allowed = |j: usize| cell.on_way(j, w) && (cell.corridor_at(j, w) != 0 || cell.node_of(j, w).is_some_and(|n| n == ends[0] || n == ends[1]));
     let weight = |j: usize| if cell.corridor_at(j, w) == cor || cell.node_of(j, w).is_some() { 1.0 } else { 4.0 };
     let mut dist: HashMap<usize, (f64, usize)> = HashMap::new();
     dist.insert(from, (0.0, usize::MAX));
@@ -834,13 +862,13 @@ pub fn find_cached(store: Arc<dyn CellStore>, dem: Arc<dyn CellStore>, from: (f6
         if std::env::var_os("MAHERE_ROUTE_TRACE").is_some() {
             eprintln!("expand\t{depth}\t{:.5}\t{:.5}\t{}\t{:.0}\t{:?}\t{forced}\t{}", here.0, here.1, n.osm, g, via_here, cell.ways[w as usize - 1].name);
         }
-        let reached = within(reach(depth));
+        let reached = within(reach(depth, travel));
         let trixels = cell.node_trixels(n.name, w);
         // To the same place at another depth: a node there, or a point along a corridor there, whose two ends cost their way along it (the way is on every parent and child trixel of its own, the pyramid being a union).
         let level = |cells: &mut Cells, states: &mut Vec<(Node, f64, usize, Via)>, open: &mut BinaryHeap<Reverse<(u64, usize)>>, index: &mut HashMap<Node, usize>, node_ll: &mut HashMap<Node, (f64, f64)>, t: T, dead: bool| -> bool {
             let Some((st, c, cw)) = stand(cells, t, n.osm) else { return false };
             // Standing in a corridor there and going on to its end is a walk at that depth: not where a finer depth holds this spot and the spot is within its reach (Nick 2026-10-26: the Snow Lake walk was drawn at depth 8, its corridors a hair cheaper than the fine maze's for having fewer cells to cross).
-            if matches!(st, Stand::Between { .. }) && t.depth < ROUTE_DEPTH && near(t.lat_lon(), reach(t.depth + 1)) {
+            if matches!(st, Stand::Between { .. }) && t.depth < ROUTE_DEPTH && near(t.lat_lon(), reach(t.depth + 1, travel)) {
                 let finer = t.children().iter().any(|ct| {
                     let (ck, ci) = ct.cell();
                     cells.get(ck).is_some_and(|cc| cc.ways_at(ci).any(|x| cc.ways[x as usize - 1].osm == n.osm))
@@ -893,7 +921,7 @@ pub fn find_cached(store: Arc<dyn CellStore>, dem: Arc<dyn CellStore>, from: (f6
         }
         // Down a depth, where the finer maze is this spot's (within its reach of an end): the fine maze for the first and last legs, and the depth the trip's middle belongs to.
         let mut descended = false;
-        if depth < ROUTE_DEPTH && within(reach(depth + 1)) {
+        if depth < ROUTE_DEPTH && within(reach(depth + 1, travel)) {
             for &t in &trixels {
                 for ct in T::from_cell(n.key, t as usize).children() {
                     descended |= level(&mut cells, &mut states, &mut open, &mut index, &mut node_ll, ct, false);
@@ -901,7 +929,7 @@ pub fn find_cached(store: Arc<dyn CellStore>, dem: Arc<dyn CellStore>, from: (f6
             }
         }
         // A depth is walked within its reach of an end and outside the finer depth's, or inside the finer one's where the finer maze has no way to come down to (2026-10-27: east of Cle Elum the Leavenworth area has no fine cells, so every coarser depth left I-90 to a finer one that was not there).
-        let walk = forced || (reached && (depth == ROUTE_DEPTH || !within(reach(depth + 1)) || !descended));
+        let walk = forced || (reached && (depth == ROUTE_DEPTH || !within(reach(depth + 1, travel)) || !descended));
         // A node that can neither climb (no coarser cell yet, a way not kept there, the coarsest depth) nor come down (no finer cell here) walks on at its own depth.
         // Either move is enough: the coarsest depth walked on wherever it could not climb (Nick 2026-10-26, the Snow Lake walk drawn in 100 m pieces), its corridors a hair cheaper than the fine maze's for having fewer cells to cross.
         if !walk && (climbed || descended) {
@@ -911,9 +939,10 @@ pub fn find_cached(store: Arc<dyn CellStore>, dem: Arc<dyn CellStore>, from: (f6
         // Only where the whole cell lies past the finer depth's reach of both ends: inside it nothing would come down to the finer maze, so the jump loses no way the walk would find (a cell with such a node in it walks, 2026-11-26: a town's grid came out ten seconds slower in fourteen minutes, its jumps passing where the walk came down).
         let wholly_past = depth == ROUTE_DEPTH || {
             let edge = TEX as f64 * mahere_tiles::texel_m(depth);
-            !near(here, reach(depth + 1) + edge * 2.)
+            !near(here, reach(depth + 1, travel) + edge * 2.)
         };
-        let crossing = if end_cells.contains(&n.key) || !wholly_past { None } else { cell.crossings.as_ref().and_then(|x| x.end(n.name, w).map(|k| (x, k))) };
+        // At the coarsest depth only (2026-11-27, measured): there a long trip's middle crosses many big cells, and Seattle to Minneapolis took 206,000 nodes with the jumps against 315,000 without; at finer depths a jump fanned out to every edge node of a small cell and read more cells around it, and Seattle to Spokane came out a second slower.
+        let crossing = if end_cells.contains(&n.key) || !wholly_past || (depth > ROUTE_MIN && !CROSS_EVERY_DEPTH.load(std::sync::atomic::Ordering::Relaxed)) { None } else { cell.crossings.as_ref().and_then(|x| x.end(n.name, w).map(|k| (x, k))) };
         if let Some((x, k)) = crossing {
             CROSSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             for (j, &(name, ow)) in x.ends.iter().enumerate() {
@@ -1428,6 +1457,7 @@ mod tests {
             }
         }
         let with = baked_with(&roads, &junctions, true);
+        CROSS_EVERY_DEPTH.store(true, std::sync::atomic::Ordering::Relaxed);
         let before = CROSSED.load(std::sync::atomic::Ordering::Relaxed);
         let without = baked_with(&roads, &junctions, false);
         let (from, to) = ((lat as f64 + 0.001, lon as f64 + 0.0005), ((lat + span) as f64 - 0.001, (lon + span) as f64 - 0.0005));
