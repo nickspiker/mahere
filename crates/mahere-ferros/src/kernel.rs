@@ -154,7 +154,9 @@ pub struct Ring {
 
 impl Ring {
     pub fn from_globe(g: &mahere_engine::GlobeRing) -> Ring {
-        Ring { centre: g.centre, radius: g.radius, half_w: g.half_w, end: [g.sweep.sin(), g.sweep.cos()], long: g.sweep > core::f32::consts::PI, rgb: g.rgb }
+        // Its colour is the marks' gamma-2 bytes; the kernel reads it as `g2t` codes, as the overlay's, so it goes thru fluor's table as the marks do (owner 2026-11-27: 0xFF in `g2t` is "infinity", the most the display puts out).
+        let c = mahere_panel::Panel::g2t_of_gamma2(((g.rgb[0] as u32) << 16) | ((g.rgb[1] as u32) << 8) | g.rgb[2] as u32);
+        Ring { centre: g.centre, radius: g.radius, half_w: g.half_w, end: [g.sweep.sin(), g.sweep.cos()], long: g.sweep > core::f32::consts::PI, rgb: [(c >> 16) as u8, (c >> 8) as u8, c as u8] }
     }
 
     /// Its opacity at full coverage: the marks' sum takes a mark's brightest channel as its opacity.

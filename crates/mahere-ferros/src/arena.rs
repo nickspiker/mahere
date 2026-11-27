@@ -624,6 +624,8 @@ pub fn overlay_sum(marks: &[u32], panel: Option<&[u32]>, w: usize, b: PixelBox, 
                     row[x] = 0;
                     continue;
                 }
+                // The marks are drawn in gamma-2 bytes (255 white); the overlay is read as `g2t` codes, where 255 is the most the display puts out (owner 2026-11-27: "ffffff is infinity"), so they go thru fluor's table into `g2t` first.
+                let m = mahere_panel::Panel::g2t_of_gamma2(m);
                 let (mr, mg, mb) = ((m >> 16) & 255, (m >> 8) & 255, m & 255);
                 let ma = mr.max(mg).max(mb);
                 let (r, g, bl, a) = if p >> 24 == 0 { (0, 0, 0, 0) } else { mahere_panel::Panel::premul_pub(p) };

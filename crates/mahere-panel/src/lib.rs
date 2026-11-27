@@ -482,9 +482,9 @@ fn set(mask: &mut LayerMask, ctl: &mut Controls, l: Layer, v: bool) {
     }
 }
 
-/// A colour authored as visible 0xRRGGBB with an opacity, in fluor's stored form on this platform.
+/// A colour authored as visible 0xRRGGBB (gamma 2, 0xFF white) with an opacity, in fluor's stored form on this platform. Through [`theme::from_gamma2`] first: fluor's buffer is VSF `g2t`, where 0xFF is not white but the most the display puts out (9.7 times diffuse white, `g2t` 0xC2), and the panel's whites, its amber and its blues came out as glare on the Pro's panel (owner 2026-11-27: "ffffff is infinity, max display can put out"). The darks are as they were; the brights come in under white.
 const fn ink(rgb: u32, alpha: u8) -> u32 {
-    (theme::dark(theme::fmt(theme::vsf(rgb))) & 0x00FF_FFFF) | ((alpha as u32) << 24)
+    (theme::dark(theme::fmt(theme::vsf(theme::from_gamma2(rgb)))) & 0x00FF_FFFF) | ((alpha as u32) << 24)
 }
 
 /// The panel's colours: its own palette, or, once a platform has set a look of its own (ferros: the device theme as fluor's look, which its host sets and follows, preference 5; owner 2026-11-20: every kist in the device theme), drawn from that look, so the panel's words, ground and controls are the device's. Without one (desktop, Android) every colour is the palette's, as it always was.
@@ -2632,6 +2632,11 @@ impl Panel {
     /// A pixel of fluor's (α + darkness) as premultiplied RGBA in this platform's channel order.
     pub fn premul_pub(p: u32) -> (u8, u8, u8, u8) {
         Self::premul(p)
+    }
+
+    /// Gamma-2 bytes (0xRRGGBB, 255 white) as fluor's `g2t` codes, where 255 is the most the display puts out, not white (fluor `from_gamma2`): for a host summing the map's marks into an overlay read as `g2t`.
+    pub fn g2t_of_gamma2(c: u32) -> u32 {
+        theme::from_gamma2(c)
     }
 
     /// The panel's base font size, pixels, for anything lettered to match it.

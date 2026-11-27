@@ -71,8 +71,10 @@ pub struct DeviceApp<G: MapGpu = NoGpu> {
     pub w: usize,
     pub h: usize,
     pub dragging: bool,
-    /// Pixels the finger has travelled since the press: under a dozen at release is a tap.
+    /// The farthest the finger has been from where it pressed, pixels: under [`Self::tap_slop`] at release is a tap.
     pub travel: f64,
+    /// Where the finger pressed.
+    pub press_at: (f64, f64),
     /// A second finger touched during this press.
     pub had_two: bool,
     /// A finger down on the map with the panel open: the panel closes when it lifts, unless a second finger came (a pinch sizes the interface or the lettering, Nick 2026-10-26) or it travelled.
@@ -727,6 +729,18 @@ impl<G: MapGpu> DeviceApp<G> {
         }
     }
 
+    /// How far a finger may wander and still tap: a 64th of the screen's span (its sides' harmonic mean), about 29 pixels on the Pro, 15 on a laptop. It was 12 pixels of path summed over every move (2026-11-27: on the Pro's 1344-pixel width that is a millimetre, and a finger held still wanders that far, so a tap to put a route's start down was taken for a pan, sometimes).
+    fn tap_slop(&self) -> f64 {
+        let (w, h) = (self.w as f64, self.h as f64);
+        2. * w * h / (w + h) / ((1 << 6) as f64)
+    }
+
+    /// The finger at `(x, y)`: the farthest it has been from where it pressed.
+    fn note_travel(&mut self, x: f64, y: f64) {
+        let d = ((x - self.press_at.0).powi(2) + (y - self.press_at.1).powi(2)).sqrt();
+        self.travel = self.travel.max(d);
+    }
+
     /// The session saved once the view comes to rest somewhere new, or the pins or the route change: ferros has no pause to save on as Android does (2026-11-27: every relaunch on a new capsule started from the whole globe, the view never saved without a GPS fix).
     fn save_at_rest(&mut self) {
         use std::hash::{Hash, Hasher};
@@ -795,14 +809,20 @@ impl<G: MapGpu> FluorApp for DeviceApp<G> {
                     self.close_on_lift = true;
                     self.pinched = false;
                     self.travel = 0.0;
-                    self.last_cursor = (ctx.cursor_x as f64, ctx.cursor_y as f64);
+                    self.press_at = (ctx.cursor_x as f64, ctx.cursor_y as f64);
+                    self.last_cursor = self.press_at;
                     self.dragging = false;
                     return EventResponse::Handled;
                 }
-                // A route pin under the finger is picked up and moved, not the map.
+                // A route pin under the finger is picked up and moved, not the map; a press on it that never travels is a tap, as anywhere (2026-11-27: a tap near the end pin to put the start down picked the end pin up instead, and nothing was placed).
                 if self.two.is_none() {
                     if let Some(pin) = self.map.pin_at(ctx.cursor_x as f64, ctx.cursor_y as f64, self.w, self.h) {
                         self.pin_drag = Some(pin);
+                        self.dragging = true;
+                        self.travel = 0.0;
+                        self.had_two = false;
+                        self.press_at = (ctx.cursor_x as f64, ctx.cursor_y as f64);
+                        self.last_cursor = self.press_at;
                         return EventResponse::Handled;
                     }
                 }
@@ -810,7 +830,8 @@ impl<G: MapGpu> FluorApp for DeviceApp<G> {
                     self.dragging = true;
                     self.travel = 0.0;
                     self.had_two = false;
-                    self.last_cursor = (ctx.cursor_x as f64, ctx.cursor_y as f64);
+                    self.press_at = (ctx.cursor_x as f64, ctx.cursor_y as f64);
+                    self.last_cursor = self.press_at;
                     // The S Pen always writes on the map: the tool picked, or the pen with none (Nick 2026-10-13).
                     // A finger draws only with a tool on, and not while the pen is out (a pen touched in the last few seconds), when fingers only navigate (Nick 2026-10-10).
                     use mahere_engine::ink::Tool;
@@ -841,7 +862,7 @@ impl<G: MapGpu> FluorApp for DeviceApp<G> {
                 self.apply_track_acts();
                 self.apply_update_acts();
                 if std::mem::take(&mut self.close_on_lift) {
-                    if !self.pinched && self.travel < 12.0 {
+                    if !self.pinched && self.travel < self.tap_slop() {
                         self.panel.close();
                         self.save_settings();
                     }
@@ -855,14 +876,15 @@ impl<G: MapGpu> FluorApp for DeviceApp<G> {
                     ctx.window.request_redraw();
                     return EventResponse::Handled;
                 }
-                // A pin put down: the route asked for again from where it lies.
-                if self.pin_drag.take().is_some() {
+                // A pin put down: the route asked for again from where it lies. One that never moved was a tap.
+                if self.pin_drag.take().is_some() && self.travel >= self.tap_slop() {
                     self.map.reroute();
+                    self.dragging = false;
                     ctx.window.request_redraw();
                     return EventResponse::Handled;
                 }
                 // A press and release that never travelled is a tap: a new measurement to that point.
-                if self.dragging && self.two.is_none() && !self.had_two && self.travel < 12.0 {
+                if self.dragging && self.two.is_none() && !self.had_two && self.travel < self.tap_slop() {
                     // A label under the finger names what it letters first.
                     // The lettering drawn: the GPU host's where it letters the map, else this app's own (ferros, whose GPU map draws this app's labeller's lettering too).
                     let labeller = self.gpu.as_ref().map_or(&self.labeller, |g| g.labeller());
@@ -886,20 +908,26 @@ impl<G: MapGpu> FluorApp for DeviceApp<G> {
                     return EventResponse::Handled;
                 }
                 if self.close_on_lift {
-                    self.travel += (x - self.last_cursor.0).abs() + (y - self.last_cursor.1).abs();
+                    self.note_travel(x, y);
                 } else if let Some(pin) = self.pin_drag {
-                    self.map.move_pin(pin, x, y, self.w, self.h);
-                    ctx.window.request_redraw();
+                    self.note_travel(x, y);
+                    if self.travel >= self.tap_slop() {
+                        self.map.move_pin(pin, x, y, self.w, self.h);
+                        ctx.window.request_redraw();
+                    }
                 } else if self.suppress_move {
                     self.suppress_move = false;
                 } else if self.drawing {
                     self.map.extend_stroke(x, y, self.pressure as f64, self.w, self.h);
                     ctx.window.request_redraw();
                 } else if self.dragging && self.two.is_none() && (!self.panel.is_open() || self.panel.map_takes(x as f32, y as f32)) {
-                    let (dx, dy) = (x - self.last_cursor.0, y - self.last_cursor.1);
-                    self.travel += dx.abs() + dy.abs();
-                    if self.travel >= 12.0 {
-                        self.map.pan(dx, dy, self.w, self.h);
+                    // Past the slop the map follows the finger from where it pressed, so nothing of the move is lost.
+                    let was = self.travel;
+                    self.note_travel(x, y);
+                    let slop = self.tap_slop();
+                    if self.travel >= slop {
+                        let from = if was < slop { self.press_at } else { self.last_cursor };
+                        self.map.pan(x - from.0, y - from.1, self.w, self.h);
                         ctx.window.request_redraw();
                     }
                 }
@@ -1174,6 +1202,7 @@ impl<G: MapGpu> DeviceApp<G> {
             h: height as usize,
             dragging: false,
             travel: 0.0,
+            press_at: (0.0, 0.0),
             had_two: false,
             close_on_lift: false,
             pinched: false,
