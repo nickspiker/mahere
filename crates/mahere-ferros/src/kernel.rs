@@ -20,6 +20,9 @@ use valhall::ssa::{self, F, H, M, U};
 pub const SLOT_FRAME: u8 = 0;
 pub const SLOT_ARENA: u8 = 1;
 
+/// Samples a side a still frame takes, averaged in light: three, nine a pixel, the other hosts' 3× (owner 2026-10-06: still frames anti-aliased at 3×, only pan, zoom and rotate drop to 1×). The nine copies of the map's branches need valhall's labels sized by the kernel (ferros 6ceb1c84; 64 held four copies).
+pub const STILL_SAMPLES: u32 = 3;
+
 /// The arena's layout, bytes from its start. The tables first: each line class (22) and land class (14) a row of `ROW` words, f16 pairs (linear red and green, then blue and the opacity over 255), then the hypsometric ramp (4096 rows: red and green, blue twice).
 pub const LINE_TAB: usize = 0;
 pub const ROW: usize = 2;
@@ -123,6 +126,8 @@ pub struct Consts {
     pub bake: Option<Bake>,
     /// The place names (`letters.rs`), under the ring and the overlay and over the map; None when nothing is lettered.
     pub letters: Option<Letters>,
+    /// Samples a pixel takes on each side, averaged in light: 3 (nine) for a still camera, 1 while it moves (owner 2026-10-06: still frames anti-aliased at 3× whatever the cost, only pan, zoom and rotate drop to 1×; 2026-11-27, ferros had only ever drawn 1×).
+    pub samples: u32,
 }
 
 /// Where the frame's lettering is (`letters.rs`), word offsets in the arena: the tiles (a word each, `cols` a row), the letters' records, their lists and the glyph atlas; the halo's colour (in the kernel's output, as the letters' are) and its opacity.
@@ -316,7 +321,27 @@ pub fn recording(c: &Consts) -> ssa::Recording {
         (Some(a), None) | (None, Some(a)) => a,
         (None, None) => M::splat(true),
     };
-    let rgb = ssa::when(need, bg, || map(c, x, y, sx, sy, disk, bg)).f32();
+    // The map at `samples` × `samples` points in the pixel, each a sub-pixel's corner for its texels and its centre for its light (as one sample is the pixel's), averaged in light: the anti-aliasing the other hosts get from a 3× target binned down. Each sample its own branch, so a pixel on the limb is part globe and part background.
+    let n = c.samples.max(1);
+    let rgb = if n == 1 {
+        ssa::when(need, bg, || map(c, x, y, sx, sy, disk, bg)).f32()
+    } else {
+        let step = 1. / n as f32;
+        let mut sum = [F::splat(0.); 3];
+        for j in 0..n {
+            for k in 0..n {
+                let (ox, oy) = (k as f32 * step, j as f32 * step);
+                let (xs, ys) = (x + ox, y + oy);
+                let (cx, cy) = (xs + step * 0.5, ys + step * 0.5);
+                let s = ssa::when(need, bg, || map(c, xs, ys, cx, cy, disk, bg)).f32();
+                for q in 0..3 {
+                    sum[q] = sum[q] + s[q];
+                }
+            }
+        }
+        let w = 1. / (n * n) as f32;
+        sum.map(|v| v * w)
+    };
     // The place names wherever the overlay leaves anything to see (a name by the limb runs off the disk, as on the CPU path), as a layer of their own: the map goes under it below, in the output's own values.
     let lettered = c.letters.as_ref().map(|l| letters(l, x, y, sx, sy, seen.unwrap_or(M::splat(true))));
     let under = |front: (F, [F; 3]), back: [F; 3]| {

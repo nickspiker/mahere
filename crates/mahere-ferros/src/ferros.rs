@@ -101,10 +101,19 @@ impl FluorApp for App {
         if self.gpu.as_ref().is_some_and(|g| g.owes_frame()) {
             return Some(std::time::Instant::now());
         }
-        self.inner.wake_at()
+        // The still frame (anti-aliased) when the camera has rested: its time, or the map's own wake if sooner.
+        let still = self.gpu.as_ref().and_then(|g| g.still_at());
+        match (still, self.inner.wake_at()) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
     }
     fn tick(&mut self, ctx: &mut Context) -> bool {
         let mut more = self.inner.tick(ctx);
+        // The still frame is due: one more frame, drawn at `STILL_SAMPLES`.
+        if self.gpu.as_ref().and_then(|g| g.still_at()).is_some_and(|t| t <= std::time::Instant::now()) {
+            more = true;
+        }
         // The person's app scale, followed as every kist follows it: the panel, its buttons and the map's lettering laid out at 2^(s/64), from the first frame and at every change (a settings page, a pinch in the deck).
         let s = sys::pref(sys::PREF_SCALE);
         if self.scale_seen != Some(s) {
@@ -509,34 +518,31 @@ impl Touch {
         if action == Action::Down {
             app.first_down = (x0, y0);
         }
-        // With the panel open, two fingers scale the interface or the map's lettering, by where the first came down; never the map.
-        if app.panel.is_open() {
-            if count >= 2 && action != Action::PointerUp {
-                app.pinched = true;
+        // Two fingers (owner 2026-11-27: "pinch/zoom on the UI should scale the UI, pinch/zoom on the map should orient the map. First finger down calls the surface."): as the second lands, where the first came down decides for the whole gesture, the panel open or not: Mahere's own surface (the open pages, the orb, the beads, the readout) scales the interface, the map moves the map.
+        if count >= 2 && action != Action::PointerUp {
+            if app.ui_pinch.is_none() && app.two.is_none() {
+                app.pinch_on_panel = app.panel.covers(app.first_down.0 as f32, app.first_down.1 as f32);
+            }
+            app.pinched = true;
+            // A second finger means a gesture, never a tap: the last finger's lift sets no route's end (2026-11-27, the owner: "navigation endpoint sometimes triggers even tho two fingers are down").
+            app.had_two = true;
+            if app.pinch_on_panel {
                 app.ui_pinch(x0, y0, x1, y1);
-                shell.request_redraw();
-                return;
-            }
-            if count >= 2 || app.ui_pinch.is_some() {
-                app.ui_pinch = None;
-                if app.pinch_on_panel {
-                    app.save_settings();
-                } else if let Some(store) = &app.store {
-                    let _ = mahere_store::save_label_scale(store, app.panel.label_scale());
-                }
-                return;
-            }
-            pointer(shell, action, x0, y0);
-            return;
-        }
-        if count >= 2 {
-            if action == Action::PointerUp {
-                app.two_end();
             } else if app.two.is_none() {
                 app.two_begin(x0, y0, x1, y1);
             } else if action == Action::Move {
                 app.two_update(x0, y0, x1, y1);
             }
+            shell.request_redraw();
+            return;
+        }
+        // A finger of a pinch lifted: the gesture ends, the interface's scale kept.
+        if app.ui_pinch.take().is_some() {
+            app.save_settings();
+            return;
+        }
+        if count >= 2 {
+            app.two_end();
             shell.request_redraw();
             return;
         }

@@ -209,6 +209,15 @@ fn main() {
             }
         }
         let measure = map.measure_view(w, h, mahere_panel::Panel::strip_samples(w));
+        // MAHERE_LOADING=<share>[,stalled] shows the loading arc: the share of the view's cells in, stalled with a made-up reason.
+        if let Ok(spec) = std::env::var("MAHERE_LOADING") {
+            let mut p = spec.split(',');
+            let f: f32 = p.next().and_then(|v| v.parse().ok()).unwrap_or(0.5);
+            panel.set_loading(Some(if p.next() == Some("stalled") { mahere_panel::LoadState::Stalled(f, "Network stalled: the ip server has no free connection".into()) } else { mahere_panel::LoadState::Loading(f) }));
+            for _ in 0..32 {
+                panel.paint(w, h, map.layers(), controls, &readouts, None, &map.themes, &areas, None);
+            }
+        }
         // MAHERE_PRESS=x,y;x,y taps the panel at each point in turn, a frame painted before each so the panel knows where its controls are (ferros: the orb, a bead, a root row), what a tap asks of the map done as a host would.
         if let Ok(spec) = std::env::var("MAHERE_PRESS") {
             for p in spec.split(';') {

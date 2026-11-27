@@ -239,37 +239,30 @@ pub extern "system" fn Java_nz_mahere_app_MahereActivity_nativeOnTouch(
     if action == ACTION_DOWN {
         s.app().first_down = (x0 as f64, y0 as f64);
     }
-    // With the panel open, two fingers scale the interface or the map's lettering, by where the first came down; never the map.
-    if s.app().panel.is_open() {
-        if count >= 2 && action != ACTION_POINTER_UP {
-            s.app().pinched = true;
-            s.app().ui_pinch(x0 as f64, y0 as f64, x1 as f64, y1 as f64);
-            return 0;
+    // Two fingers (owner 2026-11-27: "pinch/zoom on the UI should scale the UI, pinch/zoom on the map should orient the map. First finger down calls the surface."): as the second lands, where the first came down decides for the whole gesture, the panel open or not: the panel scales the interface, the map moves the map. Never a tap: the last finger's lift sets no route's end.
+    if count >= 2 && action != ACTION_POINTER_UP {
+        let app = s.app();
+        if app.ui_pinch.is_none() && app.two.is_none() {
+            app.pinch_on_panel = app.panel.covers(app.first_down.0 as f32, app.first_down.1 as f32);
         }
-        if count >= 2 || s.app().ui_pinch.is_some() {
-            s.app().ui_pinch = None;
-            if s.app().pinch_on_panel {
-                s.app().save_settings();
-            } else {
-                let app = s.app();
-                if let Some(store) = &app.store {
-                    let _ = mahere_store::save_label_scale(store, app.panel.label_scale());
-                }
-            }
-            return 0;
+        app.pinched = true;
+        app.had_two = true;
+        if app.pinch_on_panel {
+            app.ui_pinch(x0 as f64, y0 as f64, x1 as f64, y1 as f64);
+        } else if app.two.is_none() {
+            app.two_begin(x0 as f64, y0 as f64, x1 as f64, y1 as f64);
+        } else if action == ACTION_MOVE {
+            app.two_update(x0 as f64, y0 as f64, x1 as f64, y1 as f64);
         }
-        let r = s.on_touch(action, x0, y0);
-        share_if_asked(&mut env, &activity, s);
-        return r;
+        return 0;
+    }
+    // A finger of a pinch lifted: the gesture ends, the interface's scale kept.
+    if s.app().ui_pinch.take().is_some() {
+        s.app().save_settings();
+        return 0;
     }
     if count >= 2 {
-        if action == ACTION_POINTER_UP {
-            s.app().two_end();
-        } else if s.app().two.is_none() {
-            s.app().two_begin(x0 as f64, y0 as f64, x1 as f64, y1 as f64);
-        } else if action == ACTION_MOVE {
-            s.app().two_update(x0 as f64, y0 as f64, x1 as f64, y1 as f64);
-        }
+        s.app().two_end();
         return 0;
     }
     if s.app().two.is_some() {

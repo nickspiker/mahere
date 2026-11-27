@@ -789,6 +789,11 @@ impl Residency {
         self.pending.len()
     }
 
+    /// Whether `key`'s last fetch failed (and it waits out its backoff before it is asked for again).
+    pub fn failed_recently(&self, key: &CellKey) -> bool {
+        self.failed.contains_key(key)
+    }
+
     pub fn converged(&self) -> bool {
         self.pending.is_empty() && self.fill_left == 0
     }
@@ -927,6 +932,20 @@ fn fetch_only(store: &dyn CellStore, layers: Option<&LayerStores>, key: CellKey,
     }
 }
 
+/// Why the last fetch failed, for the map's loading line to say when the cells stop coming (2026-11-27, the owner: "hard to know sometimes if the network is stuck or there just isn't coverage").
+static LAST_FAILURE: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+fn note_failure(e: &str) {
+    if let Ok(mut f) = LAST_FAILURE.lock() {
+        *f = Some(e.to_string());
+    }
+}
+
+/// Why the last fetch failed, if one has.
+pub fn last_failure() -> Option<String> {
+    LAST_FAILURE.lock().ok().and_then(|f| f.clone())
+}
+
 /// One layer's bytes: Some(empty) for none (absent, or a published cell with no base), None for a failure to try again.
 fn layer_bytes(store: &dyn CellStore, key: CellKey, what: &str) -> Option<Vec<u8>> {
     match store.get(key) {
@@ -934,6 +953,7 @@ fn layer_bytes(store: &dyn CellStore, key: CellKey, what: &str) -> Option<Vec<u8
         Fetch::Absent => Some(Vec::new()),
         Fetch::Failed(e) => {
             eprintln!("cell {} {what} fetch failed: {e}", key.name());
+            note_failure(&e);
             None
         }
     }
@@ -955,6 +975,7 @@ fn load_cell(store: &dyn CellStore, layers: Option<&LayerStores>, want: u8, key:
         }
         Fetch::Failed(e) => {
             eprintln!("cell {} fetch failed: {e}", key.name());
+            note_failure(&e);
             return Loaded { key, merge: false, entry: None };
         }
     };
@@ -981,6 +1002,7 @@ fn load_cell(store: &dyn CellStore, layers: Option<&LayerStores>, want: u8, key:
                 Fetch::Bytes(fresh) if mahere_tiles::publish::linked(&bytes, layer, &fresh) => Some(fresh),
                 Fetch::Failed(e) => {
                     eprintln!("cell {} {} fetch failed: {e}", key.name(), layer.dir());
+                    note_failure(&e);
                     None
                 }
                 _ => {

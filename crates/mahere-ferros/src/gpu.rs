@@ -17,6 +17,9 @@ use mahere_engine::PixelBox;
 /// Mahere's block in the GPU's address space (ferros_sys::gpu `ARENA_VA`), and the most it can be: ferros's ceiling a client's GPU block (ferros_sys `GPU_BLOCK_MOST`, 512 MiB since 2026-11-13; 128 MiB, the whole fixed arena, before). A kernel that cannot say a region's size (before ferros 2026-11-11) gave the whole 64 MiB arena and fenced no surface in for the GPU.
 const ARENA_VA: u64 = 0x8000_0000;
 const ARENA_MOST: usize = 512 << 20;
+/// How long the camera rests before the still frame: as the desktop host waits (mahere-app gpu.rs `QUIET`).
+const QUIET: std::time::Duration = std::time::Duration::from_millis(250);
+
 /// What Mahere asks for (ferros 2026-11-13, SYS_DMA x1 = 2): 2^29, 512 MiB. The 8a's 1080 x 2400 names 114 to 376 cells' planes of a MiB at the scale's depth (2026-11-12), and its frame regions take 24 MiB more; 256 MiB would hold the plans two or three depths short at a city, 512 the whole of them. Halved while the pool cannot give it, down to `BLOCK_LEAST_LOG` (32 MiB, what a kist holds at launch).
 const ASK_LOG: u32 = 29;
 const BLOCK_LEAST_LOG: u32 = 25;
@@ -61,6 +64,10 @@ pub struct GpuMap {
     report_at: std::time::Instant,
     /// The camera when it last moved and since when, and whether the frames since have been said sharp (`sharpness`).
     moved: (u64, std::time::Instant),
+    /// The camera's key when it last moved and when, and whether the still frame (anti-aliased, `STILL_SAMPLES`) has been drawn since: a camera at rest `QUIET` gets it.
+    still: (u64, std::time::Instant, bool),
+    /// The samples a side the frame being planned takes (`draw` chooses them).
+    samples: u32,
     sharp_said: bool,
 }
 
@@ -245,6 +252,8 @@ impl GpuMap {
             stats: Stats::default(),
             report_at: std::time::Instant::now(),
             moved: (0, std::time::Instant::now()),
+            still: (0, std::time::Instant::now(), true),
+            samples: 1,
             sharp_said: true,
         })
     }
@@ -280,6 +289,11 @@ impl GpuMap {
     /// A frame planned and not yet drawn (the last draw's, pipelined): the host should draw once more, so it reaches the glass when the map comes to rest.
     pub fn owes_frame(&self) -> bool {
         self.ready.is_some()
+    }
+
+    /// When the still frame is due: a camera come to rest gets one anti-aliased frame `QUIET` after its last move (as the desktop's host); None once it is drawn.
+    pub fn still_at(&self) -> Option<std::time::Instant> {
+        (!self.still.2).then(|| self.still.1 + QUIET)
     }
 
     /// What a frame shows, as far as a frame planned again would differ: the view, the cells, the style and layers, the panel.
@@ -334,7 +348,21 @@ impl GpuMap {
             // Region 0 first, as one region always is (its frame in the window's own surface).
             (self.next, self.shown) = (0, 0);
         }
-        let key = Self::view_key(app, w, h);
+        // Moving or still: the camera's place against the last frame's; still for `QUIET`, the frame takes `STILL_SAMPLES` a side.
+        let cam = {
+            use std::hash::{Hash, Hasher};
+            let c = app.map.cam;
+            let mut hs = std::collections::hash_map::DefaultHasher::new();
+            (c.lat().to_bits(), c.lon().to_bits(), c.ppd.to_bits(), c.bearing().to_bits()).hash(&mut hs);
+            hs.finish()
+        };
+        if cam != self.still.0 {
+            self.still = (cam, std::time::Instant::now(), false);
+        }
+        let samples = if self.still.1.elapsed() >= QUIET { kernel::STILL_SAMPLES } else { 1 };
+        self.samples = samples;
+        // A frame at another sampling is another frame: the one waiting is not shown as this one.
+        let key = Self::view_key(app, w, h) ^ samples as u64;
         let d = |a: std::time::Instant, b: std::time::Instant| (b - a).as_micros() as u64;
         let inflight = match self.ready.take() {
             Some(r) => {
@@ -473,6 +501,10 @@ impl GpuMap {
         }
         self.baked[region] = c.bake.is_some();
         c.letters = lettered.map(|f| f.consts);
+        c.samples = self.samples;
+        if self.samples > 1 {
+            self.still.2 = true;
+        }
         let rec = kernel::recording(&c);
         let t5 = std::time::Instant::now();
         self.kernel(rec);

@@ -14,7 +14,7 @@ use fluor::host::app::{Context, FluorApp};
 use fluor::paint::pack_argb;
 use mahere_engine::{Camera, GpsFix, MapCore};
 use mahere_panel::{Controls, Panel, Readouts};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// The platform's GPU map host, as the app needs it: the lettering it laid out, to name what a tap lands on. Android's Vulkan host is one; a platform with none uses [`NoGpu`].
 pub trait MapGpu {
@@ -47,6 +47,10 @@ pub struct DeviceApp<G: MapGpu = NoGpu> {
     pub map: MapCore,
     /// Why `tick` asked for a frame beyond the map's own (`MapCore::tick_why`), counted: a search landed, the panel dirty, the lettering landed.
     pub tick_why: [u64; 3],
+    /// The loading arc's bookkeeping: when the view began waiting for cells, the count in and when it last grew, and when the last wait ended.
+    load_began: Option<Instant>,
+    load_got: (u32, Instant),
+    load_ended: Option<Instant>,
     /// The panel asked to be painted again since a host that paints it itself last looked (`tick` takes its dirty flag): a GPU host's overlay repaints it on this as well as on its own key (ferros, 2026-11-12: a font pack arriving marked the panel dirty every tick until a paint loaded it, the GPU host never painted it for that, and the still map drew at the panel's rate).
     pub panel_changed: bool,
     /// Whether the map is lettered (place names laid out by the labeller and drawn over it): a host that draws the map itself without the lettering turns it off, and with it the labeller's layouts, its glyph atlases and the font packs only place names ask for (ferros's GPU map, 2026-11-12: lettered every time the view rested, never drawn, with the Chinese, Korean and Japanese packs, 37 MiB, loaded for it). On by default.
@@ -934,6 +938,7 @@ impl<G: MapGpu> FluorApp for DeviceApp<G> {
     }
 
     fn tick(&mut self, ctx: &mut Context) -> bool {
+        self.follow_loading();
         if let Some(what) = self.panel.take_copy() {
             ctx.window.set_clipboard(&what);
         }
@@ -1188,6 +1193,9 @@ impl<G: MapGpu> DeviceApp<G> {
             share_file: None,
             areas_shown: Instant::now(),
             tick_why: [0; 3],
+            load_began: None,
+            load_got: (0, Instant::now()),
+            load_ended: None,
             panel_changed: false,
             lettering: true,
             updater: {
@@ -1239,4 +1247,38 @@ fn when_text(et: i64) -> String {
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     let y = yoe + era * 400 + (m <= 2) as i64;
     format!("{y:04}-{m:02}-{d:02}  {:02}:{:02} UTC", rem / 3600, rem % 3600 / 60)
+}
+
+impl<G: MapGpu> DeviceApp<G> {
+    /// The loading arc's state from the view's cells (2026-11-27, the owner: "hard to know sometimes if the network is stuck or there just isn't coverage"): shown once a wait has lasted half a second (a quick load never flashes it), the share of the view's cells in; stalled when nothing has come for five seconds, with the last fetch's failure or the network's slowness as the reason; and for three seconds after a wait, where part of the view has nothing finer, that it has none.
+    fn follow_loading(&mut self) {
+        let l = self.map.loading();
+        let now = Instant::now();
+        let got = l.done + l.empty;
+        if got != self.load_got.0 {
+            self.load_got = (got, now);
+        }
+        let state = if l.pending + l.failing > 0 {
+            self.load_ended = None;
+            let began = *self.load_began.get_or_insert(now);
+            if now - began < Duration::from_millis(1 << 9) {
+                None
+            } else if now - self.load_got.1 >= Duration::from_secs(5) {
+                let why = match mahere_engine::residency::last_failure().filter(|_| l.failing > 0) {
+                    Some(e) => format!("Network stalled: {}", e.chars().take(48).collect::<String>()),
+                    None => "Waiting on the network".to_string(),
+                };
+                Some(mahere_panel::LoadState::Stalled(l.fraction(), why))
+            } else {
+                Some(mahere_panel::LoadState::Loading(l.fraction()))
+            }
+        } else {
+            if self.load_began.take().is_some() {
+                self.load_ended = Some(now);
+            }
+            let fresh = self.load_ended.is_some_and(|t| now - t < Duration::from_secs(3));
+            (fresh && l.empty > 0).then_some(mahere_panel::LoadState::NoFiner)
+        };
+        self.panel.set_loading(state);
+    }
 }

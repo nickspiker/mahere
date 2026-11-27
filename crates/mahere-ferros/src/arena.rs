@@ -604,6 +604,7 @@ pub fn consts(luts: &FrameLuts, plan: &ViewPlan, lay: &Layout, region: usize, ov
         // The display's bake and the lettering are the frame loop's to set (gpu.rs `prepare`).
         bake: None,
         letters: None,
+        samples: 1,
     }
 }
 

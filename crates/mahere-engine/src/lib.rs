@@ -1645,6 +1645,21 @@ impl MapCore {
         self.res.pending_count()
     }
 
+    /// How far the view's cells have come in (2026-11-27, the owner: "a progress bar showing the percentage loaded"): of the cells the last frame wanted at its own depths (not the coarser ones standing in), those resident, those the store has nothing for (no coverage there: as done, they will not come), those whose last fetch failed, and those still on their way.
+    pub fn loading(&self) -> Loading {
+        let mut l = Loading::default();
+        for k in self.want_last.0.iter().filter(|k| k.depth == self.dem_depth || k.depth == self.vec_depth) {
+            l.wanted += 1;
+            match self.res.pool.map.get(k) {
+                Some(e) if e.is_absent() => l.empty += 1,
+                Some(_) => l.done += 1,
+                None if self.res.failed_recently(k) => l.failing += 1,
+                None => l.pending += 1,
+            }
+        }
+        l
+    }
+
     /// Cells in view still without their base: the lines are all drawn when it is none.
     pub fn bases_left(&self) -> usize {
         self.res.bases_left()
@@ -2822,6 +2837,23 @@ pub struct MeasureView {
     pub target: (f64, f64),
     /// The route card (directions or navigation): its lines and the way of travel, no measurement.
     pub route: bool,
+}
+
+/// The view's cells as they come in ([`MapCore::loading`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Loading {
+    pub wanted: u32,
+    pub done: u32,
+    pub empty: u32,
+    pub failing: u32,
+    pub pending: u32,
+}
+
+impl Loading {
+    /// The share come in: resident, or known to have nothing; 1 when the view wants nothing.
+    pub fn fraction(&self) -> f32 {
+        if self.wanted == 0 { 1. } else { (self.done + self.empty) as f32 / self.wanted as f32 }
+    }
 }
 
 /// What a tap does with routes.

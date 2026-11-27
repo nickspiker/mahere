@@ -428,6 +428,38 @@ fn the_fold_draws_what_the_search_drew() {
     }
 }
 
+/// A still frame's samples a pixel (owner 2026-10-06: still frames anti-aliased): the kernel compiles and runs them, their average keeps the single sample's picture (its mean within three percent) and changes its edges (so it is not one sample taken again).
+#[test]
+fn a_still_frame_averages_its_samples() {
+    let (w, h) = (96usize, 80usize);
+    let cam = Camera::new(10.0, 30.0, 0.4, 0.0);
+    let d = select_depth(0.4, 0, 14);
+    let mut pool = Pool::default();
+    let mut want = plan_view(w, h, &cam, &pool, d, d).want;
+    want.sort();
+    for (n, k) in want.iter().enumerate() {
+        pool.map.insert(*k, cell(n as u32 * 7919));
+    }
+    let plan = plan_view(w, h, &cam, &pool, d, d);
+    let luts = luts(&plan, &cam, LayerMask::default());
+    let lay = Layout::new(w, h, BYTES, kernel::Out::Surface).unwrap();
+    let mut words = vec![0u32; BYTES / 4];
+    arena::view(&mut Slots::new(lay.slots), &mut pool, &plan, &lay, 0, &mut words).unwrap();
+    arena::tables(&luts, &plan, true, &lay, 0, &mut words);
+    let c = arena::consts(&luts, &plan, &lay, 0, false, None);
+    let one = surface(&kernel::record(&c), &words, w, h);
+    let nine = surface(&kernel::record(&kernel::Consts { samples: kernel::STILL_SAMPLES, ..c }), &words, w, h);
+    // The frame's mean working value, a channel at a time: averaging moves edges, not the picture (these cells are noise, every texel an edge, so a pixel's change says nothing alone).
+    let mean = |f: &[[u32; 3]], k: usize| f.iter().map(|p| p[k] as f64).sum::<f64>() / f.len() as f64;
+    let apart = (0..w * h).filter(|&i| one[i] != nine[i]).count();
+    for k in 0..3 {
+        let (a, b) = (mean(&one, k), mean(&nine, k));
+        println!("channel {k}: one sample {a:.0}, averaged {b:.0}; {apart} of {} pixels changed", w * h);
+        assert!((a - b).abs() <= a * 0.03, "channel {k}: the average moved the picture, {a:.0} to {b:.0}");
+    }
+    assert!(apart > 0, "the samples drew the one sample's frame exactly");
+}
+
 /// A frame of a structure met before takes the kernel compiled for it with its own params bound in (gpu.rs's cache): the same words and uniforms as compiling it afresh, for a pan and a pinch of the same view; and a frame with another structure (the ring on) has another key.
 #[test]
 fn a_bound_kernel_is_the_compiled_one() {

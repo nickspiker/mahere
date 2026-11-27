@@ -460,7 +460,7 @@ impl Panel {
 
     /// Whether the circle is turning a page or its snap is still settling: the host keeps drawing frames while it is.
     pub fn animating(&self) -> bool {
-        self.round.turning || self.round.turn != 0. || self.round.settle != 0
+        self.round.turning || self.round.turn != 0. || self.round.settle != 0 || self.loading_eases()
     }
 
     /// One frame of a released turn's snap: half the distance left, floored (owner 2026-11-18); at rest, the page it landed on is the open one.
@@ -541,6 +541,7 @@ impl Panel {
         self.round.bloom_beads.clear();
         self.round.cap_beads.clear();
         self.round.cap_top = None;
+        self.paint_loading(&mut canvas);
         self.paint_recording(&mut canvas, &ctl);
         if !self.open {
             self.paint_round_map(&mut canvas, &ctl, r, measure);
@@ -1232,5 +1233,98 @@ mod timing {
         time(&mut p, "with the cap", Some(&m));
         p.open = true;
         time(&mut p, "the split on Layers", None);
+    }
+}
+
+/// What the map's cells are doing, for the loading arc (2026-11-27, the owner: "a progress bar showing the percentage loaded ... hard to know sometimes if the network is stuck or there just isn't coverage in certain spots").
+#[derive(Clone, Debug, PartialEq)]
+pub enum LoadState {
+    /// Coming in: the share of the view's cells in.
+    Loading(f32),
+    /// Nothing has come for a while: the share in, and why (the last fetch's failure, or that the network is slow to answer).
+    Stalled(f32, String),
+    /// Everything there is has come, and some of the view has nothing finer.
+    NoFiner,
+}
+
+/// The loading arc's amber, when the cells have stopped coming.
+const STALLED: u32 = ink(0xE0_A0_40, 255);
+
+impl Panel {
+    /// The cells' state for the loading arc, or None when the view is in and nothing need be said; repaints only when it changes.
+    pub fn set_loading(&mut self, state: Option<LoadState>) {
+        if self.load != state {
+            self.load = state;
+            self.dirty = true;
+        }
+    }
+
+    /// Whether the loading arc is still easing (its share or its fade), for the host to keep drawing frames.
+    pub(super) fn loading_eases(&self) -> bool {
+        let (target, frac) = self.load_target();
+        (self.load_shown.0 - target).abs() > 1. / 64. || (self.load_shown.1 - frac).abs() > 1. / 256.
+    }
+
+    /// The arc's opacity and share to ease toward.
+    fn load_target(&self) -> (f32, f32) {
+        match &self.load {
+            Some(LoadState::Loading(f)) | Some(LoadState::Stalled(f, _)) => (1., *f),
+            Some(LoadState::NoFiner) => (1., 1.),
+            None => (0., self.load_shown.1),
+        }
+    }
+
+    /// The loading arc: on ferros a stretch of an arc along the circle's top beside the orb, filling from its left end with the share of the view's cells in; elsewhere a line along the map's foot. Amber with the reason under it when the cells have stopped coming; "No finer map here" where the store has nothing finer. Its opacity and share ease toward their targets a quarter of the way a frame (a smooth approach, no step), the panel asking for frames until they settle.
+    pub(super) fn paint_loading(&mut self, canvas: &mut Canvas) {
+        let (target, frac) = self.load_target();
+        let ease = |a: f32, b: f32| a + (b - a) * 0.25;
+        self.load_shown = (ease(self.load_shown.0, target), ease(self.load_shown.1, frac));
+        if self.loading_eases() {
+            self.dirty = true;
+        }
+        let (alpha, f) = self.load_shown;
+        if alpha < 1. / 256. {
+            return;
+        }
+        let (font, w, h) = (self.font, self.w as f32, self.h as f32);
+        let stalled = matches!(self.load, Some(LoadState::Stalled(..)));
+        let colour = part(if stalled { STALLED } else { hue::text() }, alpha);
+        let words = match &self.load {
+            Some(LoadState::Stalled(_, why)) => Some(why.clone()),
+            Some(LoadState::NoFiner) => Some("No finer map here".to_string()),
+            _ => None,
+        };
+        match self.safe.filter(|_| self.host_orb.is_none()) {
+            Some(c) => {
+                let u = self.round.u;
+                let (gx, gy, gr) = self.gear;
+                // Along the circle's top, a third of a radian each side of the orb, a little inside the circle's edge.
+                let (rad, spread, half) = (c.r - u * 0.35, 0.33f32, (u * 0.06).max(1.));
+                if let Some(s) = words {
+                    let style = fitted(&mut self.text, &s, font * 0.75, colour, w * 0.6, 600);
+                    self.text.draw_text_center(canvas, &s, gx, gy + gr + u * 2.7, &style, None, None);
+                }
+                if f > 0. {
+                    arc(canvas, c.cx, c.cy, rad, -spread + spread * f, spread * f, half, colour);
+                }
+                arc(canvas, c.cx, c.cy, rad, 0., spread, half, part(colour, 0.25));
+            }
+            None => {
+                let t = (font * 0.15).max(2.);
+                if let Some(s) = words {
+                    self.text.draw_text_center(canvas, &s, w * 0.5, h - t - font * 0.7, &TextStyle::new(font * 0.75, colour).weight(600), None, None);
+                }
+                paint::fill_rect(canvas, 0, (h - t) as isize, (w * f) as isize, t as isize, colour, None, None);
+                paint::fill_rect(canvas, 0, (h - t) as isize, w as isize, t as isize, part(colour, 0.25), None, None);
+            }
+        }
+    }
+}
+
+impl Panel {
+    /// Whether `(x, y)` is on one of the circle's controls over the map (the orb, a bead, the tool bead or its bloom, the readout's cap): Mahere's own surface, where a pinch scales the interface (owner 2026-11-27: "First finger down calls the surface").
+    pub(super) fn on_round_control(&self, x: f32, y: f32) -> bool {
+        let near = |(bx, by, br): (f32, f32, f32)| (x - bx).powi(2) + (y - by).powi(2) <= (br * 1.15).powi(2);
+        near(self.gear) || self.round.beads.iter().any(|&b| near(b)) || near(self.round.tool_drawn) || self.round.bloom_beads.iter().any(|&(bx, by, br, _)| near((bx, by, br))) || self.round.cap_top.is_some_and(|t| y >= t)
     }
 }
