@@ -222,10 +222,13 @@ impl<G: MapGpu> DeviceApp<G> {
                 return;
             };
             // The cells the device keeps, listed on the worker: the index is long on a phone that has looked around.
+            let t = std::time::Instant::now();
             job.cached = cells.keys(mahere_tiles::publish::Layer::Base);
             let mut cache = cache.lock().unwrap();
             // A worker's cache of names: bounded by its bytes, the cells farthest from the view let go first (it was a thousand cells, whatever each held: half a gigabyte of name planes at the most).
             let found = mahere_engine::search::run(&job, &mut cache, &mahere_panel::labels::tier);
+            // What a search did, on the console (2026-11-27: on ferros it found nothing the owner could see, and said nothing).
+            eprintln!("search: \"{}\": {} cells kept, {} found, {} addresses, {} ms", job.query, job.cached.len(), found.len(), addresses.len(), t.elapsed().as_millis());
             mahere_engine::labels::trim_cache(&mut cache, SEARCH_NAMES_BYTES, job.cam.lat(), job.cam.lon());
             let _ = tx.send((found, addresses));
         });
@@ -382,7 +385,7 @@ impl<G: MapGpu> DeviceApp<G> {
                     self.map.found_at = Some((lat, lon));
                     self.map.go_to(lat, lon, None, self.w, self.h);
                 }
-                SearchAct::Go(lat, lon) => self.map.set_pin(mahere_engine::Pin::Dest, (lat, lon)),
+                SearchAct::Go(lat, lon) => self.map.route_to((lat, lon), self.w, self.h),
                 SearchAct::From(lat, lon) => self.map.set_pin(mahere_engine::Pin::A, (lat, lon)),
                 SearchAct::To(lat, lon) => self.map.set_pin(mahere_engine::Pin::B, (lat, lon)),
             }
@@ -761,7 +764,6 @@ impl<G: MapGpu> FluorApp for DeviceApp<G> {
                     self.apply_theme_edits();
                     self.apply_area_acts();
                     self.apply_track_acts();
-                self.apply_update_acts();
                     self.apply_update_acts();
                     if self.panel.take_clear_measure() {
                         self.map.clear_measure();
@@ -860,7 +862,6 @@ impl<G: MapGpu> FluorApp for DeviceApp<G> {
                     self.apply_theme_edits();
                     self.apply_area_acts();
                     self.apply_track_acts();
-                self.apply_update_acts();
                     self.apply_update_acts();
                     self.last_cursor = (x, y);
                     return EventResponse::Handled;

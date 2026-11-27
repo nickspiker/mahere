@@ -101,11 +101,15 @@ pub fn run(job: &SearchJob, cache: &mut NamesCache, tier: &dyn Fn(&Named) -> Opt
     let (cx, cy) = Camera::centre(job.w, job.h);
     // Merged by (kind, name, reference): the best fit, the position and size at the finest depth seen (a coarse texel is hundreds of metres wide: a trailhead placed from a depth-5 cell stood a kilometre from where the map letters it), nearest the centre among that depth's.
     let mut found: Vec<(Found, u8, f64)> = Vec::new();
+    // How many of the kept cells were under the screen, and how many of those had names to read (on the console with the search).
+    let (mut under, mut named) = (0usize, 0usize);
     for &key in &job.cached {
         if !meets(&job.cam, job.w, job.h, key) {
             continue;
         }
+        under += 1;
         let Some(names) = names_of(&*job.store, cache, key) else { continue };
+        named += 1;
         // The entries that fit, by their 1-based index.
         let fits: Vec<(usize, u8)> = names
             .entries
@@ -162,6 +166,7 @@ pub fn run(job: &SearchJob, cache: &mut NamesCache, tier: &dyn Fn(&Named) -> Opt
     };
     found.sort_by(|a, b| order(&a.0).cmp(&order(&b.0)).then(b.0.rank.cmp(&a.0.rank)).then(b.0.size_m.total_cmp(&a.0.size_m)));
     found.truncate(MAX_FOUND);
+    eprintln!("search: {under} cells under the screen, {named} with names, {} places", found.len());
     found.into_iter().map(|e| e.0).collect()
 }
 

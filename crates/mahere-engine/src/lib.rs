@@ -1379,8 +1379,16 @@ impl MapCore {
         let dem = self.res.layer_stores().map_or(store.clone(), |l| l.dem);
         let (tx, rx) = std::sync::mpsc::channel();
         let cache = self.route_cache.clone();
+        // What a route search did, on the console (2026-11-27: on ferros routes never came and nothing said why).
+        eprintln!("route: asked by {} from {:.5},{:.5} to {:.5},{:.5}", travel.word(), from.0, from.1, to.0, to.1);
         std::thread::spawn(move || {
-            let _ = tx.send(route::find_cached(store, dem, from, to, travel, Some(cache)));
+            let t = Instant::now();
+            let r = route::find_cached(store, dem, from, to, travel, Some(cache));
+            match &r {
+                Ok(route) => eprintln!("route: found {:.2} km, {:.0} min, in {} ms", route.metres / 1000., route.seconds / 60., t.elapsed().as_millis()),
+                Err(e) => eprintln!("route: none after {} ms: {e}", t.elapsed().as_millis()),
+            }
+            let _ = tx.send(r);
         });
         self.route_rx = Some(rx);
         self.route_asked = Some(Instant::now());
@@ -1517,6 +1525,20 @@ impl MapCore {
         self.route_error = None;
         self.reroute();
         self.dirty = true;
+    }
+
+    /// A route to `to` from wherever the device is: navigation from the fix when there is one, else directions from the readout's origin or the view's centre (2026-11-27: on ferros, without a fix, "Route" set a destination that waited for a fix that never came, and nothing was ever routed).
+    pub fn route_to(&mut self, to: (f64, f64), w: usize, h: usize) {
+        if self.gps.is_some() {
+            self.set_route_mode(RouteMode::Navigate);
+            self.set_pin(Pin::Dest, to);
+            return;
+        }
+        let (cx, cy) = Camera::centre(w, h);
+        let from = self.measure_origin(w, h).unwrap_or_else(|| self.cam.screen_to_geo(cx, cy, w, h));
+        self.set_route_mode(RouteMode::Directions);
+        self.pin_a = Some(from);
+        self.set_pin(Pin::B, to);
     }
 
     /// Directions the other way round.
@@ -2698,6 +2720,29 @@ mod tests {
         assert_eq!(map.pin_a, b);
         map.tap(50.0, 50.0, w, h);
         assert!(map.pin_a.is_some() && map.pin_b.is_none(), "a third tap starts again");
+    }
+
+    /// "Route" to a place: navigation from the fix when there is one, directions from the view's centre when there is none (ferros 2026-11-27: a destination with no fix waited forever).
+    #[test]
+    fn route_to_navigates_from_a_fix_and_directs_without_one() {
+        let (lat0, lon0) = (47.5f64, -122.5f64);
+        let to = (47.51, -122.49);
+        let (w, h) = (400, 400);
+        let mut map = MapCore::new(Arc::new(Empty), Camera::new(lat0, lon0, 20_000.0, 0.0));
+        map.set_travel(Some(route::Travel::Foot));
+        map.route_to(to, w, h);
+        assert_eq!(map.route_mode, RouteMode::Directions);
+        let a = map.pin_a.expect("a start at the centre");
+        assert!((a.0 - lat0).abs() < 1e-6 && (a.1 - lon0).abs() < 1e-6, "the start is the view's centre: {a:?}");
+        assert_eq!(map.pin_b, Some(to));
+        assert!(map.routing(), "the route is asked for at once");
+
+        map.gps = Some(GpsFix { lat: lat0, lon: lon0, accuracy_m: 5.0, height_m: None, v_accuracy_m: None });
+        map.route_to(to, w, h);
+        assert_eq!(map.route_mode, RouteMode::Navigate);
+        assert_eq!(map.nav_to, Some(to));
+        assert!(map.pin_a.is_none() && map.pin_b.is_none());
+        assert!(map.routing());
     }
 
     /// Shells that draw on demand rely on `tick` to report camera changes (the Android two-finger path has no redraw request of its own).
