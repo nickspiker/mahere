@@ -25,7 +25,7 @@ repository = "https://github.com/nickspiker/mahere"
 
 # valhall (ferros's Valhall recorder, mahere-ferros's GPU map) is not published: it comes from the ferros checkout beside this one; the ferros build (its tools/mahere-build.sh) points it at its own.
 [patch.crates-io]
-valhall = { path = "../ferros/valhall" }
+valhall = { path = "../ferros/crates/valhall" }
 
 # Dev builds keep line tables only: backtraces still name the file and line, and the full debug info that filled Harbor (2026-11-08) is gone.
 [profile.dev]
