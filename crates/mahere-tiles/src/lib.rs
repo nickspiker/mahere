@@ -1910,6 +1910,7 @@ impl CellPlanes {
         }
         sections.extend(self.names.as_ref().and_then(NameCell::section));
         sections.extend(self.route.as_ref().and_then(route::RouteCell::section));
+        sections.extend(self.route.as_ref().and_then(|r| r.crossings.as_ref()).map(route::Crossings::section));
         if let Some(g) = &self.geoid {
             let mut s = vsf::VsfSection::new("geoid");
             s.add_field("cm", VsfType::t_i4(Tensor::new(vec![2, TEX * TEX], mem_to_disk(g))));
@@ -1991,6 +1992,8 @@ pub fn decode_cell_with(data: &[u8], keep: &dyn Fn(&str) -> bool) -> Result<Cell
     let (header, end) = vsf::VsfHeader::decode(data).map_err(|e| e.to_string())?;
     let sections = header.sections(data, end).map_err(|e| e.to_string())?;
     let mut out = CellPlanes::default();
+    // A crossing section read before its route section waits for it.
+    let mut crossings: Option<route::Crossings> = None;
     for s in sections {
         if !keep(s.name.as_str()) {
             continue;
@@ -2021,7 +2024,14 @@ pub fn decode_cell_with(data: &[u8], keep: &dyn Fn(&str) -> bool) -> Result<Cell
                 out.img = decode_img(&fields)
             }
             "name" => out.names = NameCell::decode(&fields),
-            "route" => out.route = route::RouteCell::decode(&fields),
+            "route" => out.route = route::RouteCell::decode(&fields).map(|mut r| {
+                r.crossings = crossings.take();
+                r
+            }),
+            "crossing" => match out.route.as_mut() {
+                Some(r) => r.crossings = route::Crossings::decode(&fields),
+                None => crossings = route::Crossings::decode(&fields),
+            },
             "geoid" => out.geoid = decode_geoid(&fields),
             _ => {}
         }
@@ -2076,7 +2086,9 @@ pub fn decode_geoid_only(data: &[u8]) -> Option<Vec<i16>> {
 
 /// Only a cell's routing, from raw file bytes: what a route search reads for every cell it passes through, its terrain and imagery never parsed.
 pub fn decode_route(data: &[u8]) -> Option<route::RouteCell> {
-    route::RouteCell::decode(&section_alone(data, "route")?)
+    let mut r = route::RouteCell::decode(&section_alone(data, "route")?)?;
+    r.crossings = section_alone(data, "crossing").and_then(|f| route::Crossings::decode(&f));
+    Some(r)
 }
 
 pub(crate) fn scalar_f32(v: &VsfType) -> Option<f32> {

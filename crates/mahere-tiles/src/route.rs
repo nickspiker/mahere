@@ -50,6 +50,8 @@ pub struct RouteCell {
     pub places: Vec<std::sync::OnceLock<Vec<(u32, f32, f32)>>>,
     /// Worked out when the cell is read (never written): the nodes by (name, way, trixel), so a node's trixels are a binary search, not a pass over every node ([`Self::index_nodes`]).
     pub by_name: Vec<(u32, u16, u32)>,
+    /// The crossings ([`Crossings`]): worked out with the graph, written in a section of their own.
+    pub crossings: Option<Crossings>,
 }
 
 /// A run of one way's trixels between two nodes.
@@ -62,6 +64,113 @@ pub struct Corridor {
     pub dir: u8,
 }
 
+
+// The ways of travelling and what each way costs them (moved from mahere_engine::route on 2026-11-26, so the bake prices a cell's crossings exactly as the search prices its corridors).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Travel {
+    Car,
+    Bike,
+    Foot,
+}
+
+/// A ferry's line class id (`RoadClass::Ferry` + 1).
+pub const FERRY: u8 = mahere_osm::RoadClass::Ferry as u8 + 1;
+
+impl Travel {
+    /// Every way of travelling, in the order the crossings keep their tables.
+    pub const ALL: [Travel; 3] = [Travel::Car, Travel::Bike, Travel::Foot];
+
+    /// Its table's field in a cell's `crossing` section.
+    pub fn field(self) -> &'static str {
+        match self {
+            Travel::Car => "car",
+            Travel::Bike => "bike",
+            Travel::Foot => "foot",
+        }
+    }
+
+    pub fn word(self) -> &'static str {
+        match self {
+            Travel::Car => "Car",
+            Travel::Bike => "Bike",
+            Travel::Foot => "Foot",
+        }
+    }
+
+    /// The fastest this way of travelling goes, m/s: the search's estimate of what is left may never be more than the truth.
+    pub fn top_speed(self) -> f64 {
+        match self {
+            Travel::Car => 130.0 / 3.6,
+            Travel::Bike => 30.0 / 3.6,
+            Travel::Foot => 6.0 / 3.6,
+        }
+    }
+
+    /// The speed on a way, m/s; None where this way of travelling may not go.
+    pub fn speed(self, w: &Way) -> Option<f64> {
+        let unpaved = w.uses & crate::use_bits::UNPAVED != 0;
+        // Trail difficulty (sac_scale, 1 T1 .. 6 T6) and roughness (1 gravel .. 3 high clearance) from the grade byte (2026-10-16).
+        let (difficulty, rough) = (w.grade & 15, w.grade >> 4);
+        // A ferry carries every way of travelling at its own pace.
+        if w.class == FERRY {
+            return Some(if w.speed_kmh > 0 { w.speed_kmh as f64 } else { 20.0 } / 3.6);
+        }
+        let kmh = match self {
+            Travel::Car => {
+                if w.uses & crate::use_bits::MOTOR == 0 {
+                    return None;
+                }
+                // A road for high clearance only where nothing else goes.
+                let rough_factor = [1.0, 0.8, 0.5, 0.15][rough.min(3) as usize];
+                let class = match w.class {
+                    1 => 105.0,
+                    2 => 90.0,
+                    3 => 70.0,
+                    4 => 60.0,
+                    5 => 50.0,
+                    6 => 40.0,
+                    _ => 20.0,
+                };
+                let posted = if w.speed_kmh > 0 { w.speed_kmh as f64 } else { class };
+                // A gated, private or seasonal way only where nothing else goes.
+                let penalty = if w.uses & crate::use_bits::RESTRICTED != 0 { 0.2 } else { 1.0 };
+                posted * if unpaved { 0.6 } else { 1.0 } * penalty * rough_factor
+            }
+            Travel::Bike => {
+                if w.uses & crate::use_bits::BIKE == 0 {
+                    return None;
+                }
+                // Alpine routes are no place for a bike; demanding mountain trails are walked alongside it.
+                match difficulty {
+                    4.. => return None,
+                    3 => 5.0,
+                    _ => (if unpaved || w.class >= 8 { 12.0 } else { 18.0 }) * [1.0, 0.9, 0.6, 0.4][rough.min(3) as usize],
+                }
+            }
+            Travel::Foot => {
+                if w.uses & crate::use_bits::FOOT == 0 {
+                    return None;
+                }
+                // Walking pace by the trail's difficulty: a hiking trail at 4.8 km/h down to hands-on scrambling at 1.
+                [4.8, 4.8, 4.0, 3.0, 2.0, 1.5, 1.0][difficulty.min(6) as usize]
+            }
+        };
+        Some(kmh / 3.6)
+    }
+
+    /// What changing ways costs, seconds: a turn at an intersection.
+    pub fn turn(self) -> f64 {
+        match self {
+            Travel::Car => 4.0,
+            Travel::Bike => 2.0,
+            Travel::Foot => 0.0,
+        }
+    }
+
+    pub fn keeps_one_ways(self) -> bool {
+        self != Travel::Foot
+    }
+}
 /// The two halves of the squares around a trixel: its eight-ish neighbours in the cell, by memory index.
 fn around(i: usize) -> impl Iterator<Item = usize> {
     let (tx, ty) = ((i >> 1) & (TEX - 1), i >> (1 + super::TEX_BITS));
@@ -222,6 +331,7 @@ impl RouteCell {
             self.graph_of_way(w, &trixels, depth);
         }
         self.nodes.sort_unstable();
+        self.crossings = self.make_crossings(depth);
     }
 
     /// One way's nodes and corridors. The way's trixels are visited in a set the size of the cell; components of the non-node trixels are its corridors.
@@ -562,7 +672,7 @@ impl RouteCell {
         if stackcor.len() != stack.len() {
             stackcor = vec![0; stack.len()];
         }
-        Some(RouteCell { way, ways, stack, joins: u32s("join"), dir, nodes, corridors, cor, stackcor, arc: Vec::new(), places: Vec::new(), by_name: Vec::new() })
+        Some(RouteCell { way, ways, stack, joins: u32s("join"), dir, nodes, corridors, cor, stackcor, arc: Vec::new(), places: Vec::new(), by_name: Vec::new(), crossings: None })
     }
 }
 
@@ -751,6 +861,191 @@ pub fn pyramid_routes(mut cells: HashMap<CellKey, RouteCell>, base_depth: u8, mi
     cells
 }
 
+/// A cell's crossings (Nick 2026-11-26: "if we route from one tile to the surrounding tiles and so on, it should recurse up and down depending on the destination desired, altho of course with the precompute done on our end"): the nodes on the cell's edge, and for each way of travelling the best time from each of them to each other through this cell alone, worked out when the graph is built, so a search crossing the cell jumps edge to edge instead of walking its corridors (the multi-level tables the big routers keep, over the cells' own pyramid).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Crossings {
+    /// The cell's edge nodes, (cluster name, way), sorted: the tables' rows and columns.
+    pub ends: Vec<(u32, u16)>,
+    /// Per way of travelling, in [`Travel::ALL`]'s order, milliseconds from row to column, row-major; [`NO_CROSSING`] where there is no way through.
+    pub ms: [Vec<u32>; 3],
+}
+
+/// No way from one edge node to another through the cell.
+pub const NO_CROSSING: u32 = u32::MAX;
+
+impl Crossings {
+    /// The time from end `a` to end `b` for `travel`, seconds; None where there is no way through.
+    pub fn secs(&self, travel: Travel, a: usize, b: usize) -> Option<f64> {
+        let n = self.ends.len();
+        let v = *self.ms[travel as usize].get(a * n + b)?;
+        (v != NO_CROSSING).then(|| v as f64 / 1000.)
+    }
+
+    /// The index of edge node `(name, way)`.
+    pub fn end(&self, name: u32, way: u16) -> Option<usize> {
+        self.ends.binary_search(&(name, way)).ok()
+    }
+
+    pub fn section(&self) -> vsf::VsfSection {
+        use vsf::{types::Tensor, VsfType};
+        let n = self.ends.len();
+        let mut s = vsf::VsfSection::new("crossing");
+        s.add_field("endname", VsfType::t_u5(Tensor::new(vec![n], self.ends.iter().map(|e| e.0).collect())));
+        s.add_field("endway", VsfType::t_u4(Tensor::new(vec![n], self.ends.iter().map(|e| e.1).collect())));
+        for (t, ms) in Travel::ALL.iter().zip(&self.ms) {
+            s.add_field(t.field(), VsfType::t_u5(Tensor::new(vec![n, n], ms.clone())));
+        }
+        s
+    }
+
+    /// A `crossing` section's fields; None when it does not hold together (each table the square of its ends).
+    pub fn decode(fields: &HashMap<String, Vec<vsf::VsfType>>) -> Option<Crossings> {
+        use vsf::VsfType;
+        let u32s = |name: &str| -> Option<Vec<u32>> {
+            match fields.get(name)?.first()? {
+                VsfType::t_u5(t) => Some(t.data.clone()),
+                _ => None,
+            }
+        };
+        let names = u32s("endname")?;
+        let ways = fields.get("endway").and_then(|v| v.first()).and_then(raw_u16)?;
+        if names.len() != ways.len() {
+            return None;
+        }
+        let n = names.len();
+        let table = |t: Travel| u32s(t.field()).filter(|v| v.len() == n * n);
+        Some(Crossings { ends: names.into_iter().zip(ways).collect(), ms: [table(Travel::Car)?, table(Travel::Bike)?, table(Travel::Foot)?] })
+    }
+}
+
+/// A move inside a cell: along a corridor (1-based) or onto another way where they meet.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum CrossMove {
+    Corridor(u16),
+    Turn,
+}
+
+/// A cell's nodes as one way of travelling moves between them: the states (cluster name, way), sorted, and from each the moves with their seconds.
+struct CellGraph {
+    states: Vec<(u32, u16)>,
+    out: Vec<Vec<(usize, f64, CrossMove)>>,
+}
+
+impl CellGraph {
+    fn at(&self, s: (u32, u16)) -> Option<usize> {
+        self.states.binary_search(&s).ok()
+    }
+
+    /// The best time from `s0` to every state, and the state and move each was reached by.
+    fn search(&self, s0: usize) -> (Vec<f64>, Vec<Option<(usize, CrossMove)>>) {
+        let mut dist = vec![f64::INFINITY; self.states.len()];
+        let mut prev = vec![None; self.states.len()];
+        dist[s0] = 0.;
+        let mut heap = std::collections::BinaryHeap::new();
+        heap.push(std::cmp::Reverse((0u64, s0)));
+        while let Some(std::cmp::Reverse((dk, k))) = heap.pop() {
+            if dk as f64 / 1e6 > dist[k] + 1e-6 {
+                continue;
+            }
+            // From the exact time, not the heap's key, which is truncated to a microsecond: across a move of no cost (a walker's turn) the truncated time undercut its own source, and the two nodes each became the other's way in, a loop the path back never left (2026-11-26: a walk's crossing unpacked to 32 GB).
+            let d = dist[k];
+            for &(j, s, m) in &self.out[k] {
+                let nd = d + s;
+                if nd < dist[j] {
+                    dist[j] = nd;
+                    prev[j] = Some((k, m));
+                    heap.push(std::cmp::Reverse(((nd * 1e6) as u64, j)));
+                }
+            }
+        }
+        (dist, prev)
+    }
+}
+
+impl RouteCell {
+    /// The cell's graph for `travel` at `depth`, priced as the route search prices it: a corridor its length over the way's speed (a one-way one only the way it goes, where this way of travelling keeps to them), a turn onto another way where two meet its turn's seconds; a way this travel may not use has no moves.
+    fn cell_graph(&self, depth: u8, travel: Travel) -> CellGraph {
+        let mut states: Vec<(u32, u16)> = self.nodes.iter().map(|n| (n.2, n.1)).collect();
+        states.sort_unstable();
+        states.dedup();
+        let at = |s: (u32, u16)| states.binary_search(&s).ok();
+        let texel = super::texel_m(depth);
+        let mut out: Vec<Vec<(usize, f64, CrossMove)>> = vec![Vec::new(); states.len()];
+        let keep = travel.keeps_one_ways();
+        for (ci, c) in self.corridors.iter().enumerate() {
+            let Some(speed) = travel.speed(&self.ways[c.way as usize - 1]) else { continue };
+            let (Some(a), Some(b)) = (at((c.a, c.way)), at((c.b, c.way))) else { continue };
+            let s = c.len as f64 / 256. * texel / speed;
+            let m = CrossMove::Corridor(ci as u16 + 1);
+            if !keep || c.dir != 2 {
+                out[a].push((b, s, m));
+            }
+            if !keep || c.dir != 1 {
+                out[b].push((a, s, m));
+            }
+        }
+        for &t in &self.joins {
+            let here: Vec<(u16, u32)> = self.ways_at(t as usize).filter_map(|w| self.node_of(t as usize, w).map(|n| (w, n))).filter(|&(w, _)| travel.speed(&self.ways[w as usize - 1]).is_some()).collect();
+            for &(wa, na) in &here {
+                for &(wb, nb) in &here {
+                    if wb == wa || self.ways[wb as usize - 1].osm == self.ways[wa as usize - 1].osm {
+                        continue;
+                    }
+                    if let (Some(a), Some(b)) = (at((na, wa)), at((nb, wb))) {
+                        out[a].push((b, travel.turn(), CrossMove::Turn));
+                    }
+                }
+            }
+        }
+        CellGraph { states, out }
+    }
+
+    /// The cell's crossings at `depth` ([`Crossings`]): from each edge node a search through this cell's corridors and turns alone; None for a cell with fewer than two edge nodes.
+    pub fn make_crossings(&self, depth: u8) -> Option<Crossings> {
+        let mut ends: Vec<(u32, u16)> = self.nodes.iter().filter(|n| on_border(n.0 as usize)).map(|n| (n.2, n.1)).collect();
+        ends.sort_unstable();
+        ends.dedup();
+        if ends.len() < 2 {
+            return None;
+        }
+        let ms = Travel::ALL.map(|travel| {
+            let g = self.cell_graph(depth, travel);
+            let mut table = vec![NO_CROSSING; ends.len() * ends.len()];
+            for (r, &e) in ends.iter().enumerate() {
+                // A way this travel may not use leaves its row empty: the search never stands on it.
+                let Some(s0) = g.at(e).filter(|_| travel.speed(&self.ways[e.1 as usize - 1]).is_some()) else { continue };
+                let (dist, _) = g.search(s0);
+                for (c, &f) in ends.iter().enumerate() {
+                    if let Some(j) = g.at(f).filter(|&j| c != r && dist[j].is_finite()) {
+                        table[r * ends.len() + c] = (dist[j] * 1000.).round() as u32;
+                    }
+                }
+            }
+            table
+        });
+        Some(Crossings { ends, ms })
+    }
+
+    /// The moves a crossing stands for, from edge node `from` to `to` (each (cluster name, way)): every node passed with the move that reached it, `to` last; None where there is no way through.
+    pub fn cross_path(&self, depth: u8, travel: Travel, from: (u32, u16), to: (u32, u16)) -> Option<Vec<((u32, u16), CrossMove)>> {
+        let g = self.cell_graph(depth, travel);
+        let (s0, s1) = (g.at(from)?, g.at(to)?);
+        let (dist, prev) = g.search(s0);
+        if !dist[s1].is_finite() {
+            return None;
+        }
+        let mut path = Vec::new();
+        let mut k = s1;
+        while k != s0 {
+            let (p, m) = prev[k]?;
+            path.push((g.states[k], m));
+            k = p;
+        }
+        path.reverse();
+        Some(path)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -787,7 +1082,13 @@ mod tests {
         let fields: HashMap<String, Vec<vsf::VsfType>> = s.fields.into_iter().map(|f| (f.name, f.values)).collect();
         let mut written = c.clone();
         written.arc.clear();
+        // The crossings are a section of their own, and round-trip there.
+        let crossings = written.crossings.take();
         assert_eq!(RouteCell::decode(&fields), Some(written));
+        if let Some(x) = crossings {
+            let fields: HashMap<String, Vec<vsf::VsfType>> = x.section().fields.into_iter().map(|f| (f.name, f.values)).collect();
+            assert_eq!(Crossings::decode(&fields), Some(x));
+        }
         for c in cells.values() {
             graph_holds(c);
         }

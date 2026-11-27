@@ -5,9 +5,12 @@ use std::sync::Arc;
 
 use mahere_coord::{uv_to_lat_lon, Coord};
 use mahere_tiles::route::RouteCell;
-use mahere_tiles::{tri_at, tri_idx, use_bits, CellKey, TEX};
+use mahere_tiles::{tri_at, tri_idx, CellKey, TEX};
 
 use crate::residency::{CellStore, Fetch};
+
+pub use mahere_tiles::route::Travel;
+use mahere_tiles::route::FERRY;
 
 /// The depth routes are found at: the areas' finest.
 pub const ROUTE_DEPTH: u8 = 14;
@@ -40,99 +43,6 @@ const SNAP_REACH: i64 = 200;
 /// How far a start or an end looks for a way at a coarser depth, metres: the fine maze is not everywhere, and a trip from open country starts on the nearest major road.
 const SNAP_REACH_M: f64 = 2000.0;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Travel {
-    Car,
-    Bike,
-    Foot,
-}
-
-/// A ferry's line class id (`RoadClass::Ferry` + 1).
-const FERRY: u8 = mahere_tiles::osm::RoadClass::Ferry as u8 + 1;
-
-impl Travel {
-    pub fn word(self) -> &'static str {
-        match self {
-            Travel::Car => "Car",
-            Travel::Bike => "Bike",
-            Travel::Foot => "Foot",
-        }
-    }
-
-    /// The fastest this way of travelling goes, m/s: the search's estimate of what is left may never be more than the truth.
-    fn top_speed(self) -> f64 {
-        match self {
-            Travel::Car => 130.0 / 3.6,
-            Travel::Bike => 30.0 / 3.6,
-            Travel::Foot => 6.0 / 3.6,
-        }
-    }
-
-    /// The speed on a way, m/s; None where this way of travelling may not go.
-    fn speed(self, w: &mahere_tiles::route::Way) -> Option<f64> {
-        let unpaved = w.uses & use_bits::UNPAVED != 0;
-        // Trail difficulty (sac_scale, 1 T1 .. 6 T6) and roughness (1 gravel .. 3 high clearance) from the grade byte (2026-10-16).
-        let (difficulty, rough) = (w.grade & 15, w.grade >> 4);
-        // A ferry carries every way of travelling at its own pace.
-        if w.class == FERRY {
-            return Some(if w.speed_kmh > 0 { w.speed_kmh as f64 } else { 20.0 } / 3.6);
-        }
-        let kmh = match self {
-            Travel::Car => {
-                if w.uses & use_bits::MOTOR == 0 {
-                    return None;
-                }
-                // A road for high clearance only where nothing else goes.
-                let rough_factor = [1.0, 0.8, 0.5, 0.15][rough.min(3) as usize];
-                let class = match w.class {
-                    1 => 105.0,
-                    2 => 90.0,
-                    3 => 70.0,
-                    4 => 60.0,
-                    5 => 50.0,
-                    6 => 40.0,
-                    _ => 20.0,
-                };
-                let posted = if w.speed_kmh > 0 { w.speed_kmh as f64 } else { class };
-                // A gated, private or seasonal way only where nothing else goes.
-                let penalty = if w.uses & use_bits::RESTRICTED != 0 { 0.2 } else { 1.0 };
-                posted * if unpaved { 0.6 } else { 1.0 } * penalty * rough_factor
-            }
-            Travel::Bike => {
-                if w.uses & use_bits::BIKE == 0 {
-                    return None;
-                }
-                // Alpine routes are no place for a bike; demanding mountain trails are walked alongside it.
-                match difficulty {
-                    4.. => return None,
-                    3 => 5.0,
-                    _ => (if unpaved || w.class >= 8 { 12.0 } else { 18.0 }) * [1.0, 0.9, 0.6, 0.4][rough.min(3) as usize],
-                }
-            }
-            Travel::Foot => {
-                if w.uses & use_bits::FOOT == 0 {
-                    return None;
-                }
-                // Walking pace by the trail's difficulty: a hiking trail at 4.8 km/h down to hands-on scrambling at 1.
-                [4.8, 4.8, 4.0, 3.0, 2.0, 1.5, 1.0][difficulty.min(6) as usize]
-            }
-        };
-        Some(kmh / 3.6)
-    }
-
-    /// What changing ways costs, seconds: a turn at an intersection.
-    fn turn(self) -> f64 {
-        match self {
-            Travel::Car => 4.0,
-            Travel::Bike => 2.0,
-            Travel::Foot => 0.0,
-        }
-    }
-
-    fn keeps_one_ways(self) -> bool {
-        self != Travel::Foot
-    }
-}
 
 /// One instruction: where a route turns onto a way.
 #[derive(Clone, Debug)]
@@ -295,6 +205,8 @@ const PREFETCH_RING: i64 = 2;
 /// Time spent reading cells from the store and decoding their routing, summed over a process (MAHERE_ROUTE_LOG).
 pub static READ_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static DECODE_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Edge-to-edge jumps a search took by the cells' crossings, summed over a process (MAHERE_ROUTE_LOG, and the tests' proof they were used).
+pub static CROSSED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Cells' routing as the search reads it, each read once from the store, through the shared cache.
 struct Cells {
@@ -589,6 +501,8 @@ enum Via {
     /// To the same place a depth up or down the pyramid: the trixel stood on there, and the corridor it lies in (0 at a node), whose run to the node reached is part of the way.
     /// `dead`: up from a node where the finer maze ended (an area's edge cuts the road): this node drives on at its own depth.
     Level { at: T, cor: u16, dead: bool },
+    /// Across the cell by its crossings, from one edge node to another (their places in the cell's [`mahere_tiles::route::Crossings`]).
+    Cross { from: u16, to: u16 },
 }
 
 impl T {
@@ -886,6 +800,11 @@ pub fn find_cached(store: Arc<dyn CellStore>, dem: Arc<dyn CellStore>, from: (f6
     if goal.is_empty() {
         return Err("no way to arrive on near the target".into());
     }
+    // The cells the trip starts and ends in: walked, never crossed by a table, since the way in or out stands inside them.
+    // A list: a few cells (a start's or an end's stands lie a trixel or two apart).
+    let mut end_cells: Vec<CellKey> = start_stands.iter().map(|(t, _, _)| t.cell().0).chain(goal.keys().map(|n| n.key)).collect();
+    end_cells.sort_unstable_by_key(|k| (k.depth, k.raw()));
+    end_cells.dedup();
     let mut done: Option<(usize, f64)> = None;
     while let Some(Reverse((_, i))) = open.pop() {
         let (n, g, _, via_here) = states[i];
@@ -988,8 +907,24 @@ pub fn find_cached(store: Arc<dyn CellStore>, dem: Arc<dyn CellStore>, from: (f6
         if !walk && (climbed || descended) {
             continue;
         }
+        // Across the cell by its crossings (Nick 2026-11-26, "with the precompute done on our end"): from an edge node of a cell neither end is in, straight to each other edge node at its table's time; the corridors and turns inside are the table's, unpacked only to draw the line.
+        // Only where the whole cell lies past the finer depth's reach of both ends: inside it nothing would come down to the finer maze, so the jump loses no way the walk would find (a cell with such a node in it walks, 2026-11-26: a town's grid came out ten seconds slower in fourteen minutes, its jumps passing where the walk came down).
+        let wholly_past = depth == ROUTE_DEPTH || {
+            let edge = TEX as f64 * mahere_tiles::texel_m(depth);
+            !near(here, reach(depth + 1) + edge * 2.)
+        };
+        let crossing = if end_cells.contains(&n.key) || !wholly_past { None } else { cell.crossings.as_ref().and_then(|x| x.end(n.name, w).map(|k| (x, k))) };
+        if let Some((x, k)) = crossing {
+            CROSSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            for (j, &(name, ow)) in x.ends.iter().enumerate() {
+                let Some(s) = x.secs(travel, k, j) else { continue };
+                let m = Node { key: n.key, name, osm: cell.ways[ow as usize - 1].osm };
+                let est = estimate(ll_of(&mut cells, m, &mut node_ll));
+                push(&mut states, &mut open, &mut index, m, g + s, i, Via::Cross { from: k as u16, to: j as u16 }, est);
+            }
+        }
         // Along the corridors from this node.
-        for (ci, c) in cell.corridors.iter().enumerate() {
+        for (ci, c) in cell.corridors.iter().enumerate().filter(|_| crossing.is_none()) {
             if c.way != w || (c.a != n.name && c.b != n.name) {
                 continue;
             }
@@ -1006,8 +941,8 @@ pub fn find_cached(store: Arc<dyn CellStore>, dem: Arc<dyn CellStore>, from: (f6
         }
         for &t in &trixels {
             let ti = t as usize;
-            // Onto another way, where they meet.
-            if cell.is_join(ti) {
+            // Onto another way, where they meet (a crossing's table holds the turns inside the cell).
+            if crossing.is_none() && cell.is_join(ti) {
                 for ow in cell.ways_at(ti) {
                     let way = &cell.ways[ow as usize - 1];
                     if way.osm == n.osm || travel.speed(way).is_none() {
@@ -1039,7 +974,7 @@ pub fn find_cached(store: Arc<dyn CellStore>, dem: Arc<dyn CellStore>, from: (f6
         }
     }
     if std::env::var_os("MAHERE_ROUTE_LOG").is_some() {
-        eprintln!("route: {} nodes, {} cells read, {:.0} ms reading them, {:.0} ms decoding them", states.len(), cells.got.len(), READ_NS.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e6, DECODE_NS.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e6);
+        eprintln!("route: {} nodes, {} crossings taken, {} cells read, {:.0} ms reading them, {:.0} ms decoding them", states.len(), CROSSED.load(std::sync::atomic::Ordering::Relaxed), cells.got.len(), READ_NS.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e6, DECODE_NS.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e6);
     }
     let Some((last, seconds)) = done else { return Err("no route between them on the ways baked so far".into()) };
     // The nodes back to the start, then the trixels: along each corridor its traced run, at a turn or a hop the node itself.
@@ -1050,6 +985,29 @@ pub fn find_cached(store: Arc<dyn CellStore>, dem: Arc<dyn CellStore>, from: (f6
         i = states[i].2;
     }
     nodes.reverse();
+    // A crossing stands for the corridors and turns its cell's own search went by: unpacked into them, so the line is drawn along the road (a crossing found again through the same cell's graph, priced as the table was).
+    let mut unpacked = Vec::with_capacity(nodes.len());
+    for &(n, g, from, via) in &nodes {
+        if let Via::Cross { from: fk, to: tk } = via {
+            let path = cells.get(n.key).and_then(|cell| {
+                let x = cell.crossings.as_ref()?;
+                let moves = cell.cross_path(n.key.depth, travel, *x.ends.get(fk as usize)?, *x.ends.get(tk as usize)?)?;
+                Some(moves.into_iter().map(|((name, way), m)| {
+                    let via = match m {
+                        mahere_tiles::route::CrossMove::Corridor(c) => Via::Corridor(c),
+                        mahere_tiles::route::CrossMove::Turn => Via::Turn,
+                    };
+                    (Node { key: n.key, name, osm: cell.ways[way as usize - 1].osm }, g, from, via)
+                }).collect::<Vec<_>>())
+            });
+            if let Some(p) = path {
+                unpacked.extend(p);
+                continue;
+            }
+        }
+        unpacked.push((n, g, from, via));
+    }
+    nodes = unpacked;
     if std::env::var_os("MAHERE_ROUTE_LOG").is_some() {
         for (n, g, _, via) in &nodes {
             eprintln!("  depth {} cell {} node {} way {} at {:.0} s via {via:?}", n.key.depth, n.key.name(), n.name, n.osm, g);
@@ -1112,7 +1070,7 @@ pub fn find_cached(store: Arc<dyn CellStore>, dem: Arc<dyn CellStore>, from: (f6
                     None => extend(&mut runs, vec![T::from_cell(n.key, n.name as usize)], n.osm, None),
                 }
             }
-            Via::Turn | Via::Hop | Via::Start | Via::Level { .. } => extend(&mut runs, vec![T::from_cell(n.key, n.name as usize)], n.osm, None),
+            Via::Turn | Via::Hop | Via::Start | Via::Level { .. } | Via::Cross { .. } => extend(&mut runs, vec![T::from_cell(n.key, n.name as usize)], n.osm, None),
         }
     }
     // From the last node to the end trixel.
@@ -1396,12 +1354,13 @@ fn ground_time(ground: &mut Ground, path: &[T], afloat: &[bool], travel: Travel)
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mahere_tiles::use_bits;
 
     /// Ferries carry everyone at a ferry's pace; a trail's difficulty slows a walker and turns a bike away; a high-clearance road slows a car to a crawl.
     #[test]
     fn grades_and_ferries_set_the_pace() {
         let way = |class: u8, uses: u8, grade: u8| mahere_tiles::route::Way { class, uses, grade, ..Default::default() };
-        let all = use_bits::FOOT | use_bits::BIKE | use_bits::MOTOR;
+        let all = mahere_tiles::use_bits::FOOT | mahere_tiles::use_bits::BIKE | mahere_tiles::use_bits::MOTOR;
         for t in [Travel::Car, Travel::Bike, Travel::Foot] {
             assert_eq!(t.speed(&way(FERRY, all, 0)), Some(20.0 / 3.6), "{} by ferry", t.word());
         }
@@ -1428,11 +1387,62 @@ mod tests {
     }
 
     fn baked(roads: &[Road], junctions: &[(f32, f32)]) -> Arc<dyn CellStore> {
+        baked_with(roads, junctions, true)
+    }
+
+    /// The cells baked, with their crossings or without (as cells baked before them are).
+    fn baked_with(roads: &[Road], junctions: &[(f32, f32)], crossings: bool) -> Arc<dyn CellStore> {
         let names: Vec<mahere_tiles::Named> = ["", "East Road", "North Road", "The Bridge", "The Highway"].iter().map(|n| mahere_tiles::Named { kind: 6, rank: 0, name: n.to_string(), reference: String::new() }).collect();
         let cells = mahere_tiles::route::bake_routes(roads, &names, junctions, ROUTE_DEPTH);
         let cells = mahere_tiles::route::pyramid_routes(cells, ROUTE_DEPTH, ROUTE_MIN);
-        let bytes = cells.into_iter().map(|(k, r)| (k, mahere_tiles::Cell { route: Some(r), ..Default::default() }.quantize().encode(&mahere_tiles::Loss { dem_m: 0.0, img: 0 }).unwrap())).collect();
+        let bytes = cells
+            .into_iter()
+            .map(|(k, mut r)| {
+                if !crossings {
+                    r.crossings = None;
+                }
+                (k, mahere_tiles::Cell { route: Some(r), ..Default::default() }.quantize().encode(&mahere_tiles::Loss { dem_m: 0.0, img: 0 }).unwrap())
+            })
+            .collect();
         Arc::new(Baked(bytes))
+    }
+
+    /// A trip across a town's grid finds the same route with the cells' crossings as without them (2026-11-26): the same time to the second and the same length, by car, by bike and on foot, the crossings having been used.
+    #[test]
+    fn crossings_find_the_route_walking_finds() {
+        let (lat, lon) = (47.60f32, -122.33f32);
+        // Eight streets east and eight avenues north, 6 km each way, a junction at every meeting, one street one-way.
+        let mut roads = Vec::new();
+        let mut junctions = Vec::new();
+        let n = 8;
+        let (span, step) = (0.054f32, 0.054f32 / (n - 1) as f32);
+        for k in 0..n {
+            let y = lat + step * k as f32;
+            roads.push(road(10 + k as i64, (0..=16).map(|q| (y, lon + span * q as f32 / 16.)).collect(), if k == 3 { 1 } else { 0 }, 0));
+            let x = lon + step * k as f32;
+            roads.push(road(30 + k as i64, (0..=16).map(|q| (lat + span * q as f32 / 16., x)).collect(), 0, 0));
+        }
+        for a in 0..n {
+            for b in 0..n {
+                junctions.push((lat + step * a as f32, lon + step * b as f32));
+            }
+        }
+        let with = baked_with(&roads, &junctions, true);
+        let before = CROSSED.load(std::sync::atomic::Ordering::Relaxed);
+        let without = baked_with(&roads, &junctions, false);
+        let (from, to) = ((lat as f64 + 0.001, lon as f64 + 0.0005), ((lat + span) as f64 - 0.001, (lon + span) as f64 - 0.0005));
+        for travel in [Travel::Car, Travel::Bike, Travel::Foot] {
+            if std::env::var("MAHERE_TEST_TRAVEL").is_ok_and(|v| v != travel.word()) {
+                continue;
+            }
+            let a = find(with.clone(), with.clone(), from, to, travel).unwrap();
+            let b = find(without.clone(), without.clone(), from, to, travel).unwrap();
+            eprintln!("{}: with {:.1} s {:.0} m, without {:.1} s {:.0} m", travel.word(), a.seconds, a.metres, b.seconds, b.metres);
+            // Within a hundredth: the walk climbs to coarser depths whose staircase measures a little short, so it finds a hair less time than the fine maze the jumps keep to (the line the jumps draw was the shorter in each).
+            assert!((a.seconds - b.seconds).abs() < b.seconds * 0.01, "{}: {} s with crossings, {} s without", travel.word(), a.seconds, b.seconds);
+            assert!((a.metres - b.metres).abs() < b.metres * 0.01, "{}: {} m with crossings, {} m without", travel.word(), a.metres, b.metres);
+        }
+        assert!(CROSSED.load(std::sync::atomic::Ordering::Relaxed) > before, "the crossings were never taken");
     }
 
     #[test]
