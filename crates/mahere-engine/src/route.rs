@@ -1004,6 +1004,12 @@ pub fn find_cached(store: Arc<dyn CellStore>, dem: Arc<dyn CellStore>, from: (f6
     }
     if std::env::var_os("MAHERE_ROUTE_LOG").is_some() {
         eprintln!("route: {} nodes, {} crossings taken, {} cells read, {:.0} ms reading them, {:.0} ms decoding them", states.len(), CROSSED.load(std::sync::atomic::Ordering::Relaxed), cells.got.len(), READ_NS.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e6, DECODE_NS.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e6);
+        let mut by_depth = [(0usize, 0usize); 32];
+        for (k, c) in &cells.got {
+            by_depth[k.depth as usize].0 += 1;
+            by_depth[k.depth as usize].1 += c.is_some() as usize;
+        }
+        eprintln!("route: cells by depth (read, with routing): {}", by_depth.iter().enumerate().filter(|(_, n)| n.0 > 0).map(|(d, n)| format!("d{d} {}/{}", n.0, n.1)).collect::<Vec<_>>().join(", "));
     }
     let Some((last, seconds)) = done else { return Err("no route between them on the ways baked so far".into()) };
     // The nodes back to the start, then the trixels: along each corridor its traced run, at a turn or a hop the node itself.

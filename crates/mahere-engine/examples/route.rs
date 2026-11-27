@@ -1,5 +1,41 @@
 //! `route <cells dir> <lat lon> <lat lon> [car|bike|foot]`: the best route between two points from a cell directory, its length, time, climb and turns.
-use std::sync::Arc;
+//! MAHERE_SLOW_NET=<ms>: the store as ferros's network has it (2026-11-27): eight fetches at once, each `ms` long, and a local read finding only what was fetched (the device's vault).
+use std::sync::{Arc, Condvar, Mutex};
+
+use mahere_engine::residency::{CellStore, Fetch};
+use mahere_tiles::CellKey;
+
+/// A store behind a slow network of eight connections, remembering what came through it.
+struct Slow {
+    inner: Arc<dyn CellStore>,
+    ms: u64,
+    busy: Mutex<usize>,
+    free: Condvar,
+    kept: Mutex<Vec<(CellKey, Vec<u8>)>>,
+}
+
+impl CellStore for Slow {
+    fn get(&self, key: CellKey) -> Fetch {
+        if let Some(b) = self.kept.lock().unwrap().iter().find(|(k, _)| *k == key).map(|(_, b)| b.clone()) {
+            return Fetch::Bytes(b);
+        }
+        let mut busy = self.free.wait_while(self.busy.lock().unwrap(), |b| *b >= 8).unwrap();
+        *busy += 1;
+        drop(busy);
+        std::thread::sleep(std::time::Duration::from_millis(self.ms));
+        let got = self.inner.get(key);
+        *self.busy.lock().unwrap() -= 1;
+        self.free.notify_one();
+        if let Fetch::Bytes(b) = &got {
+            self.kept.lock().unwrap().push((key, b.clone()));
+        }
+        got
+    }
+
+    fn get_local(&self, key: CellKey) -> Fetch {
+        self.kept.lock().unwrap().iter().find(|(k, _)| *k == key).map_or(Fetch::Absent, |(_, b)| Fetch::Bytes(b.clone()))
+    }
+}
 
 fn main() {
     let a: Vec<String> = std::env::args().collect();
@@ -20,6 +56,11 @@ fn main() {
     } else {
         let s = Arc::new(mahere_engine::residency::DirStore(root));
         (s.clone(), s)
+    };
+    let slow = |s: Arc<dyn CellStore>, ms: u64| -> Arc<dyn CellStore> { Arc::new(Slow { inner: s, ms, busy: Mutex::new(0), free: Condvar::new(), kept: Mutex::new(Vec::new()) }) };
+    let (store, dem) = match std::env::var("MAHERE_SLOW_NET").ok().and_then(|v| v.parse::<u64>().ok()) {
+        Some(ms) => (slow(store, ms), slow(dem, ms)),
+        None => (store, dem),
     };
     let t = std::time::Instant::now();
     match mahere_engine::route::find(store, dem, (n(2), n(3)), (n(4), n(5)), travel) {

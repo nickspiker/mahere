@@ -99,6 +99,8 @@ pub struct DeviceApp<G: MapGpu = NoGpu> {
     /// Recording a track (Nick 2026-10-13): fixes go to the recorder only while this is on, and the activity runs the track service, which owns the GPS meanwhile.
     pub recording: bool,
     pub fixes_since_save: u32,
+    /// The view and the route as last saved ([`Self::save_at_rest`]).
+    pub session_saved: u64,
     /// The recorded tracks (Nick 2026-11-21: a track "doesn't save to map and disappears when you're done... no data for the track"): the saved ones newest first with their numbers, the recording's numbers as it grows, the saved one drawn on the map, and a list a background load has made ready.
     pub tracks: Vec<(i64, mahere_store::TrackStats)>,
     pub track_live: mahere_store::TrackStats,
@@ -385,7 +387,8 @@ impl<G: MapGpu> DeviceApp<G> {
                     self.map.found_at = Some((lat, lon));
                     self.map.go_to(lat, lon, None, self.w, self.h);
                 }
-                SearchAct::Go(lat, lon) => self.map.route_to((lat, lon), self.w, self.h),
+                SearchAct::Go(lat, lon) => self.map.route_to((lat, lon), false, self.w, self.h),
+                SearchAct::Route(lat, lon) => self.map.route_to((lat, lon), true, self.w, self.h),
                 SearchAct::From(lat, lon) => self.map.set_pin(mahere_engine::Pin::A, (lat, lon)),
                 SearchAct::To(lat, lon) => self.map.set_pin(mahere_engine::Pin::B, (lat, lon)),
             }
@@ -724,6 +727,22 @@ impl<G: MapGpu> DeviceApp<G> {
         }
     }
 
+    /// The session saved once the view comes to rest somewhere new, or the pins or the route change: ferros has no pause to save on as Android does (2026-11-27: every relaunch on a new capsule started from the whole globe, the view never saved without a GPS fix).
+    fn save_at_rest(&mut self) {
+        use std::hash::{Hash, Hasher};
+        if !self.label_rest() {
+            return;
+        }
+        let c = self.map.cam;
+        let mut hs = std::hash::DefaultHasher::new();
+        (c.lat().to_bits(), c.lon().to_bits(), c.ppd.to_bits(), c.bearing().to_bits(), self.map.marks_state()).hash(&mut hs);
+        let key = hs.finish();
+        if key != self.session_saved {
+            self.session_saved = key;
+            self.save_session();
+        }
+    }
+
     pub fn save_session(&self) {
         if let Some(store) = &self.store {
             let c = &self.map.cam;
@@ -940,6 +959,7 @@ impl<G: MapGpu> FluorApp for DeviceApp<G> {
 
     fn tick(&mut self, ctx: &mut Context) -> bool {
         self.follow_loading();
+        self.save_at_rest();
         if let Some(what) = self.panel.take_copy() {
             ctx.window.set_clipboard(&what);
         }
@@ -1173,6 +1193,7 @@ impl<G: MapGpu> DeviceApp<G> {
             recorder,
             recording: settings.is_some_and(|s| s.record),
             fixes_since_save: 0,
+            session_saved: 0,
             tracks: Vec::new(),
             track_live: Default::default(),
             track_shown: None,

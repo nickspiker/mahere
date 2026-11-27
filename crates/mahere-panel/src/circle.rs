@@ -998,9 +998,9 @@ impl Panel {
                 let (lat, lon) = self.round.cap_at;
                 match a {
                     CapAct::Copy => self.copied = Some(format!("{lat:.6}, {lon:.6}")),
-                    // A route from here to the readout's point: navigation, which the host turns to directions when there is no fix ([`mahere_engine::MapCore::route_to`]).
+                    // A route to the readout's point: navigation, which the host turns to directions from where the readout measured when there is no fix ([`mahere_engine::MapCore::route_to`]).
                     CapAct::Route => {
-                        self.search_act = Some(SearchAct::Go(lat, lon));
+                        self.search_act = Some(SearchAct::Route(lat, lon));
                         ctl.route = 2;
                         if ctl.travel == 0 {
                             ctl.travel = 1;

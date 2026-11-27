@@ -1011,6 +1011,8 @@ pub struct SearchRow {
 pub enum SearchAct {
     Show(f64, f64),
     Go(f64, f64),
+    /// A route to the readout's point from where it measured (its Route bead on ferros's circle).
+    Route(f64, f64),
     From(f64, f64),
     To(f64, f64),
 }

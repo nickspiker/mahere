@@ -304,6 +304,8 @@ impl GpuMap {
         let mut hs = std::collections::hash_map::DefaultHasher::new();
         (w, h, c.lat().to_bits(), c.lon().to_bits(), c.ppd.to_bits(), c.bearing().to_bits(), map.pool_version(), map.style_version(), map.layers().bits()).hash(&mut hs);
         (app.panel.is_open(), app.panel.ru().to_bits(), map.globe_loading().map(|d| d.to_bits()), map.gps.is_some()).hash(&mut hs);
+        // The pins, the tapped point, the route: a frame waiting from before a tap is not shown as it is (2026-11-27: a tap showed only once the map moved).
+        map.marks_state().hash(&mut hs);
         // The panel asking to be painted again: a frame waiting is not drawn as it is, its overlay predates the change.
         app.panel_changed.hash(&mut hs);
         // A layout of the place names landed: the frame waiting has the last one's.
@@ -608,13 +610,15 @@ impl GpuMap {
         let marks_key = hash(&|hs| {
             // The bearing as the compass can show it (2^-8 radians turn its arrow's tip a tenth of a pixel): the two-finger solve moves it by less every frame, and each was a repaint.
             (w, h, (c.bearing() * (1u32 << 8) as f64).round() as i64, map.zoom_depth(), map.past_data(), map.layers().bits()).hash(hs);
+            map.marks_state().hash(hs);
             if pinned {
                 (c.lat().to_bits(), c.lon().to_bits(), c.ppd.to_bits()).hash(hs);
             }
         });
         let panel_key = hash(&|hs| {
-            (w, h, app.panel.is_open(), map.layers().bits(), app.panel.ru().to_bits(), map.view_depth(), map.zoom_depth(), map.route_version, map.contour_major().map(f32::to_bits)).hash(hs);
-            if app.panel.is_open() {
+            (w, h, app.panel.is_open(), map.layers().bits(), app.panel.ru().to_bits(), map.view_depth(), map.zoom_depth(), map.marks_state(), map.contour_major().map(f32::to_bits)).hash(hs);
+            // The readout in the cap measures from the view's centre, so it follows the camera as the open pages do.
+            if app.panel.is_open() || map.has_measure() {
                 (c.lat().to_bits(), c.lon().to_bits(), c.ppd.to_bits(), c.bearing().to_bits()).hash(hs);
             }
         });

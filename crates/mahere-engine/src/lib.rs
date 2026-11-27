@@ -1527,17 +1527,16 @@ impl MapCore {
         self.dirty = true;
     }
 
-    /// A route to `to` from wherever the device is: navigation from the fix when there is one, else directions from the readout's origin or the view's centre (2026-11-27: on ferros, without a fix, "Route" set a destination that waited for a fix that never came, and nothing was ever routed).
-    pub fn route_to(&mut self, to: (f64, f64), w: usize, h: usize) {
+    /// A route to `to`: navigation from the fix when there is one; without one, directions to it, from where the readout measured when `from_readout` (its Route bead), else from the start the next tap puts down (2026-11-27: on ferros, without a fix, a destination waited for a fix that never came, and nothing was ever routed).
+    pub fn route_to(&mut self, to: (f64, f64), from_readout: bool, w: usize, h: usize) {
         if self.gps.is_some() {
             self.set_route_mode(RouteMode::Navigate);
             self.set_pin(Pin::Dest, to);
             return;
         }
-        let (cx, cy) = Camera::centre(w, h);
-        let from = self.measure_origin(w, h).unwrap_or_else(|| self.cam.screen_to_geo(cx, cy, w, h));
+        let from = if from_readout { self.measure_origin(w, h) } else { None };
         self.set_route_mode(RouteMode::Directions);
-        self.pin_a = Some(from);
+        self.pin_a = from;
         self.set_pin(Pin::B, to);
     }
 
@@ -2722,7 +2721,7 @@ mod tests {
         assert!(map.pin_a.is_some() && map.pin_b.is_none(), "a third tap starts again");
     }
 
-    /// "Route" to a place: navigation from the fix when there is one, directions from the view's centre when there is none (ferros 2026-11-27: a destination with no fix waited forever).
+    /// "Go" to a place: navigation from the fix when there is one; without one, directions to it from the start the next tap puts down, or from the readout's origin for its Route bead (ferros 2026-11-27: a destination with no fix waited forever).
     #[test]
     fn route_to_navigates_from_a_fix_and_directs_without_one() {
         let (lat0, lon0) = (47.5f64, -122.5f64);
@@ -2730,15 +2729,24 @@ mod tests {
         let (w, h) = (400, 400);
         let mut map = MapCore::new(Arc::new(Empty), Camera::new(lat0, lon0, 20_000.0, 0.0));
         map.set_travel(Some(route::Travel::Foot));
-        map.route_to(to, w, h);
+        map.route_to(to, false, w, h);
         assert_eq!(map.route_mode, RouteMode::Directions);
-        let a = map.pin_a.expect("a start at the centre");
-        assert!((a.0 - lat0).abs() < 1e-6 && (a.1 - lon0).abs() < 1e-6, "the start is the view's centre: {a:?}");
-        assert_eq!(map.pin_b, Some(to));
+        assert_eq!((map.pin_a, map.pin_b), (None, Some(to)));
+        assert!(!map.routing());
+        assert_eq!(map.route_card(), vec!["Tap the start".to_string()]);
+        let (cx, cy) = Camera::centre(w, h);
+        map.tap(cx, cy, w, h);
+        assert!(map.pin_a.is_some() && map.routing(), "the tap is the start, and the route is asked for");
+
+        map.set_route_mode(RouteMode::Off);
+        map.tap(cx, cy, w, h);
+        map.route_to(to, true, w, h);
+        let a = map.pin_a.expect("a start where the readout measured from");
+        assert!((a.0 - lat0).abs() < 1e-6 && (a.1 - lon0).abs() < 1e-6, "the readout measures from the view's centre: {a:?}");
         assert!(map.routing(), "the route is asked for at once");
 
         map.gps = Some(GpsFix { lat: lat0, lon: lon0, accuracy_m: 5.0, height_m: None, v_accuracy_m: None });
-        map.route_to(to, w, h);
+        map.route_to(to, false, w, h);
         assert_eq!(map.route_mode, RouteMode::Navigate);
         assert_eq!(map.nav_to, Some(to));
         assert!(map.pin_a.is_none() && map.pin_b.is_none());
@@ -3272,6 +3280,16 @@ impl MapCore {
 
     pub fn has_measure(&self) -> bool {
         self.measure.is_some()
+    }
+
+    /// What the marks and the readout show beyond the camera: the pins, the place found, the tapped point, the ruler, and the route, its mode, its way of travel and its search. A host that keeps them painted and draws again only on a change (ferros's GPU map) watches this (2026-11-27: a tap's pin and readout showed only once the map was moved).
+    pub fn marks_state(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let at = |p: Option<(f64, f64)>| p.map(|(a, b)| (a.to_bits(), b.to_bits()));
+        let mut hs = std::hash::DefaultHasher::new();
+        (at(self.pin_a), at(self.pin_b), at(self.nav_to), at(self.found_at), at(self.measure.map(|m| m.target)), self.measure.map(|m| m.from_fix), self.ruler).hash(&mut hs);
+        (self.route_version, self.route_rx.is_some(), &self.route_error, self.route_mode as u8, self.travel.map(|t| t.word())).hash(&mut hs);
+        hs.finish()
     }
 }
 

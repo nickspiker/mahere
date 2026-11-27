@@ -551,7 +551,8 @@ impl MahereApp {
                     self.map.found_at = Some((lat, lon));
                     self.map.go_to(lat, lon, None, w, h);
                 }
-                SearchAct::Go(lat, lon) => self.map.route_to((lat, lon), w, h),
+                SearchAct::Go(lat, lon) => self.map.route_to((lat, lon), false, w, h),
+                SearchAct::Route(lat, lon) => self.map.route_to((lat, lon), true, w, h),
                 SearchAct::From(lat, lon) => self.map.set_pin(mahere_engine::Pin::A, (lat, lon)),
                 SearchAct::To(lat, lon) => self.map.set_pin(mahere_engine::Pin::B, (lat, lon)),
             }

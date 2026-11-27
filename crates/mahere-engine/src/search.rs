@@ -11,6 +11,12 @@ use crate::{Camera, MapCore};
 /// Results kept, best first.
 pub const MAX_FOUND: usize = 60;
 
+/// Depths finer than the map letters at that a search still reads: what the view shows and a little more (a shop the lettering leaves out), not every finer cell the device keeps under it (ferros 2026-11-27: a search of a view over thousands of kept cells never came back).
+const FINER_DEPTHS: u8 = 3;
+
+/// How long a search reads cells before it answers with what it found, milliseconds: the coarsest and the middlemost first, so what is cut is the finest at the edges.
+const BUDGET_MS: u128 = 1 << 11;
+
 /// A place the search found.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Found {
@@ -34,13 +40,15 @@ pub struct SearchJob {
     pub h: usize,
     pub query: String,
     pub cached: Vec<CellKey>,
+    /// The depth the map letters at ([`MapCore::vec_depth`]).
+    pub depth: u8,
     store: Arc<dyn CellStore>,
 }
 
 impl MapCore {
     /// A search of the view for `query` over `cached` (the base cells the device keeps, any depth), for another thread to run ([`run`]).
     pub fn search_job(&self, query: &str, w: usize, h: usize, cached: Vec<CellKey>) -> SearchJob {
-        SearchJob { cam: self.cam, w, h, query: query.to_string(), cached, store: self.res.store() }
+        SearchJob { cam: self.cam, w, h, query: query.to_string(), cached, depth: self.vec_depth(), store: self.res.store() }
     }
 }
 
@@ -101,13 +109,23 @@ pub fn run(job: &SearchJob, cache: &mut NamesCache, tier: &dyn Fn(&Named) -> Opt
     let (cx, cy) = Camera::centre(job.w, job.h);
     // Merged by (kind, name, reference): the best fit, the position and size at the finest depth seen (a coarse texel is hundreds of metres wide: a trailhead placed from a depth-5 cell stood a kilometre from where the map letters it), nearest the centre among that depth's.
     let mut found: Vec<(Found, u8, f64)> = Vec::new();
-    // How many of the kept cells were under the screen, and how many of those had names to read (on the console with the search).
-    let (mut under, mut named) = (0usize, 0usize);
-    for &key in &job.cached {
-        if !meets(&job.cam, job.w, job.h, key) {
-            continue;
+    // The kept cells under the screen to a few depths past the lettering's, coarsest first and the middle first within a depth.
+    let t = std::time::Instant::now();
+    let centre_of = |k: CellKey| {
+        let c = k.corners();
+        let (lat, lon) = (c.iter().map(|p| p.0).sum::<f64>() / c.len() as f64, c.iter().map(|p| p.1).sum::<f64>() / c.len() as f64);
+        let (x, y) = job.cam.geo_to_screen(lat, lon, job.w, job.h);
+        (x - cx).powi(2) + (y - cy).powi(2)
+    };
+    let mut under: Vec<(u8, f64, CellKey)> = job.cached.iter().filter(|k| k.depth <= job.depth + FINER_DEPTHS && meets(&job.cam, job.w, job.h, **k)).map(|&k| (k.depth, centre_of(k), k)).collect();
+    under.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.total_cmp(&b.1)));
+    // How many of those were read and had names to read, and whether the time ran out first (on the console with the search).
+    let (mut read, mut named) = (0usize, 0usize);
+    for &(_, _, key) in &under {
+        if t.elapsed().as_millis() > BUDGET_MS {
+            break;
         }
-        under += 1;
+        read += 1;
         let Some(names) = names_of(&*job.store, cache, key) else { continue };
         named += 1;
         // The entries that fit, by their 1-based index.
@@ -126,8 +144,17 @@ pub fn run(job: &SearchJob, cache: &mut NamesCache, tier: &dyn Fn(&Named) -> Opt
         }
         // Each fitting entry's texels on the screen: how many, and the one nearest the centre.
         let mut seen: Vec<(usize, u32, f64, (f64, f64))> = fits.iter().map(|&(i, _)| (i, 0, f64::MAX, (0.0, 0.0))).collect();
+        // Each entry's place in `seen` by its index (u32::MAX for one that does not fit): a texel looked up, not searched for (a one-letter query fits thousands of a cell's entries, and a search through them for each of its hundred thousand texels took minutes on ferros).
+        let mut slot = vec![u32::MAX; names.entries.len() + 1];
+        for (k, s) in seen.iter().enumerate() {
+            slot[s.0] = k as u32;
+        }
         for (t, v) in names.line.iter().map(|&(t, v)| (t as usize, v)).chain(names.area_texels()) {
-            let Some(s) = seen.iter_mut().find(|s| s.0 == v as usize) else { continue };
+            let k = slot[v as usize];
+            if k == u32::MAX {
+                continue;
+            }
+            let s = &mut seen[k as usize];
             let (lat, lon) = key.texel_lat_lon(t);
             let (x, y) = job.cam.geo_to_screen(lat, lon, job.w, job.h);
             if x < 0.0 || y < 0.0 || x > w || y > h {
@@ -166,7 +193,7 @@ pub fn run(job: &SearchJob, cache: &mut NamesCache, tier: &dyn Fn(&Named) -> Opt
     };
     found.sort_by(|a, b| order(&a.0).cmp(&order(&b.0)).then(b.0.rank.cmp(&a.0.rank)).then(b.0.size_m.total_cmp(&a.0.size_m)));
     found.truncate(MAX_FOUND);
-    eprintln!("search: {under} cells under the screen, {named} with names, {} places", found.len());
+    eprintln!("search: {} cells under the screen to depth {}, {read} read, {named} with names, {} places, {} ms{}", under.len(), job.depth + FINER_DEPTHS, found.len(), t.elapsed().as_millis(), if read < under.len() { ", the rest left for the time" } else { "" });
     found.into_iter().map(|e| e.0).collect()
 }
 
