@@ -872,9 +872,8 @@ pub struct Panel {
     page_gear: (f32, f32, f32),
     /// The circle's state on ferros (circle.rs).
     round: circle::Round,
-    /// The loading arc's state (`set_loading`), and its opacity and share as drawn, easing toward it.
+    /// The loading ring's state (`set_loading`).
     load: Option<circle::LoadState>,
-    load_shown: (f32, f32),
     /// The Layers page scrolls between the orb and the footer (Nick 2026-10-11): how far, how far it can, a press on it (where it started, whether it has moved), and the band it scrolls in (top, bottom, where the footer starts).
     layers_scroll: f32,
     layers_extent: f32,
@@ -1057,7 +1056,7 @@ impl Panel {
         let pills = Pills::new(hits + 1000);
         let interval = Slider::new(&mut hits, 0.0, 0.0, 10.0, 10.0, 0.0);
         let text_slider = Slider::new(&mut hits, 0.0, 0.0, 10.0, 10.0, text_pos(1.0));
-        Panel { fonts: None, font_cursor: Default::default(), open: false, dirty: true, ru: 1.0, stack: vec![Page::Layers], theme_rows: Vec::new(), edit_rows: Vec::new(), edit_scroll: 0.0, edit_extent: 0.0, press: None, sliders: Vec::new(), field_vals: [0.0; 4], held: None, edits: Vec::new(), hits, shown: vec![true; LAYERS.len()], group_open: GROUPS_OPEN, group_rows: Vec::new(), tree: Vec::new(), layer_open: None, field_open: None, theme_now: None, interval, interval_held: false, text_slider, text_pending: None, ru_request: None, label_scale: 1.0, touch: false, checks, text: TextRenderer::new(), buf: Vec::new(), w: 0, h: 0, font: 16.0, gear: (0.0, 0.0, 0.0), panel_w: 0.0, theme_row: (0.0, 0.0, 0.0), slider: (0.0, 0.0, 0.0), slider_held: false, cache_max: CACHE_MIN + 1, strip_close: None, notice: None, notice_btn: None, notice_tapped: false, clear_measure: false, area_rows: Vec::new(), area_acts: Vec::new(), areas: AreasView::default(), update_rows: Vec::new(), update_acts: Vec::new(), updates: UpdatesView::default(), host_orb: None, safe: None, page_gear: (0.0, 0.0, 0.0), round: circle::Round::default(), load: None, load_shown: (0.0, 0.0), layers_scroll: 0.0, layers_extent: 0.0, layers_press: None, layers_band: (0.0, 0.0), orb_icon: fluor::host::icon::Icon::from_vsf_bytes(APP_ORB_VSF).ok(), orb_scaled: (0, Vec::new()), locate_btn: None, tool_btn: None, toolbox_open: false, tool_rows: Vec::new(), pills, auto_check, travel, toolbox, marker_choice, colour_of_track: false, theme_list, area_list, search_list, track_list, tracks: TracksView::default(), tracks_version: 0, track_rows: Vec::new(), track_acts: Vec::new(), copy_btns: Vec::new(), copied: None, query: String::new(), search_box: None, query_dirty: false, search_pending: false, found: Vec::new(), picked: None, search_act: None, search_rows: Vec::new(), search_acts: Vec::new(), search_field: None, route_pills: Vec::new(), swap: false, card_top: None }
+        Panel { fonts: None, font_cursor: Default::default(), open: false, dirty: true, ru: 1.0, stack: vec![Page::Layers], theme_rows: Vec::new(), edit_rows: Vec::new(), edit_scroll: 0.0, edit_extent: 0.0, press: None, sliders: Vec::new(), field_vals: [0.0; 4], held: None, edits: Vec::new(), hits, shown: vec![true; LAYERS.len()], group_open: GROUPS_OPEN, group_rows: Vec::new(), tree: Vec::new(), layer_open: None, field_open: None, theme_now: None, interval, interval_held: false, text_slider, text_pending: None, ru_request: None, label_scale: 1.0, touch: false, checks, text: TextRenderer::new(), buf: Vec::new(), w: 0, h: 0, font: 16.0, gear: (0.0, 0.0, 0.0), panel_w: 0.0, theme_row: (0.0, 0.0, 0.0), slider: (0.0, 0.0, 0.0), slider_held: false, cache_max: CACHE_MIN + 1, strip_close: None, notice: None, notice_btn: None, notice_tapped: false, clear_measure: false, area_rows: Vec::new(), area_acts: Vec::new(), areas: AreasView::default(), update_rows: Vec::new(), update_acts: Vec::new(), updates: UpdatesView::default(), host_orb: None, safe: None, page_gear: (0.0, 0.0, 0.0), round: circle::Round::default(), load: None, layers_scroll: 0.0, layers_extent: 0.0, layers_press: None, layers_band: (0.0, 0.0), orb_icon: fluor::host::icon::Icon::from_vsf_bytes(APP_ORB_VSF).ok(), orb_scaled: (0, Vec::new()), locate_btn: None, tool_btn: None, toolbox_open: false, tool_rows: Vec::new(), pills, auto_check, travel, toolbox, marker_choice, colour_of_track: false, theme_list, area_list, search_list, track_list, tracks: TracksView::default(), tracks_version: 0, track_rows: Vec::new(), track_acts: Vec::new(), copy_btns: Vec::new(), copied: None, query: String::new(), search_box: None, query_dirty: false, search_pending: false, found: Vec::new(), picked: None, search_act: None, search_rows: Vec::new(), search_acts: Vec::new(), search_field: None, route_pills: Vec::new(), swap: false, card_top: None }
     }
 
     pub fn is_open(&self) -> bool {
@@ -2244,7 +2243,7 @@ impl Panel {
         self.copy_btns.clear();
         self.pills.begin();
         self.notice_btn = None;
-        // The loading line first: in front of everything the column draws.
+        // The loading ring round the orb, in front of what the column draws.
         self.paint_loading(&mut canvas);
         if let Some((words, button)) = self.notice.clone() {
             // Along the top, level with the orb, right of it: the words, then the button lit beside them.

@@ -47,7 +47,7 @@ pub struct DeviceApp<G: MapGpu = NoGpu> {
     pub map: MapCore,
     /// Why `tick` asked for a frame beyond the map's own (`MapCore::tick_why`), counted: a search landed, the panel dirty, the lettering landed.
     pub tick_why: [u64; 3],
-    /// The loading arc's bookkeeping: when the view began waiting for cells, the count in and when it last grew, and when the last wait ended.
+    /// The loading ring's bookkeeping: when the view began waiting for cells, the count in and when it last grew, and when the last wait ended.
     load_began: Option<Instant>,
     load_got: (u32, Instant),
     load_ended: Option<Instant>,
@@ -1250,7 +1250,7 @@ fn when_text(et: i64) -> String {
 }
 
 impl<G: MapGpu> DeviceApp<G> {
-    /// The loading arc's state from the view's cells (2026-11-27, the owner: "hard to know sometimes if the network is stuck or there just isn't coverage"): shown once a wait has lasted half a second (a quick load never flashes it), the share of the view's cells in; stalled when nothing has come for five seconds, with the last fetch's failure or the network's slowness as the reason; and for three seconds after a wait, where part of the view has nothing finer, that it has none.
+    /// The loading ring's state from the view's cells (2026-11-27, the owner: "hard to know sometimes if the network is stuck or there just isn't coverage"): the share of the view's cells in while any are on their way; stalled when nothing has come for five seconds, with the last fetch's failure or the network's slowness as the reason; and for three seconds after a wait, where part of the view has nothing finer, that it has none.
     fn follow_loading(&mut self) {
         let l = self.map.loading();
         let now = Instant::now();
@@ -1260,10 +1260,8 @@ impl<G: MapGpu> DeviceApp<G> {
         }
         let state = if l.pending + l.failing > 0 {
             self.load_ended = None;
-            let began = *self.load_began.get_or_insert(now);
-            if now - began < Duration::from_millis(1 << 9) {
-                None
-            } else if now - self.load_got.1 >= Duration::from_secs(5) {
+            self.load_began.get_or_insert(now);
+            if now - self.load_got.1 >= Duration::from_secs(5) {
                 let why = match mahere_engine::residency::last_failure().filter(|_| l.failing > 0) {
                     Some(e) => format!("Network stalled: {}", e.chars().take(48).collect::<String>()),
                     None => "Waiting on the network".to_string(),

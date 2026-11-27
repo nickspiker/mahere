@@ -209,7 +209,7 @@ fn main() {
             }
         }
         let measure = map.measure_view(w, h, mahere_panel::Panel::strip_samples(w));
-        // MAHERE_LOADING=<share>[,stalled] shows the loading arc: the share of the view's cells in, stalled with a made-up reason.
+        // MAHERE_LOADING=<share>[,stalled] shows the loading ring: the share of the view's cells in, stalled with a made-up reason.
         if let Ok(spec) = std::env::var("MAHERE_LOADING") {
             let mut p = spec.split(',');
             let f: f32 = p.next().and_then(|v| v.parse().ok()).unwrap_or(0.5);
