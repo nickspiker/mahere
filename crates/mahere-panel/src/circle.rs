@@ -82,12 +82,12 @@ fn soft_cap(z: f32, limit: f32) -> f32 {
 }
 
 /// How much of a pixel a shape covers, its centre `d` pixels outside the shape's edge (negative inside): a logistic, half at the edge, about a pixel wide, C∞.
-fn cover(d: f32) -> f32 {
+pub(crate) fn cover(d: f32) -> f32 {
     1. / (1. + (4. * d).exp())
 }
 
 /// A colour at a fraction of its coverage: its opacity and darkness together, as fluor's layers hold them.
-fn part(c: u32, k: f32) -> u32 {
+pub(crate) fn part(c: u32, k: f32) -> u32 {
     let b = |s: u32| ((((c >> s) & 0xFF) as f32 * k) as u32) << s;
     b(24) | b(16) | b(8) | b(0)
 }

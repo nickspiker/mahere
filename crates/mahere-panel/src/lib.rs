@@ -2594,20 +2594,22 @@ impl Panel {
             None => self.orb_pixels(size).to_vec(),
         };
         let (x0, y0) = ((gx - gr) as isize, (gy - gr) as isize);
-        let rr = gr * gr;
-        if px.len() == size * size {
+        let drawn = px.len() == size * size;
+        if drawn {
             for py in 0..size {
                 for qx in 0..size {
                     let (dx, dy) = (qx as f32 + 0.5 - gr, py as f32 + 0.5 - gr);
                     let p = px[py * size + qx];
-                    if dx * dx + dy * dy > rr || p == 0 {
+                    // Its edge the panel's logistic across a pixel, half a pixel in from the radius so the image square holds it: what it leaves of an edge pixel is the loading ring's behind it, with no seam (2026-11-27: a hard cut, and the gear's dark disc drawn out to the radius under it, left a pixel of black between the orb and its ring).
+                    let d = dx.hypot(dy) - gr + 1.;
+                    if d > 2. || p == 0 {
                         continue;
                     }
                     let (x, y) = (x0 + qx as isize, y0 + py as isize);
                     if x < 0 || y < 0 || x as usize >= w || y as usize >= h {
                         continue;
                     }
-                    self.buf[y as usize * w + x as usize] = p;
+                    self.buf[y as usize * w + x as usize] = if d < -2. { p } else { circle::part(p, circle::cover(d)) };
                 }
             }
         }
@@ -2624,7 +2626,10 @@ impl Panel {
                 self.text.draw_text_left(&mut canvas, APP_NAME, nx + ox, ny + oy, &shade, None, None);
             }
         }
-        paint::circle_filled(&mut canvas, gx as isize, gy as isize, gr as isize, hue::gear_bg(), None, None);
+        // The gear's own ground only where there is no orb to show: under the orb its edge was a dark ring between the orb and the loading ring.
+        if !drawn {
+            paint::circle_filled(&mut canvas, gx as isize, gy as isize, gr as isize, hue::gear_bg(), None, None);
+        }
     }
 
     /// One painted pixel as premultiplied visible (r, g, b, a): fluor stores accumulated darkness with `dark ≤ α`, so the premultiplied channel is `α − dark`; Android's theme bytes are R↔B swapped.
